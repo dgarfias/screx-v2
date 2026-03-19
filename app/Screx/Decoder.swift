@@ -47,6 +47,9 @@ final class DecoderService: ObservableObject {
         case 34:
             pps = nalu
             rebuildFormatDescriptionIfPossible()
+        case 35:
+            // AUD: delimiter only, not needed in AVCC payload.
+            break
         default:
             accessUnitNalus.append(nalu)
         }
@@ -96,6 +99,7 @@ final class DecoderService: ObservableObject {
         guard !accessUnitNalus.isEmpty else { return }
         guard let formatDescription else {
             accessUnitNalus.removeAll(keepingCapacity: true)
+            onRequestIDR?()
             return
         }
 

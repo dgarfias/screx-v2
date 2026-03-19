@@ -188,20 +188,29 @@ final class TransportService {
         }
 
         reorderBuffer[packet.sequenceNumber] = packet
-        if reorderBuffer.count > 64 {
-            droppedPackets += UInt64(reorderBuffer.count)
-            reorderBuffer.removeAll(keepingCapacity: true)
-            nextSequenceNumber = packet.sequenceNumber &+ 1
-            process(packet: packet)
-            publishMetricsFallback()
-            return
-        }
-
         var cursor = expected
         while let next = reorderBuffer.removeValue(forKey: cursor) {
             process(packet: next)
             cursor = cursor &+ 1
             nextSequenceNumber = cursor
+        }
+
+        // If one packet is lost, do not stall forever waiting for it.
+        // After a small buffer fills, skip ahead to the earliest available packet.
+        if reorderBuffer.count >= 8, let expectedNow = nextSequenceNumber {
+            let sorted = reorderBuffer.keys.sorted(by: sequenceLess)
+            if let earliest = sorted.first {
+                let skipped = UInt16(truncatingIfNeeded: earliest &- expectedNow)
+                droppedPackets += UInt64(max(skipped, 1))
+
+                var cursor = earliest
+                while let next = reorderBuffer.removeValue(forKey: cursor) {
+                    process(packet: next)
+                    cursor = cursor &+ 1
+                    nextSequenceNumber = cursor
+                }
+                publishMetricsFallback()
+            }
         }
     }
 
@@ -263,6 +272,10 @@ final class TransportService {
                 droppedPackets: droppedPackets
             )
         )
+    }
+
+    private func sequenceLess(_ lhs: UInt16, _ rhs: UInt16) -> Bool {
+        Int16(bitPattern: lhs &- rhs) < 0
     }
 }
 
