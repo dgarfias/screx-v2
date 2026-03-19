@@ -130,30 +130,52 @@ final class StreamViewModel: ObservableObject {
 
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
+    @State private var showInfoPanel = true
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text("Screx V2 Receiver")
-                .font(.title2.bold())
-            Text("Status: \(model.statusText)")
-                .font(.footnote)
-            Text("Connected: \(model.connectedEndpointName)")
-                .font(.footnote)
-            Text("Latency: \(model.latencyText)")
-                .font(.footnote)
-            Text("Jitter: \(model.jitterText)")
-                .font(.footnote)
-            Text("Packet loss: \(model.packetLossText)")
-                .font(.footnote)
-            Text("Dropped packets: \(model.droppedPacketsText)")
-                .font(.footnote)
-            Text("Dropped frames: \(model.droppedFramesText)")
-                .font(.footnote)
-            Text("Decoder errors: \(model.decoderErrorText)")
-                .font(.footnote)
+        ZStack(alignment: .topTrailing) {
+            DisplayView(layer: model.decoder.displayLayer)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .ignoresSafeArea()
 
-            HStack(spacing: 8) {
-                Button("Request IDR") {
+            VStack(alignment: .trailing, spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showInfoPanel.toggle()
+                    }
+                } label: {
+                    Image(systemName: showInfoPanel ? "info.circle.fill" : "info.circle")
+                        .font(.title3.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+
+                if showInfoPanel {
+                    diagnosticsPanel
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            }
+            .padding()
+        }
+    }
+
+    private var diagnosticsPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Screx V2")
+                .font(.headline)
+            Text("Status: \(model.statusText)")
+            Text("Connected: \(model.connectedEndpointName)")
+            Text("Latency: \(model.latencyText)")
+            Text("Jitter: \(model.jitterText)")
+            Text("Packet loss: \(model.packetLossText)")
+            Text("Dropped packets: \(model.droppedPacketsText)")
+            Text("Dropped frames: \(model.droppedFramesText)")
+            Text("Decoder errors: \(model.decoderErrorText)")
+
+            Divider()
+
+            HStack(spacing: 6) {
+                Button("IDR") {
                     model.requestIDR()
                 }
                 Button("8 Mbps") {
@@ -162,6 +184,10 @@ struct ContentView: View {
                 Button("12 Mbps") {
                     model.setBitrate(12_000_000)
                 }
+            }
+            .buttonStyle(.bordered)
+
+            HStack(spacing: 6) {
                 Button("720p") {
                     model.setResolution(width: 1280, height: 720)
                 }
@@ -170,16 +196,11 @@ struct ContentView: View {
                 }
             }
             .buttonStyle(.bordered)
-            .font(.footnote)
-
-            DisplayView(layer: model.decoder.displayLayer)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
 
             if !model.discoveredEndpoints.isEmpty {
+                Divider()
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack {
+                    HStack(spacing: 6) {
                         ForEach(model.discoveredEndpoints) { endpoint in
                             Button(endpoint.name) {
                                 model.connect(to: endpoint)
@@ -190,6 +211,9 @@ struct ContentView: View {
                 }
             }
         }
-        .padding()
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: 360, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 }

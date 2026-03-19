@@ -351,7 +351,7 @@ mod vaapi {
             cmd.args(["-hide_banner", "-loglevel", "error"])
                 .args(["-vaapi_device", "/dev/dri/renderD128"])
                 .args(["-f", "rawvideo"])
-                .args(["-pix_fmt", "bgra"])
+                .args(["-pix_fmt", "bgr0"])
                 .args([
                     "-video_size",
                     &format!("{}x{}", config.width, config.height),
@@ -360,6 +360,7 @@ mod vaapi {
                 .args(["-i", "-"])
                 .args(["-vf", "format=nv12,hwupload"])
                 .args(["-c:v", "hevc_vaapi"])
+                .args(["-async_depth", "8"])
                 .args(["-rc_mode", "CBR"])
                 .args(["-b:v", &config.bitrate_bps.to_string()])
                 .args(["-maxrate", &config.bitrate_bps.to_string()])

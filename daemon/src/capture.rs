@@ -468,11 +468,6 @@ mod real_capture {
                     let copy_len = expected.min(payload.len());
                     frame_data[..copy_len].copy_from_slice(&payload[..copy_len]);
                 }
-                // Ensure opaque alpha channel for BGRx payloads.
-                for px in frame_data.chunks_exact_mut(4) {
-                    px[3] = 255;
-                }
-
                 let timestamp_90k =
                     ((user_data.frame_index * 90_000) / user_data.fps as u64) as u32;
                 let frame = CaptureFrame {
@@ -592,7 +587,8 @@ mod real_capture {
             session.node_id
         );
         while !*stop_rx.borrow() {
-            let _ = mainloop.loop_().iterate(Duration::from_millis(50));
+            // Keep a short iterate timeout to avoid throttling capture callback delivery.
+            let _ = mainloop.loop_().iterate(Duration::from_millis(5));
         }
         let _ = stream.disconnect();
         println!("[capture] PipeWire stream disconnected");
