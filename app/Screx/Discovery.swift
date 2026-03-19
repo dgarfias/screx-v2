@@ -14,6 +14,18 @@ final class DiscoveryService {
     var onStatusUpdate: ((String) -> Void)?
     var onEndpointsChanged: (([StreamEndpoint]) -> Void)?
 
+    private func emitStatus(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onStatusUpdate?(text)
+        }
+    }
+
+    private func emitEndpoints(_ endpoints: [StreamEndpoint]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onEndpointsChanged?(endpoints)
+        }
+    }
+
     func startBrowsing() {
         let parameters = NWParameters.udp
         parameters.includePeerToPeer = true
@@ -27,11 +39,11 @@ final class DiscoveryService {
         browser.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                self?.onStatusUpdate?("Discovery ready")
+                self?.emitStatus("Discovery ready")
             case .failed(let error):
-                self?.onStatusUpdate?("Discovery failed: \(error.localizedDescription)")
+                self?.emitStatus("Discovery failed: \(error.localizedDescription)")
             case .waiting(let error):
-                self?.onStatusUpdate?("Discovery waiting: \(error.localizedDescription)")
+                self?.emitStatus("Discovery waiting: \(error.localizedDescription)")
             default:
                 break
             }
@@ -48,8 +60,8 @@ final class DiscoveryService {
                 }
                 return StreamEndpoint(name: name, endpoint: $0.endpoint)
             }
-            self?.onStatusUpdate?("Found \(endpoints.count) service(s)")
-            self?.onEndpointsChanged?(endpoints)
+            self?.emitStatus("Found \(endpoints.count) service(s)")
+            self?.emitEndpoints(endpoints)
         }
 
         browser.start(queue: queue)

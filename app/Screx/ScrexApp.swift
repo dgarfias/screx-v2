@@ -44,10 +44,11 @@ final class StreamViewModel: ObservableObject {
         }
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
-                self?.discoveredEndpoints = endpoints
+                guard let self else { return }
+                self.discoveredEndpoints = endpoints
+                guard !self.hasConnected, let first = endpoints.first else { return }
+                self.connect(to: first)
             }
-            guard let self, !self.hasConnected, let first = endpoints.first else { return }
-            self.connect(to: first)
         }
 
         transport.onStatusUpdate = { [weak self] status in

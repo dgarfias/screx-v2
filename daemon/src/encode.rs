@@ -88,10 +88,21 @@ pub async fn run_encoder_loop(
                     Some(ControlMessage::RequestIdr) => {
                         println!("[encode] control: forcing IDR on next frame");
                         force_next_idr = true;
+                        #[cfg(feature = "real-encode")]
+                        if let Some(worker) = vaapi_encoder.as_mut() {
+                            // Restarting encoder guarantees a keyframe boundary and helps
+                            // recover the receiver if parameter sets were missed.
+                            *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                        }
                     }
                     Some(ControlMessage::SetBitrate(bps)) => {
                         println!("[encode] control: updating bitrate {} -> {}", config.bitrate_bps, bps);
                         config.bitrate_bps = bps.max(500_000);
+                        #[cfg(feature = "real-encode")]
+                        if let Some(worker) = vaapi_encoder.as_mut() {
+                            // ffmpeg subprocess bitrate is configured at process start.
+                            *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                        }
                     }
                     Some(ControlMessage::SetResolution(w, h)) => {
                         println!("[encode] control: target resolution {}x{} -> {}x{}", config.width, config.height, w, h);
@@ -318,6 +329,7 @@ mod vaapi {
                 .args(["-g", &config.gop.to_string()])
                 .args(["-bf", "0"])
                 .args(["-aud", "1"])
+                .args(["-bsf:v", "hevc_mp4toannexb,dump_extra=freq=keyframe"])
                 .args(["-f", "hevc"])
                 .arg("-")
                 .stdin(Stdio::piped())

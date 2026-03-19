@@ -30,6 +30,18 @@ final class TransportService {
     var onStatusUpdate: ((String) -> Void)?
     var onMetricsUpdate: ((TransportMetrics) -> Void)?
 
+    private func emitStatus(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onStatusUpdate?(text)
+        }
+    }
+
+    private func emitMetrics(_ metrics: TransportMetrics) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onMetricsUpdate?(metrics)
+        }
+    }
+
     func startListening(
         onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
     ) {
@@ -80,7 +92,7 @@ final class TransportService {
         streamConnection?.receiveMessage { [weak self] data, _, _, error in
             guard let self else { return }
             if let error {
-                self.onStatusUpdate?("Receive error: \(error.localizedDescription)")
+                self.emitStatus("Receive error: \(error.localizedDescription)")
                 return
             }
 
@@ -101,13 +113,13 @@ final class TransportService {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                self?.onStatusUpdate?("Control ready")
+                self?.emitStatus("Control ready")
             case .waiting(let error):
-                self?.onStatusUpdate?("Control waiting: \(error.localizedDescription)")
+                self?.emitStatus("Control waiting: \(error.localizedDescription)")
             case .failed(let error):
-                self?.onStatusUpdate?("Control failed: \(error.localizedDescription)")
+                self?.emitStatus("Control failed: \(error.localizedDescription)")
             case .cancelled:
-                self?.onStatusUpdate?("Control disconnected")
+                self?.emitStatus("Control disconnected")
             default:
                 break
             }
@@ -128,13 +140,13 @@ final class TransportService {
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    self?.onStatusUpdate?("Listening on UDP 5004")
+                    self?.emitStatus("Listening on UDP 5004")
                 case .waiting(let error):
-                    self?.onStatusUpdate?("Listener waiting: \(error.localizedDescription)")
+                    self?.emitStatus("Listener waiting: \(error.localizedDescription)")
                 case .failed(let error):
-                    self?.onStatusUpdate?("Listener failed: \(error.localizedDescription)")
+                    self?.emitStatus("Listener failed: \(error.localizedDescription)")
                 case .cancelled:
-                    self?.onStatusUpdate?("Listener stopped")
+                    self?.emitStatus("Listener stopped")
                 default:
                     break
                 }
@@ -145,7 +157,7 @@ final class TransportService {
             listener.start(queue: queue)
             streamListener = listener
         } catch {
-            onStatusUpdate?("Listener setup failed: \(error.localizedDescription)")
+            emitStatus("Listener setup failed: \(error.localizedDescription)")
         }
     }
 
@@ -155,13 +167,13 @@ final class TransportService {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                self?.onStatusUpdate?("Stream connected")
+                self?.emitStatus("Stream connected")
             case .waiting(let error):
-                self?.onStatusUpdate?("Stream waiting: \(error.localizedDescription)")
+                self?.emitStatus("Stream waiting: \(error.localizedDescription)")
             case .failed(let error):
-                self?.onStatusUpdate?("Stream failed: \(error.localizedDescription)")
+                self?.emitStatus("Stream failed: \(error.localizedDescription)")
             case .cancelled:
-                self?.onStatusUpdate?("Stream disconnected")
+                self?.emitStatus("Stream disconnected")
             default:
                 break
             }
@@ -249,7 +261,7 @@ final class TransportService {
         // This remains a coarse estimate without sender clock sync.
         let estimatedMs = max(0, (jitter90k / 90_000.0) * 1000.0 + (1000.0 / 60.0))
         let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        onMetricsUpdate?(
+        emitMetrics(
             TransportMetrics(
                 estimatedOneWayLatencyMs: estimatedMs,
                 lossPercent: loss,
@@ -264,7 +276,7 @@ final class TransportService {
             ? max(0, (Double(expectedPackets - receivedPackets) / Double(expectedPackets)) * 100.0)
             : 0
         let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        onMetricsUpdate?(
+        emitMetrics(
             TransportMetrics(
                 estimatedOneWayLatencyMs: max(0, jitterMs + (1000.0 / 60.0)),
                 lossPercent: loss,
