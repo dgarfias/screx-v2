@@ -366,6 +366,7 @@ mod vaapi {
                 .args(["-maxrate", &config.bitrate_bps.to_string()])
                 .args(["-bufsize", &(config.bitrate_bps / 2).max(1).to_string()])
                 .args(["-g", &config.gop.to_string()])
+                .args(["-idr_interval", &config.gop.to_string()])
                 .args(["-bf", "0"])
                 .args(["-aud", "1"])
                 .args(["-bsf:v", "hevc_mp4toannexb,dump_extra=freq=keyframe"])
@@ -494,13 +495,13 @@ mod vaapi {
         }
 
         fn finish_current_au(&mut self) -> Vec<u8> {
-            let mut contains_vcl = false;
+            let mut contains_irap = false;
             let mut contains_vps = false;
             let mut contains_sps = false;
             let mut contains_pps = false;
             for nalu in &self.current_au {
                 match hevc_nalu_type(nalu) {
-                    0..=31 => contains_vcl = true,
+                    16..=23 => contains_irap = true,
                     32 => contains_vps = true,
                     33 => contains_sps = true,
                     34 => contains_pps = true,
@@ -509,7 +510,7 @@ mod vaapi {
             }
 
             let mut output = Vec::new();
-            if contains_vcl {
+            if contains_irap {
                 if !contains_vps {
                     if let Some(vps) = &self.cached_vps {
                         output.extend_from_slice(vps);
