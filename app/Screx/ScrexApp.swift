@@ -1,8 +1,5 @@
-import Foundation
 import SwiftUI
-import UIKit
-import Network
-import Combine
+import WebKit
 
 @main
 struct ScrexApp: App {
@@ -12,207 +9,148 @@ struct ScrexApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .task {
-                    model.start()
-                }
+                .onAppear { model.startDiscovery() }
         }
     }
 }
 
 @MainActor
 final class StreamViewModel: ObservableObject {
-    @Published var statusText: String = "Idle"
-    @Published var latencyText: String = "-- ms"
-    @Published var jitterText: String = "-- ms"
-    @Published var packetLossText: String = "--"
-    @Published var droppedPacketsText: String = "--"
-    @Published var droppedFramesText: String = "--"
-    @Published var decoderErrorText: String = "--"
-    @Published var connectedEndpointName: String = "None"
-    @Published var discoveredEndpoints: [StreamEndpoint] = []
+    @Published var status: String = "Searching for daemon..."
+    @Published var daemonURL: URL?
+    @Published var manualHost: String = ""
 
-    let discovery = DiscoveryService()
-    let transport = TransportService()
-    let decoder = DecoderService()
+    private let discovery = DiscoveryService()
 
-    private var hasConnected = false
-
-    init() {
-        discovery.onStatusUpdate = { [weak self] status in
-            Task { @MainActor in
-                self?.statusText = status
-            }
+    func startDiscovery() {
+        discovery.onStatusUpdate = { [weak self] msg in
+            Task { @MainActor in self?.status = msg }
         }
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
-                guard let self else { return }
-                self.discoveredEndpoints = endpoints
-                guard !self.hasConnected, let first = endpoints.first else { return }
-                self.connect(to: first)
+                guard let self, let ep = endpoints.first else { return }
+                self.connectTo(host: ep.name)
             }
-        }
-
-        transport.onStatusUpdate = { [weak self] status in
-            Task { @MainActor in
-                self?.statusText = status
-                if status.contains("failed") || status.contains("disconnected") {
-                    self?.hasConnected = false
-                    self?.reconnectIfPossible()
-                }
-            }
-        }
-        transport.onMetricsUpdate = { [weak self] metrics in
-            Task { @MainActor in
-                self?.latencyText = String(format: "%.1f ms", metrics.estimatedOneWayLatencyMs)
-                self?.jitterText = String(format: "%.1f ms", metrics.jitterMs)
-                self?.packetLossText = String(format: "%.2f%%", metrics.lossPercent)
-                self?.droppedPacketsText = "\(metrics.droppedPackets)"
-            }
-        }
-        transport.onPlayoutResyncNeeded = { [weak self] in
-            self?.transport.sendControl(message: "IDR")
-        }
-
-        decoder.onRequestIDR = { [weak self] in
-            self?.transport.sendControl(message: "IDR")
-        }
-        decoder.onHealthUpdate = { [weak self] health in
-            Task { @MainActor in
-                self?.droppedFramesText = "\(health.droppedFrames)"
-                self?.decoderErrorText = "\(health.displayErrors)"
-            }
-        }
-    }
-
-    func start() {
-        statusText = "Discovering services..."
-        let screen = UIScreen.main.bounds
-        let w = Int(max(screen.width, screen.height))
-        let h = Int(min(screen.width, screen.height))
-        transport.screenWidth = w & ~1
-        transport.screenHeight = h & ~1
-        transport.startListening { [weak self] nalu, timestamp90k, isAccessUnitEnd in
-            self?.decoder.handleNalu(
-                nalu: nalu,
-                timestamp90k: timestamp90k,
-                isAccessUnitEnd: isAccessUnitEnd
-            )
         }
         discovery.startBrowsing()
     }
 
-    func connect(to endpoint: StreamEndpoint) {
-        hasConnected = true
-        connectedEndpointName = endpoint.name
-        statusText = "Connecting to \(endpoint.name)..."
-        transport.connect(endpoint: endpoint.endpoint) { [weak self] nalu, timestamp90k, isAccessUnitEnd in
-            self?.decoder.handleNalu(
-                nalu: nalu,
-                timestamp90k: timestamp90k,
-                isAccessUnitEnd: isAccessUnitEnd
-            )
+    func connectManually() {
+        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return }
+        connectTo(host: host)
+    }
+
+    private func connectTo(host: String) {
+        let clean = host.contains("://") ? host : "http://\(host):8080"
+        guard let url = URL(string: clean) else {
+            status = "Invalid URL: \(clean)"
+            return
         }
-    }
-
-    func requestIDR() {
-        transport.sendControl(message: "IDR")
-    }
-
-    func setBitrate(_ bps: Int) {
-        transport.sendControl(message: "BITRATE:\(bps)")
-    }
-
-    func setResolution(width: Int, height: Int) {
-        transport.sendControl(message: "RES:\(width)x\(height)")
-    }
-
-    private func reconnectIfPossible() {
-        guard !hasConnected, let first = discoveredEndpoints.first else { return }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if !self.hasConnected {
-                self.connect(to: first)
-            }
-        }
+        status = "Connecting to \(url.absoluteString)..."
+        daemonURL = url
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
-    @State private var showInfoPanel = true
+    @State private var showOverlay = true
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            DisplayView(layer: model.decoder.displayLayer)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
-                .ignoresSafeArea()
+        ZStack {
+            Color.black.ignoresSafeArea()
 
-            VStack(alignment: .trailing, spacing: 8) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showInfoPanel.toggle()
-                    }
-                } label: {
-                    Image(systemName: showInfoPanel ? "info.circle.fill" : "info.circle")
-                        .font(.title3.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent)
-
-                if showInfoPanel {
-                    diagnosticsPanel
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
+            if let url = model.daemonURL {
+                WebRTCReceiverView(url: url)
+                    .ignoresSafeArea()
             }
-            .padding()
+
+            VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+                    } label: {
+                        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(10)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .padding(.trailing, 16)
+                    .padding(.top, 8)
+                }
+
+                if showOverlay {
+                    connectionPanel
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                Spacer()
+            }
         }
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
     }
 
-    private var diagnosticsPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Screx V2")
-                .font(.headline)
-            Text("Status: \(model.statusText)")
-            Text("Connected: \(model.connectedEndpointName)")
-            Text("Latency: \(model.latencyText)")
-            Text("Jitter: \(model.jitterText)")
-            Text("Packet loss: \(model.packetLossText)")
-            Text("Dropped packets: \(model.droppedPacketsText)")
-            Text("Dropped frames: \(model.droppedFramesText)")
-            Text("Decoder errors: \(model.decoderErrorText)")
+    private var connectionPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Screx").font(.headline)
+            Text(model.status).font(.caption).foregroundStyle(.secondary)
 
-            Divider()
+            if model.daemonURL == nil {
+                HStack {
+                    TextField("Daemon IP (e.g. 192.168.1.100)", text: $model.manualHost)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        .onSubmit { model.connectManually() }
 
-            HStack(spacing: 6) {
-                Button("IDR") {
-                    model.requestIDR()
+                    Button("Connect") { model.connectManually() }
+                        .buttonStyle(.borderedProminent)
                 }
-                Button("8 Mbps") {
-                    model.setBitrate(8_000_000)
-                }
-                Button("12 Mbps") {
-                    model.setBitrate(12_000_000)
-                }
-            }
-            .buttonStyle(.bordered)
-
-            if !model.discoveredEndpoints.isEmpty {
-                Divider()
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(model.discoveredEndpoints) { endpoint in
-                            Button(endpoint.name) {
-                                model.connect(to: endpoint)
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
+            } else {
+                HStack {
+                    Text("Connected to: \(model.daemonURL!.host ?? "?")")
+                        .font(.caption)
+                    Spacer()
+                    Button("Disconnect") {
+                        model.daemonURL = nil
+                        model.status = "Disconnected"
                     }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
                 }
             }
         }
-        .font(.caption)
-        .padding(10)
-        .frame(maxWidth: 360, alignment: .leading)
+        .padding(12)
+        .frame(maxWidth: 400)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 16)
+    }
+}
+
+struct WebRTCReceiverView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = true
+        webView.backgroundColor = .black
+        webView.scrollView.isScrollEnabled = false
+        webView.scrollView.bounces = false
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        if webView.url != url {
+            webView.load(URLRequest(url: url))
+        }
     }
 }

@@ -1,20 +1,22 @@
 mod capture;
+#[allow(dead_code)]
 mod discovery;
 mod doctor;
 mod encode;
+mod signaling;
+#[allow(dead_code)]
 mod transport;
+mod webrtc_sender;
 
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 struct AppConfig {
-    stream_target: SocketAddr,
-    control_bind: SocketAddr,
     capture_backend: capture::CaptureBackend,
     capture_source: capture::CaptureSource,
     encoder_backend: encode::EncoderBackend,
@@ -23,51 +25,33 @@ struct AppConfig {
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
-    mtu: usize,
+    signaling_port: u16,
 }
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let stream_port = read_env("SCREX_TARGET_PORT", "5004")
-            .parse::<u16>()
-            .context("invalid SCREX_TARGET_PORT")?;
-        let control_port = match env::var("SCREX_CONTROL_PORT") {
-            Ok(raw) => raw.parse::<u16>().context("invalid SCREX_CONTROL_PORT")?,
-            Err(_) => stream_port,
-        };
-
-        let stream_target = if let Ok(ip_str) = env::var("SCREX_TARGET_IP") {
-            let ip = ip_str.parse::<IpAddr>().context("invalid SCREX_TARGET_IP")?;
-            Some(SocketAddr::new(ip, stream_port))
-        } else {
-            None
-        };
-
         let capture_source =
             capture::CaptureSource::from_env(&read_env("SCREX_CAPTURE_SOURCE", "virtual"));
-        let width = read_env("SCREX_WIDTH", "0")
+        let width = read_env("SCREX_WIDTH", "1920")
             .parse::<u32>()
             .context("invalid SCREX_WIDTH")?;
-        let height = read_env("SCREX_HEIGHT", "0")
+        let height = read_env("SCREX_HEIGHT", "1080")
             .parse::<u32>()
             .context("invalid SCREX_HEIGHT")?;
         let fps = read_env("SCREX_FPS", "60")
             .parse::<u32>()
             .context("invalid SCREX_FPS")?;
-        let gop = read_env("SCREX_GOP", "30")
+        let gop = read_env("SCREX_GOP", "60")
             .parse::<u32>()
             .context("invalid SCREX_GOP")?;
         let bitrate_bps = read_env("SCREX_BITRATE_BPS", "10000000")
             .parse::<u32>()
             .context("invalid SCREX_BITRATE_BPS")?;
-        let mtu = read_env("SCREX_MTU", "1200")
-            .parse::<usize>()
-            .context("invalid SCREX_MTU")?;
+        let signaling_port = read_env("SCREX_SIGNAL_PORT", "8080")
+            .parse::<u16>()
+            .context("invalid SCREX_SIGNAL_PORT")?;
 
         Ok(Self {
-            stream_target: stream_target
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), stream_port)),
-            control_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), control_port),
             capture_backend: capture::CaptureBackend::from_env(&read_env(
                 "SCREX_CAPTURE_BACKEND",
                 "auto",
@@ -82,7 +66,7 @@ impl AppConfig {
             fps,
             gop: gop.max(10),
             bitrate_bps,
-            mtu,
+            signaling_port,
         })
     }
 }
@@ -99,64 +83,39 @@ async fn main() -> Result<()> {
         return doctor::run_doctor();
     }
 
-    let mut config = AppConfig::from_env()?;
-
-    let has_manual_target = env::var("SCREX_TARGET_IP").is_ok();
-
-    let discovery_handle = if has_manual_target {
-        println!(
-            "[main] using manual target {} (SCREX_TARGET_IP set)",
-            config.stream_target
-        );
-        if config.width == 0 || config.height == 0 {
-            config.width = 1920;
-            config.height = 1080;
-            println!("[main] no resolution specified, defaulting to {}x{}", config.width, config.height);
-        }
-        None
-    } else {
-        let service = read_env("SCREX_DISCOVERY_SERVICE", "_screx._udp");
-        let timeout_secs = read_env("SCREX_DISCOVERY_TIMEOUT", "30")
-            .parse::<u64>()
-            .unwrap_or(30);
-
-        println!("[main] no SCREX_TARGET_IP set, discovering receiver via mDNS...");
-
-        let (receiver, handle) =
-            discovery::browse_for_receiver(&service, Duration::from_secs(timeout_secs))?;
-
-        config.stream_target = receiver.addr;
-
-        if config.width == 0 || config.height == 0 {
-            config.width = receiver.width;
-            config.height = receiver.height;
-            println!(
-                "[main] auto-configured resolution to {}x{} from receiver",
-                config.width, config.height
-            );
-        } else {
-            println!(
-                "[main] using explicit resolution {}x{} (receiver reports {}x{})",
-                config.width, config.height, receiver.width, receiver.height
-            );
-        }
-
-        Some(handle)
-    };
-
-    if config.capture_source == capture::CaptureSource::Virtual1080p {
-        println!(
-            "[main] virtual source: overriding resolution to {}x{}",
-            config.width, config.height
-        );
-    }
-
+    let config = AppConfig::from_env()?;
     println!("screx-daemon boot with config: {config:?}");
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (frame_tx, frame_rx) = mpsc::channel(2);
     let (au_tx, au_rx) = mpsc::channel(2);
-    let (control_tx, control_rx) = mpsc::channel(32);
+    let (_control_tx, control_rx) = mpsc::channel(32);
+
+    let sender = Arc::new(webrtc_sender::WebRtcSender::new().await?);
+
+    let signal_addr: SocketAddr = ([0, 0, 0, 0], config.signaling_port).into();
+    let router = signaling::build_router(sender.clone());
+    let signal_listener = tokio::net::TcpListener::bind(signal_addr).await?;
+    println!("[main] signaling server listening on http://0.0.0.0:{}", config.signaling_port);
+    println!("[main] open http://<this-machine-ip>:{} on iPad Safari to receive", config.signaling_port);
+
+    let signal_stop = stop_rx.clone();
+    let signal_task = tokio::spawn(async move {
+        axum::serve(signal_listener, router)
+            .with_graceful_shutdown(async move {
+                let mut rx = signal_stop;
+                loop {
+                    if *rx.borrow() {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("signaling server error: {e}"))
+    });
 
     let capture_handle = capture::spawn_capture_thread(
         capture::CaptureConfig {
@@ -189,19 +148,9 @@ async fn main() -> Result<()> {
         )
     });
 
-    let transport_task = tokio::spawn(transport::run_transport_loop(
-        transport::TransportConfig {
-            target: config.stream_target,
-            mtu: config.mtu,
-            payload_type: 96,
-        },
+    let webrtc_task = tokio::spawn(webrtc_sender::run_webrtc_feed_loop(
+        sender.clone(),
         au_rx,
-        stop_rx.clone(),
-    ));
-
-    let control_task = tokio::spawn(transport::run_control_channel(
-        config.control_bind,
-        control_tx,
         stop_rx.clone(),
     ));
 
@@ -209,14 +158,14 @@ async fn main() -> Result<()> {
     println!("shutdown requested (ctrl-c), draining tasks...");
     let _ = stop_tx.send(true);
 
-    let control_result = control_task.await?;
-    if let Err(err) = control_result {
-        eprintln!("control channel stopped with error: {err:#}");
+    let signal_result = signal_task.await?;
+    if let Err(err) = signal_result {
+        eprintln!("signaling server stopped with error: {err:#}");
     }
 
-    let transport_result = transport_task.await?;
-    if let Err(err) = transport_result {
-        eprintln!("transport stopped with error: {err:#}");
+    let webrtc_result = webrtc_task.await?;
+    if let Err(err) = webrtc_result {
+        eprintln!("webrtc sender stopped with error: {err:#}");
     }
 
     let encode_result = encode_task.await?;
@@ -228,10 +177,6 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("capture thread stopped with error: {err:#}"),
         Err(_) => eprintln!("capture thread panicked"),
-    }
-
-    if let Some(handle) = discovery_handle {
-        handle.shutdown();
     }
 
     println!("screx-daemon shutdown complete");

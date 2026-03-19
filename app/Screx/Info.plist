@@ -5,9 +5,13 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_screx._udp</string>
-		<string>_screenstream._udp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Screx needs local network access to discover and stream to/from screen sharing daemons.</string>
+	<string>Screx needs local network access to discover and connect to the screen streaming daemon.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

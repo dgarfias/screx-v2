@@ -278,10 +278,10 @@ mod vaapi {
 
     pub(super) fn initialize(config: &EncoderConfig) -> Result<()> {
         ffmpeg::init().context("ffmpeg init failed")?;
-        let encoder = ffmpeg::codec::encoder::find_by_name("hevc_vaapi")
-            .context("hevc_vaapi encoder unavailable")?;
+        let encoder = ffmpeg::codec::encoder::find_by_name("h264_vaapi")
+            .context("h264_vaapi encoder unavailable")?;
         if !encoder.is_encoder() {
-            bail!("hevc_vaapi codec is not flagged as encoder");
+            bail!("h264_vaapi codec is not flagged as encoder");
         }
 
         let render_node = "/dev/dri/renderD128";
@@ -317,10 +317,10 @@ mod vaapi {
             let height = config.height as i32;
 
             unsafe {
-                let codec_name = std::ffi::CString::new("hevc_vaapi").unwrap();
+                let codec_name = std::ffi::CString::new("h264_vaapi").unwrap();
                 let codec = ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
                 if codec.is_null() {
-                    bail!("hevc_vaapi encoder not found");
+                    bail!("h264_vaapi encoder not found");
                 }
 
                 let ctx = ffi::avcodec_alloc_context3(codec);
@@ -418,7 +418,7 @@ mod vaapi {
                 }
 
                 println!(
-                    "[encode] direct VA-API encoder opened: {}x{}@{} bitrate={} gop={} async_depth=0",
+                    "[encode] direct VA-API H.264 encoder opened: {}x{}@{} bitrate={} gop={} async_depth=0",
                     width, height, config.fps, config.bitrate_bps, config.gop
                 );
 
