@@ -34,7 +34,7 @@ final class StreamViewModel: ObservableObject {
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
                 guard let self, let ep = endpoints.first else { return }
-                if self.daemonURL != ep.url {
+                if self.daemonURL == nil {
                     self.status = "Discovered \(ep.name)"
                     self.daemonURL = ep.url
                 }
@@ -63,6 +63,7 @@ final class StreamViewModel: ObservableObject {
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
+    @State private var showManualEntry = false
 
     var body: some View {
         ZStack {
@@ -111,15 +112,24 @@ struct ContentView: View {
             Text(model.status).font(.caption).foregroundStyle(.secondary)
 
             if model.daemonURL == nil {
-                HStack {
-                    TextField("Daemon IP (e.g. 192.168.1.100)", text: $model.manualHost)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.numbersAndPunctuation)
+                Button(showManualEntry ? "Hide Manual IP" : "Enter IP Manually") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showManualEntry.toggle()
+                    }
+                }
+                .buttonStyle(.bordered)
 
-                    Button("Connect") { model.connectManually() }
-                        .buttonStyle(.borderedProminent)
+                if showManualEntry {
+                    HStack {
+                        TextField("Daemon IP (e.g. 192.168.1.100)", text: $model.manualHost)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.numbersAndPunctuation)
+
+                        Button("Connect") { model.connectManually() }
+                            .buttonStyle(.borderedProminent)
+                    }
                 }
             } else {
                 HStack {
@@ -187,10 +197,18 @@ struct WebRTCReceiverView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                return
+            }
             onStatus("Load failed: \(error.localizedDescription)")
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                return
+            }
             onStatus("Navigation failed: \(error.localizedDescription)")
         }
 
