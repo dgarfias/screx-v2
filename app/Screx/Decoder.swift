@@ -15,7 +15,6 @@ final class DecoderService: ObservableObject {
     var onHealthUpdate: ((DecoderHealth) -> Void)?
 
     private let decodeQueue = DispatchQueue(label: "screx.decode", qos: .userInteractive)
-    private let decodeQueueKey = DispatchSpecificKey<Void>()
     private var vps: Data?
     private var sps: Data?
     private var pps: Data?
@@ -28,16 +27,11 @@ final class DecoderService: ObservableObject {
 
     init() {
         displayLayer.videoGravity = .resizeAspect
-        decodeQueue.setSpecific(key: decodeQueueKey, value: ())
     }
 
     func handleNalu(nalu: Data, timestamp90k: UInt32, isAccessUnitEnd: Bool) {
-        if DispatchQueue.getSpecific(key: decodeQueueKey) != nil {
-            processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
-            return
-        }
-        decodeQueue.sync {
-            self.processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
+        decodeQueue.async { [weak self] in
+            self?.processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
         }
     }
 
@@ -154,7 +148,7 @@ final class DecoderService: ObservableObject {
         }
 
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 60),
+            duration: .invalid,
             presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
             decodeTimeStamp: .invalid
         )
@@ -200,11 +194,8 @@ final class DecoderService: ObservableObject {
                 self.displayLayer.flushAndRemoveImage()
                 self.onRequestIDR?()
             }
-            if !self.displayLayer.isReadyForMoreMediaData {
-                // Drop stale queued frames to avoid seconds-long delayed playback loops.
-                self.markDroppedFrame()
-                self.displayLayer.flush()
-            }
+            // Real-time mode: keep only newest frame and discard stale queued frames.
+            self.displayLayer.flush()
             self.displayLayer.enqueue(sampleBuffer)
             if self.displayLayer.error != nil {
                 self.displayErrors += 1
