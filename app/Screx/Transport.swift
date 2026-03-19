@@ -325,7 +325,7 @@ final class TransportService {
             return
         }
 
-        var dropped = 0_u64
+        var dropped: UInt64 = 0
         while jitterBuffer.count > maxJitterBufferPackets {
             var dropKey: UInt16?
             var worstScore = UInt16.min
