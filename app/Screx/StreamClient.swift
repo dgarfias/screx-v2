@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import QuartzCore
 
 final class StreamClient {
     private let endpoint: NWEndpoint
@@ -10,7 +11,7 @@ final class StreamClient {
     var onStatus: ((String) -> Void)?
 
     private static let headerLen = 10
-    private static let chunkPayload = 1400
+    static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
     private static let frameTimeout: TimeInterval = 0.050
