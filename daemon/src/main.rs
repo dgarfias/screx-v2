@@ -81,8 +81,8 @@ async fn main() -> Result<()> {
     println!("screx-daemon boot with config: {config:?}");
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let (frame_tx, frame_rx) = mpsc::channel(2);
-    let (au_tx, au_rx) = mpsc::channel(2);
+    let (frame_tx, frame_rx) = mpsc::channel(4);
+    let (au_tx, au_rx) = mpsc::channel(8);
     let (_control_tx, control_rx) = mpsc::channel(32);
 
     let mdns_handle = match discovery::start_sender_advertisement(

@@ -17,24 +17,43 @@ pub async fn run_stream_server(
     println!("[stream] waiting for iPad to connect...");
 
     loop {
-        let stream = tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() { break; }
-                continue;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, addr)) => {
-                        println!("[stream] client connected from {addr}");
-                        stream
+        // While waiting for a client, keep draining frames so the encoder never blocks
+        let stream = loop {
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        println!("[stream] server shutting down");
+                        return Ok(());
                     }
-                    Err(e) => {
-                        eprintln!("[stream] accept error: {e}");
-                        continue;
+                }
+                _ = au_rx.recv() => {
+                    // Discard frames while no client is connected
+                    continue;
+                }
+                accept = listener.accept() => {
+                    match accept {
+                        Ok((stream, addr)) => {
+                            println!("[stream] client connected from {addr}");
+                            break stream;
+                        }
+                        Err(e) => {
+                            eprintln!("[stream] accept error: {e}");
+                            continue;
+                        }
                     }
                 }
             }
         };
+
+        // Drain stale frames so the first frame sent is fresh
+        let mut drained = 0;
+        while au_rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        if drained > 0 {
+            println!("[stream] drained {drained} stale frames");
+        }
 
         stream.set_nodelay(true)?;
         let (reader, mut writer) = stream.into_split();
@@ -46,6 +65,7 @@ pub async fn run_stream_server(
 
         loop {
             let au = tokio::select! {
+                biased;
                 _ = stop_rx.changed() => {
                     if *stop_rx.borrow() { break; }
                     continue;
@@ -91,7 +111,4 @@ pub async fn run_stream_server(
 
         println!("[stream] client disconnected, waiting for next connection...");
     }
-
-    println!("[stream] server shutting down");
-    Ok(())
 }
