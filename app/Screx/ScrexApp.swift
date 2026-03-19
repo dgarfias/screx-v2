@@ -41,6 +41,17 @@ final class StreamViewModel: ObservableObject {
             }
         }
         discovery.startBrowsing()
+
+        // Fallback for cases where Bonjour finds no entries yet: try the
+        // conventional local mDNS hostname used by the daemon.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await MainActor.run {
+                guard let self, self.daemonURL == nil else { return }
+                self.status = "No service yet, trying screx-daemon.local..."
+                self.connectTo(host: "screx-daemon.local")
+            }
+        }
     }
 
     func connectManually() {

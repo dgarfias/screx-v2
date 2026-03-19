@@ -83,7 +83,12 @@ final class DiscoveryService {
         // Resolve each endpoint once.
         for endpoint in endpoints {
             let key = endpointKey(endpoint)
-            if endpointsByKey[key] != nil || resolveConnections[key] != nil {
+            // Publish an immediate candidate endpoint so discovery can progress
+            // even if async TCP resolution takes longer.
+            if let immediate = makeEndpoint(from: endpoint, fallback: endpoint) {
+                endpointsByKey[key] = immediate
+            }
+            if resolveConnections[key] != nil {
                 continue
             }
             resolve(endpoint, key: key)
