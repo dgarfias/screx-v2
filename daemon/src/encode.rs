@@ -87,10 +87,6 @@ pub fn run_encoder_loop(
                 ControlMessage::RequestIdr => {
                     println!("[encode] control: forcing IDR on next frame");
                     force_next_idr = true;
-                    #[cfg(feature = "real-encode")]
-                    if let Some(worker) = vaapi_encoder.as_mut() {
-                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
-                    }
                 }
                 ControlMessage::SetBitrate(bps) => {
                     println!("[encode] control: updating bitrate {} -> {}", config.bitrate_bps, bps);

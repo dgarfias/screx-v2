@@ -50,7 +50,7 @@ impl AppConfig {
         let fps = read_env("SCREX_FPS", "60")
             .parse::<u32>()
             .context("invalid SCREX_FPS")?;
-        let gop = read_env("SCREX_GOP", "120")
+        let gop = read_env("SCREX_GOP", "30")
             .parse::<u32>()
             .context("invalid SCREX_GOP")?;
         let bitrate_bps = read_env("SCREX_BITRATE_BPS", "10000000")
@@ -82,7 +82,7 @@ impl AppConfig {
             width,
             height,
             fps,
-            gop: gop.max(60),
+            gop: gop.max(10),
             bitrate_bps,
             mtu,
         })

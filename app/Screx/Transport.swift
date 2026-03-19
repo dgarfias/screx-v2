@@ -17,9 +17,6 @@ final class TransportService {
     private var naluHandler: ((_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void)?
     private var depacketizer = HevcDepacketizer()
     private var nextSequenceNumber: UInt16?
-    private var jitterBuffer: [UInt16: RTPPacket] = [:]
-    private var waitingForMissingSinceNs: UInt64?
-    private let maxJitterBufferPackets = 64
     private var consecutiveGapSkips = 0
     private var lastResyncRequestNs: UInt64 = 0
 
@@ -75,8 +72,6 @@ final class TransportService {
         selectedEndpoint = nil
         naluHandler = nil
         nextSequenceNumber = nil
-        jitterBuffer.removeAll(keepingCapacity: true)
-        waitingForMissingSinceNs = nil
         consecutiveGapSkips = 0
         lastResyncRequestNs = 0
         lastSequenceNumber = nil
@@ -204,21 +199,32 @@ final class TransportService {
         updateMetrics(with: packet)
 
         guard let expected = nextSequenceNumber else {
-            nextSequenceNumber = packet.sequenceNumber
-            jitterBuffer[packet.sequenceNumber] = packet
-            drainJitterBuffer()
+            nextSequenceNumber = packet.sequenceNumber &+ 1
+            process(packet: packet)
             return
         }
 
-        if isOlderSequence(packet.sequenceNumber, than: expected) {
+        if packet.sequenceNumber == expected {
+            process(packet: packet)
+            nextSequenceNumber = expected &+ 1
+            consecutiveGapSkips = 0
+            return
+        }
+
+        let delta = packet.sequenceNumber &- expected
+        if delta > 0x7FFF {
             droppedPackets += 1
-            publishMetricsFallback()
             return
         }
 
-        jitterBuffer[packet.sequenceNumber] = packet
-        trimJitterBufferIfNeeded()
-        drainJitterBuffer()
+        droppedPackets += UInt64(delta)
+        depacketizer.reset()
+        consecutiveGapSkips += 1
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        maybeRequestResync(nowNs: nowNs)
+
+        process(packet: packet)
+        nextSequenceNumber = packet.sequenceNumber &+ 1
     }
 
     private func process(packet: RTPPacket) {
@@ -253,151 +259,21 @@ final class TransportService {
         self.lastArrivalNs = nowNs
         self.lastTimestamp90k = packet.timestamp
 
-        // Coarse estimate for "network + playout buffer" in this RTP-only transport.
         let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let playoutDelayMs = Double(currentMissingTimeoutNs()) / 1_000_000.0
-        let estimatedMs = max(0, jitterMs + playoutDelayMs)
         emitMetrics(
             TransportMetrics(
-                estimatedOneWayLatencyMs: estimatedMs,
+                estimatedOneWayLatencyMs: max(0, jitterMs),
                 lossPercent: loss,
                 jitterMs: jitterMs,
                 droppedPackets: droppedPackets
             )
         )
-    }
-
-    private func publishMetricsFallback() {
-        let loss = expectedPackets > 0
-            ? max(0, (Double(expectedPackets - receivedPackets) / Double(expectedPackets)) * 100.0)
-            : 0
-        let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let playoutDelayMs = Double(currentMissingTimeoutNs()) / 1_000_000.0
-        emitMetrics(
-            TransportMetrics(
-                estimatedOneWayLatencyMs: max(0, jitterMs + playoutDelayMs),
-                lossPercent: loss,
-                jitterMs: jitterMs,
-                droppedPackets: droppedPackets
-            )
-        )
-    }
-
-    private func drainJitterBuffer() {
-        guard var expected = nextSequenceNumber else { return }
-
-        while true {
-            if let packet = jitterBuffer.removeValue(forKey: expected) {
-                process(packet: packet)
-                expected = expected &+ 1
-                nextSequenceNumber = expected
-                waitingForMissingSinceNs = nil
-                consecutiveGapSkips = 0
-                continue
-            }
-
-            guard !jitterBuffer.isEmpty else {
-                nextSequenceNumber = expected
-                return
-            }
-
-            let gap = smallestAheadGap(from: expected)
-            let nowNs = DispatchTime.now().uptimeNanoseconds
-            let timeoutNs = currentMissingTimeoutNs()
-            let timedOut: Bool
-            if let since = waitingForMissingSinceNs {
-                timedOut = nowNs >= since ? (nowNs - since) >= timeoutNs : false
-            } else {
-                waitingForMissingSinceNs = nowNs
-                timedOut = false
-            }
-
-            if gap >= currentReorderWindowPackets() || timedOut {
-                droppedPackets += 1
-                publishMetricsFallback()
-                depacketizer.reset()
-                consecutiveGapSkips += 1
-                maybeRequestResync(nowNs: nowNs)
-                expected = expected &+ 1
-                nextSequenceNumber = expected
-                waitingForMissingSinceNs = nil
-                continue
-            }
-            nextSequenceNumber = expected
-            return
-        }
-    }
-
-    private func trimJitterBufferIfNeeded() {
-        guard jitterBuffer.count > maxJitterBufferPackets, let expected = nextSequenceNumber else {
-            return
-        }
-
-        var dropped: UInt64 = 0
-        while jitterBuffer.count > maxJitterBufferPackets {
-            var dropKey: UInt16?
-            var worstScore = UInt16.min
-            for key in jitterBuffer.keys {
-                let score = sequenceDistanceScore(from: expected, to: key)
-                if dropKey == nil || score > worstScore {
-                    worstScore = score
-                    dropKey = key
-                }
-            }
-            if let dropKey {
-                jitterBuffer.removeValue(forKey: dropKey)
-                dropped += 1
-            } else {
-                break
-            }
-        }
-        if dropped > 0 {
-            droppedPackets += dropped
-            publishMetricsFallback()
-            let nowNs = DispatchTime.now().uptimeNanoseconds
-            consecutiveGapSkips += 1
-            maybeRequestResync(nowNs: nowNs)
-        }
-    }
-
-    private func isOlderSequence(_ sequence: UInt16, than expected: UInt16) -> Bool {
-        let delta = sequence &- expected
-        return delta > 0x7FFF
-    }
-
-    private func smallestAheadGap(from expected: UInt16) -> UInt16 {
-        var best = UInt16.max
-        for key in jitterBuffer.keys {
-            let delta = key &- expected
-            if delta <= 0x7FFF, delta < best {
-                best = delta
-            }
-        }
-        return best
-    }
-
-    private func sequenceDistanceScore(from expected: UInt16, to sequence: UInt16) -> UInt16 {
-        let delta = sequence &- expected
-        // Older packets are always worse than future packets for live playout.
-        return delta > 0x7FFF ? UInt16.max : delta
-    }
-
-    private func currentReorderWindowPackets() -> UInt16 {
-        let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let window = Int((3.0 + jitterMs * 0.35).rounded())
-        return UInt16(min(16, max(3, window)))
-    }
-
-    private func currentMissingTimeoutNs() -> UInt64 {
-        let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let timeoutMs = min(35.0, max(6.0, 6.0 + jitterMs * 1.5))
-        return UInt64(timeoutMs * 1_000_000.0)
     }
 
     private func maybeRequestResync(nowNs: UInt64) {
-        guard consecutiveGapSkips >= 3 else { return }
+        guard consecutiveGapSkips >= 2 else { return }
         if lastResyncRequestNs != 0, nowNs > lastResyncRequestNs,
-            nowNs - lastResyncRequestNs < 400_000_000
+            nowNs - lastResyncRequestNs < 500_000_000
         {
             return
         }

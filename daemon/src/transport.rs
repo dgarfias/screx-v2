@@ -24,77 +24,6 @@ struct PayloadPacket {
     payload: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct RtpPacer {
-    first_timestamp: Option<u32>,
-    first_instant: Option<Instant>,
-    last_timestamp: Option<u32>,
-    next_send_at: Option<Instant>,
-}
-
-impl RtpPacer {
-    fn new() -> Self {
-        Self {
-            first_timestamp: None,
-            first_instant: None,
-            last_timestamp: None,
-            next_send_at: None,
-        }
-    }
-
-    fn schedule(&mut self, timestamp_90k: u32, packet_count: usize) -> (Instant, Duration) {
-        let now = Instant::now();
-        if self.first_timestamp.is_none() {
-            self.first_timestamp = Some(timestamp_90k);
-            self.first_instant = Some(now);
-            self.last_timestamp = Some(timestamp_90k);
-            self.next_send_at = Some(now);
-            return (now, Duration::from_micros(200));
-        }
-
-        let base_ts = self.first_timestamp.expect("initialized above");
-        let base_instant = self.first_instant.expect("initialized above");
-        let elapsed_90k = timestamp_90k.wrapping_sub(base_ts) as u64;
-        let target_au_time = base_instant + Duration::from_nanos(elapsed_90k * 1_000_000_000 / 90_000);
-
-        // If we're badly behind, drop pacing history and jump to "now" to avoid replaying stale media.
-        let start_time = if target_au_time + Duration::from_millis(80) < now {
-            now
-        } else {
-            target_au_time
-        };
-        let start_time = match self.next_send_at {
-            Some(next) if next > start_time => next,
-            _ => start_time,
-        };
-
-        let delta_90k = self
-            .last_timestamp
-            .map(|last| timestamp_90k.wrapping_sub(last) as u64)
-            .unwrap_or(1500);
-        self.last_timestamp = Some(timestamp_90k);
-
-        let au_duration = Duration::from_nanos((delta_90k.max(300) * 1_000_000_000) / 90_000);
-        let packet_spacing = if packet_count > 1 {
-            divide_duration(au_duration, packet_count)
-        } else {
-            Duration::from_micros(200)
-        }
-        .max(Duration::from_micros(80));
-
-        self.next_send_at = Some(start_time + packet_spacing * (packet_count as u32));
-        (start_time, packet_spacing)
-    }
-}
-
-fn divide_duration(duration: Duration, divisor: usize) -> Duration {
-    if divisor <= 1 {
-        return duration;
-    }
-    let nanos = duration.as_nanos() / divisor as u128;
-    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
-}
-
 pub async fn run_transport_loop(
     config: TransportConfig,
     mut au_rx: mpsc::Receiver<EncodedAccessUnit>,
@@ -121,7 +50,6 @@ pub async fn run_transport_loop(
     let mut aud_in_window = 0_u64;
     let mut other_in_window = 0_u64;
     let mut window_start = Instant::now();
-    let mut pacer = RtpPacer::new();
 
     loop {
         tokio::select! {
@@ -149,12 +77,7 @@ pub async fn run_transport_loop(
                 }
                 let payloads = packetize_hevc_annex_b(&au.annex_b, config.mtu);
                 let packet_count = payloads.len();
-                let (mut send_at, packet_spacing) = pacer.schedule(au.timestamp_90k, packet_count);
                 for payload in payloads {
-                    let now = Instant::now();
-                    if send_at > now {
-                        tokio::time::sleep_until(send_at).await;
-                    }
                     let packet = build_rtp_packet(
                         seq,
                         au.timestamp_90k,
@@ -166,14 +89,12 @@ pub async fn run_transport_loop(
                     seq = seq.wrapping_add(1);
                     if let Err(err) = socket.send(&packet).await {
                         if err.kind() == ErrorKind::ConnectionRefused {
-                            // iOS may not be listening yet; keep pipeline alive and retry on next packet.
                             send_errors_in_window += 1;
                             continue;
                         }
                         return Err(io::Error::new(err.kind(), err.to_string()))
                             .context("failed to send RTP packet");
                     }
-                    send_at += packet_spacing;
                 }
                 packets_in_window += packet_count as u64;
                 if window_start.elapsed() >= Duration::from_secs(1) {
