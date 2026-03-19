@@ -12,8 +12,58 @@ final class H264Decoder {
     private var pps: Data?
     private var naluCount = 0
 
+    private let bufferLock = NSLock()
+    private var latestSampleBuffer: CMSampleBuffer?
+    private var displayLink: CADisplayLink?
+
+    private var framesReceived: UInt64 = 0
+    private var framesDisplayed: UInt64 = 0
+    private var framesDropped: UInt64 = 0
+    private var statsWindowStart = CACurrentMediaTime()
+
     init() {
         displayLayer.videoGravity = .resizeAspect
+        startDisplayLink()
+    }
+
+    deinit {
+        displayLink?.invalidate()
+    }
+
+    private func startDisplayLink() {
+        let link = CADisplayLink(target: self, selector: #selector(displayLinkFired))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    @objc private func displayLinkFired() {
+        bufferLock.lock()
+        let sb = latestSampleBuffer
+        latestSampleBuffer = nil
+        bufferLock.unlock()
+
+        guard let sb else { return }
+
+        if displayLayer.status == .failed {
+            let err = displayLayer.error
+            print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
+            displayLayer.flush()
+        }
+        displayLayer.enqueue(sb)
+        framesDisplayed += 1
+
+        let now = CACurrentMediaTime()
+        let elapsed = now - statsWindowStart
+        if elapsed >= 2.0 {
+            let recvFps = Double(framesReceived) / elapsed
+            let dispFps = Double(framesDisplayed) / elapsed
+            let dropCount = framesDropped
+            print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) display_fps=\(String(format: "%.1f", dispFps)) dropped=\(dropCount)")
+            framesReceived = 0
+            framesDisplayed = 0
+            framesDropped = 0
+            statsWindowStart = now
+        }
     }
 
     func decodeAccessUnit(_ data: Data) {
@@ -133,26 +183,22 @@ final class H264Decoder {
             sampleBufferOut: &sampleBuffer
         )
 
-        guard let sampleBuffer else {
-            if naluCount <= 10 {
-                print("[decoder] CMSampleBufferCreateReady returned nil")
-            }
-            return
-        }
+        guard let sampleBuffer else { return }
 
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [NSMutableDictionary],
            let dict = attachments.first {
             dict[kCMSampleAttachmentKey_DisplayImmediately] = true
         }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.displayLayer.status == .failed {
-                let err = self.displayLayer.error
-                print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
-                self.displayLayer.flush()
-            }
-            self.displayLayer.enqueue(sampleBuffer)
+        framesReceived += 1
+
+        bufferLock.lock()
+        let hadPrevious = latestSampleBuffer != nil
+        latestSampleBuffer = sampleBuffer
+        bufferLock.unlock()
+
+        if hadPrevious {
+            framesDropped += 1
         }
     }
 
