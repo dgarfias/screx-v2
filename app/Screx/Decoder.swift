@@ -20,8 +20,11 @@ final class DecoderService: ObservableObject {
     private var pps: Data?
     private var formatDescription: CMFormatDescription?
     private var accessUnitNalus: [Data] = []
+    private var sampleCounter: Int64 = 0
     private var droppedFrames = 0
     private var displayErrors = 0
+    private var nalCounters = NalCounters()
+    private var nextNalLogAt = Date()
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -36,6 +39,8 @@ final class DecoderService: ObservableObject {
     private func processNalu(nalu: Data, timestamp90k: UInt32, isAccessUnitEnd: Bool) {
         guard nalu.count >= 2 else { return }
         let nalType = (nalu[nalu.startIndex] >> 1) & 0x3F
+        nalCounters.record(type: Int(nalType))
+        maybeLogNalCounters()
 
         switch nalType {
         case 32:
@@ -95,7 +100,7 @@ final class DecoderService: ObservableObject {
         }
     }
 
-    private func enqueueAccessUnit(timestamp90k: UInt32) {
+    private func enqueueAccessUnit(timestamp90k _: UInt32) {
         guard !accessUnitNalus.isEmpty else { return }
         guard let formatDescription else {
             accessUnitNalus.removeAll(keepingCapacity: true)
@@ -141,9 +146,10 @@ final class DecoderService: ObservableObject {
 
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 60),
-            presentationTimeStamp: CMTime(value: Int64(timestamp90k), timescale: 90_000),
+            presentationTimeStamp: CMTime(value: sampleCounter, timescale: 60),
             decodeTimeStamp: .invalid
         )
+        sampleCounter += 1
         var sampleBuffer: CMSampleBuffer?
         let sampleSize = [avcc.count]
         let sampleStatus = CMSampleBufferCreateReady(
@@ -161,6 +167,21 @@ final class DecoderService: ObservableObject {
             markDroppedFrame()
             onRequestIDR?()
             return
+        }
+
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: true
+        ) {
+            let dict = unsafeBitCast(
+                CFArrayGetValueAtIndex(attachments, 0),
+                to: CFMutableDictionary.self
+            )
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
         }
 
         DispatchQueue.main.async { [weak self] in
@@ -198,5 +219,36 @@ final class DecoderService: ObservableObject {
 
     private func publishHealth() {
         onHealthUpdate?(DecoderHealth(droppedFrames: droppedFrames, displayErrors: displayErrors))
+    }
+
+    private func maybeLogNalCounters() {
+        let now = Date()
+        guard now >= nextNalLogAt else { return }
+        nextNalLogAt = now.addingTimeInterval(1.0)
+        print(
+            "[decoder] nals vps=\(nalCounters.vps) sps=\(nalCounters.sps) pps=\(nalCounters.pps) idr=\(nalCounters.idr) vcl=\(nalCounters.vcl) aud=\(nalCounters.aud) other=\(nalCounters.other)"
+        )
+    }
+}
+
+private struct NalCounters {
+    var vps = 0
+    var sps = 0
+    var pps = 0
+    var idr = 0
+    var vcl = 0
+    var aud = 0
+    var other = 0
+
+    mutating func record(type: Int) {
+        switch type {
+        case 32: vps += 1
+        case 33: sps += 1
+        case 34: pps += 1
+        case 19, 20: idr += 1
+        case 0...31: vcl += 1
+        case 35: aud += 1
+        default: other += 1
+        }
     }
 }
