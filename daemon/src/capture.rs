@@ -538,12 +538,12 @@ mod real_capture {
                     height: config.height
                 },
                 pw::spa::utils::Rectangle {
-                    width: config.width,
-                    height: config.height
+                    width: 1,
+                    height: 1
                 },
                 pw::spa::utils::Rectangle {
-                    width: config.width,
-                    height: config.height
+                    width: 8192,
+                    height: 8192
                 }
             ),
             pw::spa::pod::property!(
@@ -552,20 +552,12 @@ mod real_capture {
                 Range,
                 Fraction,
                 pw::spa::utils::Fraction {
-                    num: config.fps,
+                    num: config.fps.max(1),
                     denom: 1
                 },
-                pw::spa::utils::Fraction { num: 1, denom: 1 },
+                pw::spa::utils::Fraction { num: 0, denom: 1 },
                 pw::spa::utils::Fraction {
-                    num: config.fps.max(1),
-                    denom: 1
-                }
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoMaxFramerate,
-                Fraction,
-                pw::spa::utils::Fraction {
-                    num: config.fps.max(1),
+                    num: 240,
                     denom: 1
                 }
             ),
