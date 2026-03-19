@@ -132,10 +132,6 @@ impl WebRtcSender {
         Ok(local_desc.sdp)
     }
 
-    pub async fn wait_connected(&self) {
-        self.connected.notified().await;
-    }
-
     pub async fn send_sample(&self, au: &EncodedAccessUnit) -> Result<()> {
         self.video_track
             .write_sample(&Sample {
@@ -154,7 +150,20 @@ pub async fn run_webrtc_feed_loop(
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     println!("[webrtc] waiting for peer to connect...");
-    sender.wait_connected().await;
+    if sender.pc.connection_state() != RTCPeerConnectionState::Connected {
+        let connected = sender.connected.notified();
+        tokio::pin!(connected);
+        tokio::select! {
+            _ = &mut connected => {}
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    println!("[webrtc] stop signal received before peer connection");
+                    let _ = sender.pc.close().await;
+                    return Ok(());
+                }
+            }
+        }
+    }
     println!("[webrtc] peer connected, streaming video");
 
     let mut frames_in_window = 0_u64;

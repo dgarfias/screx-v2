@@ -34,8 +34,10 @@ final class StreamViewModel: ObservableObject {
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
                 guard let self, let ep = endpoints.first else { return }
-                self.status = "Discovered \(ep.name)"
-                self.daemonURL = ep.url
+                if self.daemonURL != ep.url {
+                    self.status = "Discovered \(ep.name)"
+                    self.daemonURL = ep.url
+                }
             }
         }
         discovery.startBrowsing()
@@ -67,8 +69,11 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
 
             if let url = model.daemonURL {
-                WebRTCReceiverView(url: url)
+                WebRTCReceiverView(url: url) { webStatus in
+                    model.status = webStatus
+                }
                     .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
 
             VStack {
@@ -94,6 +99,7 @@ struct ContentView: View {
 
                 Spacer()
             }
+            .zIndex(100)
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -138,6 +144,7 @@ struct ContentView: View {
 
 struct WebRTCReceiverView: UIViewRepresentable {
     let url: URL
+    let onStatus: (String) -> Void
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -145,6 +152,7 @@ struct WebRTCReceiverView: UIViewRepresentable {
         config.mediaTypesRequiringUserActionForPlayback = []
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
         webView.isOpaque = true
         webView.backgroundColor = .black
         webView.scrollView.isScrollEnabled = false
@@ -156,6 +164,38 @@ struct WebRTCReceiverView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {
         if webView.url != url {
             webView.load(URLRequest(url: url))
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onStatus: onStatus)
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        private let onStatus: (String) -> Void
+
+        init(onStatus: @escaping (String) -> Void) {
+            self.onStatus = onStatus
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            onStatus("Loading stream page...")
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            onStatus("Connected")
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            onStatus("Load failed: \(error.localizedDescription)")
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            onStatus("Navigation failed: \(error.localizedDescription)")
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            onStatus("Web content process terminated")
         }
     }
 }
