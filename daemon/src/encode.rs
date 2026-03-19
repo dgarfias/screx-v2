@@ -124,6 +124,20 @@ pub async fn run_encoder_loop(
                     break;
                 };
 
+                if frame.width != config.width || frame.height != config.height {
+                    println!(
+                        "[encode] capture geometry change detected: {}x{} -> {}x{}; reconfiguring encoder",
+                        config.width, config.height, frame.width, frame.height
+                    );
+                    config.width = frame.width.max(1);
+                    config.height = frame.height.max(1);
+                    force_next_idr = true;
+                    #[cfg(feature = "real-encode")]
+                    if let Some(worker) = vaapi_encoder.as_mut() {
+                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                    }
+                }
+
                 let is_idr = force_next_idr || frame.frame_index % u64::from(config.gop.max(1)) == 0;
                 let mut produced_aus = Vec::new();
                 #[cfg(feature = "real-encode")]

@@ -287,9 +287,11 @@ mod real_capture {
         sender: mpsc::Sender<CaptureFrame>,
         frame_index: u64,
         fps: u32,
-        lock_resolution: bool,
+        requested_width: u32,
+        requested_height: u32,
         fallback_width: u32,
         fallback_height: u32,
+        warned_size_mismatch: bool,
         last_stats: Instant,
         stats_frames: u64,
     }
@@ -340,9 +342,11 @@ mod real_capture {
             sender: tx.clone(),
             frame_index: 0,
             fps: config.fps.max(1),
-            lock_resolution: config.source == CaptureSource::Virtual1080p,
+            requested_width: config.width,
+            requested_height: config.height,
             fallback_width: effective_config.width,
             fallback_height: effective_config.height,
+            warned_size_mismatch: false,
             last_stats: Instant::now(),
             stats_frames: 0,
         };
@@ -371,9 +375,22 @@ mod real_capture {
                 }
                 if user_data.format.parse(param).is_ok() {
                     let size = user_data.format.size();
-                    if !user_data.lock_resolution && size.width > 0 && size.height > 0 {
+                    if size.width > 0 && size.height > 0 {
                         user_data.fallback_width = size.width;
                         user_data.fallback_height = size.height;
+                        if !user_data.warned_size_mismatch
+                            && (size.width != user_data.requested_width
+                                || size.height != user_data.requested_height)
+                        {
+                            eprintln!(
+                                "[capture] negotiated size {}x{} differs from requested {}x{}; adapting encoder geometry",
+                                size.width,
+                                size.height,
+                                user_data.requested_width,
+                                user_data.requested_height
+                            );
+                            user_data.warned_size_mismatch = true;
+                        }
                     }
                     println!(
                         "[capture] negotiated video format={:?} size={}x{} framerate={}/{}",
@@ -398,6 +415,7 @@ mod real_capture {
                 let chunk = data.chunk();
                 let chunk_size = chunk.size() as usize;
                 let chunk_offset = chunk.offset() as usize;
+                let chunk_stride = chunk.stride();
 
                 let Some(raw) = data.data() else {
                     // If this is a non-mapped DMA-BUF path, keep loop alive and fall back in higher layer.
@@ -407,15 +425,43 @@ mod real_capture {
                     return;
                 }
                 let max_len = raw.len() - chunk_offset;
-                let use_len = chunk_size.min(max_len);
+                let use_len = if chunk_size == 0 {
+                    max_len
+                } else {
+                    chunk_size.min(max_len)
+                };
                 let payload = &raw[chunk_offset..(chunk_offset + use_len)];
 
                 let width = user_data.fallback_width.max(1);
                 let height = user_data.fallback_height.max(1);
                 let expected = (width as usize) * (height as usize) * 4;
                 let mut frame_data = vec![0_u8; expected];
-                let copy_len = expected.min(payload.len());
-                frame_data[..copy_len].copy_from_slice(&payload[..copy_len]);
+                let row_bytes = (width as usize) * 4;
+                let stride_abs = if chunk_stride == 0 {
+                    row_bytes
+                } else {
+                    chunk_stride.unsigned_abs() as usize
+                };
+                let mut copied_rows = 0_usize;
+                if stride_abs >= row_bytes {
+                    let h = height as usize;
+                    for row in 0..h {
+                        let src_row = if chunk_stride < 0 { h - 1 - row } else { row };
+                        let src_start = src_row.saturating_mul(stride_abs);
+                        let src_end = src_start.saturating_add(row_bytes);
+                        let dst_start = row.saturating_mul(row_bytes);
+                        let dst_end = dst_start.saturating_add(row_bytes);
+                        if src_end > payload.len() || dst_end > frame_data.len() {
+                            break;
+                        }
+                        frame_data[dst_start..dst_end].copy_from_slice(&payload[src_start..src_end]);
+                        copied_rows += 1;
+                    }
+                }
+                if copied_rows == 0 {
+                    let copy_len = expected.min(payload.len());
+                    frame_data[..copy_len].copy_from_slice(&payload[..copy_len]);
+                }
                 // Ensure opaque alpha channel for BGRx payloads.
                 for px in frame_data.chunks_exact_mut(4) {
                     px[3] = 255;
