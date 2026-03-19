@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import VideoToolbox
+import Combine
 
 struct DecoderHealth {
     let droppedFrames: Int

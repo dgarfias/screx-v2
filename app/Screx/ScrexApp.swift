@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Network
+import Combine
 
 @main
 struct ScrexApp: App {
