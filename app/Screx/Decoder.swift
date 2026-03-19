@@ -10,6 +10,7 @@ final class H264Decoder {
     private var formatDescription: CMVideoFormatDescription?
     private var sps: Data?
     private var pps: Data?
+    private var naluCount = 0
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -21,6 +22,11 @@ final class H264Decoder {
         for nalu in nalus {
             guard nalu.count > 0 else { continue }
             let naluType = nalu[0] & 0x1F
+            naluCount += 1
+
+            if naluCount <= 5 {
+                print("[decoder] NALU #\(naluCount) type=\(naluType) len=\(nalu.count)")
+            }
 
             switch naluType {
             case 7:
@@ -32,6 +38,8 @@ final class H264Decoder {
             default:
                 if formatDescription != nil {
                     enqueueNalu(nalu)
+                } else if naluCount <= 10 {
+                    print("[decoder] dropping NALU type=\(naluType), no format description yet")
                 }
             }
         }
@@ -40,18 +48,19 @@ final class H264Decoder {
     private func tryBuildFormatDescription() {
         guard let sps, let pps else { return }
 
-        let paramSets: [Data] = [sps, pps]
-        let pointers = paramSets.map { $0.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) } }
-        let sizes = paramSets.map { $0.count }
+        let spsBytes = [UInt8](sps)
+        let ppsBytes = [UInt8](pps)
 
         var newFmt: CMVideoFormatDescription?
-        let status = pointers.withUnsafeBufferPointer { ptrBuf in
-            sizes.withUnsafeBufferPointer { sizeBuf in
-                CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        let status = spsBytes.withUnsafeBufferPointer { spsBuf in
+            ppsBytes.withUnsafeBufferPointer { ppsBuf in
+                var paramPointers: [UnsafePointer<UInt8>] = [spsBuf.baseAddress!, ppsBuf.baseAddress!]
+                var paramSizes: [Int] = [spsBytes.count, ppsBytes.count]
+                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
                     allocator: kCFAllocatorDefault,
                     parameterSetCount: 2,
-                    parameterSetPointers: ptrBuf.baseAddress!,
-                    parameterSetSizes: sizeBuf.baseAddress!,
+                    parameterSetPointers: &paramPointers,
+                    parameterSetSizes: &paramSizes,
                     nalUnitHeaderLength: 4,
                     formatDescriptionOut: &newFmt
                 )
@@ -60,6 +69,10 @@ final class H264Decoder {
 
         if status == noErr, let newFmt {
             formatDescription = newFmt
+            let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
+            print("[decoder] format description created: \(dims.width)x\(dims.height)")
+        } else {
+            print("[decoder] CMVideoFormatDescriptionCreateFromH264ParameterSets failed: \(status)")
         }
     }
 
@@ -120,7 +133,12 @@ final class H264Decoder {
             sampleBufferOut: &sampleBuffer
         )
 
-        guard let sampleBuffer else { return }
+        guard let sampleBuffer else {
+            if naluCount <= 10 {
+                print("[decoder] CMSampleBufferCreateReady returned nil")
+            }
+            return
+        }
 
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [NSMutableDictionary],
            let dict = attachments.first {
@@ -130,6 +148,8 @@ final class H264Decoder {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.displayLayer.status == .failed {
+                let err = self.displayLayer.error
+                print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
                 self.displayLayer.flush()
             }
             self.displayLayer.enqueue(sampleBuffer)
