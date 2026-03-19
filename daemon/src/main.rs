@@ -1,5 +1,4 @@
 mod capture;
-#[allow(dead_code)]
 mod discovery;
 mod doctor;
 mod encode;
@@ -92,6 +91,17 @@ async fn main() -> Result<()> {
     let (_control_tx, control_rx) = mpsc::channel(32);
 
     let sender = Arc::new(webrtc_sender::WebRtcSender::new().await?);
+    let mdns_advertisement = match discovery::start_sender_advertisement(
+        "_screx._tcp",
+        "screx-daemon",
+        config.signaling_port,
+    ) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!("[main] mDNS advertisement failed (continuing): {err:#}");
+            None
+        }
+    };
 
     let signal_addr: SocketAddr = ([0, 0, 0, 0], config.signaling_port).into();
     let router = signaling::build_router(sender.clone());
@@ -177,6 +187,10 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(err)) => eprintln!("capture thread stopped with error: {err:#}"),
         Err(_) => eprintln!("capture thread panicked"),
+    }
+
+    if let Some(handle) = mdns_advertisement {
+        handle.shutdown();
     }
 
     println!("screx-daemon shutdown complete");

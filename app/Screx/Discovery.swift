@@ -4,7 +4,7 @@ import Network
 struct StreamEndpoint: Identifiable {
     let id = UUID()
     let name: String
-    let endpoint: NWEndpoint
+    let url: URL
 }
 
 final class DiscoveryService {
@@ -27,11 +27,13 @@ final class DiscoveryService {
     }
 
     func startBrowsing() {
-        let parameters = NWParameters.udp
+        guard browser == nil else { return }
+
+        let parameters = NWParameters.tcp
         parameters.includePeerToPeer = false
 
         let browser = NWBrowser(
-            for: .bonjour(type: "_screx._udp", domain: nil),
+            for: .bonjour(type: "_screx._tcp", domain: nil),
             using: parameters
         )
         self.browser = browser
@@ -50,15 +52,34 @@ final class DiscoveryService {
         }
 
         browser.browseResultsChangedHandler = { [weak self] results, _ in
-            let endpoints: [StreamEndpoint] = results.map {
-                let name: String
+            let endpoints: [StreamEndpoint] = results.compactMap {
                 switch $0.endpoint {
-                case .service(let svcName, _, _, _):
-                    name = svcName
+                case .service(let svcName, _, let domain, _):
+                    let trimmedDomain = domain.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                    let host = trimmedDomain.isEmpty ? "\(svcName).local" : "\(svcName).\(trimmedDomain)"
+                    guard let url = URL(string: "http://\(host):8080") else {
+                        return nil
+                    }
+                    return StreamEndpoint(name: svcName, url: url)
+                case .hostPort(let host, let port):
+                    let hostString: String
+                    switch host {
+                    case .ipv4(let addr):
+                        hostString = addr.debugDescription
+                    case .ipv6(let addr):
+                        hostString = "[\(addr.debugDescription)]"
+                    case .name(let name, _):
+                        hostString = name
+                    @unknown default:
+                        hostString = "\(host)"
+                    }
+                    guard let url = URL(string: "http://\(hostString):\(port.rawValue)") else {
+                        return nil
+                    }
+                    return StreamEndpoint(name: hostString, url: url)
                 default:
-                    name = "\($0.endpoint)"
+                    return nil
                 }
-                return StreamEndpoint(name: name, endpoint: $0.endpoint)
             }
             self?.emitStatus("Found \(endpoints.count) service(s)")
             self?.emitEndpoints(endpoints)

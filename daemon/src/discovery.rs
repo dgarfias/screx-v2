@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredReceiver {
@@ -20,6 +20,48 @@ impl DiscoveryHandle {
     pub fn shutdown(self) {
         let _ = self.daemon.shutdown();
     }
+}
+
+pub struct AdvertisementHandle {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+impl AdvertisementHandle {
+    pub fn shutdown(self) {
+        let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
+    }
+}
+
+pub fn start_sender_advertisement(
+    service_type: &str,
+    instance_name: &str,
+    port: u16,
+) -> Result<AdvertisementHandle> {
+    let mdns = ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mdns-sd init failed: {e}"))?;
+
+    let qualified = if service_type.ends_with(".local.") {
+        service_type.to_string()
+    } else {
+        format!("{service_type}.local.")
+    };
+
+    // mdns-sd fills interface addresses when given empty addrs.
+    let host_name = format!("{instance_name}.local.");
+    let info = ServiceInfo::new(&qualified, instance_name, &host_name, "", port, None)
+        .map_err(|e| anyhow::anyhow!("failed to build mdns service info: {e}"))?;
+    let fullname = info.get_fullname().to_string();
+
+    mdns.register(info)
+        .map_err(|e| anyhow::anyhow!("failed to register mdns service: {e}"))?;
+
+    println!(
+        "[discovery] advertising sender '{}' on {} (port {})",
+        instance_name, qualified, port
+    );
+
+    Ok(AdvertisementHandle { daemon: mdns, fullname })
 }
 
 pub fn browse_for_receiver(

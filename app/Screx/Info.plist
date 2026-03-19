@@ -4,7 +4,7 @@
 <dict>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_screx._udp</string>
+		<string>_screx._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Screx needs local network access to discover and connect to the screen streaming daemon.</string>

@@ -22,15 +22,20 @@ final class StreamViewModel: ObservableObject {
     @Published var manualHost: String = ""
 
     private let discovery = DiscoveryService()
+    private var discoveryStarted = false
 
     func startDiscovery() {
+        guard !discoveryStarted else { return }
+        discoveryStarted = true
+
         discovery.onStatusUpdate = { [weak self] msg in
             Task { @MainActor in self?.status = msg }
         }
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
                 guard let self, let ep = endpoints.first else { return }
-                self.connectTo(host: ep.name)
+                self.status = "Discovered \(ep.name)"
+                self.daemonURL = ep.url
             }
         }
         discovery.startBrowsing()
@@ -105,8 +110,7 @@ struct ContentView: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                        .onSubmit { model.connectManually() }
+                        .keyboardType(.numbersAndPunctuation)
 
                     Button("Connect") { model.connectManually() }
                         .buttonStyle(.borderedProminent)
