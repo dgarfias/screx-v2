@@ -16,7 +16,6 @@ final class TransportService {
     private var selectedEndpoint: NWEndpoint?
     private var naluHandler: ((_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void)?
     private var depacketizer = HevcDepacketizer()
-    private var reorderBuffer: [UInt16: RTPPacket] = [:]
     private var nextSequenceNumber: UInt16?
 
     private var lastSequenceNumber: UInt16?
@@ -69,7 +68,6 @@ final class TransportService {
         streamListener = nil
         selectedEndpoint = nil
         naluHandler = nil
-        reorderBuffer.removeAll(keepingCapacity: true)
         nextSequenceNumber = nil
         lastSequenceNumber = nil
         expectedPackets = 0
@@ -202,38 +200,27 @@ final class TransportService {
         }
 
         let delta = packet.sequenceNumber &- expected
-        if delta > 0x7FFF {
-            // Old packet arrived too late, skip it.
-            droppedPackets += 1
-            publishMetricsFallback()
+        if delta == 0 {
+            // In-order packet.
+            process(packet: packet)
+            nextSequenceNumber = expected &+ 1
             return
         }
 
-        reorderBuffer[packet.sequenceNumber] = packet
-        var cursor = expected
-        while let next = reorderBuffer.removeValue(forKey: cursor) {
-            process(packet: next)
-            cursor = cursor &+ 1
-            nextSequenceNumber = cursor
+        if delta < 0x8000 {
+            // Packet is ahead of expected: treat missing range as lost and keep moving.
+            droppedPackets += UInt64(delta)
+            publishMetricsFallback()
+            depacketizer.reset()
+            process(packet: packet)
+            nextSequenceNumber = packet.sequenceNumber &+ 1
+            return
         }
 
-        // If one packet is lost, do not stall forever waiting for it.
-        // After a small buffer fills, skip ahead to the earliest available packet.
-        if reorderBuffer.count >= 8, let expectedNow = nextSequenceNumber {
-            let sorted = reorderBuffer.keys.sorted(by: sequenceLess)
-            if let earliest = sorted.first {
-                let skipped = UInt16(truncatingIfNeeded: earliest &- expectedNow)
-                droppedPackets += UInt64(max(skipped, 1))
-
-                var cursor = earliest
-                while let next = reorderBuffer.removeValue(forKey: cursor) {
-                    process(packet: next)
-                    cursor = cursor &+ 1
-                    nextSequenceNumber = cursor
-                }
-                publishMetricsFallback()
-            }
-        }
+        // Packet is behind expected (late/reordered) - drop to preserve low latency.
+        droppedPackets += 1
+        publishMetricsFallback()
+        depacketizer.reset()
     }
 
     private func process(packet: RTPPacket) {
@@ -296,9 +283,6 @@ final class TransportService {
         )
     }
 
-    private func sequenceLess(_ lhs: UInt16, _ rhs: UInt16) -> Bool {
-        Int16(bitPattern: lhs &- rhs) < 0
-    }
 }
 
 private struct AssembledNalu {
@@ -308,6 +292,10 @@ private struct AssembledNalu {
 
 private final class HevcDepacketizer {
     private var fuBuffer = Data()
+
+    func reset() {
+        fuBuffer.removeAll(keepingCapacity: true)
+    }
 
     func push(payload: Data, marker: Bool) -> [AssembledNalu] {
         guard payload.count >= 2 else { return [] }
@@ -333,6 +321,9 @@ private final class HevcDepacketizer {
             let header1 = payload[1]
             fuBuffer.append(header0)
             fuBuffer.append(header1)
+        } else if fuBuffer.isEmpty {
+            // Lost FU start; discard orphan continuation fragment.
+            return []
         }
 
         fuBuffer.append(contentsOf: payload[3...])

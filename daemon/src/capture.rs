@@ -294,6 +294,7 @@ mod real_capture {
         warned_size_mismatch: bool,
         last_stats: Instant,
         stats_frames: u64,
+        stats_dropped_pw_buffers: u64,
     }
 
     pub(super) fn run_capture(
@@ -349,6 +350,7 @@ mod real_capture {
             warned_size_mismatch: false,
             last_stats: Instant::now(),
             stats_frames: 0,
+            stats_dropped_pw_buffers: 0,
         };
 
         let _listener = stream
@@ -406,6 +408,10 @@ mod real_capture {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
+                while let Some(next) = stream.dequeue_buffer() {
+                    buffer = next;
+                    user_data.stats_dropped_pw_buffers += 1;
+                }
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
@@ -496,11 +502,12 @@ mod real_capture {
                         "SHM"
                     };
                     println!(
-                        "[capture] fps={fps:.1} resolution={}x{} format=BGRA buffer={buffer_name}",
-                        width, height
+                        "[capture] fps={fps:.1} resolution={}x{} format=BGRA buffer={buffer_name} dropped_pw_buffers_per_sec={}",
+                        width, height, user_data.stats_dropped_pw_buffers
                     );
                     user_data.last_stats = Instant::now();
                     user_data.stats_frames = 0;
+                    user_data.stats_dropped_pw_buffers = 0;
                 }
             })
             .register()

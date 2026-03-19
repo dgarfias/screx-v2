@@ -73,6 +73,7 @@ pub async fn run_encoder_loop(
     let mut force_next_idr = true;
     let mut encoded_in_window = 0_u64;
     let mut bytes_in_window = 0_u64;
+    let mut dropped_au_in_window = 0_u64;
     let mut window_start = Instant::now();
 
     loop {
@@ -165,15 +166,26 @@ pub async fn run_encoder_loop(
                         let elapsed = window_start.elapsed().as_secs_f64();
                         let fps = encoded_in_window as f64 / elapsed;
                         let mbps = (bytes_in_window as f64 * 8.0 / elapsed) / 1_000_000.0;
-                        println!("[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={}", config.bitrate_bps);
+                        println!(
+                            "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_au_per_sec={}",
+                            config.bitrate_bps, dropped_au_in_window
+                        );
                         encoded_in_window = 0;
                         bytes_in_window = 0;
+                        dropped_au_in_window = 0;
                         window_start = Instant::now();
                     }
 
-                    if au_tx.send(au).await.is_err() {
-                        println!("[encode] downstream channel closed");
-                        break;
+                    match au_tx.try_send(au) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Low-latency policy: drop stale AU instead of waiting and building delay.
+                            dropped_au_in_window += 1;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            println!("[encode] downstream channel closed");
+                            break;
+                        }
                     }
                 }
             }

@@ -15,6 +15,7 @@ final class DecoderService: ObservableObject {
     var onHealthUpdate: ((DecoderHealth) -> Void)?
 
     private let decodeQueue = DispatchQueue(label: "screx.decode", qos: .userInteractive)
+    private let decodeQueueKey = DispatchSpecificKey<Void>()
     private var vps: Data?
     private var sps: Data?
     private var pps: Data?
@@ -27,11 +28,16 @@ final class DecoderService: ObservableObject {
 
     init() {
         displayLayer.videoGravity = .resizeAspect
+        decodeQueue.setSpecific(key: decodeQueueKey, value: ())
     }
 
     func handleNalu(nalu: Data, timestamp90k: UInt32, isAccessUnitEnd: Bool) {
-        decodeQueue.async { [weak self] in
-            self?.processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
+        if DispatchQueue.getSpecific(key: decodeQueueKey) != nil {
+            processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
+            return
+        }
+        decodeQueue.sync {
+            self.processNalu(nalu: nalu, timestamp90k: timestamp90k, isAccessUnitEnd: isAccessUnitEnd)
         }
     }
 
@@ -52,7 +58,11 @@ final class DecoderService: ObservableObject {
             pps = nalu
             rebuildFormatDescriptionIfPossible()
         case 35:
-            // AUD: delimiter only, not needed in AVCC payload.
+            // AUD marks the start of a new access unit. If we already accumulated
+            // VCL NALs, flush the previous frame now instead of waiting on RTP marker.
+            if !accessUnitNalus.isEmpty {
+                enqueueAccessUnit(timestamp90k: timestamp90k)
+            }
             break
         default:
             accessUnitNalus.append(nalu)
