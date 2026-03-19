@@ -14,6 +14,7 @@ final class TransportService {
     private var controlConnection: NWConnection?
     private var streamListener: NWListener?
     private var selectedEndpoint: NWEndpoint?
+    private var naluHandler: ((_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void)?
     private var depacketizer = HevcDepacketizer()
     private var reorderBuffer: [UInt16: RTPPacket] = [:]
     private var nextSequenceNumber: UInt16?
@@ -29,14 +30,22 @@ final class TransportService {
     var onStatusUpdate: ((String) -> Void)?
     var onMetricsUpdate: ((TransportMetrics) -> Void)?
 
+    func startListening(
+        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
+    ) {
+        naluHandler = onNalu
+        if streamListener == nil {
+            setupStreamListener()
+        }
+    }
+
     func connect(
         endpoint: NWEndpoint,
         onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
     ) {
-        disconnect()
+        startListening(onNalu: onNalu)
         selectedEndpoint = endpoint
         setupControlConnection(to: endpoint)
-        setupStreamListener(onNalu: onNalu)
     }
 
     func disconnect() {
@@ -47,6 +56,7 @@ final class TransportService {
         streamListener?.cancel()
         streamListener = nil
         selectedEndpoint = nil
+        naluHandler = nil
         reorderBuffer.removeAll(keepingCapacity: true)
         nextSequenceNumber = nil
         lastSequenceNumber = nil
@@ -66,9 +76,7 @@ final class TransportService {
         controlConnection?.send(content: payload, completion: .contentProcessed { _ in })
     }
 
-    private func receiveLoop(
-        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
-    ) {
+    private func receiveLoop() {
         streamConnection?.receiveMessage { [weak self] data, _, _, error in
             guard let self else { return }
             if let error {
@@ -77,13 +85,13 @@ final class TransportService {
             }
 
             guard let data, let packet = RTPPacket(data: data) else {
-                self.receiveLoop(onNalu: onNalu)
+                self.receiveLoop()
                 return
             }
 
-            self.ingest(packet: packet, onNalu: onNalu)
+            self.ingest(packet: packet)
 
-            self.receiveLoop(onNalu: onNalu)
+            self.receiveLoop()
         }
     }
 
@@ -108,9 +116,7 @@ final class TransportService {
         controlConnection = connection
     }
 
-    private func setupStreamListener(
-        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
-    ) {
+    private func setupStreamListener() {
         let parameters = NWParameters.udp
         parameters.includePeerToPeer = true
 
@@ -134,7 +140,7 @@ final class TransportService {
                 }
             }
             listener.newConnectionHandler = { [weak self] connection in
-                self?.attachStreamConnection(connection, onNalu: onNalu)
+                self?.attachStreamConnection(connection)
             }
             listener.start(queue: queue)
             streamListener = listener
@@ -143,10 +149,7 @@ final class TransportService {
         }
     }
 
-    private func attachStreamConnection(
-        _ connection: NWConnection,
-        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
-    ) {
+    private func attachStreamConnection(_ connection: NWConnection) {
         streamConnection?.cancel()
         streamConnection = connection
         connection.stateUpdateHandler = { [weak self] state in
@@ -164,18 +167,15 @@ final class TransportService {
             }
         }
         connection.start(queue: queue)
-        receiveLoop(onNalu: onNalu)
+        receiveLoop()
     }
 
-    private func ingest(
-        packet: RTPPacket,
-        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
-    ) {
+    private func ingest(packet: RTPPacket) {
         updateMetrics(with: packet)
 
         guard let expected = nextSequenceNumber else {
             nextSequenceNumber = packet.sequenceNumber &+ 1
-            process(packet: packet, onNalu: onNalu)
+            process(packet: packet)
             return
         }
 
@@ -192,26 +192,24 @@ final class TransportService {
             droppedPackets += UInt64(reorderBuffer.count)
             reorderBuffer.removeAll(keepingCapacity: true)
             nextSequenceNumber = packet.sequenceNumber &+ 1
-            process(packet: packet, onNalu: onNalu)
+            process(packet: packet)
             publishMetricsFallback()
             return
         }
 
         var cursor = expected
         while let next = reorderBuffer.removeValue(forKey: cursor) {
-            process(packet: next, onNalu: onNalu)
+            process(packet: next)
             cursor = cursor &+ 1
             nextSequenceNumber = cursor
         }
     }
 
-    private func process(
-        packet: RTPPacket,
-        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
-    ) {
+    private func process(packet: RTPPacket) {
+        guard let naluHandler else { return }
         let nalus = depacketizer.push(payload: packet.payload, marker: packet.marker)
         for nalu in nalus {
-            onNalu(nalu.bytes, packet.timestamp, nalu.accessUnitEnd)
+            naluHandler(nalu.bytes, packet.timestamp, nalu.accessUnitEnd)
         }
     }
 

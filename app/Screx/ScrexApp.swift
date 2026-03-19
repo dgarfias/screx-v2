@@ -81,6 +81,13 @@ final class StreamViewModel: ObservableObject {
 
     func start() {
         statusText = "Discovering services..."
+        transport.startListening { [weak self] nalu, timestamp90k, isAccessUnitEnd in
+            self?.decoder.handleNalu(
+                nalu: nalu,
+                timestamp90k: timestamp90k,
+                isAccessUnitEnd: isAccessUnitEnd
+            )
+        }
         discovery.startBrowsing()
     }
 
@@ -88,7 +95,6 @@ final class StreamViewModel: ObservableObject {
         hasConnected = true
         connectedEndpointName = endpoint.name
         statusText = "Connecting to \(endpoint.name)..."
-        transport.disconnect()
         transport.connect(endpoint: endpoint.endpoint) { [weak self] nalu, timestamp90k, isAccessUnitEnd in
             self?.decoder.handleNalu(
                 nalu: nalu,
