@@ -85,12 +85,14 @@ final class H264Decoder {
             case 8:
                 pps = nalu
                 tryBuildFormatDescription()
-            default:
+            case 1, 5:
                 if formatDescription != nil {
                     enqueueNalu(nalu)
                 } else if naluCount <= 10 {
-                    print("[decoder] dropping NALU type=\(naluType), no format description yet")
+                    print("[decoder] dropping slice type=\(naluType), no format description yet")
                 }
+            default:
+                break
             }
         }
     }

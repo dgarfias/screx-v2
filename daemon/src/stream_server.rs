@@ -5,11 +5,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
-use crate::encode::EncodedAccessUnit;
+use crate::encode::{ControlMessage, EncodedAccessUnit};
 
 pub async fn run_stream_server(
     port: u16,
     mut au_rx: mpsc::Receiver<EncodedAccessUnit>,
+    control_tx: mpsc::Sender<ControlMessage>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -53,6 +54,13 @@ pub async fn run_stream_server(
         }
         if drained > 0 {
             println!("[stream] drained {drained} stale frames");
+        }
+
+        // Request a fresh IDR so the client gets SPS/PPS immediately
+        if let Err(e) = control_tx.send(ControlMessage::RequestIdr).await {
+            eprintln!("[stream] failed to request IDR: {e}");
+        } else {
+            println!("[stream] requested IDR for new client");
         }
 
         stream.set_nodelay(true)?;

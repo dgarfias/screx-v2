@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let (frame_tx, frame_rx) = mpsc::channel(4);
     let (au_tx, au_rx) = mpsc::channel(8);
-    let (_control_tx, control_rx) = mpsc::channel(32);
+    let (control_tx, control_rx) = mpsc::channel(32);
 
     let mdns_handle = match discovery::start_sender_advertisement(
         "_screx._tcp",
@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
     let stream_task = tokio::spawn(stream_server::run_stream_server(
         config.stream_port,
         au_rx,
+        control_tx,
         stop_rx.clone(),
     ));
 
