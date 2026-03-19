@@ -178,12 +178,16 @@ struct WebRTCReceiverView: UIViewRepresentable {
         webView.backgroundColor = .black
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
+        context.coordinator.lastRequestedURL = url
         webView.load(URLRequest(url: url))
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        if webView.url != url {
+        if !isSameEndpointURL(lhs: webView.url, rhs: url) &&
+            !isSameEndpointURL(lhs: context.coordinator.lastRequestedURL, rhs: url) {
+            context.coordinator.lastRequestedURL = url
+            onStatus("Loading stream page...")
             webView.load(URLRequest(url: url))
         }
     }
@@ -194,6 +198,7 @@ struct WebRTCReceiverView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         private let onStatus: (String) -> Void
+        var lastRequestedURL: URL?
 
         init(onStatus: @escaping (String) -> Void) {
             self.onStatus = onStatus
@@ -204,7 +209,7 @@ struct WebRTCReceiverView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            onStatus("Connected")
+            onStatus("Page loaded, negotiating WebRTC...")
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -226,5 +231,21 @@ struct WebRTCReceiverView: UIViewRepresentable {
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             onStatus("Web content process terminated")
         }
+    }
+
+    private func isSameEndpointURL(lhs: URL?, rhs: URL?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        return normalizedURLKey(lhs) == normalizedURLKey(rhs)
+    }
+
+    private func normalizedURLKey(_ url: URL) -> String {
+        let scheme = url.scheme?.lowercased() ?? "http"
+        let host = url.host?.lowercased() ?? ""
+        let port: Int = {
+            if let p = url.port { return p }
+            return scheme == "https" ? 443 : 80
+        }()
+        let path = (url.path.isEmpty || url.path == "/") ? "/" : url.path
+        return "\(scheme)://\(host):\(port)\(path)"
     }
 }

@@ -25,9 +25,14 @@ async fn handle_offer(
     State(sender): State<Arc<WebRtcSender>>,
     body: String,
 ) -> Result<String, (StatusCode, String)> {
+    println!("[signaling] received SDP offer ({} bytes)", body.len());
     sender
         .handle_offer(body)
         .await
+        .map(|answer| {
+            println!("[signaling] sending SDP answer ({} bytes)", answer.len());
+            answer
+        })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signaling error: {e}")))
 }
 
