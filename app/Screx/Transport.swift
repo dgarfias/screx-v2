@@ -130,7 +130,7 @@ final class TransportService {
 
     private func setupStreamListener() {
         let parameters = NWParameters.udp
-        parameters.includePeerToPeer = true
+        parameters.includePeerToPeer = false
 
         do {
             let listener = try NWListener(
@@ -162,7 +162,11 @@ final class TransportService {
     }
 
     private func attachStreamConnection(_ connection: NWConnection) {
-        streamConnection?.cancel()
+        // Keep the first active flow and reject duplicates to avoid listener churn.
+        if streamConnection != nil {
+            connection.cancel()
+            return
+        }
         streamConnection = connection
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
@@ -176,6 +180,12 @@ final class TransportService {
                 self?.emitStatus("Stream disconnected")
             default:
                 break
+            }
+            if case .failed = state, self?.streamConnection === connection {
+                self?.streamConnection = nil
+            }
+            if case .cancelled = state, self?.streamConnection === connection {
+                self?.streamConnection = nil
             }
         }
         connection.start(queue: queue)

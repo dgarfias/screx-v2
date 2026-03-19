@@ -245,7 +245,7 @@ private struct NalCounters {
         case 32: vps += 1
         case 33: sps += 1
         case 34: pps += 1
-        case 19, 20: idr += 1
+        case 16...23: idr += 1
         case 0...31: vcl += 1
         case 35: aud += 1
         default: other += 1

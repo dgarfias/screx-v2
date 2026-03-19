@@ -42,6 +42,13 @@ pub async fn run_transport_loop(
     let ssrc: u32 = rand::thread_rng().gen();
     let mut packets_in_window = 0_u64;
     let mut send_errors_in_window = 0_u64;
+    let mut vps_in_window = 0_u64;
+    let mut sps_in_window = 0_u64;
+    let mut pps_in_window = 0_u64;
+    let mut irap_in_window = 0_u64;
+    let mut vcl_in_window = 0_u64;
+    let mut aud_in_window = 0_u64;
+    let mut other_in_window = 0_u64;
     let mut window_start = Instant::now();
 
     loop {
@@ -57,6 +64,17 @@ pub async fn run_transport_loop(
                     println!("[transport] upstream channel closed");
                     break;
                 };
+                for nalu in split_annex_b_nalus(&au.annex_b) {
+                    match hevc_nalu_type(nalu) {
+                        32 => vps_in_window += 1,
+                        33 => sps_in_window += 1,
+                        34 => pps_in_window += 1,
+                        16..=23 => irap_in_window += 1,
+                        0..=31 => vcl_in_window += 1,
+                        35 => aud_in_window += 1,
+                        _ => other_in_window += 1,
+                    }
+                }
                 let payloads = packetize_hevc_annex_b(&au.annex_b, config.mtu);
                 let packet_count = payloads.len();
                 for payload in payloads {
@@ -82,6 +100,9 @@ pub async fn run_transport_loop(
                 packets_in_window += packet_count as u64;
                 if window_start.elapsed() >= Duration::from_secs(1) {
                     println!("[transport] rtp_packets_per_sec={packets_in_window}");
+                    println!(
+                        "[transport] nals_per_sec vps={vps_in_window} sps={sps_in_window} pps={pps_in_window} irap={irap_in_window} vcl={vcl_in_window} aud={aud_in_window} other={other_in_window}"
+                    );
                     if send_errors_in_window > 0 {
                         println!(
                             "[transport] send_errors_per_sec={send_errors_in_window} (peer unavailable or not listening)"
@@ -89,6 +110,13 @@ pub async fn run_transport_loop(
                     }
                     packets_in_window = 0;
                     send_errors_in_window = 0;
+                    vps_in_window = 0;
+                    sps_in_window = 0;
+                    pps_in_window = 0;
+                    irap_in_window = 0;
+                    vcl_in_window = 0;
+                    aud_in_window = 0;
+                    other_in_window = 0;
                     window_start = Instant::now();
                 }
                 if au.is_idr {
@@ -211,6 +239,13 @@ fn split_annex_b_nalus(data: &[u8]) -> Vec<&[u8]> {
         }
     }
     nalus
+}
+
+fn hevc_nalu_type(nalu: &[u8]) -> u8 {
+    if nalu.len() < 2 {
+        return 0;
+    }
+    (nalu[0] >> 1) & 0x3F
 }
 
 fn find_start_codes(data: &[u8]) -> Vec<(usize, usize)> {

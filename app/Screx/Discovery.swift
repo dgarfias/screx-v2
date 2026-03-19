@@ -28,7 +28,7 @@ final class DiscoveryService {
 
     func startBrowsing() {
         let parameters = NWParameters.udp
-        parameters.includePeerToPeer = true
+        parameters.includePeerToPeer = false
 
         let browser = NWBrowser(
             for: .bonjour(type: "_screenstream._udp", domain: nil),

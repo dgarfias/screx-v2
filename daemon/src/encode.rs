@@ -455,13 +455,13 @@ mod vaapi {
         }
 
         fn finish_current_au(&mut self) -> Vec<u8> {
-            let mut contains_idr = false;
+            let mut contains_vcl = false;
             let mut contains_vps = false;
             let mut contains_sps = false;
             let mut contains_pps = false;
             for nalu in &self.current_au {
                 match hevc_nalu_type(nalu) {
-                    19 | 20 => contains_idr = true,
+                    0..=31 => contains_vcl = true,
                     32 => contains_vps = true,
                     33 => contains_sps = true,
                     34 => contains_pps = true,
@@ -470,7 +470,7 @@ mod vaapi {
             }
 
             let mut output = Vec::new();
-            if contains_idr {
+            if contains_vcl {
                 if !contains_vps {
                     if let Some(vps) = &self.cached_vps {
                         output.extend_from_slice(vps);
