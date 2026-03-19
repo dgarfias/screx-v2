@@ -78,12 +78,12 @@ Run with defaults:
 ```bash
 SCREX_TARGET_IP=192.168.1.20 \
 SCREX_TARGET_PORT=5004 \
-SCREX_CONTROL_PORT=5005 \
 SCREX_WIDTH=1920 \
 SCREX_HEIGHT=1080 \
 SCREX_FPS=60 \
 SCREX_BITRATE_BPS=10000000 \
 SCREX_CAPTURE_BACKEND=auto \
+SCREX_CAPTURE_SOURCE=virtual \
 SCREX_ENCODER_BACKEND=auto \
 cargo run
 ```
@@ -96,8 +96,14 @@ Environment variables:
 - `SCREX_DISCOVERY_NAME`: mDNS service instance name (default `screx-daemon`)
 - `SCREX_DISCOVERY_SERVICE`: mDNS service type (default `_screenstream._udp`)
 - `SCREX_CAPTURE_BACKEND`: `auto`, `portal-pipewire`, or `synthetic`
+- `SCREX_CAPTURE_SOURCE`: `virtual` (default) or `monitor`
 - `SCREX_ENCODER_BACKEND`: `auto`, `vaapi`, or `bootstrap`
 - `SCREX_WIDTH`, `SCREX_HEIGHT`, `SCREX_FPS`, `SCREX_BITRATE_BPS`, `SCREX_MTU`
+
+Notes:
+
+- `SCREX_CAPTURE_SOURCE=virtual` requests a second virtual display source from portal.
+- In virtual mode, capture resolution is locked to `1920x1080` for MVP consistency.
 
 ### Control Channel Commands
 

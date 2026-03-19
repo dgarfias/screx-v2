@@ -36,6 +36,7 @@ pub struct CaptureConfig {
     pub fps: u32,
     pub prefer_dma_buf: bool,
     pub backend: CaptureBackend,
+    pub source: CaptureSource,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,28 @@ impl CaptureBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSource {
+    Virtual1080p,
+    Monitor,
+}
+
+impl CaptureSource {
+    pub fn from_env(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "monitor" => Self::Monitor,
+            _ => Self::Virtual1080p,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Virtual1080p => "Virtual",
+            Self::Monitor => "Monitor",
+        }
+    }
+}
+
 pub fn spawn_capture_thread(
     config: CaptureConfig,
     tx: mpsc::Sender<CaptureFrame>,
@@ -80,7 +103,9 @@ fn capture_loop(
         match run_real_capture_if_available(&config, &tx, &stop_rx) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if config.backend == CaptureBackend::PortalPipewire {
+                if config.backend == CaptureBackend::PortalPipewire
+                    || config.source == CaptureSource::Virtual1080p
+                {
                     return Err(err.context("real capture backend requested explicitly"));
                 }
                 eprintln!(
@@ -90,7 +115,7 @@ fn capture_loop(
         }
     }
 
-    let portal = run_portal_flow_mock();
+    let portal = run_portal_flow_mock(config.source);
     println!(
         "[capture] using synthetic source (session id={}, source={}, node_id={:?}, size={:?})",
         portal.session_id, portal.source_type, portal.stream_node_id, portal.stream_size
@@ -158,14 +183,17 @@ fn run_synthetic_capture_loop(
     Ok(())
 }
 
-fn run_portal_flow_mock() -> PortalSession {
+fn run_portal_flow_mock(source: CaptureSource) -> PortalSession {
     // This mirrors the intended xdg-desktop-portal sequence:
     // CreateSession -> SelectSources(SourceType::Monitor) -> Start -> OpenPipeWireRemote
     // In this bootstrap implementation we keep the structure and logging while using
     // a synthetic frame source so integration can proceed before hardware capture wiring.
     println!("[capture] portal: CreateSession");
     thread::sleep(Duration::from_millis(20));
-    println!("[capture] portal: SelectSources(SourceType::Monitor)");
+    println!(
+        "[capture] portal: SelectSources(SourceType::{})",
+        source.label()
+    );
     thread::sleep(Duration::from_millis(20));
     println!("[capture] portal: Start");
     thread::sleep(Duration::from_millis(20));
@@ -173,7 +201,7 @@ fn run_portal_flow_mock() -> PortalSession {
 
     PortalSession {
         session_id: "mock-session-001".to_string(),
-        source_type: "Monitor",
+        source_type: source.label(),
         stream_node_id: None,
         stream_size: Some((1920, 1080)),
     }
@@ -244,7 +272,9 @@ mod real_capture {
     use tokio::runtime::Builder;
     use tokio::sync::{mpsc, watch};
 
-    use super::{BufferType, CaptureConfig, CaptureFrame, PixelFormat, PortalSession};
+    use super::{
+        BufferType, CaptureConfig, CaptureFrame, CaptureSource, PixelFormat, PortalSession,
+    };
 
     struct ActivePortalSession {
         meta: PortalSession,
@@ -257,6 +287,7 @@ mod real_capture {
         sender: mpsc::Sender<CaptureFrame>,
         frame_index: u64,
         fps: u32,
+        lock_resolution: bool,
         fallback_width: u32,
         fallback_height: u32,
         last_stats: Instant,
@@ -268,7 +299,7 @@ mod real_capture {
         tx: &mpsc::Sender<CaptureFrame>,
         stop_rx: &watch::Receiver<bool>,
     ) -> Result<()> {
-        let session = open_portal_session()?;
+        let session = open_portal_session(config.source, config.width, config.height)?;
         println!(
             "[capture] portal session started: id={}, source={}, node_id={:?}, size={:?}",
             session.meta.session_id,
@@ -309,6 +340,7 @@ mod real_capture {
             sender: tx.clone(),
             frame_index: 0,
             fps: config.fps.max(1),
+            lock_resolution: config.source == CaptureSource::Virtual1080p,
             fallback_width: effective_config.width,
             fallback_height: effective_config.height,
             last_stats: Instant::now(),
@@ -339,7 +371,7 @@ mod real_capture {
                 }
                 if user_data.format.parse(param).is_ok() {
                     let size = user_data.format.size();
-                    if size.width > 0 && size.height > 0 {
+                    if !user_data.lock_resolution && size.width > 0 && size.height > 0 {
                         user_data.fallback_width = size.width;
                         user_data.fallback_height = size.height;
                     }
@@ -481,7 +513,11 @@ mod real_capture {
         Ok(())
     }
 
-    fn open_portal_session() -> Result<ActivePortalSession> {
+    fn open_portal_session(
+        source: CaptureSource,
+        expected_width: u32,
+        expected_height: u32,
+    ) -> Result<ActivePortalSession> {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -497,7 +533,13 @@ mod real_capture {
 
             let options = SelectSourcesOptions::default()
                 .set_multiple(false)
-                .set_sources(Some(SourceType::Monitor.into()))
+                .set_sources(Some(
+                    match source {
+                        CaptureSource::Virtual1080p => SourceType::Virtual,
+                        CaptureSource::Monitor => SourceType::Monitor,
+                    }
+                    .into(),
+                ))
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_persist_mode(PersistMode::DoNot);
 
@@ -526,11 +568,24 @@ mod real_capture {
                 .await
                 .context("OpenPipeWireRemote failed")?;
             let node_id = node_id.expect("checked above");
+            if source == CaptureSource::Virtual1080p {
+                if let Some((width, height)) = size {
+                    if width as u32 != expected_width || height as u32 != expected_height {
+                        anyhow::bail!(
+                            "virtual stream size mismatch: expected {}x{}, got {}x{}",
+                            expected_width,
+                            expected_height,
+                            width,
+                            height
+                        );
+                    }
+                }
+            }
 
             Ok(ActivePortalSession {
                 meta: PortalSession {
                     session_id: format!("node-{node_id}"),
-                    source_type: "Monitor",
+                    source_type: source.label(),
                     stream_node_id: Some(node_id),
                     stream_size: size,
                 },

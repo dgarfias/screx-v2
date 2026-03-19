@@ -11,6 +11,9 @@ struct TransportMetrics {
 final class TransportService {
     private let queue = DispatchQueue(label: "screx.transport", qos: .userInteractive)
     private var streamConnection: NWConnection?
+    private var controlConnection: NWConnection?
+    private var streamListener: NWListener?
+    private var selectedEndpoint: NWEndpoint?
     private var depacketizer = HevcDepacketizer()
     private var reorderBuffer: [UInt16: RTPPacket] = [:]
     private var nextSequenceNumber: UInt16?
@@ -30,39 +33,37 @@ final class TransportService {
         endpoint: NWEndpoint,
         onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
     ) {
-        let connection = NWConnection(to: endpoint, using: .udp)
-        self.streamConnection = connection
-
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.onStatusUpdate?("Connected")
-            case .waiting(let error):
-                self?.onStatusUpdate?("Transport waiting: \(error.localizedDescription)")
-            case .failed(let error):
-                self?.onStatusUpdate?("Transport failed: \(error.localizedDescription)")
-            case .cancelled:
-                self?.onStatusUpdate?("Transport disconnected")
-            default:
-                break
-            }
-        }
-
-        connection.start(queue: queue)
-        receiveLoop(onNalu: onNalu)
+        disconnect()
+        selectedEndpoint = endpoint
+        setupControlConnection(to: endpoint)
+        setupStreamListener(onNalu: onNalu)
     }
 
     func disconnect() {
         streamConnection?.cancel()
         streamConnection = nil
+        controlConnection?.cancel()
+        controlConnection = nil
+        streamListener?.cancel()
+        streamListener = nil
+        selectedEndpoint = nil
         reorderBuffer.removeAll(keepingCapacity: true)
         nextSequenceNumber = nil
+        lastSequenceNumber = nil
+        expectedPackets = 0
+        receivedPackets = 0
+        droppedPackets = 0
+        jitter90k = 0
+        lastTimestamp90k = nil
+        lastArrivalNs = nil
     }
 
     func sendControl(message: String) {
         let payload = Data(message.utf8)
-        // MVP control path uses the same advertised UDP endpoint as the stream.
-        streamConnection?.send(content: payload, completion: .contentProcessed { _ in })
+        if controlConnection == nil, let selectedEndpoint {
+            setupControlConnection(to: selectedEndpoint)
+        }
+        controlConnection?.send(content: payload, completion: .contentProcessed { _ in })
     }
 
     private func receiveLoop(
@@ -84,6 +85,86 @@ final class TransportService {
 
             self.receiveLoop(onNalu: onNalu)
         }
+    }
+
+    private func setupControlConnection(to endpoint: NWEndpoint) {
+        guard controlConnection == nil else { return }
+        let connection = NWConnection(to: endpoint, using: .udp)
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.onStatusUpdate?("Control ready")
+            case .waiting(let error):
+                self?.onStatusUpdate?("Control waiting: \(error.localizedDescription)")
+            case .failed(let error):
+                self?.onStatusUpdate?("Control failed: \(error.localizedDescription)")
+            case .cancelled:
+                self?.onStatusUpdate?("Control disconnected")
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        controlConnection = connection
+    }
+
+    private func setupStreamListener(
+        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
+    ) {
+        let parameters = NWParameters.udp
+        parameters.includePeerToPeer = true
+
+        do {
+            let listener = try NWListener(
+                using: parameters,
+                on: NWEndpoint.Port(integerLiteral: 5004)
+            )
+            listener.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready:
+                    self?.onStatusUpdate?("Listening on UDP 5004")
+                case .waiting(let error):
+                    self?.onStatusUpdate?("Listener waiting: \(error.localizedDescription)")
+                case .failed(let error):
+                    self?.onStatusUpdate?("Listener failed: \(error.localizedDescription)")
+                case .cancelled:
+                    self?.onStatusUpdate?("Listener stopped")
+                default:
+                    break
+                }
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.attachStreamConnection(connection, onNalu: onNalu)
+            }
+            listener.start(queue: queue)
+            streamListener = listener
+        } catch {
+            onStatusUpdate?("Listener setup failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func attachStreamConnection(
+        _ connection: NWConnection,
+        onNalu: @escaping (_ nalu: Data, _ timestamp90k: UInt32, _ isAccessUnitEnd: Bool) -> Void
+    ) {
+        streamConnection?.cancel()
+        streamConnection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.onStatusUpdate?("Stream connected")
+            case .waiting(let error):
+                self?.onStatusUpdate?("Stream waiting: \(error.localizedDescription)")
+            case .failed(let error):
+                self?.onStatusUpdate?("Stream failed: \(error.localizedDescription)")
+            case .cancelled:
+                self?.onStatusUpdate?("Stream disconnected")
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        receiveLoop(onNalu: onNalu)
     }
 
     private func ingest(

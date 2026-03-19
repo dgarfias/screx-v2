@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::str;
+use std::{io, io::ErrorKind};
 
 use anyhow::{Context, Result};
 use rand::Rng;
@@ -40,6 +41,7 @@ pub async fn run_transport_loop(
     let mut seq: u16 = rand::thread_rng().gen();
     let ssrc: u32 = rand::thread_rng().gen();
     let mut packets_in_window = 0_u64;
+    let mut send_errors_in_window = 0_u64;
     let mut window_start = Instant::now();
 
     loop {
@@ -67,12 +69,26 @@ pub async fn run_transport_loop(
                         &payload.payload,
                     );
                     seq = seq.wrapping_add(1);
-                    socket.send(&packet).await.context("failed to send RTP packet")?;
+                    if let Err(err) = socket.send(&packet).await {
+                        if err.kind() == ErrorKind::ConnectionRefused {
+                            // iOS may not be listening yet; keep pipeline alive and retry on next packet.
+                            send_errors_in_window += 1;
+                            continue;
+                        }
+                        return Err(io::Error::new(err.kind(), err.to_string()))
+                            .context("failed to send RTP packet");
+                    }
                 }
                 packets_in_window += packet_count as u64;
                 if window_start.elapsed() >= Duration::from_secs(1) {
                     println!("[transport] rtp_packets_per_sec={packets_in_window}");
+                    if send_errors_in_window > 0 {
+                        println!(
+                            "[transport] send_errors_per_sec={send_errors_in_window} (peer unavailable or not listening)"
+                        );
+                    }
                     packets_in_window = 0;
+                    send_errors_in_window = 0;
                     window_start = Instant::now();
                 }
                 if au.is_idr {

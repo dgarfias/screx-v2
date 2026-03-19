@@ -17,6 +17,7 @@ struct AppConfig {
     discovery_name: String,
     discovery_service: String,
     capture_backend: capture::CaptureBackend,
+    capture_source: capture::CaptureSource,
     encoder_backend: encode::EncoderBackend,
     width: u32,
     height: u32,
@@ -37,10 +38,12 @@ impl AppConfig {
             Ok(raw) => raw.parse::<u16>().context("invalid SCREX_CONTROL_PORT")?,
             Err(_) => stream_port,
         };
-        let width = read_env("SCREX_WIDTH", "1920")
+        let capture_source =
+            capture::CaptureSource::from_env(&read_env("SCREX_CAPTURE_SOURCE", "virtual"));
+        let mut width = read_env("SCREX_WIDTH", "1920")
             .parse::<u32>()
             .context("invalid SCREX_WIDTH")?;
-        let height = read_env("SCREX_HEIGHT", "1080")
+        let mut height = read_env("SCREX_HEIGHT", "1080")
             .parse::<u32>()
             .context("invalid SCREX_HEIGHT")?;
         let fps = read_env("SCREX_FPS", "60")
@@ -53,6 +56,11 @@ impl AppConfig {
             .parse::<usize>()
             .context("invalid SCREX_MTU")?;
 
+        if capture_source == capture::CaptureSource::Virtual1080p {
+            width = 1920;
+            height = 1080;
+        }
+
         Ok(Self {
             stream_target: SocketAddr::new(stream_ip, stream_port),
             control_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), control_port),
@@ -62,6 +70,7 @@ impl AppConfig {
                 "SCREX_CAPTURE_BACKEND",
                 "auto",
             )),
+            capture_source,
             encoder_backend: encode::EncoderBackend::from_env(&read_env(
                 "SCREX_ENCODER_BACKEND",
                 "auto",
@@ -110,6 +119,7 @@ async fn main() -> Result<()> {
             fps: config.fps,
             prefer_dma_buf: true,
             backend: config.capture_backend,
+            source: config.capture_source,
         },
         frame_tx,
         stop_rx.clone(),
