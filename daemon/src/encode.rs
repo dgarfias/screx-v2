@@ -73,6 +73,7 @@ pub async fn run_encoder_loop(
     let mut force_next_idr = true;
     let mut encoded_in_window = 0_u64;
     let mut bytes_in_window = 0_u64;
+    let mut dropped_capture_frames_in_window = 0_u64;
     let mut dropped_au_in_window = 0_u64;
     let mut window_start = Instant::now();
 
@@ -120,10 +121,14 @@ pub async fn run_encoder_loop(
                 }
             }
             maybe_frame = frame_rx.recv() => {
-                let Some(frame) = maybe_frame else {
+                let Some(mut frame) = maybe_frame else {
                     println!("[encode] upstream channel closed");
                     break;
                 };
+                while let Ok(newer_frame) = frame_rx.try_recv() {
+                    frame = newer_frame;
+                    dropped_capture_frames_in_window += 1;
+                }
 
                 if frame.width != config.width || frame.height != config.height {
                     println!(
@@ -157,6 +162,12 @@ pub async fn run_encoder_loop(
                 if produced_aus.is_empty() {
                     continue;
                 }
+                if produced_aus.len() > 1 {
+                    dropped_au_in_window += (produced_aus.len() - 1) as u64;
+                    let newest = produced_aus.pop().expect("len checked");
+                    produced_aus.clear();
+                    produced_aus.push(newest);
+                }
                 force_next_idr = false;
 
                 for au in produced_aus {
@@ -167,11 +178,12 @@ pub async fn run_encoder_loop(
                         let fps = encoded_in_window as f64 / elapsed;
                         let mbps = (bytes_in_window as f64 * 8.0 / elapsed) / 1_000_000.0;
                         println!(
-                            "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_au_per_sec={}",
-                            config.bitrate_bps, dropped_au_in_window
+                            "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_capture_frames_per_sec={} dropped_au_per_sec={}",
+                            config.bitrate_bps, dropped_capture_frames_in_window, dropped_au_in_window
                         );
                         encoded_in_window = 0;
                         bytes_in_window = 0;
+                        dropped_capture_frames_in_window = 0;
                         dropped_au_in_window = 0;
                         window_start = Instant::now();
                     }
