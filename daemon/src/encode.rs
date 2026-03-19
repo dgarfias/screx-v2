@@ -65,7 +65,7 @@ pub fn run_encoder_loop(
     #[cfg(feature = "real-encode")]
     let mut vaapi_encoder = match active_backend {
         ActiveEncoderBackend::VaapiBootstrapPayload => {
-            Some(vaapi::VaapiEncoderProcess::new(&config)?)
+            Some(vaapi::DirectVaapiEncoder::new(&config)?)
         }
         ActiveEncoderBackend::Bootstrap => None,
     };
@@ -93,7 +93,7 @@ pub fn run_encoder_loop(
                     config.bitrate_bps = bps.max(500_000);
                     #[cfg(feature = "real-encode")]
                     if let Some(worker) = vaapi_encoder.as_mut() {
-                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                        *worker = vaapi::DirectVaapiEncoder::new(&config)?;
                     }
                 }
                 ControlMessage::SetResolution(w, h) => {
@@ -103,7 +103,7 @@ pub fn run_encoder_loop(
                     force_next_idr = true;
                     #[cfg(feature = "real-encode")]
                     if let Some(worker) = vaapi_encoder.as_mut() {
-                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                        *worker = vaapi::DirectVaapiEncoder::new(&config)?;
                     }
                 }
             }
@@ -128,7 +128,7 @@ pub fn run_encoder_loop(
             force_next_idr = true;
             #[cfg(feature = "real-encode")]
             if let Some(worker) = vaapi_encoder.as_mut() {
-                *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                *worker = vaapi::DirectVaapiEncoder::new(&config)?;
             }
         }
 
@@ -266,15 +266,12 @@ fn initialize_encoder_backend(
 
 #[cfg(feature = "real-encode")]
 mod vaapi {
-    use std::collections::VecDeque;
     use std::fs;
-    use std::io::{Read, Write};
-    use std::process::{Child, ChildStdin, Command, Stdio};
-    use std::sync::mpsc as std_mpsc;
-    use std::thread;
+    use std::ptr;
 
     use anyhow::{bail, Context, Result};
     use ffmpeg_next as ffmpeg;
+    use ffmpeg_sys_next as ffi;
 
     use super::{EncodedAccessUnit, EncoderConfig};
     use crate::capture::CaptureFrame;
@@ -294,7 +291,6 @@ mod vaapi {
             bail!("VA-API render node is not writable: {render_node}");
         }
 
-        let _ = ffmpeg::format::Pixel::NV12;
         println!(
             "[encode] vaapi init target={}x{}@{} bitrate={}",
             config.width, config.height, config.fps, config.bitrate_bps
@@ -302,264 +298,278 @@ mod vaapi {
         Ok(())
     }
 
-    pub(super) struct VaapiEncoderProcess {
-        child: Child,
-        stdin: ChildStdin,
-        chunk_rx: std_mpsc::Receiver<Vec<u8>>,
-        parser: AnnexBAccessUnitParser,
-        pending_meta: VecDeque<FrameMeta>,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct FrameMeta {
+    pub(super) struct DirectVaapiEncoder {
+        ctx: *mut ffi::AVCodecContext,
+        hw_device_ctx: *mut ffi::AVBufferRef,
+        sws: *mut ffi::SwsContext,
+        width: i32,
+        height: i32,
         frame_index: u64,
-        timestamp_90k: u32,
-        is_idr: bool,
+        fps: u32,
+        extradata: Vec<u8>,
     }
 
-    impl VaapiEncoderProcess {
+    unsafe impl Send for DirectVaapiEncoder {}
+
+    impl DirectVaapiEncoder {
         pub(super) fn new(config: &EncoderConfig) -> Result<Self> {
-            let mut cmd = Command::new("ffmpeg");
-            cmd.args(["-hide_banner", "-loglevel", "error"])
-                .args(["-vaapi_device", "/dev/dri/renderD128"])
-                .args(["-f", "rawvideo"])
-                .args(["-pix_fmt", "bgr0"])
-                .args([
-                    "-video_size",
-                    &format!("{}x{}", config.width, config.height),
-                ])
-                .args(["-framerate", &config.fps.to_string()])
-                .args(["-i", "-"])
-                .args(["-vf", "format=nv12,hwupload"])
-                .args(["-c:v", "hevc_vaapi"])
-                .args(["-async_depth", "1"])
-                .args(["-rc_mode", "CBR"])
-                .args(["-b:v", &config.bitrate_bps.to_string()])
-                .args(["-maxrate", &config.bitrate_bps.to_string()])
-                .args(["-bufsize", &(config.bitrate_bps / 2).max(1).to_string()])
-                .args(["-g", &config.gop.to_string()])
-                .args(["-idr_interval", &config.gop.to_string()])
-                .args(["-bf", "0"])
-                .args(["-aud", "1"])
-                .args(["-bsf:v", "hevc_mp4toannexb,dump_extra=freq=keyframe"])
-                .args(["-f", "hevc"])
-                .arg("-")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+            let width = config.width as i32;
+            let height = config.height as i32;
 
-            let mut child = cmd
-                .spawn()
-                .context("failed to spawn ffmpeg vaapi encoder")?;
-            let stdin = child.stdin.take().context("failed to open ffmpeg stdin")?;
-            let mut stdout = child
-                .stdout
-                .take()
-                .context("failed to open ffmpeg stdout")?;
-            let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
-            thread::spawn(move || {
-                let mut buf = [0_u8; 16 * 1024];
-                loop {
-                    match stdout.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(size) => {
-                            if tx.send(buf[..size].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
+            unsafe {
+                let codec_name = std::ffi::CString::new("hevc_vaapi").unwrap();
+                let codec = ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
+                if codec.is_null() {
+                    bail!("hevc_vaapi encoder not found");
                 }
-            });
 
-            Ok(Self {
-                child,
-                stdin,
-                chunk_rx: rx,
-                parser: AnnexBAccessUnitParser::default(),
-                pending_meta: VecDeque::new(),
-            })
+                let ctx = ffi::avcodec_alloc_context3(codec);
+                if ctx.is_null() {
+                    bail!("failed to allocate codec context");
+                }
+
+                let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
+                let device_path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+                let ret = ffi::av_hwdevice_ctx_create(
+                    &mut hw_device_ctx,
+                    ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                    device_path.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                );
+                if ret < 0 {
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to create VA-API device context (error {ret})");
+                }
+
+                let hw_frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
+                if hw_frames_ref.is_null() {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to allocate hw frames context");
+                }
+                let frames_ctx = (*hw_frames_ref).data as *mut ffi::AVHWFramesContext;
+                (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+                (*frames_ctx).width = width;
+                (*frames_ctx).height = height;
+                (*frames_ctx).initial_pool_size = 20;
+
+                let ret = ffi::av_hwframe_ctx_init(hw_frames_ref);
+                if ret < 0 {
+                    ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to init hw frames context (error {ret})");
+                }
+
+                (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
+                (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ref);
+                (*ctx).width = width;
+                (*ctx).height = height;
+                (*ctx).time_base = ffi::AVRational { num: 1, den: 90_000 };
+                (*ctx).framerate = ffi::AVRational { num: config.fps.max(1) as i32, den: 1 };
+                (*ctx).bit_rate = config.bitrate_bps as i64;
+                (*ctx).rc_buffer_size = (config.bitrate_bps / 2).max(1) as i32;
+                (*ctx).gop_size = config.gop as i32;
+                (*ctx).max_b_frames = 0;
+                (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+
+                let opt_key = std::ffi::CString::new("async_depth").unwrap();
+                ffi::av_opt_set_int((*ctx).priv_data, opt_key.as_ptr(), 0, 0);
+
+                let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+                if ret < 0 {
+                    ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to open hevc_vaapi encoder (error {ret})");
+                }
+
+                let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
+                    std::slice::from_raw_parts(
+                        (*ctx).extradata,
+                        (*ctx).extradata_size as usize,
+                    )
+                    .to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                // hw_frames_ref ownership transferred to ctx, release our ref
+                ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
+
+                let sws = ffi::sws_getContext(
+                    width,
+                    height,
+                    ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    width,
+                    height,
+                    ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                    ffi::SwsFlags::SWS_FAST_BILINEAR as i32,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                );
+                if sws.is_null() {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to create swscale context");
+                }
+
+                println!(
+                    "[encode] direct VA-API encoder opened: {}x{}@{} bitrate={} gop={} async_depth=0",
+                    width, height, config.fps, config.bitrate_bps, config.gop
+                );
+
+                Ok(Self {
+                    ctx,
+                    hw_device_ctx,
+                    sws,
+                    width,
+                    height,
+                    frame_index: 0,
+                    fps: config.fps.max(1),
+                    extradata,
+                })
+            }
         }
 
         pub(super) fn push_frame(
             &mut self,
-            config: &EncoderConfig,
+            _config: &EncoderConfig,
             frame: &CaptureFrame,
             is_idr: bool,
         ) -> Result<Vec<EncodedAccessUnit>> {
-            let expected_size = (config.width as usize) * (config.height as usize) * 4;
-            if frame.data.len() >= expected_size {
-                self.stdin
-                    .write_all(&frame.data[..expected_size])
-                    .context("failed to feed frame into ffmpeg encoder")?;
-            } else {
-                let mut padded = vec![0_u8; expected_size];
-                padded[..frame.data.len()].copy_from_slice(&frame.data);
-                self.stdin
-                    .write_all(&padded)
-                    .context("failed to feed padded frame into ffmpeg encoder")?;
-            }
-            self.pending_meta.push_back(FrameMeta {
-                frame_index: frame.frame_index,
-                timestamp_90k: frame.timestamp_90k,
-                is_idr,
-            });
+            unsafe {
+                let sw_bgra = ffi::av_frame_alloc();
+                if sw_bgra.is_null() {
+                    bail!("failed to allocate BGRA frame");
+                }
+                (*sw_bgra).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+                (*sw_bgra).width = self.width;
+                (*sw_bgra).height = self.height;
+                (*sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
+                (*sw_bgra).linesize[0] = self.width * 4;
 
-            for chunk in self.chunk_rx.try_iter() {
-                self.parser.push(&chunk);
-            }
+                let sw_nv12 = ffi::av_frame_alloc();
+                if sw_nv12.is_null() {
+                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
+                    bail!("failed to allocate NV12 frame");
+                }
+                (*sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                (*sw_nv12).width = self.width;
+                (*sw_nv12).height = self.height;
+                let ret = ffi::av_frame_get_buffer(sw_nv12, 0);
+                if ret < 0 {
+                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
+                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
+                    bail!("failed to allocate NV12 buffer (error {ret})");
+                }
 
-            let mut output = Vec::new();
-            for au_data in self.parser.take_access_units() {
-                let meta = self.pending_meta.pop_front().unwrap_or(FrameMeta {
-                    frame_index: frame.frame_index,
-                    timestamp_90k: frame.timestamp_90k,
-                    is_idr,
-                });
-                output.push(EncodedAccessUnit {
-                    frame_index: meta.frame_index,
-                    timestamp_90k: meta.timestamp_90k,
-                    is_idr: meta.is_idr,
-                    annex_b: au_data,
-                });
+                ffi::sws_scale(
+                    self.sws,
+                    (*sw_bgra).data.as_ptr() as *const *const u8,
+                    (*sw_bgra).linesize.as_ptr(),
+                    0,
+                    self.height,
+                    (*sw_nv12).data.as_mut_ptr(),
+                    (*sw_nv12).linesize.as_mut_ptr(),
+                );
+
+                let hw_frame = ffi::av_frame_alloc();
+                if hw_frame.is_null() {
+                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
+                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
+                    bail!("failed to allocate hw frame");
+                }
+                let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, hw_frame, 0);
+                if ret < 0 {
+                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
+                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
+                    ffi::av_frame_free(&mut (hw_frame as *mut _));
+                    bail!("failed to get hw frame buffer (error {ret})");
+                }
+
+                let ret = ffi::av_hwframe_transfer_data(hw_frame, sw_nv12, 0);
+                ffi::av_frame_free(&mut (sw_bgra as *mut _));
+                ffi::av_frame_free(&mut (sw_nv12 as *mut _));
+                if ret < 0 {
+                    ffi::av_frame_free(&mut (hw_frame as *mut _));
+                    bail!("failed to upload frame to VA-API surface (error {ret})");
+                }
+
+                let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
+                (*hw_frame).pts = pts;
+
+                if is_idr {
+                    (*hw_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                }
+
+                let ret = ffi::avcodec_send_frame(self.ctx, hw_frame);
+                ffi::av_frame_free(&mut (hw_frame as *mut _));
+                if ret < 0 {
+                    bail!("avcodec_send_frame failed (error {ret})");
+                }
+
+                let mut output = Vec::new();
+                let pkt = ffi::av_packet_alloc();
+                loop {
+                    let ret = ffi::avcodec_receive_packet(self.ctx, pkt);
+                    if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
+                        break;
+                    }
+                    if ret < 0 {
+                        ffi::av_packet_free(&mut (pkt as *mut _));
+                        bail!("avcodec_receive_packet failed (error {ret})");
+                    }
+
+                    let encoded =
+                        std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
+                    let is_key = ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
+                    let timestamp_90k = (*pkt).pts as u32;
+
+                    let annex_b = if is_key && !self.extradata.is_empty() {
+                        let mut buf =
+                            Vec::with_capacity(self.extradata.len() + encoded.len());
+                        buf.extend_from_slice(&self.extradata);
+                        buf.extend_from_slice(encoded);
+                        buf
+                    } else {
+                        encoded.to_vec()
+                    };
+
+                    output.push(EncodedAccessUnit {
+                        frame_index: self.frame_index,
+                        timestamp_90k,
+                        is_idr: is_key,
+                        annex_b,
+                    });
+
+                    ffi::av_packet_unref(pkt);
+                }
+                ffi::av_packet_free(&mut (pkt as *mut _));
+
+                self.frame_index += 1;
+                Ok(output)
             }
-            Ok(output)
         }
     }
 
-    impl Drop for VaapiEncoderProcess {
+    impl Drop for DirectVaapiEncoder {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-        }
-    }
-
-    #[derive(Default)]
-    struct AnnexBAccessUnitParser {
-        buffer: Vec<u8>,
-        current_au: Vec<Vec<u8>>,
-        cached_vps: Option<Vec<u8>>,
-        cached_sps: Option<Vec<u8>>,
-        cached_pps: Option<Vec<u8>>,
-    }
-
-    impl AnnexBAccessUnitParser {
-        fn push(&mut self, chunk: &[u8]) {
-            self.buffer.extend_from_slice(chunk);
-        }
-
-        fn take_access_units(&mut self) -> Vec<Vec<u8>> {
-            let mut completed = Vec::new();
-            for nalu in self.take_complete_nalus() {
-                let nal_type = hevc_nalu_type(&nalu);
-                match nal_type {
-                    32 => self.cached_vps = Some(nalu.clone()),
-                    33 => self.cached_sps = Some(nalu.clone()),
-                    34 => self.cached_pps = Some(nalu.clone()),
-                    _ => {}
+            unsafe {
+                if !self.sws.is_null() {
+                    ffi::sws_freeContext(self.sws);
                 }
-
-                if nal_type == 35 && !self.current_au.is_empty() {
-                    completed.push(self.finish_current_au());
+                if !self.ctx.is_null() {
+                    ffi::avcodec_free_context(&mut self.ctx);
                 }
-                self.current_au.push(nalu);
-            }
-            completed
-        }
-
-        fn finish_current_au(&mut self) -> Vec<u8> {
-            let mut contains_irap = false;
-            let mut contains_vps = false;
-            let mut contains_sps = false;
-            let mut contains_pps = false;
-            for nalu in &self.current_au {
-                match hevc_nalu_type(nalu) {
-                    16..=23 => contains_irap = true,
-                    32 => contains_vps = true,
-                    33 => contains_sps = true,
-                    34 => contains_pps = true,
-                    _ => {}
+                if !self.hw_device_ctx.is_null() {
+                    ffi::av_buffer_unref(&mut self.hw_device_ctx);
                 }
             }
-
-            let mut output = Vec::new();
-            if contains_irap {
-                if !contains_vps {
-                    if let Some(vps) = &self.cached_vps {
-                        output.extend_from_slice(vps);
-                    }
-                }
-                if !contains_sps {
-                    if let Some(sps) = &self.cached_sps {
-                        output.extend_from_slice(sps);
-                    }
-                }
-                if !contains_pps {
-                    if let Some(pps) = &self.cached_pps {
-                        output.extend_from_slice(pps);
-                    }
-                }
-            }
-            for nalu in self.current_au.drain(..) {
-                output.extend_from_slice(&nalu);
-            }
-            output
         }
-
-        fn take_complete_nalus(&mut self) -> Vec<Vec<u8>> {
-            let starts = find_start_codes(&self.buffer);
-            if starts.len() < 2 {
-                return Vec::new();
-            }
-
-            let mut out = Vec::new();
-            for index in 0..starts.len() - 1 {
-                let start = starts[index];
-                let end = starts[index + 1];
-                out.push(self.buffer[start..end].to_vec());
-            }
-
-            let keep_from = *starts.last().expect("len >= 2");
-            self.buffer.drain(0..keep_from);
-            out
-        }
-    }
-
-    fn find_start_codes(data: &[u8]) -> Vec<usize> {
-        let mut starts = Vec::new();
-        let mut i = 0_usize;
-        while i + 3 < data.len() {
-            if i + 4 <= data.len()
-                && data[i] == 0
-                && data[i + 1] == 0
-                && data[i + 2] == 0
-                && data[i + 3] == 1
-            {
-                starts.push(i);
-                i += 4;
-                continue;
-            }
-            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                starts.push(i);
-                i += 3;
-                continue;
-            }
-            i += 1;
-        }
-        starts
-    }
-
-    fn hevc_nalu_type(nalu: &[u8]) -> u8 {
-        let header_idx = if nalu.starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if nalu.starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            0
-        };
-        if nalu.len() <= header_idx {
-            return 0;
-        }
-        (nalu[header_idx] >> 1) & 0x3F
     }
 }
 

@@ -28,6 +28,9 @@ final class TransportService {
     private var lastTimestamp90k: UInt32?
     private var lastArrivalNs: UInt64?
 
+    var screenWidth: Int = 0
+    var screenHeight: Int = 0
+
     var onStatusUpdate: ((String) -> Void)?
     var onMetricsUpdate: ((TransportMetrics) -> Void)?
     var onPlayoutResyncNeeded: (() -> Void)?
@@ -140,10 +143,26 @@ final class TransportService {
                 using: parameters,
                 on: NWEndpoint.Port(integerLiteral: 5004)
             )
+
+            let w = max(screenWidth, 1)
+            let h = max(screenHeight, 1)
+            var txtData = Data()
+            let widthStr = "width=\(w)"
+            txtData.append(UInt8(widthStr.utf8.count))
+            txtData.append(contentsOf: widthStr.utf8)
+            let heightStr = "height=\(h)"
+            txtData.append(UInt8(heightStr.utf8.count))
+            txtData.append(contentsOf: heightStr.utf8)
+            listener.service = NWListener.Service(
+                name: "screx-receiver",
+                type: "_screx._udp",
+                txtRecord: txtData
+            )
+
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    self?.emitStatus("Listening on UDP 5004")
+                    self?.emitStatus("Listening on UDP 5004 (advertising \(w)x\(h))")
                 case .waiting(let error):
                     self?.emitStatus("Listener waiting: \(error.localizedDescription)")
                 case .failed(let error):

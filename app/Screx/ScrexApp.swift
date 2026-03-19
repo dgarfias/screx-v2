@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import Network
 import Combine
 
@@ -85,6 +86,11 @@ final class StreamViewModel: ObservableObject {
 
     func start() {
         statusText = "Discovering services..."
+        let screen = UIScreen.main.bounds
+        let w = Int(max(screen.width, screen.height))
+        let h = Int(min(screen.width, screen.height))
+        transport.screenWidth = w & ~1
+        transport.screenHeight = h & ~1
         transport.startListening { [weak self] nalu, timestamp90k, isAccessUnitEnd in
             self?.decoder.handleNalu(
                 nalu: nalu,
@@ -186,16 +192,6 @@ struct ContentView: View {
                 }
                 Button("12 Mbps") {
                     model.setBitrate(12_000_000)
-                }
-            }
-            .buttonStyle(.bordered)
-
-            HStack(spacing: 6) {
-                Button("720p") {
-                    model.setResolution(width: 1280, height: 720)
-                }
-                Button("1080p") {
-                    model.setResolution(width: 1920, height: 1080)
                 }
             }
             .buttonStyle(.bordered)

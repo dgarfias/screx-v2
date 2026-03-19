@@ -31,7 +31,7 @@ final class DiscoveryService {
         parameters.includePeerToPeer = false
 
         let browser = NWBrowser(
-            for: .bonjour(type: "_screenstream._udp", domain: nil),
+            for: .bonjour(type: "_screx._udp", domain: nil),
             using: parameters
         )
         self.browser = browser

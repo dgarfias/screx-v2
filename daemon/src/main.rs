@@ -6,6 +6,7 @@ mod transport;
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
@@ -14,8 +15,6 @@ use tokio::sync::{mpsc, watch};
 struct AppConfig {
     stream_target: SocketAddr,
     control_bind: SocketAddr,
-    discovery_name: String,
-    discovery_service: String,
     capture_backend: capture::CaptureBackend,
     capture_source: capture::CaptureSource,
     encoder_backend: encode::EncoderBackend,
@@ -29,9 +28,6 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let stream_ip = read_env("SCREX_TARGET_IP", "127.0.0.1")
-            .parse::<IpAddr>()
-            .context("invalid SCREX_TARGET_IP")?;
         let stream_port = read_env("SCREX_TARGET_PORT", "5004")
             .parse::<u16>()
             .context("invalid SCREX_TARGET_PORT")?;
@@ -39,12 +35,20 @@ impl AppConfig {
             Ok(raw) => raw.parse::<u16>().context("invalid SCREX_CONTROL_PORT")?,
             Err(_) => stream_port,
         };
+
+        let stream_target = if let Ok(ip_str) = env::var("SCREX_TARGET_IP") {
+            let ip = ip_str.parse::<IpAddr>().context("invalid SCREX_TARGET_IP")?;
+            Some(SocketAddr::new(ip, stream_port))
+        } else {
+            None
+        };
+
         let capture_source =
             capture::CaptureSource::from_env(&read_env("SCREX_CAPTURE_SOURCE", "virtual"));
-        let mut width = read_env("SCREX_WIDTH", "1920")
+        let width = read_env("SCREX_WIDTH", "0")
             .parse::<u32>()
             .context("invalid SCREX_WIDTH")?;
-        let mut height = read_env("SCREX_HEIGHT", "1080")
+        let height = read_env("SCREX_HEIGHT", "0")
             .parse::<u32>()
             .context("invalid SCREX_HEIGHT")?;
         let fps = read_env("SCREX_FPS", "60")
@@ -60,16 +64,10 @@ impl AppConfig {
             .parse::<usize>()
             .context("invalid SCREX_MTU")?;
 
-        if capture_source == capture::CaptureSource::Virtual1080p {
-            width = 1920;
-            height = 1080;
-        }
-
         Ok(Self {
-            stream_target: SocketAddr::new(stream_ip, stream_port),
+            stream_target: stream_target
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), stream_port)),
             control_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), control_port),
-            discovery_name: read_env("SCREX_DISCOVERY_NAME", "screx-daemon"),
-            discovery_service: read_env("SCREX_DISCOVERY_SERVICE", "_screenstream._udp"),
             capture_backend: capture::CaptureBackend::from_env(&read_env(
                 "SCREX_CAPTURE_BACKEND",
                 "auto",
@@ -101,21 +99,64 @@ async fn main() -> Result<()> {
         return doctor::run_doctor();
     }
 
-    let config = AppConfig::from_env()?;
+    let mut config = AppConfig::from_env()?;
+
+    let has_manual_target = env::var("SCREX_TARGET_IP").is_ok();
+
+    let discovery_handle = if has_manual_target {
+        println!(
+            "[main] using manual target {} (SCREX_TARGET_IP set)",
+            config.stream_target
+        );
+        if config.width == 0 || config.height == 0 {
+            config.width = 1920;
+            config.height = 1080;
+            println!("[main] no resolution specified, defaulting to {}x{}", config.width, config.height);
+        }
+        None
+    } else {
+        let service = read_env("SCREX_DISCOVERY_SERVICE", "_screx._udp");
+        let timeout_secs = read_env("SCREX_DISCOVERY_TIMEOUT", "30")
+            .parse::<u64>()
+            .unwrap_or(30);
+
+        println!("[main] no SCREX_TARGET_IP set, discovering receiver via mDNS...");
+
+        let (receiver, handle) =
+            discovery::browse_for_receiver(&service, Duration::from_secs(timeout_secs))?;
+
+        config.stream_target = receiver.addr;
+
+        if config.width == 0 || config.height == 0 {
+            config.width = receiver.width;
+            config.height = receiver.height;
+            println!(
+                "[main] auto-configured resolution to {}x{} from receiver",
+                config.width, config.height
+            );
+        } else {
+            println!(
+                "[main] using explicit resolution {}x{} (receiver reports {}x{})",
+                config.width, config.height, receiver.width, receiver.height
+            );
+        }
+
+        Some(handle)
+    };
+
+    if config.capture_source == capture::CaptureSource::Virtual1080p {
+        println!(
+            "[main] virtual source: overriding resolution to {}x{}",
+            config.width, config.height
+        );
+    }
+
     println!("screx-daemon boot with config: {config:?}");
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (frame_tx, frame_rx) = mpsc::channel(2);
     let (au_tx, au_rx) = mpsc::channel(2);
     let (control_tx, control_rx) = mpsc::channel(32);
-
-    let mut discovery_handle = discovery::start_avahi_advertisement(
-        &config.discovery_name,
-        &config.discovery_service,
-        config.stream_target.port(),
-        config.control_bind.port(),
-    )
-    .await?;
 
     let capture_handle = capture::spawn_capture_thread(
         capture::CaptureConfig {
@@ -189,8 +230,8 @@ async fn main() -> Result<()> {
         Err(_) => eprintln!("capture thread panicked"),
     }
 
-    if let Some(handle) = discovery_handle.as_mut() {
-        handle.stop().await;
+    if let Some(handle) = discovery_handle {
+        handle.shutdown();
     }
 
     println!("screx-daemon shutdown complete");
