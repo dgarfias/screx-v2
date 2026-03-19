@@ -528,6 +528,47 @@ mod real_capture {
                 pw::spa::param::video::VideoFormat::BGRA,
                 pw::spa::param::video::VideoFormat::BGRx
             ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                pw::spa::utils::Rectangle {
+                    width: config.width,
+                    height: config.height
+                },
+                pw::spa::utils::Rectangle {
+                    width: config.width,
+                    height: config.height
+                },
+                pw::spa::utils::Rectangle {
+                    width: config.width,
+                    height: config.height
+                }
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                pw::spa::utils::Fraction {
+                    num: config.fps,
+                    denom: 1
+                },
+                pw::spa::utils::Fraction { num: 1, denom: 1 },
+                pw::spa::utils::Fraction {
+                    num: config.fps.max(1),
+                    denom: 1
+                }
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoMaxFramerate,
+                Fraction,
+                pw::spa::utils::Fraction {
+                    num: config.fps.max(1),
+                    denom: 1
+                }
+            ),
         );
         let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),

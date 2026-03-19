@@ -20,7 +20,6 @@ final class DecoderService: ObservableObject {
     private var pps: Data?
     private var formatDescription: CMFormatDescription?
     private var accessUnitNalus: [Data] = []
-    private var sampleCounter: Int64 = 0
     private var droppedFrames = 0
     private var displayErrors = 0
     private var nalCounters = NalCounters()
@@ -146,10 +145,9 @@ final class DecoderService: ObservableObject {
 
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 60),
-            presentationTimeStamp: CMTime(value: sampleCounter, timescale: 60),
+            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
             decodeTimeStamp: .invalid
         )
-        sampleCounter += 1
         var sampleBuffer: CMSampleBuffer?
         let sampleSize = [avcc.count]
         let sampleStatus = CMSampleBufferCreateReady(
@@ -191,6 +189,11 @@ final class DecoderService: ObservableObject {
                 self.publishHealth()
                 self.displayLayer.flushAndRemoveImage()
                 self.onRequestIDR?()
+            }
+            if !self.displayLayer.isReadyForMoreMediaData {
+                // Drop stale queued frames to avoid seconds-long delayed playback loops.
+                self.markDroppedFrame()
+                self.displayLayer.flush()
             }
             self.displayLayer.enqueue(sampleBuffer)
             if self.displayLayer.error != nil {
