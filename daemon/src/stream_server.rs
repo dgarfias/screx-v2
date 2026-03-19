@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,32 +8,35 @@ use tokio::sync::{mpsc, watch};
 use crate::encode::{ControlMessage, EncodedAccessUnit};
 
 const CHUNK_PAYLOAD: usize = 1400;
-const HEADER_LEN: usize = 10;
+const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FEC_SHARDS: usize = 127;
 
-/// 10-byte packet header:
+/// 14-byte packet header:
 ///   frame_id:     u32 BE  (bytes 0..4)
-///   chunk_idx:    u8      (byte 4)
-///   total_data:   u8      (byte 5)
-///   total_parity: u8      (byte 6)
-///   flags:        u8      (byte 7)   bit 0 = is_idr
-///   payload_len:  u16 BE  (bytes 8..10)
+///   chunk_idx:    u16 BE  (bytes 4..6)
+///   total_data:   u16 BE  (bytes 6..8)
+///   total_parity: u16 BE  (bytes 8..10)
+///   flags:        u8      (byte 10)   bit 0 = is_idr
+///   reserved:     u8      (byte 11)
+///   payload_len:  u16 BE  (bytes 12..14)
 fn build_header(
     frame_id: u32,
-    chunk_idx: u8,
-    total_data: u8,
-    total_parity: u8,
+    chunk_idx: u16,
+    total_data: u16,
+    total_parity: u16,
     is_idr: bool,
     payload_len: u16,
 ) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..4].copy_from_slice(&frame_id.to_be_bytes());
-    h[4] = chunk_idx;
-    h[5] = total_data;
-    h[6] = total_parity;
-    h[7] = if is_idr { 1 } else { 0 };
-    h[8..10].copy_from_slice(&payload_len.to_be_bytes());
+    h[4..6].copy_from_slice(&chunk_idx.to_be_bytes());
+    h[6..8].copy_from_slice(&total_data.to_be_bytes());
+    h[8..10].copy_from_slice(&total_parity.to_be_bytes());
+    h[10] = if is_idr { 1 } else { 0 };
+    h[11] = 0;
+    h[12..14].copy_from_slice(&payload_len.to_be_bytes());
     h
 }
 
@@ -105,14 +107,14 @@ pub async fn run_stream_server(
 
         // Inner loop: send frames to the registered client
         loop {
-            // Check for keepalive / re-registration between frame sends
             let mut check_buf = [0u8; 64];
             while let Ok(result) = socket.try_recv_from(&mut check_buf) {
                 let (len, addr) = result;
-                if len >= REGISTER_MAGIC.len() && &check_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC {
-                    if addr == client_addr {
-                        last_keepalive = tokio::time::Instant::now();
-                    }
+                if len >= REGISTER_MAGIC.len()
+                    && &check_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
+                    && addr == client_addr
+                {
+                    last_keepalive = tokio::time::Instant::now();
                 }
             }
 
@@ -141,21 +143,23 @@ pub async fn run_stream_server(
             let payload = &au.annex_b;
             let is_idr = au.is_idr;
 
-            // Chunk the access unit
             let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
-            if data_count > 200 {
-                eprintln!("[stream] frame too large ({} bytes, {data_count} chunks), skipping", payload.len());
-                continue;
-            }
-            let data_count_u8 = data_count as u8;
 
-            // FEC: ~20% overhead, minimum 1 parity shard, skip if only 1 chunk
-            let parity_count = if data_count <= 1 { 0 } else { (data_count / 5).max(1).min(50) };
-            let parity_count_u8 = parity_count as u8;
+            // FEC: ~20% overhead, min 1 parity for multi-chunk, capped for RS performance
+            let parity_count = if data_count <= 1 {
+                0
+            } else {
+                (data_count / 5).max(1).min(MAX_FEC_SHARDS)
+            };
 
-            let total_shards = data_count + parity_count;
+            // RS requires data+parity <= 256 for GF(2^8). If frame is very large,
+            // skip FEC rather than failing.
+            let use_fec = parity_count > 0 && (data_count + parity_count) <= 255;
+            let actual_parity = if use_fec { parity_count } else { 0 };
 
-            // Build data shards (all padded to CHUNK_PAYLOAD for RS)
+            let total_shards = data_count + actual_parity;
+
+            // Build data shards (padded to CHUNK_PAYLOAD for RS)
             let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
             for i in 0..data_count {
                 let start = i * CHUNK_PAYLOAD;
@@ -166,17 +170,17 @@ pub async fn run_stream_server(
             }
 
             // Generate parity shards
-            if parity_count > 0 {
-                for _ in 0..parity_count {
+            if actual_parity > 0 {
+                for _ in 0..actual_parity {
                     shards.push(vec![0u8; CHUNK_PAYLOAD]);
                 }
-                let rs = ReedSolomon::new(data_count, parity_count)
+                let rs = ReedSolomon::new(data_count, actual_parity)
                     .map_err(|e| anyhow::anyhow!("RS init failed: {e:?}"))?;
                 rs.encode(&mut shards)
                     .map_err(|e| anyhow::anyhow!("RS encode failed: {e:?}"))?;
             }
 
-            // Send all shards (data + parity)
+            // Send all shards
             let mut frame_bytes = 0_u64;
             for (idx, shard) in shards.iter().enumerate() {
                 let actual_payload_len = if idx < data_count {
@@ -189,9 +193,9 @@ pub async fn run_stream_server(
 
                 let header = build_header(
                     frame_id,
-                    idx as u8,
-                    data_count_u8,
-                    parity_count_u8,
+                    idx as u16,
+                    data_count as u16,
+                    actual_parity as u16,
                     is_idr,
                     actual_payload_len,
                 );
@@ -215,7 +219,10 @@ pub async fn run_stream_server(
                 let elapsed = window_start.elapsed().as_secs_f64();
                 let fps = frames_sent as f64 / elapsed;
                 let mbps = (bytes_sent as f64 * 8.0 / elapsed) / 1_000_000.0;
-                println!("[stream] fps={fps:.1} throughput={mbps:.2} Mbps fec={parity_count_u8}/{data_count_u8}");
+                println!(
+                    "[stream] fps={fps:.1} throughput={mbps:.2} Mbps chunks={data_count}+{actual_parity}fec frame_bytes={}",
+                    payload.len()
+                );
                 frames_sent = 0;
                 bytes_sent = 0;
                 window_start = tokio::time::Instant::now();

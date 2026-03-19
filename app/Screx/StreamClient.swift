@@ -10,7 +10,7 @@ final class StreamClient {
 
     var onStatus: ((String) -> Void)?
 
-    private static let headerLen = 10
+    private static let headerLen = 14
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
@@ -98,12 +98,18 @@ final class StreamClient {
         let frameId = data.withUnsafeBytes { buf -> UInt32 in
             buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian
         }
-        let chunkIdx = data[4]
-        let totalData = data[5]
-        let totalParity = data[6]
-        let flags = data[7]
-        let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
+        let chunkIdx = data.withUnsafeBytes { buf -> UInt16 in
+            buf.load(fromByteOffset: 4, as: UInt16.self).bigEndian
+        }
+        let totalData = data.withUnsafeBytes { buf -> UInt16 in
+            buf.load(fromByteOffset: 6, as: UInt16.self).bigEndian
+        }
+        let totalParity = data.withUnsafeBytes { buf -> UInt16 in
             buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian
+        }
+        let flags = data[10]
+        let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
+            buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
         }
         let isIdr = (flags & 1) != 0
 

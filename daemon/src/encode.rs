@@ -109,17 +109,22 @@ pub fn run_encoder_loop(
             }
         }
 
-        let mut frame = match frame_rx.blocking_recv() {
-            Some(f) => f,
-            None => {
-                println!("[encode] upstream channel closed");
+        let mut frame = loop {
+            if *stop_rx.borrow() {
+                println!("[encode] stop signal received");
                 return Ok(());
             }
+            match frame_rx.try_recv() {
+                Ok(f) => break f,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    println!("[encode] upstream channel closed");
+                    return Ok(());
+                }
+            }
         };
-        if *stop_rx.borrow() {
-            println!("[encode] stop signal received");
-            return Ok(());
-        }
         while let Ok(newer_frame) = frame_rx.try_recv() {
             frame = newer_frame;
             dropped_capture_frames_in_window += 1;
