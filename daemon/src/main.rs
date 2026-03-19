@@ -105,8 +105,8 @@ async fn main() -> Result<()> {
     println!("screx-daemon boot with config: {config:?}");
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let (frame_tx, frame_rx) = mpsc::channel(8);
-    let (au_tx, au_rx) = mpsc::channel(16);
+    let (frame_tx, frame_rx) = mpsc::channel(2);
+    let (au_tx, au_rx) = mpsc::channel(2);
     let (control_tx, control_rx) = mpsc::channel(32);
 
     let mut discovery_handle = discovery::start_avahi_advertisement(
@@ -130,20 +130,23 @@ async fn main() -> Result<()> {
         stop_rx.clone(),
     );
 
-    let encode_task = tokio::spawn(encode::run_encoder_loop(
-        encode::EncoderConfig {
-            bitrate_bps: config.bitrate_bps,
-            gop: config.gop,
-            fps: config.fps,
-            width: config.width,
-            height: config.height,
-            backend: config.encoder_backend,
-        },
-        frame_rx,
-        au_tx,
-        control_rx,
-        stop_rx.clone(),
-    ));
+    let encode_stop_rx = stop_rx.clone();
+    let encode_task = tokio::task::spawn_blocking(move || {
+        encode::run_encoder_loop(
+            encode::EncoderConfig {
+                bitrate_bps: config.bitrate_bps,
+                gop: config.gop,
+                fps: config.fps,
+                width: config.width,
+                height: config.height,
+                backend: config.encoder_backend,
+            },
+            frame_rx,
+            au_tx,
+            control_rx,
+            encode_stop_rx,
+        )
+    });
 
     let transport_task = tokio::spawn(transport::run_transport_loop(
         transport::TransportConfig {

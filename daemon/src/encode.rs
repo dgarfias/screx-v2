@@ -54,12 +54,12 @@ impl EncoderBackend {
     }
 }
 
-pub async fn run_encoder_loop(
+pub fn run_encoder_loop(
     mut config: EncoderConfig,
     mut frame_rx: mpsc::Receiver<CaptureFrame>,
     au_tx: mpsc::Sender<EncodedAccessUnit>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
-    mut stop_rx: watch::Receiver<bool>,
+    stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let active_backend = initialize_encoder_backend(config.backend, &config)?;
     #[cfg(feature = "real-encode")]
@@ -74,132 +74,108 @@ pub async fn run_encoder_loop(
     let mut encoded_in_window = 0_u64;
     let mut bytes_in_window = 0_u64;
     let mut dropped_capture_frames_in_window = 0_u64;
-    let mut dropped_au_in_window = 0_u64;
     let mut window_start = Instant::now();
 
     loop {
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    println!("[encode] stop signal received");
-                    break;
-                }
-            }
-            maybe_cmd = control_rx.recv() => {
-                match maybe_cmd {
-                    Some(ControlMessage::RequestIdr) => {
-                        println!("[encode] control: forcing IDR on next frame");
-                        force_next_idr = true;
-                        #[cfg(feature = "real-encode")]
-                        if let Some(worker) = vaapi_encoder.as_mut() {
-                            // Restarting encoder guarantees a keyframe boundary and helps
-                            // recover the receiver if parameter sets were missed.
-                            *worker = vaapi::VaapiEncoderProcess::new(&config)?;
-                        }
-                    }
-                    Some(ControlMessage::SetBitrate(bps)) => {
-                        println!("[encode] control: updating bitrate {} -> {}", config.bitrate_bps, bps);
-                        config.bitrate_bps = bps.max(500_000);
-                        #[cfg(feature = "real-encode")]
-                        if let Some(worker) = vaapi_encoder.as_mut() {
-                            // ffmpeg subprocess bitrate is configured at process start.
-                            *worker = vaapi::VaapiEncoderProcess::new(&config)?;
-                        }
-                    }
-                    Some(ControlMessage::SetResolution(w, h)) => {
-                        println!("[encode] control: target resolution {}x{} -> {}x{}", config.width, config.height, w, h);
-                        config.width = w.max(320);
-                        config.height = h.max(180);
-                        force_next_idr = true;
-                        #[cfg(feature = "real-encode")]
-                        if let Some(worker) = vaapi_encoder.as_mut() {
-                            // Reinitialize ffmpeg process so rawvideo geometry matches configured dimensions.
-                            *worker = vaapi::VaapiEncoderProcess::new(&config)?;
-                        }
-                    }
-                    None => {}
-                }
-            }
-            maybe_frame = frame_rx.recv() => {
-                let Some(mut frame) = maybe_frame else {
-                    println!("[encode] upstream channel closed");
-                    break;
-                };
-                while let Ok(newer_frame) = frame_rx.try_recv() {
-                    frame = newer_frame;
-                    dropped_capture_frames_in_window += 1;
-                }
+        if *stop_rx.borrow() {
+            println!("[encode] stop signal received");
+            break;
+        }
 
-                if frame.width != config.width || frame.height != config.height {
-                    println!(
-                        "[encode] capture geometry change detected: {}x{} -> {}x{}; reconfiguring encoder",
-                        config.width, config.height, frame.width, frame.height
-                    );
-                    config.width = frame.width.max(1);
-                    config.height = frame.height.max(1);
+        while let Ok(msg) = control_rx.try_recv() {
+            match msg {
+                ControlMessage::RequestIdr => {
+                    println!("[encode] control: forcing IDR on next frame");
                     force_next_idr = true;
                     #[cfg(feature = "real-encode")]
                     if let Some(worker) = vaapi_encoder.as_mut() {
                         *worker = vaapi::VaapiEncoderProcess::new(&config)?;
                     }
                 }
-
-                let is_idr = force_next_idr || frame.frame_index % u64::from(config.gop.max(1)) == 0;
-                let mut produced_aus = Vec::new();
-                #[cfg(feature = "real-encode")]
-                {
+                ControlMessage::SetBitrate(bps) => {
+                    println!("[encode] control: updating bitrate {} -> {}", config.bitrate_bps, bps);
+                    config.bitrate_bps = bps.max(500_000);
+                    #[cfg(feature = "real-encode")]
                     if let Some(worker) = vaapi_encoder.as_mut() {
-                        produced_aus = worker.push_frame(&config, &frame, is_idr)?;
+                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
                     }
                 }
-                #[cfg(feature = "real-encode")]
-                let has_worker = vaapi_encoder.is_some();
-                #[cfg(not(feature = "real-encode"))]
-                let has_worker = false;
-                if produced_aus.is_empty() && !has_worker {
-                    produced_aus.push(encode_frame(active_backend, &frame, is_idr));
+                ControlMessage::SetResolution(w, h) => {
+                    println!("[encode] control: target resolution {}x{} -> {}x{}", config.width, config.height, w, h);
+                    config.width = w.max(320);
+                    config.height = h.max(180);
+                    force_next_idr = true;
+                    #[cfg(feature = "real-encode")]
+                    if let Some(worker) = vaapi_encoder.as_mut() {
+                        *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+                    }
                 }
-                if produced_aus.is_empty() {
-                    continue;
-                }
-                if produced_aus.len() > 1 {
-                    dropped_au_in_window += (produced_aus.len() - 1) as u64;
-                    let newest = produced_aus.pop().expect("len checked");
-                    produced_aus.clear();
-                    produced_aus.push(newest);
-                }
-                force_next_idr = false;
+            }
+        }
 
-                for au in produced_aus {
-                    bytes_in_window += au.annex_b.len() as u64;
-                    encoded_in_window += 1;
-                    if window_start.elapsed() >= Duration::from_secs(1) {
-                        let elapsed = window_start.elapsed().as_secs_f64();
-                        let fps = encoded_in_window as f64 / elapsed;
-                        let mbps = (bytes_in_window as f64 * 8.0 / elapsed) / 1_000_000.0;
-                        println!(
-                            "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_capture_frames_per_sec={} dropped_au_per_sec={}",
-                            config.bitrate_bps, dropped_capture_frames_in_window, dropped_au_in_window
-                        );
-                        encoded_in_window = 0;
-                        bytes_in_window = 0;
-                        dropped_capture_frames_in_window = 0;
-                        dropped_au_in_window = 0;
-                        window_start = Instant::now();
-                    }
+        let Some(mut frame) = frame_rx.blocking_recv() else {
+            println!("[encode] upstream channel closed");
+            break;
+        };
+        while let Ok(newer_frame) = frame_rx.try_recv() {
+            frame = newer_frame;
+            dropped_capture_frames_in_window += 1;
+        }
 
-                    match au_tx.try_send(au) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            // Low-latency policy: drop stale AU instead of waiting and building delay.
-                            dropped_au_in_window += 1;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            println!("[encode] downstream channel closed");
-                            break;
-                        }
-                    }
-                }
+        if frame.width != config.width || frame.height != config.height {
+            println!(
+                "[encode] capture geometry change detected: {}x{} -> {}x{}; reconfiguring encoder",
+                config.width, config.height, frame.width, frame.height
+            );
+            config.width = frame.width.max(1);
+            config.height = frame.height.max(1);
+            force_next_idr = true;
+            #[cfg(feature = "real-encode")]
+            if let Some(worker) = vaapi_encoder.as_mut() {
+                *worker = vaapi::VaapiEncoderProcess::new(&config)?;
+            }
+        }
+
+        let is_idr = force_next_idr || frame.frame_index % u64::from(config.gop.max(1)) == 0;
+        let mut produced_aus = Vec::new();
+        #[cfg(feature = "real-encode")]
+        {
+            if let Some(worker) = vaapi_encoder.as_mut() {
+                produced_aus = worker.push_frame(&config, &frame, is_idr)?;
+            }
+        }
+        #[cfg(feature = "real-encode")]
+        let has_worker = vaapi_encoder.is_some();
+        #[cfg(not(feature = "real-encode"))]
+        let has_worker = false;
+        if produced_aus.is_empty() && !has_worker {
+            produced_aus.push(encode_frame(active_backend, &frame, is_idr));
+        }
+        if produced_aus.is_empty() {
+            continue;
+        }
+        force_next_idr = false;
+
+        for au in produced_aus {
+            bytes_in_window += au.annex_b.len() as u64;
+            encoded_in_window += 1;
+            if window_start.elapsed() >= Duration::from_secs(1) {
+                let elapsed = window_start.elapsed().as_secs_f64();
+                let fps = encoded_in_window as f64 / elapsed;
+                let mbps = (bytes_in_window as f64 * 8.0 / elapsed) / 1_000_000.0;
+                println!(
+                    "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_capture_frames_per_sec={}",
+                    config.bitrate_bps, dropped_capture_frames_in_window
+                );
+                encoded_in_window = 0;
+                bytes_in_window = 0;
+                dropped_capture_frames_in_window = 0;
+                window_start = Instant::now();
+            }
+
+            if au_tx.blocking_send(au).is_err() {
+                println!("[encode] downstream channel closed");
+                return Ok(());
             }
         }
     }
@@ -360,7 +336,7 @@ mod vaapi {
                 .args(["-i", "-"])
                 .args(["-vf", "format=nv12,hwupload"])
                 .args(["-c:v", "hevc_vaapi"])
-                .args(["-async_depth", "8"])
+                .args(["-async_depth", "1"])
                 .args(["-rc_mode", "CBR"])
                 .args(["-b:v", &config.bitrate_bps.to_string()])
                 .args(["-maxrate", &config.bitrate_bps.to_string()])
