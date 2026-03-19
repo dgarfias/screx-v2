@@ -68,6 +68,9 @@ final class StreamViewModel: ObservableObject {
                 self?.droppedPacketsText = "\(metrics.droppedPackets)"
             }
         }
+        transport.onPlayoutResyncNeeded = { [weak self] in
+            self?.transport.sendControl(message: "IDR")
+        }
 
         decoder.onRequestIDR = { [weak self] in
             self?.transport.sendControl(message: "IDR")

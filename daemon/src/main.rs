@@ -50,7 +50,7 @@ impl AppConfig {
         let fps = read_env("SCREX_FPS", "60")
             .parse::<u32>()
             .context("invalid SCREX_FPS")?;
-        let gop = read_env("SCREX_GOP", "60")
+        let gop = read_env("SCREX_GOP", "120")
             .parse::<u32>()
             .context("invalid SCREX_GOP")?;
         let bitrate_bps = read_env("SCREX_BITRATE_BPS", "10000000")
@@ -82,7 +82,7 @@ impl AppConfig {
             width,
             height,
             fps,
-            gop,
+            gop: gop.max(60),
             bitrate_bps,
             mtu,
         })
@@ -133,8 +133,7 @@ async fn main() -> Result<()> {
     let encode_task = tokio::spawn(encode::run_encoder_loop(
         encode::EncoderConfig {
             bitrate_bps: config.bitrate_bps,
-            // Guardrail: extremely short GOPs cause keyframe storms and poor transport behavior.
-            gop: config.gop.max(60),
+            gop: config.gop,
             fps: config.fps,
             width: config.width,
             height: config.height,

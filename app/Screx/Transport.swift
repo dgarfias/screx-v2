@@ -19,7 +19,9 @@ final class TransportService {
     private var nextSequenceNumber: UInt16?
     private var jitterBuffer: [UInt16: RTPPacket] = [:]
     private var waitingForMissingSinceNs: UInt64?
-    private let maxJitterBufferPackets = 192
+    private let maxJitterBufferPackets = 64
+    private var consecutiveGapSkips = 0
+    private var lastResyncRequestNs: UInt64 = 0
 
     private var lastSequenceNumber: UInt16?
     private var expectedPackets: UInt64 = 0
@@ -31,6 +33,7 @@ final class TransportService {
 
     var onStatusUpdate: ((String) -> Void)?
     var onMetricsUpdate: ((TransportMetrics) -> Void)?
+    var onPlayoutResyncNeeded: (() -> Void)?
 
     private func emitStatus(_ text: String) {
         DispatchQueue.main.async { [weak self] in
@@ -74,6 +77,8 @@ final class TransportService {
         nextSequenceNumber = nil
         jitterBuffer.removeAll(keepingCapacity: true)
         waitingForMissingSinceNs = nil
+        consecutiveGapSkips = 0
+        lastResyncRequestNs = 0
         lastSequenceNumber = nil
         expectedPackets = 0
         receivedPackets = 0
@@ -287,6 +292,7 @@ final class TransportService {
                 expected = expected &+ 1
                 nextSequenceNumber = expected
                 waitingForMissingSinceNs = nil
+                consecutiveGapSkips = 0
                 continue
             }
 
@@ -310,6 +316,8 @@ final class TransportService {
                 droppedPackets += 1
                 publishMetricsFallback()
                 depacketizer.reset()
+                consecutiveGapSkips += 1
+                maybeRequestResync(nowNs: nowNs)
                 expected = expected &+ 1
                 nextSequenceNumber = expected
                 waitingForMissingSinceNs = nil
@@ -346,6 +354,9 @@ final class TransportService {
         if dropped > 0 {
             droppedPackets += dropped
             publishMetricsFallback()
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            consecutiveGapSkips += 1
+            maybeRequestResync(nowNs: nowNs)
         }
     }
 
@@ -373,14 +384,26 @@ final class TransportService {
 
     private func currentReorderWindowPackets() -> UInt16 {
         let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let window = Int((6.0 + jitterMs * 0.6).rounded())
-        return UInt16(min(48, max(6, window)))
+        let window = Int((3.0 + jitterMs * 0.35).rounded())
+        return UInt16(min(16, max(3, window)))
     }
 
     private func currentMissingTimeoutNs() -> UInt64 {
         let jitterMs = (jitter90k / 90_000.0) * 1000.0
-        let timeoutMs = min(90.0, max(8.0, 12.0 + jitterMs * 3.0))
+        let timeoutMs = min(35.0, max(6.0, 6.0 + jitterMs * 1.5))
         return UInt64(timeoutMs * 1_000_000.0)
+    }
+
+    private func maybeRequestResync(nowNs: UInt64) {
+        guard consecutiveGapSkips >= 3 else { return }
+        if lastResyncRequestNs != 0, nowNs > lastResyncRequestNs,
+            nowNs - lastResyncRequestNs < 400_000_000
+        {
+            return
+        }
+        lastResyncRequestNs = nowNs
+        consecutiveGapSkips = 0
+        onPlayoutResyncNeeded?()
     }
 
 }
