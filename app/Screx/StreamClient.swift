@@ -20,6 +20,9 @@ final class StreamClient {
     private var lastCompletedFrameId: UInt32 = 0
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
+    private var lastPliTime: TimeInterval = 0
+    private static let pliMinInterval: TimeInterval = 0.3
+    private static let pliMagic = Data("PLI".utf8)
 
     init(endpoint: NWEndpoint) {
         self.endpoint = endpoint
@@ -144,6 +147,15 @@ final class StreamClient {
         }
 
         reassembly.removeValue(forKey: frameId)
+
+        // Detect frame_id gap → frames were lost in transit
+        if hasReceivedFirstFrame && frameId > lastCompletedFrameId + 1 {
+            let gap = frameId - lastCompletedFrameId - 1
+            if gap > 0 && gap < 0x80000000 {
+                sendPli()
+            }
+        }
+
         lastCompletedFrameId = frameId
         hasReceivedFirstFrame = true
 
@@ -160,7 +172,6 @@ final class StreamClient {
         var expired: [UInt32] = []
         for (fid, assembly) in reassembly {
             if now - assembly.createdAt > Self.frameTimeout {
-                // Try FEC recovery before discarding
                 if assembly.canRecover {
                     deliverFrame(frameId: fid, assembly: assembly)
                 } else {
@@ -168,9 +179,23 @@ final class StreamClient {
                 }
             }
         }
-        for fid in expired {
-            reassembly.removeValue(forKey: fid)
+        if !expired.isEmpty {
+            for fid in expired {
+                reassembly.removeValue(forKey: fid)
+            }
+            sendPli()
         }
+    }
+
+    private func sendPli() {
+        let now = CACurrentMediaTime()
+        guard now - lastPliTime >= Self.pliMinInterval else { return }
+        lastPliTime = now
+        connection?.send(content: Self.pliMagic, completion: .contentProcessed { error in
+            if let error {
+                print("[stream] PLI send error: \(error)")
+            }
+        })
     }
 }
 

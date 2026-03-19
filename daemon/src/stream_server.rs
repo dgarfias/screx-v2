@@ -10,8 +10,11 @@ use crate::encode::{ControlMessage, EncodedAccessUnit};
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
+const PLI_MAGIC: &[u8] = b"PLI";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
+const PACING_THRESHOLD: usize = 10;
+const PACING_DELAY: Duration = Duration::from_micros(50);
 
 /// 14-byte packet header:
 ///   frame_id:     u32 BE  (bytes 0..4)
@@ -110,11 +113,17 @@ pub async fn run_stream_server(
             let mut check_buf = [0u8; 64];
             while let Ok(result) = socket.try_recv_from(&mut check_buf) {
                 let (len, addr) = result;
+                if addr != client_addr {
+                    continue;
+                }
                 if len >= REGISTER_MAGIC.len()
                     && &check_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
-                    && addr == client_addr
                 {
                     last_keepalive = tokio::time::Instant::now();
+                }
+                if len >= PLI_MAGIC.len() && &check_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
+                    let _ = control_tx.try_send(ControlMessage::RequestIdr);
+                    println!("[stream] PLI received from client, requesting IDR");
                 }
             }
 
@@ -180,7 +189,8 @@ pub async fn run_stream_server(
                     .map_err(|e| anyhow::anyhow!("RS encode failed: {e:?}"))?;
             }
 
-            // Send all shards
+            // Send all shards with pacing for large frames
+            let needs_pacing = shards.len() > PACING_THRESHOLD;
             let mut frame_bytes = 0_u64;
             for (idx, shard) in shards.iter().enumerate() {
                 let actual_payload_len = if idx < data_count {
@@ -209,6 +219,10 @@ pub async fn run_stream_server(
                     break;
                 }
                 frame_bytes += pkt_len as u64;
+
+                if needs_pacing {
+                    tokio::time::sleep(PACING_DELAY).await;
+                }
             }
 
             frame_id = frame_id.wrapping_add(1);

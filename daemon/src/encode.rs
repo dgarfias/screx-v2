@@ -75,6 +75,8 @@ pub fn run_encoder_loop(
     let mut bytes_in_window = 0_u64;
     let mut dropped_capture_frames_in_window = 0_u64;
     let mut window_start = Instant::now();
+    let mut last_idr_at = Instant::now();
+    let max_idr_interval = Duration::from_secs(2);
 
     loop {
         if *stop_rx.borrow() {
@@ -144,7 +146,9 @@ pub fn run_encoder_loop(
             }
         }
 
-        let is_idr = force_next_idr || frame.frame_index % u64::from(config.gop.max(1)) == 0;
+        let is_idr = force_next_idr
+            || frame.frame_index % u64::from(config.gop.max(1)) == 0
+            || last_idr_at.elapsed() >= max_idr_interval;
         let mut produced_aus = Vec::new();
         #[cfg(feature = "real-encode")]
         {
@@ -161,6 +165,9 @@ pub fn run_encoder_loop(
         }
         if produced_aus.is_empty() {
             continue;
+        }
+        if is_idr {
+            last_idr_at = Instant::now();
         }
         force_next_idr = false;
 
