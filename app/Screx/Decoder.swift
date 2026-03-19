@@ -71,17 +71,20 @@ final class H264Decoder {
         naluWithLength.replaceSubrange(0..<4, with: withUnsafeBytes(of: length) { Data($0) })
         naluWithLength.replaceSubrange(4..<(4 + nalu.count), with: nalu)
 
+        let frameData = naluWithLength
+        let dataLength = frameData.count
+
         var blockBuffer: CMBlockBuffer?
-        naluWithLength.withUnsafeMutableBytes { rawBuf in
+        frameData.withUnsafeBytes { rawBuf in
             let ptr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt8.self)
             CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: nil,
-                blockLength: naluWithLength.count,
+                blockLength: dataLength,
                 blockAllocator: kCFAllocatorDefault,
                 customBlockSource: nil,
                 offsetToData: 0,
-                dataLength: naluWithLength.count,
+                dataLength: dataLength,
                 flags: 0,
                 blockBufferOut: &blockBuffer
             )
@@ -90,7 +93,7 @@ final class H264Decoder {
                     with: ptr,
                     blockBuffer: bb,
                     offsetIntoDestination: 0,
-                    dataLength: naluWithLength.count
+                    dataLength: dataLength
                 )
             }
         }
@@ -98,7 +101,7 @@ final class H264Decoder {
         guard let blockBuffer else { return }
 
         var sampleBuffer: CMSampleBuffer?
-        var sampleSize = naluWithLength.count
+        var sampleSize = dataLength
         var timing = CMSampleTimingInfo(
             duration: .invalid,
             presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
