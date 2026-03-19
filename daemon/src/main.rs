@@ -2,14 +2,9 @@ mod capture;
 mod discovery;
 mod doctor;
 mod encode;
-mod signaling;
-#[allow(dead_code)]
-mod transport;
-mod webrtc_sender;
+mod stream_server;
 
 use std::env;
-use std::net::SocketAddr;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
@@ -24,7 +19,7 @@ struct AppConfig {
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
-    signaling_port: u16,
+    stream_port: u16,
 }
 
 impl AppConfig {
@@ -46,9 +41,9 @@ impl AppConfig {
         let bitrate_bps = read_env("SCREX_BITRATE_BPS", "10000000")
             .parse::<u32>()
             .context("invalid SCREX_BITRATE_BPS")?;
-        let signaling_port = read_env("SCREX_SIGNAL_PORT", "8080")
+        let stream_port = read_env("SCREX_STREAM_PORT", "9000")
             .parse::<u16>()
-            .context("invalid SCREX_SIGNAL_PORT")?;
+            .context("invalid SCREX_STREAM_PORT")?;
 
         Ok(Self {
             capture_backend: capture::CaptureBackend::from_env(&read_env(
@@ -65,7 +60,7 @@ impl AppConfig {
             fps,
             gop: gop.max(10),
             bitrate_bps,
-            signaling_port,
+            stream_port,
         })
     }
 }
@@ -90,42 +85,20 @@ async fn main() -> Result<()> {
     let (au_tx, au_rx) = mpsc::channel(2);
     let (_control_tx, control_rx) = mpsc::channel(32);
 
-    let sender = Arc::new(webrtc_sender::WebRtcSender::new().await?);
-    let mdns_advertisement = match discovery::start_sender_advertisement(
+    let mdns_handle = match discovery::start_sender_advertisement(
         "_screx._tcp",
         "screx-daemon",
-        config.signaling_port,
+        config.stream_port,
     ) {
-        Ok(handle) => Some(handle),
+        Ok(handle) => {
+            println!("[main] mDNS: advertising _screx._tcp on port {}", config.stream_port);
+            Some(handle)
+        }
         Err(err) => {
             eprintln!("[main] mDNS advertisement failed (continuing): {err:#}");
             None
         }
     };
-
-    let signal_addr: SocketAddr = ([0, 0, 0, 0], config.signaling_port).into();
-    let router = signaling::build_router(sender.clone());
-    let signal_listener = tokio::net::TcpListener::bind(signal_addr).await?;
-    println!("[main] signaling server listening on http://0.0.0.0:{}", config.signaling_port);
-    println!("[main] open http://<this-machine-ip>:{} on iPad Safari to receive", config.signaling_port);
-
-    let signal_stop = stop_rx.clone();
-    let signal_task = tokio::spawn(async move {
-        axum::serve(signal_listener, router)
-            .with_graceful_shutdown(async move {
-                let mut rx = signal_stop;
-                loop {
-                    if *rx.borrow() {
-                        break;
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("signaling server error: {e}"))
-    });
 
     let capture_handle = capture::spawn_capture_thread(
         capture::CaptureConfig {
@@ -158,38 +131,26 @@ async fn main() -> Result<()> {
         )
     });
 
-    let webrtc_task = tokio::spawn(webrtc_sender::run_webrtc_feed_loop(
-        sender.clone(),
+    let stream_task = tokio::spawn(stream_server::run_stream_server(
+        config.stream_port,
         au_rx,
         stop_rx.clone(),
     ));
 
     tokio::signal::ctrl_c().await?;
-    println!("shutdown requested (ctrl-c), draining tasks...");
+    println!("\nshutdown requested (ctrl-c)");
     let _ = stop_tx.send(true);
 
-    let signal_result = signal_task.await?;
-    if let Err(err) = signal_result {
-        eprintln!("signaling server stopped with error: {err:#}");
-    }
-
-    let webrtc_result = webrtc_task.await?;
-    if let Err(err) = webrtc_result {
-        eprintln!("webrtc sender stopped with error: {err:#}");
-    }
-
-    let encode_result = encode_task.await?;
-    if let Err(err) = encode_result {
-        eprintln!("encoder stopped with error: {err:#}");
-    }
+    let _ = stream_task.await;
+    let _ = encode_task.await;
 
     match capture_handle.join() {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("capture thread stopped with error: {err:#}"),
+        Ok(Err(err)) => eprintln!("capture stopped with error: {err:#}"),
         Err(_) => eprintln!("capture thread panicked"),
     }
 
-    if let Some(handle) = mdns_advertisement {
+    if let Some(handle) = mdns_handle {
         handle.shutdown();
     }
 

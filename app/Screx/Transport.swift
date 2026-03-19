@@ -1,3 +1,2 @@
-// Replaced by WebRTC browser-based transport.
-// Keeping file to avoid Xcode project reference errors.
+// No longer used. TCP streaming handled by StreamClient.swift.
 import Foundation
