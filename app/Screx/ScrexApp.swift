@@ -17,8 +17,9 @@ struct ScrexApp: App {
 
 @MainActor
 final class StreamViewModel: ObservableObject {
-    @Published var status: String = "Searching for daemon..."
+    @Published var status: String = "Looking for daemon..."
     @Published var isConnected = false
+    @Published var manualIP: String = ""
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
@@ -38,17 +39,14 @@ final class StreamViewModel: ObservableObject {
             }
         }
         discovery.startBrowsing()
+    }
 
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            await MainActor.run {
-                guard let self, self.stream == nil else { return }
-                self.status = "Discovery timed out, trying screx-daemon.local:9000..."
-                let host = NWEndpoint.Host("screx-daemon.local")
-                let port = NWEndpoint.Port(integerLiteral: 9000)
-                self.connectToEndpoint(.hostPort(host: host, port: port), name: "screx-daemon.local")
-            }
-        }
+    func connectManual() {
+        let ip = manualIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ip.isEmpty else { return }
+        let host = NWEndpoint.Host(ip)
+        let port = NWEndpoint.Port(integerLiteral: 9000)
+        connectToEndpoint(.hostPort(host: host, port: port), name: ip)
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
@@ -109,18 +107,29 @@ struct ContentView: View {
                 }
 
                 if showOverlay {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("Screx").font(.headline)
                         Text(model.status).font(.caption).foregroundStyle(.secondary)
 
-                        if model.isConnected {
+                        if !model.isConnected {
+                            HStack {
+                                TextField("Daemon IP", text: $model.manualIP)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocorrectionDisabled()
+                                    .textInputAutocapitalization(.never)
+                                    .keyboardType(.numbersAndPunctuation)
+
+                                Button("Connect") { model.connectManual() }
+                                    .buttonStyle(.borderedProminent)
+                            }
+                        } else {
                             Button("Disconnect") { model.disconnect() }
                                 .buttonStyle(.bordered)
                                 .font(.caption)
                         }
                     }
                     .padding(12)
-                    .frame(maxWidth: 360, alignment: .leading)
+                    .frame(maxWidth: 380, alignment: .leading)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                     .padding(.horizontal, 16)
                     .transition(.move(edge: .top).combined(with: .opacity))
