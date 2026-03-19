@@ -9,14 +9,24 @@ final class StreamClient {
 
     var onStatus: ((String) -> Void)?
 
+    private static let headerLen = 10
+    private static let chunkPayload = 1400
+    private static let registerMagic = Data("SCREX".utf8)
+    private static let keepaliveInterval: TimeInterval = 2.0
+    private static let frameTimeout: TimeInterval = 0.050
+
+    private var reassembly: [UInt32: FrameAssembly] = [:]
+    private var lastCompletedFrameId: UInt32 = 0
+    private var hasReceivedFirstFrame = false
+    private var keepaliveTimer: DispatchSourceTimer?
+
     init(endpoint: NWEndpoint) {
         self.endpoint = endpoint
     }
 
     func connect() {
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        let params = NWParameters(tls: nil, tcp: tcp)
+        let params = NWParameters.udp
+        params.requiredLocalEndpoint = nil
 
         let conn = NWConnection(to: endpoint, using: params)
         self.connection = conn
@@ -25,8 +35,10 @@ final class StreamClient {
             guard let self else { return }
             switch state {
             case .ready:
-                self.onStatus?("Connected, waiting for video...")
-                self.readFrameLoop(conn)
+                self.onStatus?("Connected, registering...")
+                self.sendRegister(conn)
+                self.startKeepalive(conn)
+                self.receiveLoop(conn)
             case .failed(let error):
                 self.onStatus?("Connection failed: \(error.localizedDescription)")
             case .waiting(let error):
@@ -40,60 +52,215 @@ final class StreamClient {
     }
 
     func disconnect() {
+        keepaliveTimer?.cancel()
+        keepaliveTimer = nil
         connection?.cancel()
         connection = nil
     }
 
-    private func readFrameLoop(_ conn: NWConnection) {
-        readLengthPrefix(conn)
+    private func sendRegister(_ conn: NWConnection) {
+        conn.send(content: Self.registerMagic, completion: .contentProcessed { error in
+            if let error {
+                print("[stream] register send error: \(error)")
+            }
+        })
     }
 
-    private func readLengthPrefix(_ conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, isComplete, error in
+    private func startKeepalive(_ conn: NWConnection) {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.keepaliveInterval, repeating: Self.keepaliveInterval)
+        timer.setEventHandler { [weak self] in
+            self?.sendRegister(conn)
+        }
+        timer.resume()
+        keepaliveTimer = timer
+    }
+
+    private func receiveLoop(_ conn: NWConnection) {
+        conn.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
-            if isComplete || error != nil {
-                self.onStatus?("Stream ended")
+            if let error {
+                self.onStatus?("Receive error: \(error.localizedDescription)")
                 return
             }
 
-            guard let data, data.count == 4 else {
-                self.onStatus?("Bad header, reconnecting...")
-                return
+            if let data, data.count >= Self.headerLen {
+                self.handlePacket(data)
             }
 
-            let length = data.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
-            guard length > 0 && length < 10_000_000 else {
-                self.onStatus?("Invalid frame size: \(length)")
-                return
-            }
-
-            self.readPayload(conn, length: Int(length))
+            self.receiveLoop(conn)
         }
     }
 
-    private func readPayload(_ conn: NWConnection, length: Int) {
-        conn.receive(minimumIncompleteLength: length, maximumLength: length) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-
-            if isComplete || error != nil {
-                self.onStatus?("Stream ended")
-                return
-            }
-
-            guard let data, data.count == length else {
-                self.onStatus?("Incomplete frame (\(data?.count ?? 0)/\(length))")
-                return
-            }
-
-            self.decoder.decodeAccessUnit(data)
-
-            if !self.decoder.hasReportedFirstFrame {
-                self.decoder.hasReportedFirstFrame = true
-                self.onStatus?("Streaming")
-            }
-
-            self.readLengthPrefix(conn)
+    private func handlePacket(_ data: Data) {
+        let frameId = data.withUnsafeBytes { buf -> UInt32 in
+            buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian
         }
+        let chunkIdx = data[4]
+        let totalData = data[5]
+        let totalParity = data[6]
+        let flags = data[7]
+        let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
+            buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian
+        }
+        let isIdr = (flags & 1) != 0
+
+        let payload = data.subdata(in: Self.headerLen..<data.count)
+
+        // Skip frames older than the last completed one (unless we haven't started)
+        if hasReceivedFirstFrame && frameId < lastCompletedFrameId && (lastCompletedFrameId - frameId) < 0x80000000 {
+            return
+        }
+
+        let assembly = reassembly[frameId] ?? FrameAssembly(
+            totalData: Int(totalData),
+            totalParity: Int(totalParity),
+            isIdr: isIdr,
+            createdAt: CACurrentMediaTime()
+        )
+        reassembly[frameId] = assembly
+
+        assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen))
+
+        if assembly.isComplete {
+            deliverFrame(frameId: frameId, assembly: assembly)
+        }
+
+        pruneOldFrames()
+    }
+
+    private func deliverFrame(frameId: UInt32, assembly: FrameAssembly) {
+        guard let accessUnit = assembly.reassemble() else {
+            reassembly.removeValue(forKey: frameId)
+            return
+        }
+
+        reassembly.removeValue(forKey: frameId)
+        lastCompletedFrameId = frameId
+        hasReceivedFirstFrame = true
+
+        decoder.decodeAccessUnit(accessUnit)
+
+        if !decoder.hasReportedFirstFrame {
+            decoder.hasReportedFirstFrame = true
+            onStatus?("Streaming")
+        }
+    }
+
+    private func pruneOldFrames() {
+        let now = CACurrentMediaTime()
+        var expired: [UInt32] = []
+        for (fid, assembly) in reassembly {
+            if now - assembly.createdAt > Self.frameTimeout {
+                // Try FEC recovery before discarding
+                if assembly.canRecover {
+                    deliverFrame(frameId: fid, assembly: assembly)
+                } else {
+                    expired.append(fid)
+                }
+            }
+        }
+        for fid in expired {
+            reassembly.removeValue(forKey: fid)
+        }
+    }
+}
+
+private final class FrameAssembly {
+    let totalData: Int
+    let totalParity: Int
+    let totalShards: Int
+    let isIdr: Bool
+    let createdAt: TimeInterval
+
+    private var receivedShards: [Int: Data]
+    private var actualLengths: [Int: Int]
+    private var receivedCount: Int = 0
+
+    init(totalData: Int, totalParity: Int, isIdr: Bool, createdAt: TimeInterval) {
+        self.totalData = totalData
+        self.totalParity = totalParity
+        self.totalShards = totalData + totalParity
+        self.isIdr = isIdr
+        self.createdAt = createdAt
+        self.receivedShards = [:]
+        self.actualLengths = [:]
+    }
+
+    func addChunk(index: Int, payload: Data, actualLen: Int) {
+        guard receivedShards[index] == nil else { return }
+        receivedShards[index] = payload
+        actualLengths[index] = actualLen
+        receivedCount += 1
+    }
+
+    var isComplete: Bool {
+        if totalParity == 0 {
+            return receivedCount >= totalData
+        }
+        // All data shards present — no FEC needed
+        let hasAllData = (0..<totalData).allSatisfy { receivedShards[$0] != nil }
+        if hasAllData { return true }
+        // Enough shards for FEC recovery
+        return receivedCount >= totalData
+    }
+
+    var canRecover: Bool {
+        return receivedCount >= totalData
+    }
+
+    func reassemble() -> Data? {
+        let hasAllData = (0..<totalData).allSatisfy { receivedShards[$0] != nil }
+
+        if hasAllData {
+            return assembleFromDataShards()
+        }
+
+        if totalParity > 0 && receivedCount >= totalData {
+            return recoverAndAssemble()
+        }
+
+        return nil
+    }
+
+    private func assembleFromDataShards() -> Data {
+        var result = Data()
+        for i in 0..<totalData {
+            let shard = receivedShards[i]!
+            let actualLen = actualLengths[i] ?? shard.count
+            result.append(shard.prefix(actualLen))
+        }
+        return result
+    }
+
+    private func recoverAndAssemble() -> Data? {
+        let shardSize = StreamClient.chunkPayload
+
+        // Build shard array for FEC: nil = missing, Data = present
+        var shards: [Data?] = Array(repeating: nil, count: totalShards)
+        for (idx, data) in receivedShards {
+            // Pad to shardSize for RS
+            var padded = data
+            if padded.count < shardSize {
+                padded.append(Data(count: shardSize - padded.count))
+            } else if padded.count > shardSize {
+                padded = padded.prefix(shardSize)
+            }
+            shards[idx] = padded
+        }
+
+        guard ReedSolomonDecoder.recover(shards: &shards, dataCount: totalData, parityCount: totalParity) else {
+            return nil
+        }
+
+        // Assemble from recovered data shards
+        var result = Data()
+        for i in 0..<totalData {
+            guard let shard = shards[i] else { return nil }
+            let actualLen = actualLengths[i] ?? shard.count
+            result.append(shard.prefix(actualLen))
+        }
+        return result
     }
 }

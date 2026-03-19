@@ -29,7 +29,7 @@ final class DiscoveryService {
     func startBrowsing() {
         guard browser == nil else { return }
 
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_screx._tcp", domain: "local.")
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_screx._udp", domain: "local.")
         let browser = NWBrowser(for: descriptor, using: .init())
         self.browser = browser
 

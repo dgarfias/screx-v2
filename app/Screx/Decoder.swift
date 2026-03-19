@@ -12,58 +12,12 @@ final class H264Decoder {
     private var pps: Data?
     private var naluCount = 0
 
-    private let bufferLock = NSLock()
-    private var latestSampleBuffer: CMSampleBuffer?
-    private var displayLink: CADisplayLink?
-
     private var framesReceived: UInt64 = 0
     private var framesDisplayed: UInt64 = 0
-    private var framesDropped: UInt64 = 0
     private var statsWindowStart = CACurrentMediaTime()
 
     init() {
         displayLayer.videoGravity = .resizeAspect
-        startDisplayLink()
-    }
-
-    deinit {
-        displayLink?.invalidate()
-    }
-
-    private func startDisplayLink() {
-        let link = CADisplayLink(target: self, selector: #selector(displayLinkFired))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    @objc private func displayLinkFired() {
-        bufferLock.lock()
-        let sb = latestSampleBuffer
-        latestSampleBuffer = nil
-        bufferLock.unlock()
-
-        guard let sb else { return }
-
-        if displayLayer.status == .failed {
-            let err = displayLayer.error
-            print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
-            displayLayer.flush()
-        }
-        displayLayer.enqueue(sb)
-        framesDisplayed += 1
-
-        let now = CACurrentMediaTime()
-        let elapsed = now - statsWindowStart
-        if elapsed >= 2.0 {
-            let recvFps = Double(framesReceived) / elapsed
-            let dispFps = Double(framesDisplayed) / elapsed
-            let dropCount = framesDropped
-            print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) display_fps=\(String(format: "%.1f", dispFps)) dropped=\(dropCount)")
-            framesReceived = 0
-            framesDisplayed = 0
-            framesDropped = 0
-            statsWindowStart = now
-        }
     }
 
     func decodeAccessUnit(_ data: Data) {
@@ -121,9 +75,11 @@ final class H264Decoder {
 
         if status == noErr, let newFmt {
             formatDescription = newFmt
-            let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
-            print("[decoder] format description created: \(dims.width)x\(dims.height)")
-        } else {
+            if naluCount <= 20 {
+                let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
+                print("[decoder] format description created: \(dims.width)x\(dims.height)")
+            }
+        } else if naluCount <= 20 {
             print("[decoder] CMVideoFormatDescriptionCreateFromH264ParameterSets failed: \(status)")
         }
     }
@@ -194,13 +150,26 @@ final class H264Decoder {
 
         framesReceived += 1
 
-        bufferLock.lock()
-        let hadPrevious = latestSampleBuffer != nil
-        latestSampleBuffer = sampleBuffer
-        bufferLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.displayLayer.status == .failed {
+                let err = self.displayLayer.error
+                print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
+                self.displayLayer.flush()
+            }
+            self.displayLayer.enqueue(sampleBuffer)
+            self.framesDisplayed += 1
 
-        if hadPrevious {
-            framesDropped += 1
+            let now = CACurrentMediaTime()
+            let elapsed = now - self.statsWindowStart
+            if elapsed >= 2.0 {
+                let recvFps = Double(self.framesReceived) / elapsed
+                let dispFps = Double(self.framesDisplayed) / elapsed
+                print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) display_fps=\(String(format: "%.1f", dispFps))")
+                self.framesReceived = 0
+                self.framesDisplayed = 0
+                self.statsWindowStart = now
+            }
         }
     }
 

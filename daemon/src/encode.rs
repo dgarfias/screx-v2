@@ -176,14 +176,21 @@ pub fn run_encoder_loop(
                 window_start = Instant::now();
             }
 
-            match au_tx.try_send(au) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Drop frame rather than blocking the encoder
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    println!("[encode] downstream channel closed");
-                    return Ok(());
+            let mut pending = au;
+            loop {
+                match au_tx.try_send(pending) {
+                    Ok(()) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                        if *stop_rx.borrow() {
+                            return Ok(());
+                        }
+                        pending = returned;
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        println!("[encode] downstream channel closed");
+                        return Ok(());
+                    }
                 }
             }
         }

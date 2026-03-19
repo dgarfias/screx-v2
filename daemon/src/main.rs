@@ -81,17 +81,17 @@ async fn main() -> Result<()> {
     println!("screx-daemon boot with config: {config:?}");
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let (frame_tx, frame_rx) = mpsc::channel(4);
-    let (au_tx, au_rx) = mpsc::channel(8);
+    let (frame_tx, frame_rx) = mpsc::channel(2);
+    let (au_tx, au_rx) = mpsc::channel(2);
     let (control_tx, control_rx) = mpsc::channel(32);
 
     let mdns_handle = match discovery::start_sender_advertisement(
-        "_screx._tcp",
+        "_screx._udp",
         "screx-daemon",
         config.stream_port,
     ) {
         Ok(handle) => {
-            println!("[main] mDNS: advertising _screx._tcp on port {}", config.stream_port);
+            println!("[main] mDNS: advertising _screx._udp on port {}", config.stream_port);
             Some(handle)
         }
         Err(err) => {
