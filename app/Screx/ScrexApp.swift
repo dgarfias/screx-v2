@@ -34,17 +34,28 @@ final class StreamViewModel: ObservableObject {
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
                 guard let self, self.stream == nil, let ep = endpoints.first else { return }
-                self.connect(to: ep)
+                self.connectToEndpoint(ep.endpoint, name: ep.name)
             }
         }
         discovery.startBrowsing()
+
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await MainActor.run {
+                guard let self, self.stream == nil else { return }
+                self.status = "Discovery timed out, trying screx-daemon.local:9000..."
+                let host = NWEndpoint.Host("screx-daemon.local")
+                let port = NWEndpoint.Port(integerLiteral: 9000)
+                self.connectToEndpoint(.hostPort(host: host, port: port), name: "screx-daemon.local")
+            }
+        }
     }
 
-    func connect(to endpoint: StreamEndpoint) {
+    func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
         stream?.disconnect()
-        status = "Connecting to \(endpoint.name)..."
+        status = "Connecting to \(name)..."
 
-        let client = StreamClient(endpoint: endpoint.endpoint)
+        let client = StreamClient(endpoint: endpoint)
         self.stream = client
 
         client.onStatus = { [weak self] msg in

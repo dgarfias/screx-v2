@@ -29,13 +29,8 @@ final class DiscoveryService {
     func startBrowsing() {
         guard browser == nil else { return }
 
-        let params = NWParameters()
-        params.includePeerToPeer = false
-
-        let browser = NWBrowser(
-            for: .bonjour(type: "_screx._tcp", domain: nil),
-            using: params
-        )
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_screx._tcp", domain: "local.")
+        let browser = NWBrowser(for: descriptor, using: .init())
         self.browser = browser
 
         browser.stateUpdateHandler = { [weak self] state in
@@ -51,7 +46,7 @@ final class DiscoveryService {
             }
         }
 
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
+        browser.browseResultsChangedHandler = { [weak self] results, changes in
             let endpoints: [StreamEndpoint] = results.compactMap { result in
                 let name: String
                 switch result.endpoint {
