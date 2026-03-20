@@ -365,7 +365,6 @@ const KEY_P: u16 = 25;
 const KEY_LEFTBRACE: u16 = 26;
 const KEY_RIGHTBRACE: u16 = 27;
 const KEY_ENTER: u16 = 28;
-const KEY_LEFTCTRL: u16 = 29;
 const KEY_A: u16 = 30;
 const KEY_S: u16 = 31;
 const KEY_D: u16 = 32;
@@ -390,51 +389,26 @@ const KEY_M: u16 = 50;
 const KEY_COMMA: u16 = 51;
 const KEY_DOT: u16 = 52;
 const KEY_SLASH: u16 = 53;
-const KEY_LEFTALT: u16 = 56;
 const KEY_SPACE: u16 = 57;
-const KEY_F1: u16 = 59;
-const KEY_F2: u16 = 60;
-const KEY_F3: u16 = 61;
-const KEY_F4: u16 = 62;
-const KEY_F5: u16 = 63;
-const KEY_F6: u16 = 64;
-const KEY_F7: u16 = 65;
-const KEY_F8: u16 = 66;
-const KEY_F9: u16 = 67;
-const KEY_F10: u16 = 68;
-const KEY_F11: u16 = 87;
-const KEY_F12: u16 = 88;
-const KEY_HOME: u16 = 102;
 const KEY_UP: u16 = 103;
-const KEY_PAGEUP: u16 = 104;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
-const KEY_END: u16 = 107;
 const KEY_DOWN: u16 = 108;
-const KEY_PAGEDOWN: u16 = 109;
 const KEY_DELETE: u16 = 111;
-const KEY_LEFTMETA: u16 = 125;
+const KEY_HOME: u16 = 102;
+const KEY_END: u16 = 107;
 
 const ALL_KEYS: &[u16] = &[
     KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
     KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB,
     KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T_KEY, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
-    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER, KEY_LEFTCTRL,
+    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER,
     KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
     KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH,
     KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
-    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_LEFTALT, KEY_SPACE,
-    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
-    KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
-    KEY_HOME, KEY_UP, KEY_PAGEUP, KEY_LEFT, KEY_RIGHT, KEY_END,
-    KEY_DOWN, KEY_PAGEDOWN, KEY_DELETE, KEY_LEFTMETA,
+    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
+    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_HOME, KEY_END,
 ];
-
-// Modifier flag bits (sent inline in key packets from iPad)
-const MOD_CTRL: u8  = 0x01;
-const MOD_ALT: u8   = 0x02;
-const MOD_SUPER: u8 = 0x04;
-const MOD_SHIFT: u8 = 0x08;
 
 fn char_to_key(c: char) -> Option<(u16, bool)> {
     match c {
@@ -507,20 +481,6 @@ fn special_to_keycode(code: u8) -> Option<u16> {
         0x09 => Some(KEY_DELETE),
         0x0A => Some(KEY_HOME),
         0x0B => Some(KEY_END),
-        0x10 => Some(KEY_F1),
-        0x11 => Some(KEY_F2),
-        0x12 => Some(KEY_F3),
-        0x13 => Some(KEY_F4),
-        0x14 => Some(KEY_F5),
-        0x15 => Some(KEY_F6),
-        0x16 => Some(KEY_F7),
-        0x17 => Some(KEY_F8),
-        0x18 => Some(KEY_F9),
-        0x19 => Some(KEY_F10),
-        0x1A => Some(KEY_F11),
-        0x1B => Some(KEY_F12),
-        0x1C => Some(KEY_PAGEUP),
-        0x1D => Some(KEY_PAGEDOWN),
         _ => None,
     }
 }
@@ -564,15 +524,9 @@ impl VirtualKeyboard {
         Ok(Self { file })
     }
 
-    pub fn type_text(&mut self, text: &str, mods: u8) {
-        let has_non_ascii = text.chars().any(|c| char_to_key(c).is_none());
-        if has_non_ascii {
-            self.paste_via_clipboard(text, mods);
-            return;
-        }
+    pub fn type_text(&mut self, text: &str) {
         for c in text.chars() {
             if let Some((keycode, shift)) = char_to_key(c) {
-                self.press_modifiers(mods);
                 if shift {
                     self.key_event(KEY_LEFTSHIFT, 1);
                 }
@@ -582,82 +536,17 @@ impl VirtualKeyboard {
                 if shift {
                     self.key_event(KEY_LEFTSHIFT, 0);
                 }
-                self.release_modifiers(mods);
                 self.syn();
             }
         }
     }
 
-    pub fn press_special(&mut self, code: u8, mods: u8) {
+    pub fn press_special(&mut self, code: u8) {
         if let Some(keycode) = special_to_keycode(code) {
-            self.press_modifiers(mods);
             self.key_event(keycode, 1);
             self.syn();
             self.key_event(keycode, 0);
-            self.release_modifiers(mods);
             self.syn();
-        }
-    }
-
-    fn press_modifiers(&mut self, mods: u8) {
-        if mods & MOD_CTRL != 0  { self.key_event(KEY_LEFTCTRL, 1); }
-        if mods & MOD_ALT != 0   { self.key_event(KEY_LEFTALT, 1); }
-        if mods & MOD_SUPER != 0 { self.key_event(KEY_LEFTMETA, 1); }
-        if mods & MOD_SHIFT != 0 { self.key_event(KEY_LEFTSHIFT, 1); }
-        if mods != 0 { self.syn(); }
-    }
-
-    fn release_modifiers(&mut self, mods: u8) {
-        if mods & MOD_SHIFT != 0 { self.key_event(KEY_LEFTSHIFT, 0); }
-        if mods & MOD_SUPER != 0 { self.key_event(KEY_LEFTMETA, 0); }
-        if mods & MOD_ALT != 0   { self.key_event(KEY_LEFTALT, 0); }
-        if mods & MOD_CTRL != 0  { self.key_event(KEY_LEFTCTRL, 0); }
-        if mods != 0 { self.syn(); }
-    }
-
-    /// Paste non-ASCII text via wl-copy + Ctrl+V (works universally on Wayland).
-    fn paste_via_clipboard(&mut self, text: &str, extra_mods: u8) {
-        let (sudo_user, sudo_uid) = (
-            std::env::var("SUDO_USER").ok(),
-            std::env::var("SUDO_UID").ok(),
-        );
-
-        let result = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
-            let runtime_dir = format!("/run/user/{uid}");
-            Command::new("runuser")
-                .args(["-u", user, "--"])
-                .arg("env")
-                .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-                .arg("WAYLAND_DISPLAY=wayland-0")
-                .arg("wl-copy")
-                .arg("--")
-                .arg(text)
-                .output()
-        } else {
-            Command::new("wl-copy")
-                .arg("--")
-                .arg(text)
-                .output()
-        };
-
-        match result {
-            Ok(out) if out.status.success() => {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                let mods = extra_mods | MOD_CTRL;
-                self.press_modifiers(mods);
-                self.key_event(KEY_V, 1);
-                self.syn();
-                self.key_event(KEY_V, 0);
-                self.release_modifiers(mods);
-                self.syn();
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!("[keyboard] wl-copy failed: {stderr}");
-            }
-            Err(e) => {
-                eprintln!("[keyboard] could not run wl-copy: {e}");
-            }
         }
     }
 
@@ -705,34 +594,103 @@ impl Drop for VirtualKeyboard {
 
 pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
+pub const KEY_TYPE_OSK_TOGGLE: u8 = 0x03;
 
 /// Parse and handle a key packet from the iPad.
-///
-/// Format:
-///   0x01 (text):    modifier_flags(1) + UTF-8 bytes
-///   0x02 (special): modifier_flags(1) + code(1)
-///
-/// modifier_flags bitmask: 0x01=Ctrl, 0x02=Alt, 0x04=Super, 0x08=Shift
+/// Format: type(1) + payload(variable)
 pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
-    if data.len() < 2 {
+    if data.is_empty() {
         return;
     }
     let key_type = data[0];
-    let mods = data[1];
-    let payload = &data[2..];
+    let payload = &data[1..];
 
     match key_type {
         KEY_TYPE_TEXT => {
             if let Ok(text) = std::str::from_utf8(payload) {
-                kb.type_text(text, mods);
+                kb.type_text(text);
             }
         }
         KEY_TYPE_SPECIAL => {
             if !payload.is_empty() {
-                kb.press_special(payload[0], mods);
+                kb.press_special(payload[0]);
             }
         }
+        KEY_TYPE_OSK_TOGGLE => {
+            toggle_gnome_osk();
+        }
         _ => {}
+    }
+}
+
+/// Toggles GNOME's on-screen keyboard via gsettings.
+fn toggle_gnome_osk() {
+    let (sudo_user, sudo_uid) = (
+        std::env::var("SUDO_USER").ok(),
+        std::env::var("SUDO_UID").ok(),
+    );
+
+    let schema = "org.gnome.desktop.a11y.applications";
+    let key = "screen-keyboard-enabled";
+
+    let current = run_gsettings_get(&sudo_user, &sudo_uid, schema, key);
+    let new_val = if current.trim() == "true" { "false" } else { "true" };
+
+    let result = run_gsettings_set(&sudo_user, &sudo_uid, schema, key, new_val);
+    match result {
+        Ok(out) if out.status.success() => {
+            println!("[osk] GNOME on-screen keyboard: {new_val}");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("[osk] gsettings set failed: {stderr}");
+        }
+        Err(e) => {
+            eprintln!("[osk] could not run gsettings: {e}");
+        }
+    }
+}
+
+fn run_gsettings_get(user: &Option<String>, uid: &Option<String>, schema: &str, key: &str) -> String {
+    let output = if let (Some(ref u), Some(ref id)) = (user, uid) {
+        let rt = format!("/run/user/{id}");
+        let dbus = format!("unix:path={rt}/bus");
+        Command::new("runuser")
+            .args(["-u", u, "--"])
+            .arg("env")
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
+            .arg(format!("XDG_RUNTIME_DIR={rt}"))
+            .args(["gsettings", "get", schema, key])
+            .output()
+    } else {
+        Command::new("gsettings")
+            .args(["get", schema, key])
+            .output()
+    };
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+fn run_gsettings_set(
+    user: &Option<String>, uid: &Option<String>,
+    schema: &str, key: &str, value: &str,
+) -> std::io::Result<std::process::Output> {
+    if let (Some(ref u), Some(ref id)) = (user, uid) {
+        let rt = format!("/run/user/{id}");
+        let dbus = format!("unix:path={rt}/bus");
+        Command::new("runuser")
+            .args(["-u", u, "--"])
+            .arg("env")
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
+            .arg(format!("XDG_RUNTIME_DIR={rt}"))
+            .args(["gsettings", "set", schema, key, value])
+            .output()
+    } else {
+        Command::new("gsettings")
+            .args(["set", schema, key, value])
+            .output()
     }
 }
 

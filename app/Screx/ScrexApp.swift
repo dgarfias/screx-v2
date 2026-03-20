@@ -245,16 +245,21 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    /// Builds a "text insert" key packet: type(1) + modifiers(1) + UTF-8 bytes
-    func sendTextInsert(_ text: String, mods: UInt8 = 0) {
-        var data = Data([0x01, mods])
+    /// Builds a "text insert" key packet: type 0x01 + UTF-8 bytes
+    func sendTextInsert(_ text: String) {
+        var data = Data([0x01])
         data.append(Data(text.utf8))
         sendKey(data)
     }
 
-    /// Builds a "special key" packet: type(1) + modifiers(1) + code(1)
-    func sendSpecialKey(_ code: UInt8, mods: UInt8 = 0) {
-        sendKey(Data([0x02, mods, code]))
+    /// Builds a "special key" packet: type 0x02 + key code
+    func sendSpecialKey(_ code: UInt8) {
+        sendKey(Data([0x02, code]))
+    }
+
+    /// Tells the daemon to toggle the GNOME on-screen keyboard
+    func toggleOSK() {
+        sendKey(Data([0x03]))
     }
 
     // MARK: - Camera
@@ -319,7 +324,6 @@ final class StreamViewModel: ObservableObject {
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
-    @State private var keyboardActive = false
 
     var body: some View {
         ZStack {
@@ -334,13 +338,6 @@ struct ContentView: View {
                 )
                 .ignoresSafeArea()
             }
-
-            KeyboardInputView(
-                isActive: $keyboardActive,
-                onText: { text, mods in model.sendTextInsert(text, mods: mods) },
-                onSpecial: { code, mods in model.sendSpecialKey(code, mods: mods) }
-            )
-            .frame(width: 0, height: 0)
 
             VStack {
                 if showOverlay {
@@ -403,13 +400,12 @@ struct ContentView: View {
                             .background(.ultraThinMaterial, in: Circle())
                             .onTapGesture { model.toggleCamera() }
                             .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
-                        Button { keyboardActive.toggle() } label: {
-                            Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
-                                .font(.footnote)
-                                .foregroundStyle(.white)
-                                .frame(width: 32, height: 32)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
+                        Image(systemName: "keyboard")
+                            .font(.footnote)
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .onTapGesture { model.toggleOSK() }
                     }
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }

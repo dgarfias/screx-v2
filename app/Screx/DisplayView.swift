@@ -2,28 +2,17 @@ import SwiftUI
 import AVFoundation
 import UIKit
 
-// MARK: - Modifier flags (bitmask matching daemon protocol)
-
-struct ModFlags {
-    static let ctrl:  UInt8 = 0x01
-    static let alt:   UInt8 = 0x02
-    static let supér: UInt8 = 0x04
-    static let shift: UInt8 = 0x08
-}
-
 // MARK: - Keyboard input proxy (captures iOS native keyboard and forwards to daemon)
 
 struct KeyboardInputView: UIViewRepresentable {
     @Binding var isActive: Bool
-    /// (text, modifierFlags) — flags are consumed and cleared after each keystroke
-    let onText: (String, UInt8) -> Void
-    /// (specialCode, modifierFlags)
-    let onSpecial: (UInt8, UInt8) -> Void
+    let onText: (String) -> Void
+    let onDelete: () -> Void
 
     func makeUIView(context: Context) -> KeyInputProxyView {
         let view = KeyInputProxyView()
         view.onText = onText
-        view.onSpecial = onSpecial
+        view.onDelete = onDelete
         view.onResign = { context.coordinator.deactivate() }
         view.isUserInteractionEnabled = false
         return view
@@ -31,7 +20,7 @@ struct KeyboardInputView: UIViewRepresentable {
 
     func updateUIView(_ uiView: KeyInputProxyView, context: Context) {
         uiView.onText = onText
-        uiView.onSpecial = onSpecial
+        uiView.onDelete = onDelete
         uiView.onResign = { context.coordinator.deactivate() }
         uiView.allowFirstResponder = isActive
         uiView.isUserInteractionEnabled = isActive
@@ -54,8 +43,8 @@ struct KeyboardInputView: UIViewRepresentable {
 }
 
 final class KeyInputProxyView: UIView, UIKeyInput {
-    var onText: ((String, UInt8) -> Void)?
-    var onSpecial: ((UInt8, UInt8) -> Void)?
+    var onText: ((String) -> Void)?
+    var onDelete: (() -> Void)?
     var onResign: (() -> Void)?
     var allowFirstResponder = false
 
@@ -64,47 +53,12 @@ final class KeyInputProxyView: UIView, UIKeyInput {
 
     var autocorrectionType: UITextAutocorrectionType { .no }
 
-    // MARK: - Modifier state (managed by the toolbar)
-
-    private var modCtrl  = false
-    private var modAlt   = false
-    private var modSuper = false
-    private var modShift = false
-    private var modCtrlLocked  = false
-    private var modAltLocked   = false
-    private var modSuperLocked = false
-    private var modShiftLocked = false
-
-    private var ctrlButton:  UIButton?
-    private var altButton:   UIButton?
-    private var superButton: UIButton?
-    private var shiftButton: UIButton?
-
-    /// Builds the current modifier flags bitmask and resets one-shot modifiers.
-    private func consumeModifiers() -> UInt8 {
-        var flags: UInt8 = 0
-        if modCtrl  { flags |= ModFlags.ctrl }
-        if modAlt   { flags |= ModFlags.alt }
-        if modSuper { flags |= ModFlags.supér }
-        if modShift { flags |= ModFlags.shift }
-        if !modCtrlLocked  { modCtrl = false }
-        if !modAltLocked   { modAlt = false }
-        if !modSuperLocked { modSuper = false }
-        if !modShiftLocked { modShift = false }
-        updateButtonStyles()
-        return flags
-    }
-
-    // MARK: - UIKeyInput
-
     func insertText(_ text: String) {
-        let mods = consumeModifiers()
-        onText?(text, mods)
+        onText?(text)
     }
 
     func deleteBackward() {
-        let mods = consumeModifiers()
-        onSpecial?(0x01, mods)
+        onDelete?()
     }
 
     @discardableResult
@@ -112,171 +66,10 @@ final class KeyInputProxyView: UIView, UIKeyInput {
         let result = super.resignFirstResponder()
         if result {
             allowFirstResponder = false
-            resetModifiers()
             onResign?()
         }
         return result
     }
-
-    private func resetModifiers() {
-        modCtrl = false; modAlt = false; modSuper = false; modShift = false
-        modCtrlLocked = false; modAltLocked = false; modSuperLocked = false; modShiftLocked = false
-        updateButtonStyles()
-    }
-
-    // MARK: - Input accessory view (pure UIKit toolbar)
-
-    private lazy var toolbar: UIView = {
-        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 40),
-                              inputViewStyle: .keyboard)
-        bar.autoresizingMask = [.flexibleWidth]
-        bar.allowsSelfSizing = true
-
-        let scroll = UIScrollView()
-        scroll.showsHorizontalScrollIndicator = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(scroll)
-        NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: bar.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
-            scroll.heightAnchor.constraint(equalToConstant: 40),
-        ])
-
-        let stack = UIStackView()
-        stack.axis = .horizontal
-        stack.spacing = 4
-        stack.alignment = .center
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        scroll.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 6),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -6),
-            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
-        ])
-
-        let esc  = makeKeyButton("Esc",   action: #selector(tapEsc))
-        let tab  = makeKeyButton("Tab",   action: #selector(tapTab))
-        let ctrl = makeModButton("Ctrl",  action: #selector(tapCtrl))
-        let alt  = makeModButton("Alt",   action: #selector(tapAlt))
-        let sup  = makeModButton("Super", action: #selector(tapSuper))
-        let shft = makeModButton("Shift", action: #selector(tapShift))
-
-        ctrlButton = ctrl; altButton = alt; superButton = sup; shiftButton = shft
-
-        for btn in [esc, tab, ctrl, alt, sup, shft] { stack.addArrangedSubview(btn) }
-        stack.addArrangedSubview(makeSeparator())
-        for n in 1...12 {
-            let btn = makeKeyButton("F\(n)", action: #selector(tapFKey(_:)))
-            btn.tag = n
-            stack.addArrangedSubview(btn)
-        }
-        stack.addArrangedSubview(makeSeparator())
-        let pgup = makeKeyButton("PgUp", action: #selector(tapPgUp))
-        let pgdn = makeKeyButton("PgDn", action: #selector(tapPgDn))
-        let home = makeKeyButton("Home", action: #selector(tapHome))
-        let end  = makeKeyButton("End",  action: #selector(tapEnd))
-        for btn in [pgup, pgdn, home, end] { stack.addArrangedSubview(btn) }
-
-        return bar
-    }()
-
-    override var inputAccessoryView: UIView? { toolbar }
-
-    // MARK: - Button factory
-
-    private func makeKeyButton(_ title: String, action: Selector) -> UIButton {
-        let btn = UIButton(type: .system)
-        btn.setTitle(title, for: .normal)
-        btn.titleLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
-        btn.setTitleColor(.label, for: .normal)
-        btn.contentEdgeInsets = UIEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
-        btn.addTarget(self, action: action, for: .touchUpInside)
-        return btn
-    }
-
-    private func makeModButton(_ title: String, action: Selector) -> UIButton {
-        let btn = UIButton(type: .system)
-        btn.setTitle(title, for: .normal)
-        btn.titleLabel?.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
-        btn.setTitleColor(.label, for: .normal)
-        btn.contentEdgeInsets = UIEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
-        btn.layer.cornerRadius = 5
-        btn.addTarget(self, action: action, for: .touchUpInside)
-        return btn
-    }
-
-    private func makeSeparator() -> UIView {
-        let v = UIView()
-        v.backgroundColor = .separator
-        v.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            v.widthAnchor.constraint(equalToConstant: 1),
-            v.heightAnchor.constraint(equalToConstant: 22),
-        ])
-        return v
-    }
-
-    // MARK: - Modifier toggle logic (tap = one-shot, double-tap = lock)
-
-    private func toggleMod(active: inout Bool, locked: inout Bool) {
-        if locked {
-            active = false; locked = false
-        } else if active {
-            locked = true
-        } else {
-            active = true
-        }
-        updateButtonStyles()
-    }
-
-    private func updateButtonStyles() {
-        styleModButton(ctrlButton,  active: modCtrl,  locked: modCtrlLocked)
-        styleModButton(altButton,   active: modAlt,   locked: modAltLocked)
-        styleModButton(superButton, active: modSuper, locked: modSuperLocked)
-        styleModButton(shiftButton, active: modShift, locked: modShiftLocked)
-    }
-
-    private func styleModButton(_ btn: UIButton?, active: Bool, locked: Bool) {
-        guard let btn else { return }
-        if locked {
-            btn.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.35)
-            btn.setTitleColor(.systemYellow, for: .normal)
-        } else if active {
-            btn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.25)
-            btn.setTitleColor(.systemBlue, for: .normal)
-        } else {
-            btn.backgroundColor = .clear
-            btn.setTitleColor(.label, for: .normal)
-        }
-    }
-
-    // MARK: - Button actions
-
-    @objc private func tapCtrl()  { toggleMod(active: &modCtrl,  locked: &modCtrlLocked) }
-    @objc private func tapAlt()   { toggleMod(active: &modAlt,   locked: &modAltLocked) }
-    @objc private func tapSuper() { toggleMod(active: &modSuper, locked: &modSuperLocked) }
-    @objc private func tapShift() { toggleMod(active: &modShift, locked: &modShiftLocked) }
-
-    @objc private func tapEsc() {
-        let mods = consumeModifiers()
-        onSpecial?(0x04, mods)
-    }
-    @objc private func tapTab() {
-        let mods = consumeModifiers()
-        onSpecial?(0x03, mods)
-    }
-    @objc private func tapFKey(_ sender: UIButton) {
-        let mods = consumeModifiers()
-        onSpecial?(UInt8(0x0F + sender.tag), mods)
-    }
-    @objc private func tapPgUp() { let m = consumeModifiers(); onSpecial?(0x1C, m) }
-    @objc private func tapPgDn() { let m = consumeModifiers(); onSpecial?(0x1D, m) }
-    @objc private func tapHome() { let m = consumeModifiers(); onSpecial?(0x0A, m) }
-    @objc private func tapEnd()  { let m = consumeModifiers(); onSpecial?(0x0B, m) }
 }
 
 struct VideoDisplayView: UIViewRepresentable {
