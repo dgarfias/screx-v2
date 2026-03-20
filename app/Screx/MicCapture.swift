@@ -2,7 +2,6 @@ import AVFoundation
 
 final class MicCapture {
     private let engine = AVAudioEngine()
-    private let mixer = AVAudioMixerNode()
     private var running = false
 
     var onPCM: ((Data) -> Void)?
@@ -11,38 +10,43 @@ final class MicCapture {
         guard !running else { return }
 
         let inputNode = engine.inputNode
-        let hwFormat = inputNode.inputFormat(forBus: 0)
+        let hwFormat = inputNode.outputFormat(forBus: 0)
+        let hwRate = hwFormat.sampleRate
+        let hwChannels = Int(hwFormat.channelCount)
 
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: 48000,
-            channels: 1,
-            interleaved: true
-        ) else {
-            print("[mic] failed to create target format")
+        print("[mic] hardware: \(hwRate)Hz, \(hwChannels)ch, commonFormat=\(hwFormat.commonFormat.rawValue)")
+
+        guard hwRate > 0 else {
+            print("[mic] invalid hardware sample rate, cannot start")
             return
         }
 
-        print("[mic] hw: \(hwFormat.sampleRate)Hz \(hwFormat.channelCount)ch -> target: 48000Hz 1ch s16le")
-
-        engine.attach(mixer)
-        engine.connect(inputNode, to: mixer, format: hwFormat)
-        engine.connect(mixer, to: engine.mainMixerNode, format: targetFormat)
-
-        mixer.installTap(onBus: 0, bufferSize: 960, format: targetFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 960, format: hwFormat) { [weak self] buffer, _ in
             guard let self, let onPCM = self.onPCM else { return }
+            guard let floatData = buffer.floatChannelData else { return }
 
             let frameCount = Int(buffer.frameLength)
-            guard frameCount > 0, let int16Ptr = buffer.int16ChannelData else { return }
+            guard frameCount > 0 else { return }
 
-            let data = Data(bytes: int16Ptr[0], count: frameCount * 2)
-            onPCM(data)
+            var pcm = Data(count: frameCount * 2)
+            pcm.withUnsafeMutableBytes { raw in
+                let out = raw.bindMemory(to: Int16.self)
+                for i in 0..<frameCount {
+                    var sample: Float = floatData[0][i]
+                    if hwChannels > 1 {
+                        sample = (sample + floatData[1][i]) * 0.5
+                    }
+                    let clamped = max(-1.0, min(1.0, sample))
+                    out[i] = Int16(clamped * 32767.0)
+                }
+            }
+            onPCM(pcm)
         }
 
         do {
             try engine.start()
             running = true
-            print("[mic] capture started (s16le 48kHz mono)")
+            print("[mic] capture started — sending s16le \(Int(hwRate))Hz mono")
         } catch {
             print("[mic] engine start failed: \(error)")
         }
@@ -50,10 +54,8 @@ final class MicCapture {
 
     func stop() {
         guard running else { return }
-        mixer.removeTap(onBus: 0)
+        engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        engine.disconnectNodeInput(mixer)
-        engine.detach(mixer)
         running = false
         print("[mic] capture stopped")
     }

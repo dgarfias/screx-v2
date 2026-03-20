@@ -143,7 +143,7 @@ pub fn create_virtual_mic_source() -> Result<MicWriter> {
     }
     let loopback_child = loopback
         .args([
-            "--channel-map", "MONO",
+            "--channel-map", "[MONO]",
             "--capture-props",
             &format!(
                 "media.class=Audio/Sink node.name={MIC_SINK_NODE} node.description=\"Screx Mic Internal\""
