@@ -1,8 +1,6 @@
-use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
-use std::os::unix::fs::OpenOptionsExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -99,23 +97,33 @@ pub fn remove_virtual_sink(module_id: u32) {
 // Virtual mic source — receives PCM from iPad mic, exposes as PulseAudio source
 // ---------------------------------------------------------------------------
 
-const MIC_SOURCE_NAME: &str = "screx_ipad_mic";
-const MIC_FIFO_PATH: &str = "/tmp/screx_mic";
+const MIC_SINK_NAME: &str = "screx_ipad_mic";
 const MIC_RATE: u32 = 48000;
 const MIC_CHANNELS: u16 = 1;
 
+/// Writes incoming iPad mic PCM into a `pacat --playback` process that feeds
+/// a null-sink. Apps pick up the audio from `screx_ipad_mic.monitor`.
 pub struct MicWriter {
-    file: std::fs::File,
+    child: Child,
+    stdin: std::process::ChildStdin,
 }
 
 impl MicWriter {
     pub fn write_pcm(&mut self, data: &[u8]) {
-        let _ = self.file.write_all(data);
+        let _ = self.stdin.write_all(data);
+    }
+}
+
+impl Drop for MicWriter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        println!("[mic] pacat playback stopped");
     }
 }
 
 pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
-    // Check if already loaded
+    // Remove stale module if present
     let existing = pactl_cmd()
         .args(["list", "short", "modules"])
         .output()
@@ -123,7 +131,7 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
 
     let output = String::from_utf8_lossy(&existing.stdout);
     for line in output.lines() {
-        if line.contains(MIC_SOURCE_NAME) {
+        if line.contains(MIC_SINK_NAME) {
             let module_id: u32 = line
                 .split_whitespace()
                 .next()
@@ -134,42 +142,27 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
                 .args(["unload-module", &module_id.to_string()])
                 .output()
                 .ok();
-            println!("[mic] removed stale mic source (module {module_id})");
+            println!("[mic] removed stale mic sink (module {module_id})");
         }
     }
 
-    // Remove stale FIFO
-    let _ = fs::remove_file(MIC_FIFO_PATH);
-
-    // Create FIFO
-    let path = std::ffi::CString::new(MIC_FIFO_PATH).unwrap();
-    let ret = unsafe { libc::mkfifo(path.as_ptr(), 0o666) };
-    if ret != 0 {
-        anyhow::bail!(
-            "mkfifo({MIC_FIFO_PATH}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    // Load module-pipe-source (reads from the FIFO)
+    // Create a null-sink — its .monitor acts as a source for apps
     let result = pactl_cmd()
         .args([
             "load-module",
-            "module-pipe-source",
-            &format!("source_name={MIC_SOURCE_NAME}"),
-            &format!("source_properties=device.description=\"Screx\\ iPad\\ Mic\""),
-            &format!("file={MIC_FIFO_PATH}"),
+            "module-null-sink",
+            &format!("sink_name={MIC_SINK_NAME}"),
+            &format!("sink_properties=device.description=\"Screx\\ iPad\\ Mic\""),
             &format!("rate={MIC_RATE}"),
             &format!("channels={MIC_CHANNELS}"),
             "format=s16le",
         ])
         .output()
-        .context("failed to load module-pipe-source")?;
+        .context("failed to create mic null-sink")?;
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        let _ = fs::remove_file(MIC_FIFO_PATH);
-        anyhow::bail!("pactl load-module module-pipe-source failed: {stderr}");
+        anyhow::bail!("pactl load-module module-null-sink (mic) failed: {stderr}");
     }
 
     let module_id: u32 = String::from_utf8_lossy(&result.stdout)
@@ -177,16 +170,34 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
         .parse()
         .unwrap_or(0);
 
-    // Open the FIFO for writing (non-blocking to avoid deadlock if nothing reads yet)
-    let file = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(MIC_FIFO_PATH)
-        .context("failed to open mic FIFO for writing")?;
+    // Spawn pacat to play PCM into the null-sink
+    let mut pacat = Command::new("pacat");
+    for (k, v) in pulse_env() {
+        pacat.env(&k, &v);
+    }
+    let mut child = pacat
+        .args([
+            "--playback",
+            &format!("--device={MIC_SINK_NAME}"),
+            "--format=s16le",
+            &format!("--rate={MIC_RATE}"),
+            &format!("--channels={MIC_CHANNELS}"),
+            "--latency-msec=10",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start pacat — is pulseaudio-utils installed?")?;
 
-    println!("[mic] virtual mic source created (module {module_id})");
+    let stdin = child.stdin.take().context("no stdin from pacat")?;
 
-    Ok((module_id, MicWriter { file }))
+    println!(
+        "[mic] virtual mic source ready (module {module_id}, pacat pid {}), apps use {MIC_SINK_NAME}.monitor",
+        child.id()
+    );
+
+    Ok((module_id, MicWriter { child, stdin }))
 }
 
 pub fn remove_virtual_mic_source(module_id: u32) {
@@ -196,7 +207,6 @@ pub fn remove_virtual_mic_source(module_id: u32) {
     let _ = pactl_cmd()
         .args(["unload-module", &module_id.to_string()])
         .output();
-    let _ = fs::remove_file(MIC_FIFO_PATH);
     println!("[mic] removed virtual mic source (module {module_id})");
 }
 

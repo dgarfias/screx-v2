@@ -9,6 +9,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Screx needs local network access to discover and connect to the screen streaming daemon.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Screx uses your microphone to stream audio to the connected Linux device.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Screx uses your camera to stream video to the connected Linux device as a virtual webcam.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

@@ -1,6 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -10,35 +10,6 @@ const CARD_LABEL: &str = "Screx iPad Camera";
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
-// v4l2 constants
-const VIDIOC_S_FMT: libc::c_ulong = 0xc0d05605;
-const V4L2_BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
-const V4L2_PIX_FMT_MJPEG: u32 = u32::from_le_bytes(*b"MJPG");
-const V4L2_FIELD_NONE: u32 = 1;
-
-#[repr(C)]
-#[derive(Default)]
-struct V4l2PixFormat {
-    width: u32,
-    height: u32,
-    pixelformat: u32,
-    field: u32,
-    bytesperline: u32,
-    sizeimage: u32,
-    colorspace: u32,
-    priv_: u32,
-    flags: u32,
-    // union padding
-    ycbcr_enc_or_quantization: [u32; 2],
-}
-
-#[repr(C)]
-struct V4l2Format {
-    type_: u32,
-    pix: V4l2PixFormat,
-    // pad to full struct size (v4l2_format is 208 bytes)
-    _pad: [u8; 208 - 4 - std::mem::size_of::<V4l2PixFormat>()],
-}
 
 pub struct CamWriter {
     file: File,
@@ -51,16 +22,17 @@ impl CamWriter {
 }
 
 pub fn load_v4l2loopback() -> Result<()> {
-    // Check if already loaded with our device
+    // Always reload cleanly to avoid stale device state
     if std::path::Path::new(VIDEO_DEVICE).exists() {
-        println!("[camera] {VIDEO_DEVICE} already exists");
-        return Ok(());
+        println!("[camera] removing stale v4l2loopback...");
+        let _ = Command::new("rmmod").arg("v4l2loopback").status();
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     let status = Command::new("modprobe")
         .args([
             "v4l2loopback",
-            &format!("video_nr=10"),
+            "video_nr=10",
             &format!("card_label={CARD_LABEL}"),
             "exclusive_caps=1",
             "max_buffers=2",
@@ -72,7 +44,6 @@ pub fn load_v4l2loopback() -> Result<()> {
         anyhow::bail!("modprobe v4l2loopback failed — is v4l2loopback-dkms installed?");
     }
 
-    // Wait for device node
     for _ in 0..20 {
         if std::path::Path::new(VIDEO_DEVICE).exists() {
             break;
@@ -89,33 +60,34 @@ pub fn load_v4l2loopback() -> Result<()> {
 }
 
 pub fn create_cam_writer() -> Result<CamWriter> {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(VIDEO_DEVICE)
-        .with_context(|| format!("failed to open {VIDEO_DEVICE}"))?;
+    // Give the driver a moment to fully initialize after modprobe
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let fd = file.as_raw_fd();
+    // Use v4l2-ctl with --set-fmt-video-out (VIDEO_OUTPUT, not CAPTURE)
+    let status = Command::new("v4l2-ctl")
+        .args([
+            &format!("--device={VIDEO_DEVICE}"),
+            &format!("--set-fmt-video-out=width={WIDTH},height={HEIGHT},pixelformat=MJPG"),
+        ])
+        .status()
+        .context("v4l2-ctl not found — install v4l-utils")?;
 
-    let mut fmt = V4l2Format {
-        type_: V4L2_BUF_TYPE_VIDEO_OUTPUT,
-        pix: V4l2PixFormat {
-            width: WIDTH,
-            height: HEIGHT,
-            pixelformat: V4L2_PIX_FMT_MJPEG,
-            field: V4L2_FIELD_NONE,
-            sizeimage: WIDTH * HEIGHT * 2,
-            ..Default::default()
-        },
-        _pad: [0u8; 208 - 4 - std::mem::size_of::<V4l2PixFormat>()],
+    if !status.success() {
+        anyhow::bail!("v4l2-ctl --set-fmt-video-out failed");
+    }
+
+    let fd = unsafe {
+        let path = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
+        libc::open(path.as_ptr(), libc::O_RDWR)
     };
-
-    let ret = unsafe { libc::ioctl(fd, VIDIOC_S_FMT, &mut fmt) };
-    if ret < 0 {
+    if fd < 0 {
         anyhow::bail!(
-            "VIDIOC_S_FMT failed: {}",
+            "failed to open {VIDEO_DEVICE}: {}",
             std::io::Error::last_os_error()
         );
     }
+
+    let file = unsafe { File::from_raw_fd(fd) };
 
     println!("[camera] writer ready: {WIDTH}x{HEIGHT} MJPEG -> {VIDEO_DEVICE}");
     Ok(CamWriter { file })
