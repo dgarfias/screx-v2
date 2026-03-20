@@ -321,25 +321,38 @@ final class StreamViewModel: ObservableObject {
     var isMicActive: Bool { micCapture.isRunning }
 }
 
+enum ToolbarOrientation: String {
+    case horizontal, vertical
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
 
+    @State private var barPosition: CGPoint = Self.loadBarPosition()
+    @State private var barOrientation: ToolbarOrientation = Self.loadBarOrientation()
+    @State private var dragOffset: CGSize = .zero
+    @State private var isDragging = false
+
+    private static let btnSize: CGFloat = 32
+    private static let btnSpacing: CGFloat = 6
+    private static let edgeThreshold: CGFloat = 40
+
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        GeometryReader { geo in
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            if let layer = model.displayLayer {
-                VideoDisplayView(
-                    layer: layer,
-                    videoWidth: model.decoder.videoWidth,
-                    videoHeight: model.decoder.videoHeight,
-                    onTouch: { data in model.sendTouch(data) }
-                )
-                .ignoresSafeArea()
-            }
+                if let layer = model.displayLayer {
+                    VideoDisplayView(
+                        layer: layer,
+                        videoWidth: model.decoder.videoWidth,
+                        videoHeight: model.decoder.videoHeight,
+                        onTouch: { data in model.sendTouch(data) }
+                    )
+                    .ignoresSafeArea()
+                }
 
-            VStack {
                 if showOverlay {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -376,52 +389,152 @@ struct ContentView: View {
                     .frame(maxWidth: 380, alignment: .leading)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                     .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                Spacer()
-
-                HStack(spacing: 6) {
-                    Spacer()
-                    if model.isConnected {
-                        Image(systemName: model.isMicActive ? "mic.fill" : "mic")
-                            .font(.footnote)
-                            .foregroundStyle(model.isMicActive ? .green : .white)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .onTapGesture { model.toggleMic() }
-                        Image(systemName: model.isCameraActive
-                              ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
-                              : "video")
-                            .font(.footnote)
-                            .foregroundStyle(model.isCameraActive ? .green : .white)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .onTapGesture { model.toggleCamera() }
-                            .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
-                        Image(systemName: "keyboard")
-                            .font(.footnote)
-                            .foregroundStyle(.white)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .onTapGesture { model.toggleOSK() }
-                    }
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
-                    } label: {
-                        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
-                            .font(.footnote)
-                            .foregroundStyle(.white)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
+                floatingBar(in: geo)
+            }
+            .onAppear {
+                if barPosition == .zero {
+                    barPosition = CGPoint(x: geo.size.width - 90, y: geo.size.height - 30)
                 }
-                .padding(.trailing, 12)
-                .padding(.bottom, 8)
             }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+    }
+
+    // MARK: - Floating button bar
+
+    @ViewBuilder
+    private func floatingBar(in geo: GeometryProxy) -> some View {
+        let layout = barOrientation == .vertical
+            ? AnyLayout(VStackLayout(spacing: Self.btnSpacing))
+            : AnyLayout(HStackLayout(spacing: Self.btnSpacing))
+
+        let pos = CGPoint(
+            x: barPosition.x + dragOffset.width,
+            y: barPosition.y + dragOffset.height
+        )
+
+        layout {
+            if model.isConnected {
+                toolbarButton(
+                    icon: model.isMicActive ? "mic.fill" : "mic",
+                    active: model.isMicActive,
+                    color: model.isMicActive ? .green : .white
+                ) { model.toggleMic() }
+
+                toolbarButton(
+                    icon: model.isCameraActive
+                        ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
+                        : "video",
+                    active: model.isCameraActive,
+                    color: model.isCameraActive ? .green : .white
+                ) { model.toggleCamera() }
+                    .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
+
+                toolbarButton(icon: "keyboard", color: .white) { model.toggleOSK() }
+            }
+
+            dragHandle(in: geo)
+        }
+        .padding(4)
+        .background(.ultraThinMaterial, in: Capsule())
+        .opacity(isDragging ? 0.8 : 1)
+        .position(pos)
+    }
+
+    @ViewBuilder
+    private func toolbarButton(icon: String, active: Bool = false, color: Color, action: @escaping () -> Void) -> some View {
+        Image(systemName: icon)
+            .font(.footnote)
+            .foregroundStyle(color)
+            .frame(width: Self.btnSize, height: Self.btnSize)
+            .contentShape(Circle())
+            .onTapGesture(perform: action)
+    }
+
+    @ViewBuilder
+    private func dragHandle(in geo: GeometryProxy) -> some View {
+        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
+            .font(.footnote)
+            .foregroundStyle(.white)
+            .frame(width: Self.btnSize, height: Self.btnSize)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 5)
+                    .onChanged { value in
+                        isDragging = true
+                        dragOffset = value.translation
+                    }
+                    .onEnded { value in
+                        isDragging = false
+                        var newPos = CGPoint(
+                            x: barPosition.x + value.translation.width,
+                            y: barPosition.y + value.translation.height
+                        )
+                        dragOffset = .zero
+
+                        let margin: CGFloat = 20
+                        newPos.x = max(margin, min(newPos.x, geo.size.width - margin))
+                        newPos.y = max(margin, min(newPos.y, geo.size.height - margin))
+
+                        let newOrientation: ToolbarOrientation
+                        if newPos.x < Self.edgeThreshold {
+                            newOrientation = .vertical
+                            newPos.x = margin
+                        } else if newPos.y > geo.size.height - Self.edgeThreshold {
+                            newOrientation = .horizontal
+                            newPos.y = geo.size.height - margin
+                        } else {
+                            newOrientation = barOrientation
+                        }
+
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            barPosition = newPos
+                            barOrientation = newOrientation
+                        }
+
+                        Self.saveBarPosition(newPos)
+                        Self.saveBarOrientation(newOrientation)
+                    }
+            )
+            .simultaneousGesture(
+                TapGesture().onEnded {
+                    if !isDragging {
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+                    }
+                }
+            )
+    }
+
+    // MARK: - Persistence
+
+    private static let posXKey = "screx_bar_x"
+    private static let posYKey = "screx_bar_y"
+    private static let orientKey = "screx_bar_orient"
+
+    private static func loadBarPosition() -> CGPoint {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: posXKey) != nil else { return .zero }
+        return CGPoint(x: defaults.double(forKey: posXKey), y: defaults.double(forKey: posYKey))
+    }
+
+    private static func saveBarPosition(_ pos: CGPoint) {
+        let defaults = UserDefaults.standard
+        defaults.set(pos.x, forKey: posXKey)
+        defaults.set(pos.y, forKey: posYKey)
+    }
+
+    private static func loadBarOrientation() -> ToolbarOrientation {
+        let raw = UserDefaults.standard.string(forKey: orientKey) ?? "horizontal"
+        return ToolbarOrientation(rawValue: raw) ?? .horizontal
+    }
+
+    private static func saveBarOrientation(_ orient: ToolbarOrientation) {
+        UserDefaults.standard.set(orient.rawValue, forKey: orientKey)
     }
 }

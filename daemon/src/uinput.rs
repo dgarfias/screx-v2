@@ -636,36 +636,33 @@ pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
     }
 }
 
-/// Toggles GNOME's on-screen keyboard via gsettings.
+/// Toggles the Screx OSK GNOME Shell extension via dconf.
 fn toggle_gnome_osk() {
     println!("[osk] toggle requested");
 
+    let dconf_key = "/org/gnome/shell/extensions/screxosk/indicator/keyboard-visible";
+
+    let current = run_dconf(&["read", dconf_key]);
+    let is_visible = current.trim() == "true";
+    let new_val = if is_visible { "false" } else { "true" };
+
+    println!("[osk] current={:?} -> setting to {new_val}", current.trim());
+
+    let result = run_dconf(&["write", dconf_key, new_val]);
+    if result.is_empty() {
+        println!("[osk] Screx OSK: {new_val}");
+    } else {
+        eprintln!("[osk] dconf failed: {result}");
+    }
+}
+
+fn run_dconf(args: &[&str]) -> String {
     let (sudo_user, sudo_uid) = (
         std::env::var("SUDO_USER").ok(),
         std::env::var("SUDO_UID").ok(),
     );
 
-    println!("[osk] SUDO_USER={:?} SUDO_UID={:?}", sudo_user, sudo_uid);
-
-    let schema = "org.gnome.desktop.a11y.applications";
-    let key = "screen-keyboard-enabled";
-
-    let current = run_gsettings(&sudo_user, &sudo_uid, &["get", schema, key]);
-    let is_enabled = current.trim().contains("true");
-    let new_val = if is_enabled { "false" } else { "true" };
-
-    println!("[osk] current={:?} -> setting to {new_val}", current.trim());
-
-    let result = run_gsettings(&sudo_user, &sudo_uid, &["set", schema, key, new_val]);
-    if result.is_empty() {
-        println!("[osk] GNOME on-screen keyboard: {new_val}");
-    } else {
-        eprintln!("[osk] gsettings failed: {result}");
-    }
-}
-
-fn run_gsettings(user: &Option<String>, uid: &Option<String>, args: &[&str]) -> String {
-    let output = if let (Some(ref u), Some(ref id)) = (user, uid) {
+    let output = if let (Some(ref u), Some(ref id)) = (sudo_user, sudo_uid) {
         let rt = format!("/run/user/{id}");
         let dbus = format!("unix:path={rt}/bus");
         Command::new("runuser")
@@ -673,22 +670,22 @@ fn run_gsettings(user: &Option<String>, uid: &Option<String>, args: &[&str]) -> 
             .arg("env")
             .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
             .arg(format!("XDG_RUNTIME_DIR={rt}"))
-            .arg("gsettings")
+            .arg("dconf")
             .args(args)
             .output()
     } else {
-        Command::new("gsettings").args(args).output()
+        Command::new("dconf").args(args).output()
     };
     match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let stdout = String::from_utf8_lossy(&o.stdout);
-            eprintln!("[osk] gsettings {:?} failed: stderr={stderr} stdout={stdout}", args);
+            eprintln!("[osk] dconf {:?} failed: stderr={stderr} stdout={stdout}", args);
             format!("ERROR: {stderr}")
         }
         Err(e) => {
-            eprintln!("[osk] could not run gsettings: {e}");
+            eprintln!("[osk] could not run dconf: {e}");
             format!("ERROR: {e}")
         }
     }
