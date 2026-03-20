@@ -267,32 +267,6 @@ struct ContentView: View {
             .frame(width: 0, height: 0)
 
             VStack {
-                HStack {
-                    Spacer()
-                    if model.isConnected {
-                        Button {
-                            keyboardActive.toggle()
-                        } label: {
-                            Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
-                                .font(.title2)
-                                .foregroundStyle(.white)
-                                .padding(10)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                    }
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
-                    } label: {
-                        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
-                            .font(.title2)
-                            .foregroundStyle(.white)
-                            .padding(10)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                    .padding(.trailing, 16)
-                    .padding(.top, 8)
-                }
-
                 if showOverlay {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -329,10 +303,37 @@ struct ContentView: View {
                     .frame(maxWidth: 380, alignment: .leading)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                     .padding(.horizontal, 16)
+                    .padding(.top, 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
                 Spacer()
+
+                HStack {
+                    Spacer()
+                    if model.isConnected {
+                        Button {
+                            keyboardActive.toggle()
+                        } label: {
+                            Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
+                                .font(.footnote)
+                                .foregroundStyle(.white)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+                    } label: {
+                        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                }
+                .padding(.trailing, 12)
+                .padding(.bottom, 8)
             }
         }
         .statusBarHidden(true)
