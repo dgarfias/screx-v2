@@ -9,15 +9,6 @@ final class MicCapture {
     func start() {
         guard !running else { return }
 
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
-            try session.setActive(true)
-        } catch {
-            print("[mic] audio session setup failed: \(error)")
-            return
-        }
-
         let inputNode = engine.inputNode
         let hwFormat = inputNode.outputFormat(forBus: 0)
 

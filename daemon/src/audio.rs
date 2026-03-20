@@ -43,16 +43,23 @@ pub fn create_virtual_sink() -> Result<u32> {
         .context("pactl not found")?;
 
     let output = String::from_utf8_lossy(&existing.stdout);
+    let needle = format!("sink_name={SINK_NAME}");
     for line in output.lines() {
-        if line.contains(SINK_NAME) {
-            let module_id: u32 = line
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            println!("[audio] virtual sink '{SINK_NAME}' already exists (module {module_id})");
-            return Ok(module_id);
+        if let Some(pos) = line.find(&needle) {
+            let after = pos + needle.len();
+            let next_char = line[after..].chars().next();
+            // Only match if the sink name is followed by a space, tab, or end-of-line
+            // (avoids "screx_ipad" matching "screx_ipad_mic")
+            if next_char.is_none() || next_char == Some(' ') || next_char == Some('\t') {
+                let module_id: u32 = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+                println!("[audio] virtual sink '{SINK_NAME}' already exists (module {module_id})");
+                return Ok(module_id);
+            }
         }
     }
 
@@ -101,8 +108,8 @@ const MIC_SINK_NAME: &str = "screx_ipad_mic";
 const MIC_RATE: u32 = 48000;
 const MIC_CHANNELS: u16 = 1;
 
-/// Writes incoming iPad mic PCM into a `pacat --playback` process that feeds
-/// a null-sink. Apps pick up the audio from `screx_ipad_mic.monitor`.
+/// Writes incoming iPad mic PCM into `pw-cat --playback` targeting the
+/// virtual source node. Apps see it as "Screx_iPad_Mic" input device.
 pub struct MicWriter {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -118,7 +125,7 @@ impl Drop for MicWriter {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        println!("[mic] pacat playback stopped");
+        println!("[mic] pw-cat playback stopped");
     }
 }
 
@@ -146,16 +153,17 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
         }
     }
 
-    // Create a null-sink with media.class=Audio/Source/Virtual so PipeWire
-    // presents it as an input device (microphone) rather than an output.
+    // media.class=Audio/Source/Virtual as a top-level module arg tells PipeWire
+    // to present this node as a microphone (input), not a speaker (output).
     let result = pactl_cmd()
         .args([
             "load-module",
             "module-null-sink",
             &format!("sink_name={MIC_SINK_NAME}"),
-            &format!("sink_properties=device.description=\"Screx\\ iPad\\ Mic\"\\ media.class=Audio/Source/Virtual"),
+            "media.class=Audio/Source/Virtual",
+            "sink_properties=device.description=Screx_iPad_Mic",
             &format!("rate={MIC_RATE}"),
-            &format!("channels={MIC_CHANNELS}"),
+            "channel_map=mono",
             "format=s16le",
         ])
         .output()
@@ -171,30 +179,31 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
         .parse()
         .unwrap_or(0);
 
-    // Spawn pacat to play PCM into the null-sink
-    let mut pacat = Command::new("pacat");
+    // Use pw-cat to feed PCM into the virtual source node.
+    // pacat can't target virtual sources because PipeWire hides them from the PA sink list.
+    let mut pwcat = Command::new("pw-cat");
     for (k, v) in pulse_env() {
-        pacat.env(&k, &v);
+        pwcat.env(&k, &v);
     }
-    let mut child = pacat
+    let mut child = pwcat
         .args([
             "--playback",
-            &format!("--device={MIC_SINK_NAME}"),
-            "--format=s16le",
+            &format!("--target={MIC_SINK_NAME}"),
+            "--format=s16",
             &format!("--rate={MIC_RATE}"),
             &format!("--channels={MIC_CHANNELS}"),
-            "--latency-msec=10",
+            "-",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to start pacat — is pulseaudio-utils installed?")?;
+        .context("failed to start pw-cat — is pipewire installed?")?;
 
-    let stdin = child.stdin.take().context("no stdin from pacat")?;
+    let stdin = child.stdin.take().context("no stdin from pw-cat")?;
 
     println!(
-        "[mic] virtual mic source ready (module {module_id}, pacat pid {}), apps use {MIC_SINK_NAME}.monitor",
+        "[mic] virtual mic source ready (module {module_id}, pw-cat pid {})",
         child.id()
     );
 

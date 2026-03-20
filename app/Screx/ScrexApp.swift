@@ -10,7 +10,7 @@ struct ScrexApp: App {
     init() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
             try session.setActive(true)
         } catch {
             print("[app] audio session setup failed: \(error)")
