@@ -253,12 +253,14 @@ fn read_control_loop(
                     crate::uinput::handle_touch_packet(ts, touch_data);
                 }
             } else if ctrl.starts_with(b"OSK") {
-                let mut saved = shared.osk_was_enabled.lock().unwrap();
-                if saved.is_none() {
-                    *saved = crate::uinput::get_osk_enabled();
+                {
+                    let mut saved = shared.osk_was_enabled.lock().unwrap();
+                    if saved.is_none() {
+                        *saved = crate::uinput::get_osk_enabled();
+                    }
                 }
-                drop(saved);
-                crate::uinput::toggle_osk();
+                let mut visible = shared.osk_visible.lock().unwrap();
+                crate::uinput::toggle_osk(&mut visible);
             }
         }
     }

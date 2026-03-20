@@ -27,8 +27,10 @@ pub struct SharedState {
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
-    /// Original OSK state before we touched it, so we can restore on shutdown.
+    /// Original OSK a11y setting before we touched it, so we can restore on shutdown.
     pub osk_was_enabled: Mutex<Option<bool>>,
+    /// Tracks whether the OSK is currently visible (toggled via Shell.Eval).
+    pub osk_visible: Mutex<bool>,
 }
 
 impl SharedState {
@@ -40,6 +42,7 @@ impl SharedState {
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
             osk_was_enabled: Mutex::new(None),
+            osk_visible: Mutex::new(false),
         }
     }
 }
@@ -144,7 +147,8 @@ fn handle_osk_toggle(shared: &SharedState) {
             *saved = crate::uinput::get_osk_enabled();
         }
     }
-    crate::uinput::toggle_osk();
+    let mut visible = shared.osk_visible.lock().unwrap();
+    crate::uinput::toggle_osk(&mut visible);
 }
 
 // ---------------------------------------------------------------------------

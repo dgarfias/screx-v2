@@ -334,13 +334,13 @@ unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// On-screen keyboard (OSK) toggle via gsettings
+// On-screen keyboard (OSK) via gsettings + GNOME Shell D-Bus
 // ---------------------------------------------------------------------------
 
 const OSK_SCHEMA: &str = "org.gnome.desktop.a11y.applications";
 const OSK_KEY: &str = "screen-keyboard-enabled";
 
-fn gsettings_cmd(args: &[&str]) -> Option<String> {
+fn user_session_cmd(program: &str, args: &[&str]) -> Option<String> {
     let (sudo_user, sudo_uid) = (
         std::env::var("SUDO_USER").ok(),
         std::env::var("SUDO_UID").ok(),
@@ -354,13 +354,13 @@ fn gsettings_cmd(args: &[&str]) -> Option<String> {
             .arg("env")
             .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_addr}"))
             .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-            .arg("gsettings");
+            .arg(program);
         for a in args {
             cmd.arg(a);
         }
         cmd.output()
     } else {
-        let mut cmd = Command::new("gsettings");
+        let mut cmd = Command::new(program);
         for a in args {
             cmd.arg(a);
         }
@@ -373,14 +373,18 @@ fn gsettings_cmd(args: &[&str]) -> Option<String> {
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("[osk] gsettings failed: {stderr}");
+            eprintln!("[osk] {program} failed: {stderr}");
             None
         }
         Err(e) => {
-            eprintln!("[osk] could not run gsettings: {e}");
+            eprintln!("[osk] could not run {program}: {e}");
             None
         }
     }
+}
+
+fn gsettings_cmd(args: &[&str]) -> Option<String> {
+    user_session_cmd("gsettings", args)
 }
 
 /// Read the current on-screen keyboard enabled state.
@@ -397,12 +401,52 @@ pub fn set_osk_enabled(enabled: bool) {
     }
 }
 
-/// Toggle the on-screen keyboard and return the new state.
-pub fn toggle_osk() -> bool {
-    let current = get_osk_enabled().unwrap_or(false);
-    let new_val = !current;
-    set_osk_enabled(new_val);
-    new_val
+/// Toggle the on-screen keyboard visibility via GNOME Shell.
+/// 1. Ensures the a11y keyboard is enabled (so GNOME Shell loads the keyboard actor)
+/// 2. Calls Shell.Eval to open or close the keyboard directly
+pub fn toggle_osk(osk_visible: &mut bool) {
+    // Make sure the OSK infrastructure is enabled
+    if get_osk_enabled() != Some(true) {
+        set_osk_enabled(true);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    *osk_visible = !*osk_visible;
+
+    let js = if *osk_visible {
+        concat!(
+            "let _ki = -1; ",
+            "for (let i = 0; i < global.display.get_n_monitors(); i++) { ",
+            "  let c = global.display.get_monitor_connector(i) || ''; ",
+            "  if (c.includes('EVDI')) { _ki = i; break; } ",
+            "} ",
+            "if (_ki >= 0) imports.ui.main.layoutManager.keyboardIndex = _ki; ",
+            "imports.ui.main.keyboard.open(imports.gi.Clutter.get_current_event_time());",
+        )
+    } else {
+        "imports.ui.main.keyboard.close();"
+    };
+
+    let result = user_session_cmd("gdbus", &[
+        "call", "--session",
+        "--dest", "org.gnome.Shell",
+        "--object-path", "/org/gnome/Shell",
+        "--method", "org.gnome.Shell.Eval",
+        js,
+    ]);
+
+    match result {
+        Some(ref out) if out.contains("true") => {
+            println!("[osk] keyboard {}", if *osk_visible { "opened" } else { "closed" });
+        }
+        Some(ref out) => {
+            eprintln!("[osk] Shell.Eval returned: {out}");
+            eprintln!("[osk] keyboard will auto-show when you tap text fields instead");
+        }
+        None => {
+            eprintln!("[osk] Shell.Eval not available — keyboard will auto-show on text field tap");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
