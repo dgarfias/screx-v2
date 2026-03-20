@@ -260,7 +260,7 @@ struct ContentView: View {
             }
 
             KeyboardInputView(
-                isActive: keyboardActive,
+                isActive: $keyboardActive,
                 onText: { text in model.sendTextInsert(text) },
                 onDelete: { model.sendSpecialKey(0x01) }
             )

@@ -5,7 +5,7 @@ import UIKit
 // MARK: - Keyboard input proxy (captures iOS native keyboard and forwards to daemon)
 
 struct KeyboardInputView: UIViewRepresentable {
-    let isActive: Bool
+    @Binding var isActive: Bool
     let onText: (String) -> Void
     let onDelete: () -> Void
 
@@ -13,6 +13,7 @@ struct KeyboardInputView: UIViewRepresentable {
         let view = KeyInputProxyView()
         view.onText = onText
         view.onDelete = onDelete
+        view.onResign = { context.coordinator.deactivate() }
         view.isUserInteractionEnabled = false
         return view
     }
@@ -20,6 +21,7 @@ struct KeyboardInputView: UIViewRepresentable {
     func updateUIView(_ uiView: KeyInputProxyView, context: Context) {
         uiView.onText = onText
         uiView.onDelete = onDelete
+        uiView.onResign = { context.coordinator.deactivate() }
         uiView.allowFirstResponder = isActive
         uiView.isUserInteractionEnabled = isActive
         if isActive && !uiView.isFirstResponder {
@@ -28,11 +30,22 @@ struct KeyboardInputView: UIViewRepresentable {
             DispatchQueue.main.async { uiView.resignFirstResponder() }
         }
     }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator {
+        var parent: KeyboardInputView
+        init(_ parent: KeyboardInputView) { self.parent = parent }
+        func deactivate() {
+            DispatchQueue.main.async { self.parent.isActive = false }
+        }
+    }
 }
 
 final class KeyInputProxyView: UIView, UIKeyInput {
     var onText: ((String) -> Void)?
     var onDelete: (() -> Void)?
+    var onResign: (() -> Void)?
     var allowFirstResponder = false
 
     override var canBecomeFirstResponder: Bool { allowFirstResponder }
@@ -46,6 +59,16 @@ final class KeyInputProxyView: UIView, UIKeyInput {
 
     func deleteBackward() {
         onDelete?()
+    }
+
+    @discardableResult
+    override func resignFirstResponder() -> Bool {
+        let result = super.resignFirstResponder()
+        if result {
+            allowFirstResponder = false
+            onResign?()
+        }
+        return result
     }
 }
 
