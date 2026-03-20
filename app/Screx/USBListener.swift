@@ -135,24 +135,34 @@ final class USBListener {
 
     private func processBuffer() {
         while recvBuffer.count >= 4 {
-            let msgLen = recvBuffer.withUnsafeBytes { buf -> UInt32 in
-                buf.loadUnaligned(fromByteOffset: 0, as: UInt32.self).bigEndian
+            // Read 4-byte length header manually to avoid alignment issues
+            let b = recvBuffer.prefix(4)
+            let msgLen = Int(b[b.startIndex]) << 24
+                       | Int(b[b.startIndex + 1]) << 16
+                       | Int(b[b.startIndex + 2]) << 8
+                       | Int(b[b.startIndex + 3])
+
+            guard msgLen > 0, msgLen < 10_000_000 else {
+                recvBuffer.removeAll()
+                print("[usb] invalid frame length \(msgLen), resetting buffer")
+                break
             }
 
-            let totalNeeded = 4 + Int(msgLen)
+            let totalNeeded = 4 + msgLen
             guard recvBuffer.count >= totalNeeded else { break }
 
-            let msgData = recvBuffer.subdata(in: 4..<totalNeeded)
-            recvBuffer.removeFirst(totalNeeded)
+            // Copy out the message bytes into a fresh contiguous Data
+            let msgData = Data(recvBuffer.prefix(totalNeeded).dropFirst(4))
+            recvBuffer = Data(recvBuffer.dropFirst(totalNeeded))
 
-            guard !msgData.isEmpty else { continue }
+            guard msgData.count >= 1 else { continue }
 
-            let msgType = msgData[msgData.startIndex]
+            let msgType = msgData[0]
 
             switch msgType {
             case Self.msgVideo:
                 guard msgData.count >= 3 else { continue }
-                let annexB = msgData.subdata(in: (msgData.startIndex + 2)..<msgData.endIndex)
+                let annexB = Data(msgData.dropFirst(2))
                 decoder.decodeAccessUnit(annexB)
 
                 if !hasReportedFirstFrame {
@@ -163,7 +173,7 @@ final class USBListener {
 
             case Self.msgAudio:
                 guard msgData.count >= 2 else { continue }
-                let pcm = msgData.subdata(in: (msgData.startIndex + 1)..<msgData.endIndex)
+                let pcm = Data(msgData.dropFirst(1))
                 audioPlayer.enqueueAudio(pcm)
 
             case Self.msgControl:
