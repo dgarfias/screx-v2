@@ -13,12 +13,15 @@ struct KeyboardInputView: UIViewRepresentable {
         let view = KeyInputProxyView()
         view.onText = onText
         view.onDelete = onDelete
+        view.isUserInteractionEnabled = false
         return view
     }
 
     func updateUIView(_ uiView: KeyInputProxyView, context: Context) {
         uiView.onText = onText
         uiView.onDelete = onDelete
+        uiView.allowFirstResponder = isActive
+        uiView.isUserInteractionEnabled = isActive
         if isActive && !uiView.isFirstResponder {
             DispatchQueue.main.async { uiView.becomeFirstResponder() }
         } else if !isActive && uiView.isFirstResponder {
@@ -30,8 +33,9 @@ struct KeyboardInputView: UIViewRepresentable {
 final class KeyInputProxyView: UIView, UIKeyInput {
     var onText: ((String) -> Void)?
     var onDelete: (() -> Void)?
+    var allowFirstResponder = false
 
-    override var canBecomeFirstResponder: Bool { true }
+    override var canBecomeFirstResponder: Bool { allowFirstResponder }
     var hasText: Bool { true }
 
     var autocorrectionType: UITextAutocorrectionType { .no }
