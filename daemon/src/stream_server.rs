@@ -31,13 +31,16 @@ impl SharedState {
     }
 }
 
+pub const FLAG_IDR: u8 = 0x01;
+pub const FLAG_AUDIO: u8 = 0x02;
+
 /// 14-byte packet header
 fn build_header(
     frame_id: u32,
     chunk_idx: u16,
     total_data: u16,
     total_parity: u16,
-    is_idr: bool,
+    flags: u8,
     payload_len: u16,
 ) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
@@ -45,7 +48,7 @@ fn build_header(
     h[4..6].copy_from_slice(&chunk_idx.to_be_bytes());
     h[6..8].copy_from_slice(&total_data.to_be_bytes());
     h[8..10].copy_from_slice(&total_parity.to_be_bytes());
-    h[10] = if is_idr { 1 } else { 0 };
+    h[10] = flags;
     h[11] = 0;
     h[12..14].copy_from_slice(&payload_len.to_be_bytes());
     h
@@ -140,9 +143,11 @@ impl UdpSender {
 
         let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
-        // FEC: ~20% overhead, min 1 parity for multi-chunk frames
+        // FEC: 20% for small frames, 30% for large bursts (>50 chunks)
         let parity_count = if data_count <= 1 {
             0
+        } else if data_count > 50 {
+            (data_count * 3 / 10).max(1).min(MAX_FEC_SHARDS)
         } else {
             (data_count / 5).max(1).min(MAX_FEC_SHARDS)
         };
@@ -185,12 +190,13 @@ impl UdpSender {
                 CHUNK_PAYLOAD as u16
             };
 
+            let flags = if is_idr { FLAG_IDR } else { 0 };
             let header = build_header(
                 self.frame_id,
                 idx as u16,
                 data_count as u16,
                 actual_parity as u16,
-                is_idr,
+                flags,
                 actual_payload_len,
             );
 
@@ -225,6 +231,57 @@ impl UdpSender {
             self.stats_start = Instant::now();
         }
 
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio sender — separate frame_id space, no FEC (audio chunks are small)
+// ---------------------------------------------------------------------------
+
+pub struct AudioSender {
+    socket: UdpSocket,
+    frame_id: u32,
+}
+
+impl AudioSender {
+    pub fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            frame_id: 0,
+        }
+    }
+
+    pub fn send_audio(&mut self, pcm: &[u8], client_addr: SocketAddr) -> Result<()> {
+        let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+
+        for i in 0..data_count {
+            let start = i * CHUNK_PAYLOAD;
+            let end = (start + CHUNK_PAYLOAD).min(pcm.len());
+            let chunk = &pcm[start..end];
+            let payload_len = (end - start) as u16;
+
+            let header = build_header(
+                self.frame_id,
+                i as u16,
+                data_count as u16,
+                0,
+                FLAG_AUDIO,
+                payload_len,
+            );
+
+            let pkt_len = HEADER_LEN + chunk.len();
+            let mut buf = vec![0u8; pkt_len];
+            buf[..HEADER_LEN].copy_from_slice(&header);
+            buf[HEADER_LEN..].copy_from_slice(chunk);
+
+            if let Err(e) = self.socket.send_to(&buf, client_addr) {
+                eprintln!("[audio] send error: {e}");
+                break;
+            }
+        }
+
+        self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
 }

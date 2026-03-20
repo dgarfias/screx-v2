@@ -48,10 +48,11 @@ pub struct Encoder {
     stats_start: Instant,
     stats_encoded: u64,
     stats_bytes: u64,
+    stats_idr_count: u64,
 }
 
 impl Encoder {
-    const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_millis(500);
+    const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_secs(3);
 
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let mut use_vaapi = false;
@@ -88,10 +89,11 @@ impl Encoder {
             use_vaapi,
             frame_count: 0,
             last_idr_at: Instant::now(),
-            max_idr_interval: Duration::from_secs(2),
+            max_idr_interval: Duration::from_secs(5),
             stats_start: Instant::now(),
             stats_encoded: 0,
             stats_bytes: 0,
+            stats_idr_count: 0,
         })
     }
 
@@ -138,17 +140,21 @@ impl Encoder {
         for au in &aus {
             self.stats_encoded += 1;
             self.stats_bytes += au.annex_b.len() as u64;
+            if au.is_idr {
+                self.stats_idr_count += 1;
+            }
         }
         if self.stats_start.elapsed() >= Duration::from_secs(1) {
             let elapsed = self.stats_start.elapsed().as_secs_f64();
             let fps = self.stats_encoded as f64 / elapsed;
             let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
             println!(
-                "[encode] fps={fps:.1} stream_mbps={mbps:.2} bitrate={}",
-                self.config.bitrate_bps
+                "[encode] fps={fps:.1} stream_mbps={mbps:.2} idr={}/{} bitrate={}",
+                self.stats_idr_count, self.stats_encoded, self.config.bitrate_bps
             );
             self.stats_encoded = 0;
             self.stats_bytes = 0;
+            self.stats_idr_count = 0;
             self.stats_start = Instant::now();
         }
 

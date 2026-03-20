@@ -1,3 +1,4 @@
+mod audio;
 mod capture;
 mod discovery;
 mod doctor;
@@ -37,7 +38,7 @@ impl AppConfig {
         let gop = read_env("SCREX_GOP", "30")
             .parse::<u32>()
             .context("invalid SCREX_GOP")?;
-        let bitrate_bps = read_env("SCREX_BITRATE_BPS", "15000000")
+        let bitrate_bps = read_env("SCREX_BITRATE_BPS", "8000000")
             .parse::<u32>()
             .context("invalid SCREX_BITRATE_BPS")?;
         let stream_port = read_env("SCREX_STREAM_PORT", "9000")
@@ -159,6 +160,38 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn capture thread")?;
 
+    // Audio capture thread
+    let audio_socket = socket.try_clone().context("clone socket for audio")?;
+    let audio_shared = Arc::clone(&shared);
+    let audio_stop = Arc::clone(&stop);
+    let audio_module_id = match audio::create_virtual_sink() {
+        Ok(id) => {
+            println!("[main] audio: virtual sink ready (module {id})");
+            id
+        }
+        Err(e) => {
+            eprintln!("[main] audio: failed to create virtual sink ({e:#}), audio disabled");
+            0
+        }
+    };
+
+    let audio_thread = if audio_module_id > 0 {
+        Some(
+            thread::Builder::new()
+                .name("audio".into())
+                .spawn(move || {
+                    if let Err(e) =
+                        audio::run_audio_capture(audio_socket, audio_shared, audio_stop)
+                    {
+                        eprintln!("[audio] capture error: {e:#}");
+                    }
+                })
+                .context("failed to spawn audio thread")?,
+        )
+    } else {
+        None
+    };
+
     // Wait for Ctrl-C
     tokio::signal::ctrl_c().await?;
     println!("\nshutdown requested (ctrl-c)");
@@ -167,9 +200,16 @@ async fn main() -> Result<()> {
     if let Err(e) = capture_thread.join() {
         eprintln!("[main] capture thread panicked: {e:?}");
     }
+    if let Some(t) = audio_thread {
+        if let Err(e) = t.join() {
+            eprintln!("[main] audio thread panicked: {e:?}");
+        }
+    }
     if let Err(e) = client_thread.join() {
         eprintln!("[main] client manager thread panicked: {e:?}");
     }
+
+    audio::remove_virtual_sink(audio_module_id);
 
     if let Some(handle) = mdns_handle {
         handle.shutdown();

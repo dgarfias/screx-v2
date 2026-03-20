@@ -7,6 +7,7 @@ final class StreamClient {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
     let decoder = H264Decoder()
+    let audioPlayer = AudioPlayer()
 
     var onStatus: ((String) -> Void)?
 
@@ -16,7 +17,10 @@ final class StreamClient {
     private static let keepaliveInterval: TimeInterval = 2.0
     private static let frameTimeout: TimeInterval = 0.050
 
+    private static let flagAudio: UInt8 = 0x02
+
     private var reassembly: [UInt32: FrameAssembly] = [:]
+    private var audioReassembly: [UInt32: AudioAssembly] = [:]
     private var lastCompletedFrameId: UInt32 = 0
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
@@ -43,6 +47,7 @@ final class StreamClient {
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
                 self.receiveLoop(conn)
+                self.audioPlayer.start()
             case .failed(let error):
                 self.onStatus?("Connection failed: \(error.localizedDescription)")
             case .waiting(let error):
@@ -60,6 +65,7 @@ final class StreamClient {
         keepaliveTimer = nil
         connection?.cancel()
         connection = nil
+        audioPlayer.stop()
     }
 
     private func sendRegister(_ conn: NWConnection) {
@@ -114,11 +120,19 @@ final class StreamClient {
         let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
             buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
         }
+        let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
         let payload = data.subdata(in: Self.headerLen..<data.count)
 
-        // Skip frames older than the last completed one (unless we haven't started)
+        if isAudio {
+            handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
+                              totalData: Int(totalData), payload: payload,
+                              actualLen: Int(payloadLen))
+            return
+        }
+
+        // Video path
         if hasReceivedFirstFrame && frameId < lastCompletedFrameId && (lastCompletedFrameId - frameId) < 0x80000000 {
             return
         }
@@ -138,6 +152,33 @@ final class StreamClient {
         }
 
         pruneOldFrames()
+    }
+
+    private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
+                                   payload: Data, actualLen: Int) {
+        if totalData == 1 {
+            audioPlayer.enqueueAudio(payload.prefix(actualLen))
+            return
+        }
+
+        let assembly = audioReassembly[frameId] ?? AudioAssembly(totalData: totalData)
+        audioReassembly[frameId] = assembly
+        assembly.addChunk(index: chunkIdx, payload: payload, actualLen: actualLen)
+
+        if assembly.isComplete {
+            if let pcm = assembly.reassemble() {
+                audioPlayer.enqueueAudio(pcm)
+            }
+            audioReassembly.removeValue(forKey: frameId)
+        }
+
+        // Prune stale audio assemblies (keep last 10)
+        if audioReassembly.count > 10 {
+            let sorted = audioReassembly.keys.sorted()
+            for key in sorted.prefix(audioReassembly.count - 10) {
+                audioReassembly.removeValue(forKey: key)
+            }
+        }
     }
 
     private func deliverFrame(frameId: UInt32, assembly: FrameAssembly) {
@@ -292,6 +333,36 @@ private final class FrameAssembly {
             guard let shard = shards[i] else { return nil }
             let actualLen = actualLengths[i] ?? shard.count
             result.append(shard.prefix(actualLen))
+        }
+        return result
+    }
+}
+
+private final class AudioAssembly {
+    let totalData: Int
+    private var chunks: [Int: Data] = [:]
+    private var actualLengths: [Int: Int] = [:]
+    private var receivedCount = 0
+
+    init(totalData: Int) {
+        self.totalData = totalData
+    }
+
+    func addChunk(index: Int, payload: Data, actualLen: Int) {
+        guard chunks[index] == nil else { return }
+        chunks[index] = payload
+        actualLengths[index] = actualLen
+        receivedCount += 1
+    }
+
+    var isComplete: Bool { receivedCount >= totalData }
+
+    func reassemble() -> Data? {
+        var result = Data()
+        for i in 0..<totalData {
+            guard let chunk = chunks[i] else { return nil }
+            let len = actualLengths[i] ?? chunk.count
+            result.append(chunk.prefix(len))
         }
         return result
     }

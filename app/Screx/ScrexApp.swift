@@ -6,6 +6,16 @@ import AVFoundation
 struct ScrexApp: App {
     @StateObject private var model = StreamViewModel()
 
+    init() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+        } catch {
+            print("[app] audio session setup failed: \(error)")
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
