@@ -221,15 +221,15 @@ async fn main() -> Result<()> {
         .context("failed to spawn USB transport thread")?;
 
     // Virtual mic source (iPad mic -> Linux PulseAudio source)
-    let mic_module_id = match audio::create_virtual_mic_source() {
-        Ok((id, writer)) => {
+    let (mic_feed_module, mic_remap_module) = match audio::create_virtual_mic_source() {
+        Ok((feed_id, remap_id, writer)) => {
             *shared.mic_writer.lock().unwrap() = Some(writer);
-            println!("[main] mic: virtual source ready (module {id})");
-            id
+            println!("[main] mic: virtual source ready");
+            (feed_id, remap_id)
         }
         Err(e) => {
             eprintln!("[main] mic: failed to create virtual source ({e:#}), mic disabled");
-            0
+            (0, 0)
         }
     };
 
@@ -314,7 +314,7 @@ async fn main() -> Result<()> {
     // Cleanup mic/camera/audio
     *shared.mic_writer.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
-    audio::remove_virtual_mic_source(mic_module_id);
+    audio::remove_virtual_mic_source(mic_feed_module, mic_remap_module);
     audio::remove_virtual_sink(audio_module_id);
 
     println!("screx-daemon shutdown complete");

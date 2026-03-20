@@ -90,6 +90,7 @@ pub fn run_client_manager(
     let mut last_keepalive = Instant::now();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
+    let mut mic_pkt_count: u64 = 0;
 
     println!("[client] listening for iPad registration...");
 
@@ -131,6 +132,10 @@ pub fn run_client_manager(
 
                 if len > MIC_MAGIC.len() && &recv_buf[..MIC_MAGIC.len()] == MIC_MAGIC {
                     let pcm = &recv_buf[MIC_MAGIC.len()..len];
+                    mic_pkt_count += 1;
+                    if mic_pkt_count == 1 {
+                        println!("[mic] first packet received ({} bytes PCM)", pcm.len());
+                    }
                     let mut mic = shared.mic_writer.lock().unwrap();
                     if let Some(ref mut mw) = *mic {
                         mw.write_pcm(pcm);

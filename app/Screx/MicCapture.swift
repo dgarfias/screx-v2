@@ -10,40 +10,23 @@ final class MicCapture {
         guard !running else { return }
 
         let inputNode = engine.inputNode
-        let hwFormat = inputNode.outputFormat(forBus: 0)
 
-        guard let targetFormat = AVAudioFormat(
+        // Request s16le mono 48kHz directly — AVAudioEngine handles conversion
+        guard let tapFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: 48000,
             channels: 1,
             interleaved: true
         ) else {
-            print("[mic] failed to create target format")
+            print("[mic] failed to create tap format")
             return
         }
 
-        guard let converter = AVAudioConverter(from: hwFormat, to: targetFormat) else {
-            print("[mic] failed to create audio converter")
-            return
-        }
-
-        let bufferSize: AVAudioFrameCount = 480 // 10ms at 48kHz
-
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 960, format: tapFormat) { [weak self] buffer, _ in
             guard let self, let onPCM = self.onPCM else { return }
 
-            guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: bufferSize) else { return }
-
-            var error: NSError?
-            let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-                outStatus.pointee = .haveData
-                return buffer
-            }
-
-            guard status == .haveData, error == nil else { return }
-
-            let frameCount = Int(outputBuffer.frameLength)
-            guard frameCount > 0, let int16Ptr = outputBuffer.int16ChannelData else { return }
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0, let int16Ptr = buffer.int16ChannelData else { return }
 
             let byteCount = frameCount * 2
             let data = Data(bytes: int16Ptr[0], count: byteCount)
