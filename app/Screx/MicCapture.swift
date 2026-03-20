@@ -10,27 +10,31 @@ final class MicCapture {
         guard !running else { return }
 
         let inputNode = engine.inputNode
+        let hwFormat = inputNode.outputFormat(forBus: 0)
+        let hwChannels = Int(hwFormat.channelCount)
 
-        // Request s16le mono 48kHz directly — AVAudioEngine handles conversion
-        guard let tapFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: 48000,
-            channels: 1,
-            interleaved: true
-        ) else {
-            print("[mic] failed to create tap format")
-            return
-        }
+        print("[mic] hardware format: \(hwFormat.sampleRate)Hz, \(hwChannels)ch, \(hwFormat.commonFormat.rawValue)")
 
-        inputNode.installTap(onBus: 0, bufferSize: 960, format: tapFormat) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] buffer, _ in
             guard let self, let onPCM = self.onPCM else { return }
+            guard let floatData = buffer.floatChannelData else { return }
 
             let frameCount = Int(buffer.frameLength)
-            guard frameCount > 0, let int16Ptr = buffer.int16ChannelData else { return }
+            guard frameCount > 0 else { return }
 
-            let byteCount = frameCount * 2
-            let data = Data(bytes: int16Ptr[0], count: byteCount)
-            onPCM(data)
+            var pcm = Data(count: frameCount * 2)
+            pcm.withUnsafeMutableBytes { raw in
+                let out = raw.bindMemory(to: Int16.self)
+                for i in 0..<frameCount {
+                    var sample: Float = floatData[0][i]
+                    if hwChannels > 1 {
+                        sample = (sample + floatData[1][i]) * 0.5
+                    }
+                    let clamped = max(-1.0, min(1.0, sample))
+                    out[i] = Int16(clamped * 32767.0)
+                }
+            }
+            onPCM(pcm)
         }
 
         do {
