@@ -168,9 +168,8 @@ final class StreamClient {
         let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
             buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
         }
-        let timestampMs = data.withUnsafeBytes { buf -> UInt32 in
-            buf.load(fromByteOffset: 14, as: UInt32.self).bigEndian
-        }
+        let timestampMs: UInt32 = UInt32(data[14]) << 24 | UInt32(data[15]) << 16
+                               | UInt32(data[16]) << 8  | UInt32(data[17])
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 

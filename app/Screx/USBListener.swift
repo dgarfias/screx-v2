@@ -164,9 +164,9 @@ final class USBListener {
             case Self.msgVideo:
                 // type(1) + is_idr(1) + timestamp_ms(4) + annex_b
                 guard msgData.count >= 6 else { continue }
-                let tsMs = msgData.withUnsafeBytes { buf -> UInt32 in
-                    buf.load(fromByteOffset: 2, as: UInt32.self).bigEndian
-                }
+                let o = msgData.startIndex + 2
+                let tsMs: UInt32 = UInt32(msgData[o]) << 24 | UInt32(msgData[o+1]) << 16
+                                 | UInt32(msgData[o+2]) << 8 | UInt32(msgData[o+3])
                 let annexB = Data(msgData.dropFirst(6))
                 avSync.updateVideo(timestamp: tsMs)
                 decoder.decodeAccessUnit(annexB)
@@ -180,9 +180,9 @@ final class USBListener {
             case Self.msgAudio:
                 // type(1) + timestamp_ms(4) + pcm
                 guard msgData.count >= 5 else { continue }
-                let tsMs = msgData.withUnsafeBytes { buf -> UInt32 in
-                    buf.load(fromByteOffset: 1, as: UInt32.self).bigEndian
-                }
+                let o = msgData.startIndex + 1
+                let tsMs: UInt32 = UInt32(msgData[o]) << 24 | UInt32(msgData[o+1]) << 16
+                                 | UInt32(msgData[o+2]) << 8 | UInt32(msgData[o+3])
                 let pcm = Data(msgData.dropFirst(5))
                 audioPlayer.enqueueAudio(pcm, timestampMs: tsMs)
 
