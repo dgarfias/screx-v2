@@ -85,7 +85,6 @@ final class USBListener {
                 print("[usb] TCP connection established from daemon")
                 self?.onStatus?("USB: connected")
                 self?.onConnected?()
-                self?.audioPlayer.start()
                 self?.readLoop(conn)
             case .failed(let error):
                 print("[usb] connection failed: \(error)")

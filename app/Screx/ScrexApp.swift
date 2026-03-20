@@ -57,18 +57,22 @@ final class StreamViewModel: ObservableObject {
         }
         usb.onConnected = { [weak self] in
             Task { @MainActor in
-                self?.usbConnected = true
-                self?.isConnected = true
-                self?.transport = "USB"
+                guard let self else { return }
+                self.usbConnected = true
+                self.isConnected = true
+                self.transport = "USB"
+                self.audioPlayer.start()
             }
         }
         usb.onDisconnected = { [weak self] in
             Task { @MainActor in
-                self?.usbConnected = false
-                if self?.stream == nil {
-                    self?.isConnected = false
-                    self?.transport = ""
-                    self?.status = "USB disconnected, looking for WiFi..."
+                guard let self else { return }
+                self.usbConnected = false
+                if self.stream == nil {
+                    self.isConnected = false
+                    self.transport = ""
+                    self.status = "USB disconnected, looking for WiFi..."
+                    self.audioPlayer.stop()
                 }
             }
         }
@@ -122,9 +126,11 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 if !self.usbConnected {
                     self.status = msg
-                    self.isConnected = msg.contains("Streaming")
-                    if self.isConnected {
+                    let nowConnected = msg.contains("Streaming")
+                    self.isConnected = nowConnected
+                    if nowConnected {
                         self.transport = "WiFi"
+                        self.audioPlayer.start()
                     }
                 }
             }
@@ -144,6 +150,7 @@ final class StreamViewModel: ObservableObject {
             isConnected = false
             transport = ""
             status = "Daemon disconnected, looking..."
+            audioPlayer.stop()
             discovery.resetKnownHost()
         }
     }
@@ -157,6 +164,7 @@ final class StreamViewModel: ObservableObject {
         isConnected = false
         transport = ""
         status = "Disconnected"
+        audioPlayer.stop()
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {

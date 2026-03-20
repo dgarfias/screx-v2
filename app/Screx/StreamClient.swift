@@ -53,7 +53,6 @@ final class StreamClient {
                 self.startKeepalive(conn)
                 self.startDataTimeout()
                 self.receiveLoop(conn)
-                self.audioPlayer.start()
             case .failed(let error):
                 self.onStatus?("Connection failed: \(error.localizedDescription)")
                 self.handleTimeout()
@@ -74,7 +73,6 @@ final class StreamClient {
         dataTimeoutTimer = nil
         connection?.cancel()
         connection = nil
-        audioPlayer.stop()
     }
 
     private func sendRegister(_ conn: NWConnection) {
