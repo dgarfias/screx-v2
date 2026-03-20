@@ -6,8 +6,8 @@ final class StreamClient {
     private let endpoint: NWEndpoint
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
-    let decoder = H264Decoder()
-    let audioPlayer = AudioPlayer()
+    let decoder: H264Decoder
+    let audioPlayer: AudioPlayer
 
     var onStatus: ((String) -> Void)?
 
@@ -28,8 +28,10 @@ final class StreamClient {
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
 
-    init(endpoint: NWEndpoint) {
+    init(endpoint: NWEndpoint, decoder: H264Decoder, audioPlayer: AudioPlayer) {
         self.endpoint = endpoint
+        self.decoder = decoder
+        self.audioPlayer = audioPlayer
     }
 
     func connect() {

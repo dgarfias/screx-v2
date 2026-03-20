@@ -7,6 +7,7 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::encode::EncodedAccessUnit;
+use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 14;
@@ -20,6 +21,8 @@ const PACING_DELAY: Duration = Duration::from_micros(10);
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
     pub force_idr: AtomicBool,
+    pub usb_sender: Mutex<Option<TcpFramedSender>>,
+    pub usb_active: AtomicBool,
 }
 
 impl SharedState {
@@ -27,6 +30,8 @@ impl SharedState {
         Self {
             client_addr: Mutex::new(None),
             force_idr: AtomicBool::new(false),
+            usb_sender: Mutex::new(None),
+            usb_active: AtomicBool::new(false),
         }
     }
 }

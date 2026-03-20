@@ -4,6 +4,7 @@ mod discovery;
 mod doctor;
 mod encode;
 mod stream_server;
+mod usb;
 
 use std::env;
 use std::net::UdpSocket;
@@ -157,9 +158,22 @@ async fn main() -> Result<()> {
 
                 match encoder.encode_frame(&frame, force_idr) {
                     Ok(aus) => {
-                        let client_addr = *capture_shared.client_addr.lock().unwrap();
-                        if let Some(addr) = client_addr {
-                            for au in &aus {
+                        for au in &aus {
+                            // Prefer USB if active
+                            if capture_shared.usb_active.load(Ordering::Relaxed) {
+                                let mut usb = capture_shared.usb_sender.lock().unwrap();
+                                if let Some(ref mut tcp) = *usb {
+                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr) {
+                                        eprintln!("[pipeline] USB send error: {e:#}");
+                                        drop(usb);
+                                        capture_shared.usb_active.store(false, Ordering::SeqCst);
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Fall back to WiFi UDP
+                            let client_addr = *capture_shared.client_addr.lock().unwrap();
+                            if let Some(addr) = client_addr {
                                 if let Err(e) = sender.send_frame(au, addr) {
                                     eprintln!("[pipeline] send error: {e:#}");
                                 }
@@ -173,6 +187,16 @@ async fn main() -> Result<()> {
             })
         })
         .context("failed to spawn capture thread")?;
+
+    // USB transport thread (auto-detects iOS device, manages iproxy + TCP)
+    let usb_shared = Arc::clone(&shared);
+    let usb_stop = Arc::clone(&stop);
+    let usb_thread = thread::Builder::new()
+        .name("usb".into())
+        .spawn(move || {
+            usb::run_usb_transport(usb_shared, usb_stop);
+        })
+        .context("failed to spawn USB transport thread")?;
 
     // Audio capture thread
     let audio_socket = socket.try_clone().context("clone socket for audio")?;
@@ -218,6 +242,9 @@ async fn main() -> Result<()> {
         if let Err(e) = t.join() {
             eprintln!("[main] audio thread panicked: {e:?}");
         }
+    }
+    if let Err(e) = usb_thread.join() {
+        eprintln!("[main] USB thread panicked: {e:?}");
     }
     if let Err(e) = client_thread.join() {
         eprintln!("[main] client manager thread panicked: {e:?}");

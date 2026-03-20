@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import Network
 
 @main
 struct ScrexApp: App {
@@ -30,17 +31,57 @@ final class StreamViewModel: ObservableObject {
     @Published var status: String = "Looking for daemon..."
     @Published var isConnected = false
     @Published var manualIP: String = ""
+    @Published var transport: String = ""
+
+    let decoder = H264Decoder()
+    let audioPlayer = AudioPlayer()
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
+    private var usbListener: USBListener?
     private var discoveryStarted = false
+    private var usbConnected = false
 
     func startDiscovery() {
         guard !discoveryStarted else { return }
         discoveryStarted = true
 
+        // Start USB listener
+        let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer)
+        self.usbListener = usb
+
+        usb.onStatus = { [weak self] msg in
+            Task { @MainActor in
+                self?.status = msg
+            }
+        }
+        usb.onConnected = { [weak self] in
+            Task { @MainActor in
+                self?.usbConnected = true
+                self?.isConnected = true
+                self?.transport = "USB"
+            }
+        }
+        usb.onDisconnected = { [weak self] in
+            Task { @MainActor in
+                self?.usbConnected = false
+                if self?.stream == nil {
+                    self?.isConnected = false
+                    self?.transport = ""
+                    self?.status = "USB disconnected, looking for WiFi..."
+                }
+            }
+        }
+        usb.start()
+
+        // Start WiFi discovery
         discovery.onStatusUpdate = { [weak self] msg in
-            Task { @MainActor in self?.status = msg }
+            Task { @MainActor in
+                guard let self else { return }
+                if !self.usbConnected {
+                    self.status = msg
+                }
+            }
         }
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
@@ -63,13 +104,19 @@ final class StreamViewModel: ObservableObject {
         stream?.disconnect()
         status = "Connecting to \(name)..."
 
-        let client = StreamClient(endpoint: endpoint)
+        let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer)
         self.stream = client
 
         client.onStatus = { [weak self] msg in
             Task { @MainActor in
-                self?.status = msg
-                self?.isConnected = msg.contains("Streaming")
+                guard let self else { return }
+                if !self.usbConnected {
+                    self.status = msg
+                    self.isConnected = msg.contains("Streaming")
+                    if self.isConnected {
+                        self.transport = "WiFi"
+                    }
+                }
             }
         }
         client.connect()
@@ -78,12 +125,16 @@ final class StreamViewModel: ObservableObject {
     func disconnect() {
         stream?.disconnect()
         stream = nil
+        usbListener?.stop()
+        usbListener = nil
+        usbConnected = false
         isConnected = false
+        transport = ""
         status = "Disconnected"
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
-        stream?.decoder.displayLayer
+        decoder.displayLayer
     }
 }
 
@@ -118,7 +169,17 @@ struct ContentView: View {
 
                 if showOverlay {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Screx").font(.headline)
+                        HStack {
+                            Text("Screx").font(.headline)
+                            if !model.transport.isEmpty {
+                                Text(model.transport)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(model.transport == "USB" ? Color.green : Color.blue, in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                        }
                         Text(model.status).font(.caption).foregroundStyle(.secondary)
 
                         if !model.isConnected {

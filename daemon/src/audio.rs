@@ -126,6 +126,19 @@ pub fn run_audio_capture(
     while !stop.load(Ordering::Relaxed) {
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
+                // Prefer USB if active
+                if shared.usb_active.load(Ordering::Relaxed) {
+                    let mut usb = shared.usb_sender.lock().unwrap();
+                    if let Some(ref mut tcp) = *usb {
+                        if let Err(e) = tcp.send_audio(&buf) {
+                            eprintln!("[audio] USB send error: {e}");
+                            drop(usb);
+                            shared.usb_active.store(false, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                }
+                // Fall back to WiFi UDP
                 let client_addr = *shared.client_addr.lock().unwrap();
                 if let Some(addr) = client_addr {
                     if let Err(e) = sender.send_audio(&buf, addr) {
