@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
 
-use crate::capture::{BufferType, CaptureFrame, PixelFormat};
+use crate::capture::CaptureFrame;
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -16,16 +15,7 @@ pub struct EncoderConfig {
 }
 
 #[derive(Debug, Clone)]
-pub enum ControlMessage {
-    RequestIdr,
-    SetBitrate(u32),
-    SetResolution(u32, u32),
-}
-
-#[derive(Debug, Clone)]
 pub struct EncodedAccessUnit {
-    pub frame_index: u64,
-    pub timestamp_90k: u32,
     pub is_idr: bool,
     pub annex_b: Vec<u8>,
 }
@@ -35,13 +25,6 @@ pub enum EncoderBackend {
     Auto,
     Bootstrap,
     Vaapi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveEncoderBackend {
-    Bootstrap,
-    #[cfg(feature = "real-encode")]
-    VaapiBootstrapPayload,
 }
 
 impl EncoderBackend {
@@ -54,251 +37,148 @@ impl EncoderBackend {
     }
 }
 
-pub fn run_encoder_loop(
-    mut config: EncoderConfig,
-    mut frame_rx: mpsc::Receiver<CaptureFrame>,
-    au_tx: mpsc::Sender<EncodedAccessUnit>,
-    mut control_rx: mpsc::Receiver<ControlMessage>,
-    stop_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let active_backend = initialize_encoder_backend(config.backend, &config)?;
+pub struct Encoder {
+    config: EncoderConfig,
     #[cfg(feature = "real-encode")]
-    let mut vaapi_encoder = match active_backend {
-        ActiveEncoderBackend::VaapiBootstrapPayload => {
-            Some(vaapi::DirectVaapiEncoder::new(&config)?)
-        }
-        ActiveEncoderBackend::Bootstrap => None,
-    };
+    vaapi: Option<vaapi::DirectVaapiEncoder>,
+    use_vaapi: bool,
+    frame_count: u64,
+    last_idr_at: Instant,
+    max_idr_interval: Duration,
+    stats_start: Instant,
+    stats_encoded: u64,
+    stats_bytes: u64,
+}
 
-    let mut force_next_idr = true;
-    let mut encoded_in_window = 0_u64;
-    let mut bytes_in_window = 0_u64;
-    let mut dropped_capture_frames_in_window = 0_u64;
-    let mut window_start = Instant::now();
-    let mut last_idr_at = Instant::now();
-    let max_idr_interval = Duration::from_secs(2);
+impl Encoder {
+    const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_millis(500);
 
-    loop {
-        if *stop_rx.borrow() {
-            println!("[encode] stop signal received");
-            break;
-        }
+    pub fn new(config: EncoderConfig) -> Result<Self> {
+        let mut use_vaapi = false;
 
-        while let Ok(msg) = control_rx.try_recv() {
-            match msg {
-                ControlMessage::RequestIdr => {
-                    println!("[encode] control: forcing IDR on next frame");
-                    force_next_idr = true;
-                }
-                ControlMessage::SetBitrate(bps) => {
-                    println!("[encode] control: updating bitrate {} -> {}", config.bitrate_bps, bps);
-                    config.bitrate_bps = bps.max(500_000);
-                    #[cfg(feature = "real-encode")]
-                    if let Some(worker) = vaapi_encoder.as_mut() {
-                        *worker = vaapi::DirectVaapiEncoder::new(&config)?;
-                    }
-                }
-                ControlMessage::SetResolution(w, h) => {
-                    println!("[encode] control: target resolution {}x{} -> {}x{}", config.width, config.height, w, h);
-                    config.width = w.max(320);
-                    config.height = h.max(180);
-                    force_next_idr = true;
-                    #[cfg(feature = "real-encode")]
-                    if let Some(worker) = vaapi_encoder.as_mut() {
-                        *worker = vaapi::DirectVaapiEncoder::new(&config)?;
-                    }
-                }
+        #[cfg(feature = "real-encode")]
+        let vaapi_enc = match config.backend {
+            EncoderBackend::Vaapi => {
+                let enc = vaapi::DirectVaapiEncoder::new(&config)?;
+                use_vaapi = true;
+                Some(enc)
             }
-        }
-
-        let mut frame = loop {
-            if *stop_rx.borrow() {
-                println!("[encode] stop signal received");
-                return Ok(());
-            }
-            match frame_rx.try_recv() {
-                Ok(f) => break f,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(5));
+            EncoderBackend::Auto => match vaapi::DirectVaapiEncoder::new(&config) {
+                Ok(enc) => {
+                    use_vaapi = true;
+                    println!("[encode] backend=vaapi(auto)");
+                    Some(enc)
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    println!("[encode] upstream channel closed");
-                    return Ok(());
+                Err(e) => {
+                    eprintln!("[encode] VA-API unavailable ({e:#}), falling back to bootstrap");
+                    None
                 }
-            }
+            },
+            EncoderBackend::Bootstrap => None,
         };
-        while let Ok(newer_frame) = frame_rx.try_recv() {
-            frame = newer_frame;
-            dropped_capture_frames_in_window += 1;
+
+        if !use_vaapi {
+            println!("[encode] backend=bootstrap (synthetic encoder)");
         }
 
-        if frame.width != config.width || frame.height != config.height {
-            println!(
-                "[encode] capture geometry change detected: {}x{} -> {}x{}; reconfiguring encoder",
-                config.width, config.height, frame.width, frame.height
-            );
-            config.width = frame.width.max(1);
-            config.height = frame.height.max(1);
-            force_next_idr = true;
+        Ok(Self {
+            config,
             #[cfg(feature = "real-encode")]
-            if let Some(worker) = vaapi_encoder.as_mut() {
-                *worker = vaapi::DirectVaapiEncoder::new(&config)?;
-            }
-        }
-
-        let is_idr = force_next_idr
-            || frame.frame_index % u64::from(config.gop.max(1)) == 0
-            || last_idr_at.elapsed() >= max_idr_interval;
-        let mut produced_aus = Vec::new();
-        #[cfg(feature = "real-encode")]
-        {
-            if let Some(worker) = vaapi_encoder.as_mut() {
-                produced_aus = worker.push_frame(&config, &frame, is_idr)?;
-            }
-        }
-        #[cfg(feature = "real-encode")]
-        let has_worker = vaapi_encoder.is_some();
-        #[cfg(not(feature = "real-encode"))]
-        let has_worker = false;
-        if produced_aus.is_empty() && !has_worker {
-            produced_aus.push(encode_frame(active_backend, &frame, is_idr));
-        }
-        if produced_aus.is_empty() {
-            continue;
-        }
-        if is_idr {
-            last_idr_at = Instant::now();
-        }
-        force_next_idr = false;
-
-        for au in produced_aus {
-            bytes_in_window += au.annex_b.len() as u64;
-            encoded_in_window += 1;
-            if window_start.elapsed() >= Duration::from_secs(1) {
-                let elapsed = window_start.elapsed().as_secs_f64();
-                let fps = encoded_in_window as f64 / elapsed;
-                let mbps = (bytes_in_window as f64 * 8.0 / elapsed) / 1_000_000.0;
-                println!(
-                    "[encode] fps={fps:.1} stream_mbps={mbps:.2} target_bitrate_bps={} dropped_capture_frames_per_sec={}",
-                    config.bitrate_bps, dropped_capture_frames_in_window
-                );
-                encoded_in_window = 0;
-                bytes_in_window = 0;
-                dropped_capture_frames_in_window = 0;
-                window_start = Instant::now();
-            }
-
-            let mut pending = au;
-            loop {
-                match au_tx.try_send(pending) {
-                    Ok(()) => break,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
-                        if *stop_rx.borrow() {
-                            return Ok(());
-                        }
-                        pending = returned;
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        println!("[encode] downstream channel closed");
-                        return Ok(());
-                    }
-                }
-            }
-        }
+            vaapi: vaapi_enc,
+            use_vaapi,
+            frame_count: 0,
+            last_idr_at: Instant::now(),
+            max_idr_interval: Duration::from_secs(2),
+            stats_start: Instant::now(),
+            stats_encoded: 0,
+            stats_bytes: 0,
+        })
     }
 
-    Ok(())
-}
+    pub fn encode_frame(
+        &mut self,
+        frame: &CaptureFrame<'_>,
+        force_idr: bool,
+    ) -> Result<Vec<EncodedAccessUnit>> {
+        if frame.width != self.config.width || frame.height != self.config.height {
+            println!(
+                "[encode] resolution change: {}x{} -> {}x{}",
+                self.config.width, self.config.height, frame.width, frame.height
+            );
+            self.config.width = frame.width.max(1);
+            self.config.height = frame.height.max(1);
+            #[cfg(feature = "real-encode")]
+            if self.use_vaapi {
+                self.vaapi = Some(vaapi::DirectVaapiEncoder::new(&self.config)?);
+            }
+        }
 
-fn encode_frame(
-    active_backend: ActiveEncoderBackend,
-    frame: &CaptureFrame,
-    is_idr: bool,
-) -> EncodedAccessUnit {
-    match active_backend {
-        ActiveEncoderBackend::Bootstrap => encode_frame_bootstrap(frame, is_idr),
+        let pli_idr = force_idr && self.last_idr_at.elapsed() >= Self::MIN_PLI_IDR_INTERVAL;
+        let is_idr = pli_idr
+            || self.frame_count % u64::from(self.config.gop.max(1)) == 0
+            || self.last_idr_at.elapsed() >= self.max_idr_interval;
+
+        let mut aus = Vec::new();
+
         #[cfg(feature = "real-encode")]
-        ActiveEncoderBackend::VaapiBootstrapPayload => encode_frame_bootstrap(frame, is_idr),
+        if let Some(enc) = self.vaapi.as_mut() {
+            aus = enc.push_frame(&self.config, frame, is_idr)?;
+        }
+
+        if aus.is_empty() && !self.use_vaapi {
+            aus.push(encode_bootstrap(frame, is_idr));
+        }
+
+        if is_idr && !aus.is_empty() {
+            self.last_idr_at = Instant::now();
+        }
+
+        self.frame_count += 1;
+
+        for au in &aus {
+            self.stats_encoded += 1;
+            self.stats_bytes += au.annex_b.len() as u64;
+        }
+        if self.stats_start.elapsed() >= Duration::from_secs(1) {
+            let elapsed = self.stats_start.elapsed().as_secs_f64();
+            let fps = self.stats_encoded as f64 / elapsed;
+            let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
+            println!(
+                "[encode] fps={fps:.1} stream_mbps={mbps:.2} bitrate={}",
+                self.config.bitrate_bps
+            );
+            self.stats_encoded = 0;
+            self.stats_bytes = 0;
+            self.stats_start = Instant::now();
+        }
+
+        Ok(aus)
     }
 }
 
-fn encode_frame_bootstrap(frame: &CaptureFrame, is_idr: bool) -> EncodedAccessUnit {
+fn encode_bootstrap(frame: &CaptureFrame<'_>, is_idr: bool) -> EncodedAccessUnit {
     let mut annex_b = Vec::with_capacity(256);
     if is_idr {
-        annex_b.extend_from_slice(&nal_with_start_code(32, &[0x01, 0x02, 0x03, 0x04])); // VPS
-        annex_b.extend_from_slice(&nal_with_start_code(33, &[0x11, 0x22, 0x33, 0x44])); // SPS
-        annex_b.extend_from_slice(&nal_with_start_code(34, &[0x55, 0x66, 0x77])); // PPS
-        annex_b.extend_from_slice(&nal_with_start_code(
-            19,
-            build_slice_payload(frame, 96).as_slice(),
-        )); // IDR
+        // Minimal H.264 SPS/PPS/IDR
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0A, 0xF8, 0x41, 0xA2]);
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x38, 0x80]);
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        let payload_len = 96.min(frame.data.len());
+        annex_b.extend_from_slice(&frame.data[..payload_len]);
     } else {
-        annex_b.extend_from_slice(&nal_with_start_code(
-            1,
-            build_slice_payload(frame, 96).as_slice(),
-        )); // non-IDR
+        annex_b.extend_from_slice(&[0, 0, 0, 1, 0x41]);
+        let payload_len = 96.min(frame.data.len());
+        annex_b.extend_from_slice(&frame.data[..payload_len]);
     }
-
-    EncodedAccessUnit {
-        frame_index: frame.frame_index,
-        timestamp_90k: frame.timestamp_90k,
-        is_idr,
-        annex_b,
-    }
+    EncodedAccessUnit { is_idr, annex_b }
 }
 
-fn nal_with_start_code(nal_type: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 6);
-    out.extend_from_slice(&[0, 0, 0, 1]);
-    out.extend_from_slice(&hevc_nal_header(nal_type));
-    out.extend_from_slice(payload);
-    out
-}
-
-fn initialize_encoder_backend(
-    backend: EncoderBackend,
-    config: &EncoderConfig,
-) -> Result<ActiveEncoderBackend> {
-    match backend {
-        EncoderBackend::Bootstrap => {
-            println!(
-                "[encode] backend=bootstrap codec=hevc_vaapi profile=low-latency-cbr bitrate={} gop={} fps={} bf=0",
-                config.bitrate_bps, config.gop, config.fps
-            );
-            Ok(ActiveEncoderBackend::Bootstrap)
-        }
-        EncoderBackend::Auto => {
-            #[cfg(feature = "real-encode")]
-            {
-                if vaapi::initialize(config).is_ok() {
-                    println!(
-                        "[encode] backend=vaapi(auto) device=/dev/dri/renderD128 codec=hevc_vaapi"
-                    );
-                    return Ok(ActiveEncoderBackend::VaapiBootstrapPayload);
-                }
-            }
-            println!("[encode] backend=bootstrap(auto-fallback)");
-            Ok(ActiveEncoderBackend::Bootstrap)
-        }
-        EncoderBackend::Vaapi => {
-            #[cfg(feature = "real-encode")]
-            {
-                vaapi::initialize(config)?;
-                println!("[encode] backend=vaapi device=/dev/dri/renderD128 codec=hevc_vaapi");
-                return Ok(ActiveEncoderBackend::VaapiBootstrapPayload);
-            }
-            #[cfg(not(feature = "real-encode"))]
-            {
-                anyhow::bail!("requested vaapi backend but daemon was built without `real-encode`");
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// VA-API encoder
+// ---------------------------------------------------------------------------
 
 #[cfg(feature = "real-encode")]
 mod vaapi {
-    use std::fs;
     use std::ptr;
 
     use anyhow::{bail, Context, Result};
@@ -307,28 +187,6 @@ mod vaapi {
 
     use super::{EncodedAccessUnit, EncoderConfig};
     use crate::capture::CaptureFrame;
-
-    pub(super) fn initialize(config: &EncoderConfig) -> Result<()> {
-        ffmpeg::init().context("ffmpeg init failed")?;
-        let encoder = ffmpeg::codec::encoder::find_by_name("h264_vaapi")
-            .context("h264_vaapi encoder unavailable")?;
-        if !encoder.is_encoder() {
-            bail!("h264_vaapi codec is not flagged as encoder");
-        }
-
-        let render_node = "/dev/dri/renderD128";
-        let meta = fs::metadata(render_node)
-            .with_context(|| format!("VA-API render node missing: {render_node}"))?;
-        if meta.permissions().readonly() {
-            bail!("VA-API render node is not writable: {render_node}");
-        }
-
-        println!(
-            "[encode] vaapi init target={}x{}@{} bitrate={}",
-            config.width, config.height, config.fps, config.bitrate_bps
-        );
-        Ok(())
-    }
 
     pub(super) struct DirectVaapiEncoder {
         ctx: *mut ffi::AVCodecContext,
@@ -345,6 +203,7 @@ mod vaapi {
 
     impl DirectVaapiEncoder {
         pub(super) fn new(config: &EncoderConfig) -> Result<Self> {
+            ffmpeg::init().context("ffmpeg init")?;
             let width = config.width as i32;
             let height = config.height as i32;
 
@@ -400,35 +259,35 @@ mod vaapi {
                 (*ctx).width = width;
                 (*ctx).height = height;
                 (*ctx).time_base = ffi::AVRational { num: 1, den: 90_000 };
-                (*ctx).framerate = ffi::AVRational { num: config.fps.max(1) as i32, den: 1 };
+                (*ctx).framerate = ffi::AVRational {
+                    num: config.fps.max(1) as i32,
+                    den: 1,
+                };
                 (*ctx).bit_rate = config.bitrate_bps as i64;
                 (*ctx).rc_buffer_size = (config.bitrate_bps / 2).max(1) as i32;
                 (*ctx).gop_size = config.gop as i32;
                 (*ctx).max_b_frames = 0;
                 (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
 
+                // async_depth=1 for minimal pipeline delay (0 is rejected by VA-API)
                 let opt_key = std::ffi::CString::new("async_depth").unwrap();
-                ffi::av_opt_set_int((*ctx).priv_data, opt_key.as_ptr(), 0, 0);
+                ffi::av_opt_set_int((*ctx).priv_data, opt_key.as_ptr(), 1, 0);
 
                 let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
                 if ret < 0 {
                     ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
                     ffi::av_buffer_unref(&mut hw_device_ctx);
                     ffi::avcodec_free_context(&mut (ctx as *mut _));
-                    bail!("failed to open hevc_vaapi encoder (error {ret})");
+                    bail!("failed to open h264_vaapi encoder (error {ret})");
                 }
 
                 let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
-                    std::slice::from_raw_parts(
-                        (*ctx).extradata,
-                        (*ctx).extradata_size as usize,
-                    )
-                    .to_vec()
+                    std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize)
+                        .to_vec()
                 } else {
                     Vec::new()
                 };
 
-                // hw_frames_ref ownership transferred to ctx, release our ref
                 ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
 
                 let sws = ffi::sws_getContext(
@@ -450,7 +309,7 @@ mod vaapi {
                 }
 
                 println!(
-                    "[encode] direct VA-API H.264 encoder opened: {}x{}@{} bitrate={} gop={} async_depth=0",
+                    "[encode] VA-API H.264 encoder: {}x{}@{} bitrate={} gop={} async_depth=1",
                     width, height, config.fps, config.bitrate_bps, config.gop
                 );
 
@@ -470,7 +329,7 @@ mod vaapi {
         pub(super) fn push_frame(
             &mut self,
             _config: &EncoderConfig,
-            frame: &CaptureFrame,
+            frame: &CaptureFrame<'_>,
             is_idr: bool,
         ) -> Result<Vec<EncodedAccessUnit>> {
             unsafe {
@@ -559,11 +418,9 @@ mod vaapi {
                     let encoded =
                         std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
                     let is_key = ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
-                    let timestamp_90k = (*pkt).pts as u32;
 
                     let annex_b = if is_key && !self.extradata.is_empty() {
-                        let mut buf =
-                            Vec::with_capacity(self.extradata.len() + encoded.len());
+                        let mut buf = Vec::with_capacity(self.extradata.len() + encoded.len());
                         buf.extend_from_slice(&self.extradata);
                         buf.extend_from_slice(encoded);
                         buf
@@ -571,13 +428,7 @@ mod vaapi {
                         encoded.to_vec()
                     };
 
-                    output.push(EncodedAccessUnit {
-                        frame_index: self.frame_index,
-                        timestamp_90k,
-                        is_idr: is_key,
-                        annex_b,
-                    });
-
+                    output.push(EncodedAccessUnit { is_idr: is_key, annex_b });
                     ffi::av_packet_unref(pkt);
                 }
                 ffi::av_packet_free(&mut (pkt as *mut _));
@@ -603,37 +454,4 @@ mod vaapi {
             }
         }
     }
-}
-
-fn hevc_nal_header(nal_type: u8) -> [u8; 2] {
-    // F=0, LayerId=0, TID=1
-    let b0 = (nal_type & 0x3F) << 1;
-    let b1 = 0x01;
-    [b0, b1]
-}
-
-fn build_slice_payload(frame: &CaptureFrame, desired_len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(desired_len);
-    out.extend_from_slice(&(frame.width as u16).to_be_bytes());
-    out.extend_from_slice(&(frame.height as u16).to_be_bytes());
-    out.extend_from_slice(&(frame.frame_index as u32).to_be_bytes());
-    let format_id = match frame.format {
-        PixelFormat::Bgra8888 => 1_u8,
-    };
-    let buffer_id = match frame.buffer_type {
-        BufferType::DmaBuf => 1_u8,
-        BufferType::Shm => 2_u8,
-    };
-    out.push(format_id);
-    out.push(buffer_id);
-    out.extend_from_slice(&frame.captured_at.elapsed().as_micros().to_be_bytes());
-
-    let body_len = desired_len.saturating_sub(out.len());
-    if body_len > 0 {
-        let src = &frame.data;
-        for idx in 0..body_len {
-            out.push(src[idx % src.len()]);
-        }
-    }
-    out
 }

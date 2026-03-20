@@ -21,7 +21,7 @@ final class StreamClient {
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
     private var lastPliTime: TimeInterval = 0
-    private static let pliMinInterval: TimeInterval = 0.3
+    private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
 
     init(endpoint: NWEndpoint) {

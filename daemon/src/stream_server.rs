@@ -1,11 +1,12 @@
-use std::time::Duration;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
 
-use crate::encode::{ControlMessage, EncodedAccessUnit};
+use crate::encode::EncodedAccessUnit;
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 14;
@@ -13,17 +14,24 @@ const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
-const PACING_THRESHOLD: usize = 10;
-const PACING_DELAY: Duration = Duration::from_micros(50);
+const PACING_THRESHOLD: usize = 20;
+const PACING_DELAY: Duration = Duration::from_micros(10);
 
-/// 14-byte packet header:
-///   frame_id:     u32 BE  (bytes 0..4)
-///   chunk_idx:    u16 BE  (bytes 4..6)
-///   total_data:   u16 BE  (bytes 6..8)
-///   total_parity: u16 BE  (bytes 8..10)
-///   flags:        u8      (byte 10)   bit 0 = is_idr
-///   reserved:     u8      (byte 11)
-///   payload_len:  u16 BE  (bytes 12..14)
+pub struct SharedState {
+    pub client_addr: Mutex<Option<SocketAddr>>,
+    pub force_idr: AtomicBool,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            client_addr: Mutex::new(None),
+            force_idr: AtomicBool::new(false),
+        }
+    }
+}
+
+/// 14-byte packet header
 fn build_header(
     frame_id: u32,
     chunk_idx: u16,
@@ -43,206 +51,180 @@ fn build_header(
     h
 }
 
-pub async fn run_stream_server(
-    port: u16,
-    mut au_rx: mpsc::Receiver<EncodedAccessUnit>,
-    control_tx: mpsc::Sender<ControlMessage>,
-    mut stop_rx: watch::Receiver<bool>,
+// ---------------------------------------------------------------------------
+// Client manager — runs on its own thread, handles SCREX/PLI/keepalive
+// ---------------------------------------------------------------------------
+
+pub fn run_client_manager(
+    socket: UdpSocket,
+    shared: Arc<SharedState>,
+    stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let socket = UdpSocket::bind(("0.0.0.0", port)).await?;
-    println!("[stream] UDP server listening on port {port}");
-    println!("[stream] waiting for iPad to register...");
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
 
-    let mut send_buf = vec![0u8; HEADER_LEN + CHUNK_PAYLOAD];
-    let mut frame_id: u32 = 0;
+    let mut last_keepalive = Instant::now();
+    let mut recv_buf = [0u8; 64];
 
-    loop {
-        // Outer loop: wait for a client registration while draining frames
-        let client_addr = loop {
-            let mut reg_buf = [0u8; 64];
-            tokio::select! {
-                biased;
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() {
-                        println!("[stream] server shutting down");
-                        return Ok(());
+    println!("[client] listening for iPad registration...");
+
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut recv_buf) {
+            Ok((len, addr)) => {
+                if len >= REGISTER_MAGIC.len() && &recv_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
+                {
+                    let mut client = shared.client_addr.lock().unwrap();
+                    let is_new = client.map_or(true, |prev| prev != addr);
+                    *client = Some(addr);
+                    last_keepalive = Instant::now();
+
+                    if is_new {
+                        println!("[client] registered: {addr}");
+                        shared.force_idr.store(true, Ordering::Relaxed);
                     }
                 }
-                _ = au_rx.recv() => {
-                    continue;
-                }
-                result = socket.recv_from(&mut reg_buf) => {
-                    match result {
-                        Ok((len, addr)) => {
-                            if len >= REGISTER_MAGIC.len() && &reg_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC {
-                                println!("[stream] client registered from {addr}");
-                                break addr;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[stream] recv error: {e}");
-                        }
-                    }
+
+                if len >= PLI_MAGIC.len() && &recv_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
+                    shared.force_idr.store(true, Ordering::Relaxed);
                 }
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                eprintln!("[client] recv error: {e}");
+            }
+        }
+
+        // Keepalive timeout check
+        if shared.client_addr.lock().unwrap().is_some()
+            && last_keepalive.elapsed() > KEEPALIVE_TIMEOUT
+        {
+            println!("[client] keepalive timeout, dropping client");
+            *shared.client_addr.lock().unwrap() = None;
+        }
+    }
+
+    println!("[client] manager stopped");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UDP sender — called synchronously from the capture thread
+// ---------------------------------------------------------------------------
+
+pub struct UdpSender {
+    socket: UdpSocket,
+    send_buf: Vec<u8>,
+    frame_id: u32,
+    stats_start: Instant,
+    stats_frames: u64,
+    stats_bytes: u64,
+}
+
+impl UdpSender {
+    pub fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD],
+            frame_id: 0,
+            stats_start: Instant::now(),
+            stats_frames: 0,
+            stats_bytes: 0,
+        }
+    }
+
+    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr) -> Result<()> {
+        let payload = &au.annex_b;
+        let is_idr = au.is_idr;
+
+        let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+
+        // FEC: ~20% overhead, min 1 parity for multi-chunk frames
+        let parity_count = if data_count <= 1 {
+            0
+        } else {
+            (data_count / 5).max(1).min(MAX_FEC_SHARDS)
         };
 
-        // Drain stale frames
-        let mut drained = 0;
-        while au_rx.try_recv().is_ok() {
-            drained += 1;
-        }
-        if drained > 0 {
-            println!("[stream] drained {drained} stale frames");
-        }
+        let use_fec = parity_count > 0 && (data_count + parity_count) <= 255;
+        let actual_parity = if use_fec { parity_count } else { 0 };
+        let total_shards = data_count + actual_parity;
 
-        // Request IDR for new client
-        if let Err(e) = control_tx.send(ControlMessage::RequestIdr).await {
-            eprintln!("[stream] failed to request IDR: {e}");
-        } else {
-            println!("[stream] requested IDR for new client");
+        // Build data shards (padded to CHUNK_PAYLOAD for RS)
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
+        for i in 0..data_count {
+            let start = i * CHUNK_PAYLOAD;
+            let end = (start + CHUNK_PAYLOAD).min(payload.len());
+            let mut shard = vec![0u8; CHUNK_PAYLOAD];
+            shard[..(end - start)].copy_from_slice(&payload[start..end]);
+            shards.push(shard);
         }
 
-        let mut frames_sent = 0_u64;
-        let mut bytes_sent = 0_u64;
-        let mut window_start = tokio::time::Instant::now();
-        let mut last_keepalive = tokio::time::Instant::now();
-
-        // Inner loop: send frames to the registered client
-        loop {
-            let mut check_buf = [0u8; 64];
-            while let Ok(result) = socket.try_recv_from(&mut check_buf) {
-                let (len, addr) = result;
-                if addr != client_addr {
-                    continue;
-                }
-                if len >= REGISTER_MAGIC.len()
-                    && &check_buf[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
-                {
-                    last_keepalive = tokio::time::Instant::now();
-                }
-                if len >= PLI_MAGIC.len() && &check_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
-                    let _ = control_tx.try_send(ControlMessage::RequestIdr);
-                    println!("[stream] PLI received from client, requesting IDR");
-                }
+        // Generate parity shards
+        if actual_parity > 0 {
+            for _ in 0..actual_parity {
+                shards.push(vec![0u8; CHUNK_PAYLOAD]);
             }
+            let rs = ReedSolomon::new(data_count, actual_parity)
+                .map_err(|e| anyhow::anyhow!("RS init: {e:?}"))?;
+            rs.encode(&mut shards)
+                .map_err(|e| anyhow::anyhow!("RS encode: {e:?}"))?;
+        }
 
-            if last_keepalive.elapsed() > KEEPALIVE_TIMEOUT {
-                println!("[stream] client keepalive timeout, waiting for new client...");
+        // Send all shards with pacing for large frames
+        let needs_pacing = shards.len() > PACING_THRESHOLD;
+        let mut frame_bytes = 0_u64;
+
+        for (idx, shard) in shards.iter().enumerate() {
+            let actual_payload_len = if idx < data_count {
+                let start = idx * CHUNK_PAYLOAD;
+                let end = (start + CHUNK_PAYLOAD).min(payload.len());
+                (end - start) as u16
+            } else {
+                CHUNK_PAYLOAD as u16
+            };
+
+            let header = build_header(
+                self.frame_id,
+                idx as u16,
+                data_count as u16,
+                actual_parity as u16,
+                is_idr,
+                actual_payload_len,
+            );
+
+            let pkt_len = HEADER_LEN + shard.len();
+            self.send_buf[..HEADER_LEN].copy_from_slice(&header);
+            self.send_buf[HEADER_LEN..HEADER_LEN + shard.len()].copy_from_slice(shard);
+
+            if let Err(e) = self.socket.send_to(&self.send_buf[..pkt_len], client_addr) {
+                eprintln!("[stream] send error: {e}");
                 break;
             }
+            frame_bytes += pkt_len as u64;
 
-            let au = tokio::select! {
-                biased;
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() { break; }
-                    continue;
-                }
-                maybe_au = au_rx.recv() => {
-                    match maybe_au {
-                        Some(au) => au,
-                        None => {
-                            println!("[stream] encoder channel closed");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            let payload = &au.annex_b;
-            let is_idr = au.is_idr;
-
-            let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
-
-            // FEC: ~20% overhead, min 1 parity for multi-chunk, capped for RS performance
-            let parity_count = if data_count <= 1 {
-                0
-            } else {
-                (data_count / 5).max(1).min(MAX_FEC_SHARDS)
-            };
-
-            // RS requires data+parity <= 256 for GF(2^8). If frame is very large,
-            // skip FEC rather than failing.
-            let use_fec = parity_count > 0 && (data_count + parity_count) <= 255;
-            let actual_parity = if use_fec { parity_count } else { 0 };
-
-            let total_shards = data_count + actual_parity;
-
-            // Build data shards (padded to CHUNK_PAYLOAD for RS)
-            let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
-            for i in 0..data_count {
-                let start = i * CHUNK_PAYLOAD;
-                let end = (start + CHUNK_PAYLOAD).min(payload.len());
-                let mut shard = vec![0u8; CHUNK_PAYLOAD];
-                shard[..(end - start)].copy_from_slice(&payload[start..end]);
-                shards.push(shard);
-            }
-
-            // Generate parity shards
-            if actual_parity > 0 {
-                for _ in 0..actual_parity {
-                    shards.push(vec![0u8; CHUNK_PAYLOAD]);
-                }
-                let rs = ReedSolomon::new(data_count, actual_parity)
-                    .map_err(|e| anyhow::anyhow!("RS init failed: {e:?}"))?;
-                rs.encode(&mut shards)
-                    .map_err(|e| anyhow::anyhow!("RS encode failed: {e:?}"))?;
-            }
-
-            // Send all shards with pacing for large frames
-            let needs_pacing = shards.len() > PACING_THRESHOLD;
-            let mut frame_bytes = 0_u64;
-            for (idx, shard) in shards.iter().enumerate() {
-                let actual_payload_len = if idx < data_count {
-                    let start = idx * CHUNK_PAYLOAD;
-                    let end = (start + CHUNK_PAYLOAD).min(payload.len());
-                    (end - start) as u16
-                } else {
-                    CHUNK_PAYLOAD as u16
-                };
-
-                let header = build_header(
-                    frame_id,
-                    idx as u16,
-                    data_count as u16,
-                    actual_parity as u16,
-                    is_idr,
-                    actual_payload_len,
-                );
-
-                let pkt_len = HEADER_LEN + shard.len();
-                send_buf[..HEADER_LEN].copy_from_slice(&header);
-                send_buf[HEADER_LEN..HEADER_LEN + shard.len()].copy_from_slice(shard);
-
-                if let Err(e) = socket.send_to(&send_buf[..pkt_len], client_addr).await {
-                    eprintln!("[stream] send error: {e}");
-                    break;
-                }
-                frame_bytes += pkt_len as u64;
-
-                if needs_pacing {
-                    tokio::time::sleep(PACING_DELAY).await;
-                }
-            }
-
-            frame_id = frame_id.wrapping_add(1);
-            frames_sent += 1;
-            bytes_sent += frame_bytes;
-
-            if window_start.elapsed() >= Duration::from_secs(1) {
-                let elapsed = window_start.elapsed().as_secs_f64();
-                let fps = frames_sent as f64 / elapsed;
-                let mbps = (bytes_sent as f64 * 8.0 / elapsed) / 1_000_000.0;
-                println!(
-                    "[stream] fps={fps:.1} throughput={mbps:.2} Mbps chunks={data_count}+{actual_parity}fec frame_bytes={}",
-                    payload.len()
-                );
-                frames_sent = 0;
-                bytes_sent = 0;
-                window_start = tokio::time::Instant::now();
+            if needs_pacing {
+                std::thread::sleep(PACING_DELAY);
             }
         }
 
-        println!("[stream] client disconnected, waiting for next registration...");
+        self.frame_id = self.frame_id.wrapping_add(1);
+        self.stats_frames += 1;
+        self.stats_bytes += frame_bytes;
+
+        if self.stats_start.elapsed() >= Duration::from_secs(1) {
+            let elapsed = self.stats_start.elapsed().as_secs_f64();
+            let fps = self.stats_frames as f64 / elapsed;
+            let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
+            println!(
+                "[stream] fps={fps:.1} throughput={mbps:.2}Mbps chunks={data_count}+{actual_parity}fec",
+            );
+            self.stats_frames = 0;
+            self.stats_bytes = 0;
+            self.stats_start = Instant::now();
+        }
+
+        Ok(())
     }
 }

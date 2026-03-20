@@ -1,31 +1,22 @@
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(not(feature = "real-capture"))]
-use anyhow::bail;
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
-
-#[derive(Debug, Clone, Copy)]
-pub enum BufferType {
-    DmaBuf,
-    Shm,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub enum PixelFormat {
     Bgra8888,
 }
 
-#[derive(Debug, Clone)]
-pub struct CaptureFrame {
+#[derive(Debug)]
+pub struct CaptureFrame<'a> {
     pub frame_index: u64,
     pub timestamp_90k: u32,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
-    pub buffer_type: BufferType,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
     pub captured_at: Instant,
 }
 
@@ -34,646 +25,572 @@ pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub prefer_dma_buf: bool,
-    pub backend: CaptureBackend,
-    pub source: CaptureSource,
 }
 
-#[derive(Debug, Clone)]
-struct PortalSession {
-    pub session_id: String,
-    pub source_type: &'static str,
-    pub stream_node_id: Option<u32>,
-    pub stream_size: Option<(i32, i32)>,
-}
+// ---------------------------------------------------------------------------
+// EVDI capture (real-capture feature)
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureBackend {
-    Auto,
-    Synthetic,
-    PortalPipewire,
-}
+#[cfg(feature = "real-capture")]
+mod evdi {
+    use std::os::raw::{c_int, c_uint, c_void};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-impl CaptureBackend {
-    pub fn from_env(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "synthetic" | "mock" => Self::Synthetic,
-            "portal" | "pipewire" | "portal-pipewire" | "real" => Self::PortalPipewire,
-            _ => Self::Auto,
-        }
-    }
-}
+    use anyhow::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureSource {
-    Virtual1080p,
-    Monitor,
-}
+    use super::{CaptureConfig, CaptureFrame, PixelFormat};
 
-impl CaptureSource {
-    pub fn from_env(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "monitor" => Self::Monitor,
-            _ => Self::Virtual1080p,
-        }
+    // -- FFI declarations --------------------------------------------------
+
+    type EvdiHandle = *mut c_void;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct EvdiRect {
+        x1: c_int,
+        y1: c_int,
+        x2: c_int,
+        y2: c_int,
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Virtual1080p => "Virtual",
-            Self::Monitor => "Monitor",
-        }
+    #[repr(C)]
+    struct EvdiBuffer {
+        id: c_int,
+        buffer: *mut c_void,
+        width: c_int,
+        height: c_int,
+        stride: c_int,
+        rects: *mut EvdiRect,
+        rect_count: c_int,
     }
-}
 
-pub fn spawn_capture_thread(
-    config: CaptureConfig,
-    tx: mpsc::Sender<CaptureFrame>,
-    stop_rx: watch::Receiver<bool>,
-) -> thread::JoinHandle<Result<()>> {
-    thread::spawn(move || capture_loop(config, tx, stop_rx))
-}
+    type DpmsHandler = extern "C" fn(c_int, *mut c_void);
+    type ModeChangedHandler = extern "C" fn(EvdiMode, *mut c_void);
+    type UpdateReadyHandler = extern "C" fn(c_int, *mut c_void);
+    type CrtcStateHandler = extern "C" fn(c_int, *mut c_void);
+    type CursorSetHandler = extern "C" fn(*const c_void, *mut c_void);
+    type CursorMoveHandler = extern "C" fn(*const c_void, *mut c_void);
+    type DdcciDataHandler = extern "C" fn(*const c_void, *mut c_void);
 
-fn capture_loop(
-    config: CaptureConfig,
-    tx: mpsc::Sender<CaptureFrame>,
-    stop_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    if config.backend != CaptureBackend::Synthetic {
-        match run_real_capture_if_available(&config, &tx, &stop_rx) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if config.backend == CaptureBackend::PortalPipewire
-                    || config.source == CaptureSource::Virtual1080p
-                {
-                    return Err(err.context("real capture backend requested explicitly"));
-                }
-                eprintln!(
-                    "[capture] real capture unavailable, falling back to synthetic source: {err:#}"
-                );
+    #[repr(C)]
+    struct EvdiEventContext {
+        dpms_handler: Option<DpmsHandler>,
+        mode_changed_handler: Option<ModeChangedHandler>,
+        update_ready_handler: Option<UpdateReadyHandler>,
+        crtc_state_handler: Option<CrtcStateHandler>,
+        cursor_set_handler: Option<CursorSetHandler>,
+        cursor_move_handler: Option<CursorMoveHandler>,
+        ddcci_data_handler: Option<DdcciDataHandler>,
+        user_data: *mut c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct EvdiMode {
+        width: c_int,
+        height: c_int,
+        refresh_rate: c_int,
+        bits_per_pixel: c_int,
+        pixel_format: c_uint,
+    }
+
+    #[link(name = "evdi")]
+    extern "C" {
+        fn evdi_check_device(device: c_int) -> c_int;
+        fn evdi_add_device() -> c_int;
+        fn evdi_open(device: c_int) -> EvdiHandle;
+        fn evdi_close(handle: EvdiHandle);
+        fn evdi_connect(
+            handle: EvdiHandle,
+            edid: *const u8,
+            edid_length: c_uint,
+            sku_area_limit: u32,
+        );
+        fn evdi_disconnect(handle: EvdiHandle);
+        fn evdi_register_buffer(handle: EvdiHandle, buffer: EvdiBuffer);
+        fn evdi_unregister_buffer(handle: EvdiHandle, buffer_id: c_int);
+        fn evdi_request_update(handle: EvdiHandle, buffer_id: c_int) -> bool;
+        fn evdi_grab_pixels(
+            handle: EvdiHandle,
+            rects: *mut EvdiRect,
+            num_rects: *mut c_int,
+        );
+        fn evdi_handle_events(handle: EvdiHandle, evtctx: *mut EvdiEventContext);
+        fn evdi_get_event_ready(handle: EvdiHandle) -> c_int;
+    }
+
+    // -- Callback ----------------------------------------------------------
+
+    struct CallbackState {
+        update_ready: bool,
+        mode: Option<EvdiMode>,
+    }
+
+    extern "C" fn on_update_ready(_buf_id: c_int, user_data: *mut c_void) {
+        let state = unsafe { &mut *(user_data as *mut CallbackState) };
+        state.update_ready = true;
+    }
+
+    extern "C" fn on_mode_changed(mode: EvdiMode, user_data: *mut c_void) {
+        let state = unsafe { &mut *(user_data as *mut CallbackState) };
+        println!(
+            "[capture] EVDI mode changed: {}x{}@{}Hz",
+            mode.width, mode.height, mode.refresh_rate
+        );
+        state.mode = Some(mode);
+    }
+
+    extern "C" fn on_dpms(mode: c_int, _user_data: *mut c_void) {
+        let name = match mode {
+            0 => "ON",
+            1 => "STANDBY",
+            2 => "SUSPEND",
+            3 => "OFF",
+            _ => "UNKNOWN",
+        };
+        println!("[capture] DPMS state changed: {name} ({mode})");
+    }
+    extern "C" fn on_crtc_state(state: c_int, _user_data: *mut c_void) {
+        println!("[capture] CRTC state changed: {state}");
+    }
+
+    // -- EDID generation ---------------------------------------------------
+
+    fn generate_edid(width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
+        let mut edid = [0u8; 128];
+
+        // Header
+        edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+
+        // Manufacturer "SRX" (S=19, R=18, X=24)
+        // Packed: 0b0_10011_10010_11000 = 0x4E58
+        edid[8] = 0x4E;
+        edid[9] = 0x58;
+
+        // Product code + serial
+        edid[10..16].copy_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x00, 0x00]);
+
+        // Week 1, Year 2024 (offset from 1990 = 34)
+        edid[16] = 0x01;
+        edid[17] = 0x22;
+
+        // EDID version 1.4
+        edid[18] = 0x01;
+        edid[19] = 0x04;
+
+        // Digital input, 8-bit color, DisplayPort
+        edid[20] = 0xA5;
+
+        // Physical size in cm (~96 DPI)
+        edid[21] = ((width as f64 * 0.02646) as u8).max(1);
+        edid[22] = ((height as f64 * 0.02646) as u8).max(1);
+
+        // Gamma 2.2
+        edid[23] = 120;
+
+        // Features: sRGB, preferred timing, continuous frequency
+        edid[24] = 0x2E;
+
+        // Chromaticity (sRGB standard values)
+        edid[25..35].copy_from_slice(&[
+            0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
+        ]);
+
+        // No established timings
+        edid[35..38].copy_from_slice(&[0x00, 0x00, 0x00]);
+
+        // Standard timings: none
+        for i in (38..54).step_by(2) {
+            edid[i] = 0x01;
+            edid[i + 1] = 0x01;
+        }
+
+        // Detailed timing descriptor for our resolution (CVT-RB style)
+        let h_blank: u32 = 80;
+        let h_sync_offset: u32 = 8;
+        let h_sync_width: u32 = 32;
+        let v_blank: u32 = 47;
+        let v_sync_offset: u32 = 3;
+        let v_sync_width: u32 = 8;
+
+        let h_total = width + h_blank;
+        let v_total = height + v_blank;
+        let pixel_clock_khz = (h_total as u64 * v_total as u64 * refresh_hz as u64) / 1000;
+        let pixel_clock_10khz = (pixel_clock_khz / 10) as u16;
+
+        let h_image = edid[21];
+        let v_image = edid[22];
+        let d = &mut edid[54..72];
+        d[0] = (pixel_clock_10khz & 0xFF) as u8;
+        d[1] = (pixel_clock_10khz >> 8) as u8;
+        d[2] = (width & 0xFF) as u8;
+        d[3] = (h_blank & 0xFF) as u8;
+        d[4] = (((width >> 8) & 0x0F) << 4 | ((h_blank >> 8) & 0x0F)) as u8;
+        d[5] = (height & 0xFF) as u8;
+        d[6] = (v_blank & 0xFF) as u8;
+        d[7] = (((height >> 8) & 0x0F) << 4 | ((v_blank >> 8) & 0x0F)) as u8;
+        d[8] = (h_sync_offset & 0xFF) as u8;
+        d[9] = (h_sync_width & 0xFF) as u8;
+        d[10] = (((v_sync_offset & 0x0F) << 4) | (v_sync_width & 0x0F)) as u8;
+        d[11] = 0x00;
+        d[12] = h_image;
+        d[13] = v_image;
+        d[14] = 0x00;
+        d[15] = 0x00;
+        d[16] = 0x00;
+        d[17] = 0x1E; // non-interlaced, digital separate, +H +V sync
+
+        // Descriptor 2: Monitor name
+        let name = b"Screx Virtual";
+        let nd = &mut edid[72..90];
+        nd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFC, 0x00]);
+        for (i, &ch) in name.iter().enumerate().take(13) {
+            nd[5 + i] = ch;
+        }
+        if name.len() < 13 {
+            nd[5 + name.len()] = 0x0A;
+            for i in (5 + name.len() + 1)..18 {
+                nd[i] = 0x20;
             }
         }
+
+        // Descriptor 3: Monitor serial
+        let serial = b"001";
+        let sd = &mut edid[90..108];
+        sd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0x00]);
+        for (i, &ch) in serial.iter().enumerate().take(13) {
+            sd[5 + i] = ch;
+        }
+        sd[5 + serial.len()] = 0x0A;
+        for i in (5 + serial.len() + 1)..18 {
+            sd[i] = 0x20;
+        }
+
+        // Descriptor 4: Range limits
+        let rd = &mut edid[108..126];
+        rd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFD, 0x00]);
+        rd[5] = (refresh_hz.saturating_sub(1).max(1)) as u8; // min V rate
+        rd[6] = (refresh_hz.saturating_add(1)) as u8; // max V rate
+        rd[7] = 1;  // min H rate kHz
+        rd[8] = 255; // max H rate kHz
+        rd[9] = ((pixel_clock_khz / 10000) + 1).min(255) as u8; // max pixel clock / 10 MHz
+        rd[10] = 0x00; // default GTF
+        for i in 11..18 {
+            rd[i] = 0x0A;
+        }
+
+        // Extension count
+        edid[126] = 0;
+
+        // Checksum
+        let sum: u8 = edid[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        edid[127] = 0u8.wrapping_sub(sum);
+
+        edid
     }
 
-    let portal = run_portal_flow_mock(config.source);
-    println!(
-        "[capture] using synthetic source (session id={}, source={}, node_id={:?}, size={:?})",
-        portal.session_id, portal.source_type, portal.stream_node_id, portal.stream_size
-    );
-    run_synthetic_capture_loop(
-        &config,
-        tx,
-        stop_rx,
-        if config.prefer_dma_buf {
-            BufferType::DmaBuf
-        } else {
-            BufferType::Shm
-        },
-    )
+    // -- Device management -------------------------------------------------
+
+    fn find_available_device() -> Option<c_int> {
+        for dev in 0..16 {
+            let status = unsafe { evdi_check_device(dev) };
+            if status == 0 {
+                // AVAILABLE
+                return Some(dev);
+            }
+        }
+        None
+    }
+
+    fn find_or_create_device() -> Result<c_int> {
+        if let Some(dev) = find_available_device() {
+            println!("[capture] found existing EVDI device at card {dev}");
+            return Ok(dev);
+        }
+
+        println!("[capture] no EVDI device found, creating one...");
+        let ret = unsafe { evdi_add_device() };
+        if ret < 0 {
+            anyhow::bail!(
+                "evdi_add_device() failed ({}). Is the evdi kernel module loaded? Try: sudo modprobe evdi",
+                ret
+            );
+        }
+
+        // Wait for udev to create the device node, then rescan
+        for attempt in 0..10 {
+            std::thread::sleep(Duration::from_millis(300));
+            if let Some(dev) = find_available_device() {
+                println!("[capture] EVDI device created at card {dev} (attempt {attempt})");
+                return Ok(dev);
+            }
+        }
+
+        anyhow::bail!("evdi_add_device succeeded but no EVDI card appeared in /dev/dri/ after 3s");
+    }
+
+    // -- Public capture entry point ----------------------------------------
+
+    pub(super) fn run_capture(
+        config: &CaptureConfig,
+        stop: &Arc<AtomicBool>,
+        on_frame: &mut impl FnMut(CaptureFrame<'_>),
+    ) -> Result<()> {
+        let dev = find_or_create_device()?;
+        let handle = unsafe { evdi_open(dev) };
+        if handle.is_null() {
+            anyhow::bail!("evdi_open({dev}) returned null");
+        }
+        println!("[capture] EVDI device {dev} opened");
+
+        // Generate EDID and connect
+        let edid = generate_edid(config.width, config.height, config.fps.max(30));
+        let area_limit = config.width * config.height;
+        unsafe {
+            evdi_connect(handle, edid.as_ptr(), edid.len() as c_uint, area_limit);
+        }
+        println!(
+            "[capture] EVDI connected: {}x{}@{}Hz",
+            config.width, config.height, config.fps
+        );
+
+        // Allocate pixel buffer (XRGB8888 = 4 bytes per pixel)
+        let stride = config.width as usize * 4;
+        let buf_size = stride * config.height as usize;
+        let mut pixel_buf = vec![0u8; buf_size];
+        let mut rects = vec![
+            EvdiRect {
+                x1: 0,
+                y1: 0,
+                x2: 0,
+                y2: 0,
+            };
+            16
+        ];
+
+        let evdi_buf = EvdiBuffer {
+            id: 0,
+            buffer: pixel_buf.as_mut_ptr() as *mut c_void,
+            width: config.width as c_int,
+            height: config.height as c_int,
+            stride: stride as c_int,
+            rects: rects.as_mut_ptr(),
+            rect_count: rects.len() as c_int,
+        };
+        unsafe {
+            evdi_register_buffer(handle, evdi_buf);
+        }
+        println!("[capture] buffer registered: {}x{} stride={stride}", config.width, config.height);
+
+        // Set up event callbacks
+        let mut cb_state = CallbackState {
+            update_ready: false,
+            mode: None,
+        };
+
+        let mut evtctx = EvdiEventContext {
+            dpms_handler: Some(on_dpms),
+            mode_changed_handler: Some(on_mode_changed),
+            update_ready_handler: Some(on_update_ready),
+            crtc_state_handler: Some(on_crtc_state),
+            cursor_set_handler: None,
+            cursor_move_handler: None,
+            ddcci_data_handler: None,
+            user_data: &mut cb_state as *mut CallbackState as *mut c_void,
+        };
+
+        let evdi_fd = unsafe { evdi_get_event_ready(handle) };
+        if evdi_fd < 0 {
+            unsafe {
+                evdi_disconnect(handle);
+                evdi_close(handle);
+            }
+            anyhow::bail!("evdi_get_event_ready returned {evdi_fd}");
+        }
+
+        let frame_interval = Duration::from_micros(1_000_000 / config.fps.max(1) as u64);
+        let poll_timeout_ms = frame_interval.as_millis().max(1).min(100) as i32;
+        let mut frame_index: u64 = 0;
+        let mut stats_start = Instant::now();
+        let mut stats_frames: u64 = 0;
+        let start_time = Instant::now();
+
+        println!("[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms)");
+        println!("[capture] NOTE: enable the 'Screx Virtual' display in GNOME Settings > Displays");
+
+        let mut pending_request = false;
+        let mut no_update_count: u64 = 0;
+
+        while !stop.load(Ordering::Relaxed) {
+            // Request an update if we don't have one pending
+            if !pending_request {
+                let ready_now = unsafe { evdi_request_update(handle, 0) };
+                if ready_now {
+                    cb_state.update_ready = true;
+                } else {
+                    pending_request = true;
+                }
+            }
+
+            // Poll the EVDI fd for events
+            if !cb_state.update_ready {
+                let mut pollfd = libc::pollfd {
+                    fd: evdi_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let poll_ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms) };
+
+                if poll_ret > 0 && (pollfd.revents & libc::POLLIN != 0) {
+                    unsafe {
+                        evdi_handle_events(handle, &mut evtctx);
+                    }
+                }
+            }
+
+            if cb_state.update_ready {
+                cb_state.update_ready = false;
+                pending_request = false;
+                no_update_count = 0;
+
+                let mut num_rects: c_int = rects.len() as c_int;
+                unsafe {
+                    evdi_grab_pixels(handle, rects.as_mut_ptr(), &mut num_rects);
+                }
+
+                let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
+                let frame = CaptureFrame {
+                    frame_index,
+                    timestamp_90k,
+                    width: config.width,
+                    height: config.height,
+                    format: PixelFormat::Bgra8888,
+                    data: &pixel_buf,
+                    captured_at: Instant::now(),
+                };
+
+                on_frame(frame);
+                frame_index += 1;
+                stats_frames += 1;
+            } else {
+                no_update_count += 1;
+                // If we've been waiting a long time, re-request
+                if no_update_count > 60 {
+                    pending_request = false;
+                    no_update_count = 0;
+                }
+            }
+
+            // Stats
+            if stats_start.elapsed() >= Duration::from_secs(1) {
+                let fps = stats_frames as f64 / stats_start.elapsed().as_secs_f64();
+                let uptime = start_time.elapsed().as_secs();
+                println!(
+                    "[capture] fps={fps:.1} resolution={}x{} uptime={uptime}s",
+                    config.width, config.height
+                );
+                stats_start = Instant::now();
+                stats_frames = 0;
+            }
+        }
+
+        println!("[capture] stopping EVDI capture");
+        unsafe {
+            evdi_unregister_buffer(handle, 0);
+            evdi_disconnect(handle);
+            evdi_close(handle);
+        }
+        println!("[capture] EVDI cleanup complete");
+        Ok(())
+    }
 }
 
-fn run_synthetic_capture_loop(
+// ---------------------------------------------------------------------------
+// Synthetic capture (fallback when real-capture is unavailable)
+// ---------------------------------------------------------------------------
+
+fn run_synthetic_capture(
     config: &CaptureConfig,
-    tx: mpsc::Sender<CaptureFrame>,
-    stop_rx: watch::Receiver<bool>,
-    buffer_type: BufferType,
+    stop: &Arc<AtomicBool>,
+    on_frame: &mut impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
     let frame_interval = Duration::from_micros(1_000_000 / config.fps.max(1) as u64);
     let mut frame_index = 0_u64;
-    let mut stats_window_start = Instant::now();
+    let mut stats_start = Instant::now();
     let mut stats_frames = 0_u64;
     let start = Instant::now();
+    let pixel_count = (config.width as usize) * (config.height as usize);
 
-    loop {
-        if *stop_rx.borrow() {
-            println!("[capture] stop signal received");
-            break;
+    println!(
+        "[capture] using synthetic source: {}x{}@{}fps",
+        config.width, config.height, config.fps
+    );
+
+    while !stop.load(Ordering::Relaxed) {
+        let mut data = vec![0u8; pixel_count * 4];
+        let t = (frame_index % 255) as u8;
+        for px in data.chunks_exact_mut(4).step_by(97) {
+            px[0] = t;
+            px[1] = t.wrapping_add(80);
+            px[2] = t.wrapping_add(160);
+            px[3] = 255;
         }
 
         let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
-        let captured_at = Instant::now();
-        let frame =
-            build_synthetic_frame(config, frame_index, timestamp_90k, captured_at, buffer_type);
-
-        if tx.blocking_send(frame).is_err() {
-            println!("[capture] downstream channel closed");
-            break;
-        }
+        on_frame(CaptureFrame {
+            frame_index,
+            timestamp_90k,
+            width: config.width,
+            height: config.height,
+            format: PixelFormat::Bgra8888,
+            data: &data,
+            captured_at: Instant::now(),
+        });
 
         frame_index += 1;
         stats_frames += 1;
-        if stats_window_start.elapsed() >= Duration::from_secs(1) {
-            let fps = stats_frames as f64 / stats_window_start.elapsed().as_secs_f64();
-            let uptime = start.elapsed().as_secs();
-            let buffer = match buffer_type {
-                BufferType::DmaBuf => "DMA-BUF",
-                BufferType::Shm => "SHM",
-            };
+        if stats_start.elapsed() >= Duration::from_secs(1) {
+            let fps = stats_frames as f64 / stats_start.elapsed().as_secs_f64();
             println!(
-                "[capture] fps={fps:.1} resolution={}x{} format=BGRA buffer={buffer} uptime={}s",
-                config.width, config.height, uptime
+                "[capture] fps={fps:.1} resolution={}x{} uptime={}s (synthetic)",
+                config.width, config.height, start.elapsed().as_secs()
             );
-            stats_window_start = Instant::now();
+            stats_start = Instant::now();
             stats_frames = 0;
         }
 
-        thread::sleep(frame_interval);
+        std::thread::sleep(frame_interval);
     }
 
     Ok(())
 }
 
-fn run_portal_flow_mock(source: CaptureSource) -> PortalSession {
-    // This mirrors the intended xdg-desktop-portal sequence:
-    // CreateSession -> SelectSources(SourceType::Monitor) -> Start -> OpenPipeWireRemote
-    // In this bootstrap implementation we keep the structure and logging while using
-    // a synthetic frame source so integration can proceed before hardware capture wiring.
-    println!("[capture] portal: CreateSession");
-    thread::sleep(Duration::from_millis(20));
-    println!(
-        "[capture] portal: SelectSources(SourceType::{})",
-        source.label()
-    );
-    thread::sleep(Duration::from_millis(20));
-    println!("[capture] portal: Start");
-    thread::sleep(Duration::from_millis(20));
-    println!("[capture] portal: OpenPipeWireRemote");
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
 
-    PortalSession {
-        session_id: "mock-session-001".to_string(),
-        source_type: source.label(),
-        stream_node_id: None,
-        stream_size: Some((1920, 1080)),
-    }
-}
-
-fn build_synthetic_frame(
-    config: &CaptureConfig,
-    frame_index: u64,
-    timestamp_90k: u32,
-    captured_at: Instant,
-    buffer_type: BufferType,
-) -> CaptureFrame {
-    let pixel_count = (config.width as usize) * (config.height as usize);
-    let mut data = vec![0_u8; pixel_count * 4];
-
-    // A lightweight gradient gives deterministic motion to exercise the pipeline.
-    let t = (frame_index % 255) as u8;
-    for px in data.chunks_exact_mut(4).step_by(97) {
-        px[0] = t; // B
-        px[1] = t.wrapping_add(80); // G
-        px[2] = t.wrapping_add(160); // R
-        px[3] = 255; // A
-    }
-
-    CaptureFrame {
-        frame_index,
-        timestamp_90k,
-        width: config.width,
-        height: config.height,
-        format: PixelFormat::Bgra8888,
-        buffer_type,
-        data,
-        captured_at,
-    }
-}
-
-#[cfg(feature = "real-capture")]
-fn run_real_capture_if_available(
-    config: &CaptureConfig,
-    tx: &mpsc::Sender<CaptureFrame>,
-    stop_rx: &watch::Receiver<bool>,
+pub fn run_capture_loop(
+    config: CaptureConfig,
+    stop: Arc<AtomicBool>,
+    mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    real_capture::run_capture(config, tx, stop_rx)
-}
-
-#[cfg(not(feature = "real-capture"))]
-fn run_real_capture_if_available(
-    _config: &CaptureConfig,
-    _tx: &mpsc::Sender<CaptureFrame>,
-    _stop_rx: &watch::Receiver<bool>,
-) -> Result<()> {
-    bail!("daemon built without `real-capture` feature")
-}
-
-#[cfg(feature = "real-capture")]
-mod real_capture {
-    use std::os::fd::OwnedFd;
-    use std::time::{Duration, Instant};
-
-    use anyhow::{Context, Result};
-    use ashpd::desktop::{
-        screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
-        PersistMode,
-    };
-    use pipewire as pw;
-    use pw::{properties::properties, spa};
-    use spa::pod::Pod;
-    use tokio::runtime::Builder;
-    use tokio::sync::{mpsc, watch};
-
-    use super::{
-        BufferType, CaptureConfig, CaptureFrame, CaptureSource, PixelFormat, PortalSession,
-    };
-
-    struct ActivePortalSession {
-        meta: PortalSession,
-        node_id: u32,
-        remote_fd: OwnedFd,
-    }
-
-    struct CaptureUserData {
-        format: spa::param::video::VideoInfoRaw,
-        sender: mpsc::Sender<CaptureFrame>,
-        frame_index: u64,
-        fps: u32,
-        requested_width: u32,
-        requested_height: u32,
-        fallback_width: u32,
-        fallback_height: u32,
-        warned_size_mismatch: bool,
-        last_stats: Instant,
-        stats_frames: u64,
-        stats_dropped_pw_buffers: u64,
-    }
-
-    pub(super) fn run_capture(
-        config: &CaptureConfig,
-        tx: &mpsc::Sender<CaptureFrame>,
-        stop_rx: &watch::Receiver<bool>,
-    ) -> Result<()> {
-        let session = open_portal_session(config.source, config.width, config.height)?;
-        println!(
-            "[capture] portal session started: id={}, source={}, node_id={:?}, size={:?}",
-            session.meta.session_id,
-            session.meta.source_type,
-            session.meta.stream_node_id,
-            session.meta.stream_size
-        );
-
-        let mainloop =
-            pw::main_loop::MainLoopRc::new(None).context("failed to create PipeWire main loop")?;
-        let context = pw::context::ContextRc::new(&mainloop, None)
-            .context("failed to create PipeWire context")?;
-        let core = context
-            .connect_fd_rc(session.remote_fd, None)
-            .context("failed to connect to PipeWire remote fd")?;
-
-        let stream = pw::stream::StreamBox::new(
-            &core,
-            "screx-capture",
-            properties! {
-                *pw::keys::MEDIA_TYPE => "Video",
-                *pw::keys::MEDIA_CATEGORY => "Capture",
-                *pw::keys::MEDIA_ROLE => "Screen",
-            },
-        )
-        .context("failed to create PipeWire capture stream")?;
-
-        let mut effective_config = config.clone();
-        if let Some((w, h)) = session.meta.stream_size {
-            if w > 0 && h > 0 {
-                effective_config.width = w as u32;
-                effective_config.height = h as u32;
+    #[cfg(feature = "real-capture")]
+    {
+        match evdi::run_capture(&config, &stop, &mut on_frame) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("[capture] EVDI capture failed: {e:#}");
+                eprintln!("[capture] falling back to synthetic source");
             }
         }
-
-        let data = CaptureUserData {
-            format: Default::default(),
-            sender: tx.clone(),
-            frame_index: 0,
-            fps: config.fps.max(1),
-            requested_width: config.width,
-            requested_height: config.height,
-            fallback_width: effective_config.width,
-            fallback_height: effective_config.height,
-            warned_size_mismatch: false,
-            last_stats: Instant::now(),
-            stats_frames: 0,
-            stats_dropped_pw_buffers: 0,
-        };
-
-        let _listener = stream
-            .add_local_listener_with_user_data(data)
-            .state_changed(|_, _, old, new| {
-                println!("[capture] pipewire stream state changed: {old:?} -> {new:?}");
-            })
-            .param_changed(|_, user_data, id, param| {
-                let Some(param) = param else {
-                    return;
-                };
-                if id != pw::spa::param::ParamType::Format.as_raw() {
-                    return;
-                }
-                let (media_type, media_subtype) =
-                    match pw::spa::param::format_utils::parse_format(param) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                if media_type != pw::spa::param::format::MediaType::Video
-                    || media_subtype != pw::spa::param::format::MediaSubtype::Raw
-                {
-                    return;
-                }
-                if user_data.format.parse(param).is_ok() {
-                    let size = user_data.format.size();
-                    if size.width > 0 && size.height > 0 {
-                        user_data.fallback_width = size.width;
-                        user_data.fallback_height = size.height;
-                        if !user_data.warned_size_mismatch
-                            && (size.width != user_data.requested_width
-                                || size.height != user_data.requested_height)
-                        {
-                            eprintln!(
-                                "[capture] negotiated size {}x{} differs from requested {}x{}; adapting encoder geometry",
-                                size.width,
-                                size.height,
-                                user_data.requested_width,
-                                user_data.requested_height
-                            );
-                            user_data.warned_size_mismatch = true;
-                        }
-                    }
-                    println!(
-                        "[capture] negotiated video format={:?} size={}x{} framerate={}/{}",
-                        user_data.format.format(),
-                        user_data.fallback_width,
-                        user_data.fallback_height,
-                        user_data.format.framerate().num,
-                        user_data.format.framerate().denom
-                    );
-                }
-            })
-            .process(|stream, user_data| {
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
-                };
-                while let Some(next) = stream.dequeue_buffer() {
-                    buffer = next;
-                    user_data.stats_dropped_pw_buffers += 1;
-                }
-                let datas = buffer.datas_mut();
-                if datas.is_empty() {
-                    return;
-                }
-                let data = &mut datas[0];
-                let data_type = data.type_();
-                let chunk = data.chunk();
-                let chunk_size = chunk.size() as usize;
-                let chunk_offset = chunk.offset() as usize;
-                let chunk_stride = chunk.stride();
-
-                let Some(raw) = data.data() else {
-                    // If this is a non-mapped DMA-BUF path, keep loop alive and fall back in higher layer.
-                    return;
-                };
-                if chunk_offset >= raw.len() {
-                    return;
-                }
-                let max_len = raw.len() - chunk_offset;
-                let use_len = if chunk_size == 0 {
-                    max_len
-                } else {
-                    chunk_size.min(max_len)
-                };
-                let payload = &raw[chunk_offset..(chunk_offset + use_len)];
-
-                let width = user_data.fallback_width.max(1);
-                let height = user_data.fallback_height.max(1);
-                let expected = (width as usize) * (height as usize) * 4;
-                let mut frame_data = vec![0_u8; expected];
-                let row_bytes = (width as usize) * 4;
-                let stride_abs = if chunk_stride == 0 {
-                    row_bytes
-                } else {
-                    chunk_stride.unsigned_abs() as usize
-                };
-                let mut copied_rows = 0_usize;
-                if stride_abs >= row_bytes {
-                    let h = height as usize;
-                    for row in 0..h {
-                        let src_row = if chunk_stride < 0 { h - 1 - row } else { row };
-                        let src_start = src_row.saturating_mul(stride_abs);
-                        let src_end = src_start.saturating_add(row_bytes);
-                        let dst_start = row.saturating_mul(row_bytes);
-                        let dst_end = dst_start.saturating_add(row_bytes);
-                        if src_end > payload.len() || dst_end > frame_data.len() {
-                            break;
-                        }
-                        frame_data[dst_start..dst_end].copy_from_slice(&payload[src_start..src_end]);
-                        copied_rows += 1;
-                    }
-                }
-                if copied_rows == 0 {
-                    let copy_len = expected.min(payload.len());
-                    frame_data[..copy_len].copy_from_slice(&payload[..copy_len]);
-                }
-                let timestamp_90k =
-                    ((user_data.frame_index * 90_000) / user_data.fps as u64) as u32;
-                let frame = CaptureFrame {
-                    frame_index: user_data.frame_index,
-                    timestamp_90k,
-                    width,
-                    height,
-                    format: PixelFormat::Bgra8888,
-                    buffer_type: if data_type == spa::buffer::DataType::DmaBuf {
-                        BufferType::DmaBuf
-                    } else {
-                        BufferType::Shm
-                    },
-                    data: frame_data,
-                    captured_at: Instant::now(),
-                };
-                let _ = user_data.sender.try_send(frame);
-
-                user_data.frame_index = user_data.frame_index.wrapping_add(1);
-                user_data.stats_frames += 1;
-                if user_data.last_stats.elapsed() >= Duration::from_secs(1) {
-                    let fps = user_data.stats_frames as f64
-                        / user_data.last_stats.elapsed().as_secs_f64();
-                    let buffer_name = if data_type == spa::buffer::DataType::DmaBuf {
-                        "DMA-BUF"
-                    } else {
-                        "SHM"
-                    };
-                    println!(
-                        "[capture] fps={fps:.1} resolution={}x{} format=BGRA buffer={buffer_name} dropped_pw_buffers_per_sec={}",
-                        width, height, user_data.stats_dropped_pw_buffers
-                    );
-                    user_data.last_stats = Instant::now();
-                    user_data.stats_frames = 0;
-                    user_data.stats_dropped_pw_buffers = 0;
-                }
-            })
-            .register()
-            .context("failed to register PipeWire stream listener")?;
-
-        let obj = pw::spa::pod::object!(
-            pw::spa::utils::SpaTypes::ObjectParamFormat,
-            pw::spa::param::ParamType::EnumFormat,
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaType,
-                Id,
-                pw::spa::param::format::MediaType::Video
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaSubtype,
-                Id,
-                pw::spa::param::format::MediaSubtype::Raw
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoFormat,
-                Choice,
-                Enum,
-                Id,
-                pw::spa::param::video::VideoFormat::BGRA,
-                pw::spa::param::video::VideoFormat::BGRA,
-                pw::spa::param::video::VideoFormat::BGRx
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoSize,
-                Choice,
-                Range,
-                Rectangle,
-                pw::spa::utils::Rectangle {
-                    width: config.width,
-                    height: config.height
-                },
-                pw::spa::utils::Rectangle {
-                    width: 1,
-                    height: 1
-                },
-                pw::spa::utils::Rectangle {
-                    width: 8192,
-                    height: 8192
-                }
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoFramerate,
-                Choice,
-                Range,
-                Fraction,
-                pw::spa::utils::Fraction {
-                    num: config.fps.max(1),
-                    denom: 1
-                },
-                pw::spa::utils::Fraction { num: 0, denom: 1 },
-                pw::spa::utils::Fraction {
-                    num: 240,
-                    denom: 1
-                }
-            ),
-        );
-        let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &pw::spa::pod::Value::Object(obj),
-        )
-        .context("failed to serialize PipeWire pod format")?
-        .0
-        .into_inner();
-        let mut params = [Pod::from_bytes(&values).context("failed to decode PipeWire pod bytes")?];
-
-        stream
-            .connect(
-                spa::utils::Direction::Input,
-                Some(session.node_id),
-                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-                &mut params,
-            )
-            .context("failed to connect PipeWire stream")?;
-
-        println!(
-            "[capture] PipeWire stream connected to node {}",
-            session.node_id
-        );
-        while !*stop_rx.borrow() {
-            // Keep a short iterate timeout to avoid throttling capture callback delivery.
-            let _ = mainloop.loop_().iterate(Duration::from_millis(5));
-        }
-        let _ = stream.disconnect();
-        println!("[capture] PipeWire stream disconnected");
-        Ok(())
     }
 
-    fn open_portal_session(
-        source: CaptureSource,
-        expected_width: u32,
-        expected_height: u32,
-    ) -> Result<ActivePortalSession> {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create capture runtime")?;
-
-        runtime.block_on(async {
-            let proxy = Screencast::new().await.context("Screencast::new failed")?;
-
-            let session = proxy
-                .create_session(Default::default())
-                .await
-                .context("CreateSession failed")?;
-
-            let options = SelectSourcesOptions::default()
-                .set_multiple(false)
-                .set_sources(Some(
-                    match source {
-                        CaptureSource::Virtual1080p => SourceType::Virtual,
-                        CaptureSource::Monitor => SourceType::Monitor,
-                    }
-                    .into(),
-                ))
-                .set_cursor_mode(CursorMode::Embedded)
-                .set_persist_mode(PersistMode::DoNot);
-
-            proxy
-                .select_sources(&session, options)
-                .await
-                .context("SelectSources request failed")?
-                .response()
-                .context("SelectSources failed")?;
-
-            let start = proxy
-                .start(&session, None, Default::default())
-                .await
-                .context("Start request failed")?
-                .response()
-                .context("Start failed")?;
-            let stream = start.streams().first();
-            let node_id = stream.map(|s| s.pipe_wire_node_id());
-            let size = stream.and_then(|s| s.size());
-            if node_id.is_none() {
-                anyhow::bail!("portal returned no screencast streams");
-            }
-
-            let pw_fd = proxy
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("OpenPipeWireRemote failed")?;
-            let node_id = node_id.expect("checked above");
-            if source == CaptureSource::Virtual1080p {
-                if let Some((width, height)) = size {
-                    if width as u32 != expected_width || height as u32 != expected_height {
-                        anyhow::bail!(
-                            "virtual stream size mismatch: expected {}x{}, got {}x{}",
-                            expected_width,
-                            expected_height,
-                            width,
-                            height
-                        );
-                    }
-                }
-            }
-
-            Ok(ActivePortalSession {
-                meta: PortalSession {
-                    session_id: format!("node-{node_id}"),
-                    source_type: source.label(),
-                    stream_node_id: Some(node_id),
-                    stream_size: size,
-                },
-                node_id,
-                remote_fd: pw_fd,
-            })
-        })
+    #[cfg(not(feature = "real-capture"))]
+    {
+        println!("[capture] built without real-capture feature, using synthetic source");
     }
+
+    run_synthetic_capture(&config, &stop, &mut on_frame)
 }

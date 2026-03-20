@@ -5,14 +5,15 @@ mod encode;
 mod stream_server;
 
 use std::env;
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 struct AppConfig {
-    capture_backend: capture::CaptureBackend,
-    capture_source: capture::CaptureSource,
     encoder_backend: encode::EncoderBackend,
     width: u32,
     height: u32,
@@ -24,21 +25,19 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let capture_source =
-            capture::CaptureSource::from_env(&read_env("SCREX_CAPTURE_SOURCE", "virtual"));
-        let width = read_env("SCREX_WIDTH", "1920")
+        let width = read_env("SCREX_WIDTH", "2160")
             .parse::<u32>()
             .context("invalid SCREX_WIDTH")?;
-        let height = read_env("SCREX_HEIGHT", "1080")
+        let height = read_env("SCREX_HEIGHT", "1620")
             .parse::<u32>()
             .context("invalid SCREX_HEIGHT")?;
-        let fps = read_env("SCREX_FPS", "60")
+        let fps = read_env("SCREX_FPS", "30")
             .parse::<u32>()
             .context("invalid SCREX_FPS")?;
-        let gop = read_env("SCREX_GOP", "60")
+        let gop = read_env("SCREX_GOP", "30")
             .parse::<u32>()
             .context("invalid SCREX_GOP")?;
-        let bitrate_bps = read_env("SCREX_BITRATE_BPS", "10000000")
+        let bitrate_bps = read_env("SCREX_BITRATE_BPS", "15000000")
             .parse::<u32>()
             .context("invalid SCREX_BITRATE_BPS")?;
         let stream_port = read_env("SCREX_STREAM_PORT", "9000")
@@ -46,11 +45,6 @@ impl AppConfig {
             .context("invalid SCREX_STREAM_PORT")?;
 
         Ok(Self {
-            capture_backend: capture::CaptureBackend::from_env(&read_env(
-                "SCREX_CAPTURE_BACKEND",
-                "auto",
-            )),
-            capture_source,
             encoder_backend: encode::EncoderBackend::from_env(&read_env(
                 "SCREX_ENCODER_BACKEND",
                 "auto",
@@ -78,13 +72,17 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::from_env()?;
-    println!("screx-daemon boot with config: {config:?}");
+    println!("screx-daemon v2 (EVDI) config: {config:?}");
 
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let (frame_tx, frame_rx) = mpsc::channel(2);
-    let (au_tx, au_rx) = mpsc::channel(2);
-    let (control_tx, control_rx) = mpsc::channel(32);
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared = Arc::new(stream_server::SharedState::new());
 
+    // UDP socket for streaming
+    let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
+        .with_context(|| format!("failed to bind UDP port {}", config.stream_port))?;
+    println!("[main] UDP socket bound on port {}", config.stream_port);
+
+    // mDNS advertisement
     let mdns_handle = match discovery::start_sender_advertisement(
         "_screx._udp",
         "screx-daemon",
@@ -100,55 +98,77 @@ async fn main() -> Result<()> {
         }
     };
 
-    let capture_handle = capture::spawn_capture_thread(
-        capture::CaptureConfig {
-            width: config.width,
-            height: config.height,
-            fps: config.fps,
-            prefer_dma_buf: true,
-            backend: config.capture_backend,
-            source: config.capture_source,
-        },
-        frame_tx,
-        stop_rx.clone(),
-    );
+    // Client manager thread (handles SCREX register + PLI packets)
+    let client_socket = socket.try_clone().context("clone socket for client mgr")?;
+    let client_shared = Arc::clone(&shared);
+    let client_stop = Arc::clone(&stop);
+    let client_thread = thread::Builder::new()
+        .name("client-mgr".into())
+        .spawn(move || {
+            if let Err(e) =
+                stream_server::run_client_manager(client_socket, client_shared, client_stop)
+            {
+                eprintln!("[client] manager error: {e:#}");
+            }
+        })
+        .context("failed to spawn client manager thread")?;
 
-    let encode_stop_rx = stop_rx.clone();
-    let encode_task = tokio::task::spawn_blocking(move || {
-        encode::run_encoder_loop(
-            encode::EncoderConfig {
-                bitrate_bps: config.bitrate_bps,
-                gop: config.gop,
-                fps: config.fps,
-                width: config.width,
-                height: config.height,
-                backend: config.encoder_backend,
-            },
-            frame_rx,
-            au_tx,
-            control_rx,
-            encode_stop_rx,
-        )
-    });
+    // Capture + encode + send thread (the synchronous hot path)
+    let send_socket = socket.try_clone().context("clone socket for sender")?;
+    let capture_shared = Arc::clone(&shared);
+    let capture_stop = Arc::clone(&stop);
+    let capture_config = capture::CaptureConfig {
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+    };
 
-    let stream_task = tokio::spawn(stream_server::run_stream_server(
-        config.stream_port,
-        au_rx,
-        control_tx,
-        stop_rx.clone(),
-    ));
+    let mut encoder = encode::Encoder::new(encode::EncoderConfig {
+        bitrate_bps: config.bitrate_bps,
+        gop: config.gop,
+        fps: config.fps,
+        width: config.width,
+        height: config.height,
+        backend: config.encoder_backend,
+    })?;
 
+    let mut sender = stream_server::UdpSender::new(send_socket);
+
+    let capture_thread = thread::Builder::new()
+        .name("capture".into())
+        .spawn(move || -> Result<()> {
+            capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
+                let force_idr = capture_shared.force_idr.swap(false, Ordering::Relaxed);
+
+                match encoder.encode_frame(&frame, force_idr) {
+                    Ok(aus) => {
+                        let client_addr = *capture_shared.client_addr.lock().unwrap();
+                        if let Some(addr) = client_addr {
+                            for au in &aus {
+                                if let Err(e) = sender.send_frame(au, addr) {
+                                    eprintln!("[pipeline] send error: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[pipeline] encode error: {e:#}");
+                    }
+                }
+            })
+        })
+        .context("failed to spawn capture thread")?;
+
+    // Wait for Ctrl-C
     tokio::signal::ctrl_c().await?;
     println!("\nshutdown requested (ctrl-c)");
-    let _ = stop_tx.send(true);
+    stop.store(true, Ordering::SeqCst);
 
-    let _ = stream_task.await;
-    let _ = encode_task.await;
-
-    match capture_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("capture stopped with error: {err:#}"),
-        Err(_) => eprintln!("capture thread panicked"),
+    if let Err(e) = capture_thread.join() {
+        eprintln!("[main] capture thread panicked: {e:?}");
+    }
+    if let Err(e) = client_thread.join() {
+        eprintln!("[main] client manager thread panicked: {e:?}");
     }
 
     if let Some(handle) = mdns_handle {

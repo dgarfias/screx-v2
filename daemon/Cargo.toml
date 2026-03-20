@@ -7,16 +7,15 @@ license = "MIT"
 
 [features]
 default = []
-real-capture = ["dep:ashpd", "dep:pipewire"]
+real-capture = ["dep:libc"]
 real-encode = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
 
 [dependencies]
 anyhow = "1"
-ashpd = { version = "0.13", optional = true, features = ["screencast"] }
 ffmpeg-next = { version = "8", optional = true }
 ffmpeg-sys-next = { version = "8", optional = true }
+libc = { version = "0.2", optional = true }
 mdns-sd = { version = "0.18.2", features = ["async"] }
-pipewire = { version = "0.9", optional = true }
 rand = "0.8"
 reed-solomon-erasure = "6"
 serde = { version = "1", features = ["derive"] }
