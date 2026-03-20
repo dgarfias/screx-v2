@@ -8,12 +8,14 @@ struct KeyboardInputView: UIViewRepresentable {
     @Binding var isActive: Bool
     let onText: (String) -> Void
     let onDelete: () -> Void
+    let modifierBar: ModifierBarState
 
     func makeUIView(context: Context) -> KeyInputProxyView {
         let view = KeyInputProxyView()
         view.onText = onText
         view.onDelete = onDelete
         view.onResign = { context.coordinator.deactivate() }
+        view.modifierBar = modifierBar
         view.isUserInteractionEnabled = false
         return view
     }
@@ -22,6 +24,7 @@ struct KeyboardInputView: UIViewRepresentable {
         uiView.onText = onText
         uiView.onDelete = onDelete
         uiView.onResign = { context.coordinator.deactivate() }
+        uiView.modifierBar = modifierBar
         uiView.allowFirstResponder = isActive
         uiView.isUserInteractionEnabled = isActive
         if isActive && !uiView.isFirstResponder {
@@ -47,11 +50,29 @@ final class KeyInputProxyView: UIView, UIKeyInput {
     var onDelete: (() -> Void)?
     var onResign: (() -> Void)?
     var allowFirstResponder = false
+    var modifierBar: ModifierBarState?
+
+    private var toolbarHostController: UIHostingController<ModifierToolbar>?
 
     override var canBecomeFirstResponder: Bool { allowFirstResponder }
     var hasText: Bool { true }
 
     var autocorrectionType: UITextAutocorrectionType { .no }
+
+    override var inputAccessoryView: UIView? {
+        guard let bar = modifierBar else { return nil }
+        if toolbarHostController == nil {
+            let host = UIHostingController(rootView: ModifierToolbar(bar: bar))
+            host.view.backgroundColor = UIColor.secondarySystemBackground
+            let width = UIScreen.main.bounds.width
+            let target = CGSize(width: width, height: UIView.layoutFittingCompressedSize.height)
+            let fitted = host.sizeThatFits(in: target)
+            host.view.frame = CGRect(x: 0, y: 0, width: width, height: max(fitted.height, 36))
+            host.view.autoresizingMask = [.flexibleWidth]
+            toolbarHostController = host
+        }
+        return toolbarHostController?.view
+    }
 
     func insertText(_ text: String) {
         onText?(text)

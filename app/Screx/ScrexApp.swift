@@ -359,7 +359,8 @@ struct ContentView: View {
             KeyboardInputView(
                 isActive: $keyboardActive,
                 onText: { text in model.sendTextInsert(text) },
-                onDelete: { model.sendSpecialKey(0x01) }
+                onDelete: { model.sendSpecialKey(0x01) },
+                modifierBar: model.modifierBar
             )
             .frame(width: 0, height: 0)
 
@@ -405,12 +406,6 @@ struct ContentView: View {
                 }
 
                 Spacer()
-
-                if keyboardActive {
-                    ModifierToolbar(bar: model.modifierBar)
-                        .padding(.bottom, 4)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
 
                 HStack(spacing: 6) {
                     Spacer()

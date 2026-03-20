@@ -601,7 +601,7 @@ impl VirtualKeyboard {
         self.key_event(KEY_LEFTCTRL, 0);
         self.syn();
 
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
         for h in hex.chars() {
             if let Some((kc, _)) = char_to_key(h) {
@@ -609,6 +609,7 @@ impl VirtualKeyboard {
                 self.syn();
                 self.key_event(kc, 0);
                 self.syn();
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
 
@@ -617,6 +618,7 @@ impl VirtualKeyboard {
         self.syn();
         self.key_event(KEY_ENTER, 0);
         self.syn();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     pub fn press_special(&mut self, code: u8) {

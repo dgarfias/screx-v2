@@ -28,7 +28,6 @@ enum ModifierState {
 @MainActor
 final class ModifierBarState: ObservableObject {
     @Published var states: [ModifierKey: ModifierState] = [:]
-    @Published var fnActive = false
 
     var onModifier: ((UInt8, Bool) -> Void)?
     var onSpecialKey: ((UInt8) -> Void)?
@@ -51,7 +50,6 @@ final class ModifierBarState: ObservableObject {
         states[key] ?? .inactive
     }
 
-    /// Sends press events for one-shot modifiers, returns which ones were activated.
     func pressOneShotModifiers() -> [ModifierKey] {
         var pressed: [ModifierKey] = []
         for key in ModifierKey.allCases {
@@ -63,7 +61,6 @@ final class ModifierBarState: ObservableObject {
         return pressed
     }
 
-    /// Releases one-shot modifiers and resets their state.
     func releaseOneShotModifiers(_ keys: [ModifierKey]) {
         for key in keys {
             onModifier?(key.protocolId, false)
@@ -79,7 +76,6 @@ final class ModifierBarState: ObservableObject {
             }
         }
         states = [:]
-        fnActive = false
     }
 }
 
@@ -87,45 +83,33 @@ struct ModifierToolbar: View {
     @ObservedObject var bar: ModifierBarState
 
     var body: some View {
-        HStack(spacing: 4) {
-            modButton("Esc") { bar.onSpecialKey?(0x04) }
-            modButton("Tab") { bar.onSpecialKey?(0x03) }
-
-            ForEach(ModifierKey.allCases) { key in
-                modKeyButton(key)
-            }
-
-            modButton("Fn") {
-                bar.fnActive.toggle()
-            }
-            .foregroundStyle(bar.fnActive ? .yellow : .white)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(.ultraThinMaterial, in: Capsule())
-
-        if bar.fnActive {
-            fnRow
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-    }
-
-    private var fnRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 3) {
-                ForEach(1...12, id: \.self) { n in
-                    modButton("F\(n)") {
-                        bar.onSpecialKey?(UInt8(0x0F + n))
-                        bar.fnActive = false
-                    }
+                modButton("Esc") { bar.onSpecialKey?(0x04) }
+                modButton("Tab") { bar.onSpecialKey?(0x03) }
+
+                Divider().frame(height: 22).opacity(0.4)
+
+                ForEach(ModifierKey.allCases) { key in
+                    modKeyButton(key)
                 }
+
+                Divider().frame(height: 22).opacity(0.4)
+
+                ForEach(1...12, id: \.self) { n in
+                    modButton("F\(n)") { bar.onSpecialKey?(UInt8(0x0F + n)) }
+                }
+
+                Divider().frame(height: 22).opacity(0.4)
+
                 modButton("PgUp") { bar.onSpecialKey?(0x1C) }
                 modButton("PgDn") { bar.onSpecialKey?(0x1D) }
+                modButton("Home") { bar.onSpecialKey?(0x0A) }
+                modButton("End")  { bar.onSpecialKey?(0x0B) }
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.horizontal, 8)
         }
+        .frame(height: 36)
     }
 
     @ViewBuilder
@@ -133,9 +117,9 @@ struct ModifierToolbar: View {
         let s = bar.state(for: key)
         Button { bar.toggle(key) } label: {
             Text(key.rawValue)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
                 .background(background(for: s), in: RoundedRectangle(cornerRadius: 5))
                 .foregroundStyle(foreground(for: s))
         }
@@ -153,9 +137,9 @@ struct ModifierToolbar: View {
     private func modButton(_ label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
