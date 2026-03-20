@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter};
 use crate::encode::EncodedAccessUnit;
 use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
@@ -18,7 +17,6 @@ const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEY_MAGIC: &[u8] = b"KEY";
-const MIC_MAGIC: &[u8] = b"MIC";
 const CAM_MAGIC: &[u8] = b"CAM";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
@@ -32,7 +30,6 @@ pub struct SharedState {
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
-    pub mic_writer: Mutex<Option<MicWriter>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
 }
 
@@ -45,7 +42,6 @@ impl SharedState {
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
-            mic_writer: Mutex::new(None),
             cam_writer: Mutex::new(None),
         }
     }
@@ -90,7 +86,6 @@ pub fn run_client_manager(
     let mut last_keepalive = Instant::now();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
-    let mut mic_last_seq: Option<u32> = None;
 
     println!("[client] listening for iPad registration...");
 
@@ -127,39 +122,6 @@ pub fn run_client_manager(
                     let mut kb = shared.virtual_keyboard.lock().unwrap();
                     if let Some(ref mut keyboard) = *kb {
                         crate::uinput::handle_key_packet(keyboard, key_data);
-                    }
-                }
-
-                if len > MIC_MAGIC.len() && &recv_buf[..MIC_MAGIC.len()] == MIC_MAGIC {
-                    let mic_pkt = &recv_buf[..len];
-                    match crate::audio::parse_mic_packet(mic_pkt) {
-                        Ok(parsed) => {
-                            if let Some(prev) = mic_last_seq {
-                                let expected = prev.wrapping_add(1);
-                                if parsed.seq != expected {
-                                    let delta = parsed.seq.wrapping_sub(expected);
-                                    eprintln!(
-                                        "[mic] seq gap on UDP: prev={prev} expected={expected} got={} delta={delta}",
-                                        parsed.seq
-                                    );
-                                }
-                            } else {
-                                println!(
-                                    "[mic] first packet received: seq={} bytes={}",
-                                    parsed.seq,
-                                    parsed.pcm.len()
-                                );
-                            }
-                            mic_last_seq = Some(parsed.seq);
-
-                            let mut mic = shared.mic_writer.lock().unwrap();
-                            if let Some(ref mut mw) = *mic {
-                                mw.write_pcm(parsed.pcm);
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("[mic] dropped malformed UDP packet: {err}");
-                        }
                     }
                 }
 

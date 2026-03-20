@@ -224,23 +224,6 @@ final class USBListener {
         })
     }
 
-    /// Sends microphone packet over USB TCP control channel.
-    func sendMicPacket(_ micPacket: Data) {
-        guard let conn = connection else { return }
-        let payloadLen = UInt32(1 + micPacket.count)
-
-        var frame = Data()
-        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
-        frame.append(Self.msgControl)
-        frame.append(micPacket)
-
-        conn.send(content: frame, completion: .contentProcessed { error in
-            if let error {
-                print("[usb] mic send error: \(error)")
-            }
-        })
-    }
-
     /// Sends a camera JPEG frame over USB TCP. Single framed control message.
     func sendCameraFrame(_ jpeg: Data) {
         guard let conn = connection else { return }

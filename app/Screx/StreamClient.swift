@@ -297,16 +297,6 @@ final class StreamClient {
         })
     }
 
-    /// Sends microphone packet over UDP.
-    func sendMicPacket(_ micPacket: Data) {
-        guard let conn = connection else { return }
-        conn.send(content: micPacket, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] mic send error: \(error)")
-            }
-        })
-    }
-
     /// Sends a camera JPEG frame over UDP, chunked.
     /// Header per chunk: "CAM" + frame_id(4 BE) + chunk_idx(2 BE) + total(2 BE) + jpeg_data
     func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {

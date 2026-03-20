@@ -10,13 +10,7 @@ struct ScrexApp: App {
     init() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .default,
-                options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
-            )
-            try session.setPreferredSampleRate(Double(MicProtocol.sampleRate))
-            try session.setPreferredIOBufferDuration(0.01)
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             print("[app] audio session: rate=\(session.sampleRate)Hz, ioBufferDuration=\(session.ioBufferDuration)")
         } catch {
@@ -42,7 +36,6 @@ final class StreamViewModel: ObservableObject {
 
     let decoder = H264Decoder()
     let audioPlayer = AudioPlayer()
-    let micCapture = MicCapture()
     let cameraCapture = CameraCapture()
 
     private let discovery = DiscoveryService()
@@ -51,7 +44,6 @@ final class StreamViewModel: ObservableObject {
     private var discoveryStarted = false
     private var usbConnected = false
     private var camFrameId: UInt32 = 0
-    private var micSeq: UInt32 = 0
 
     /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
     private var lastWifiEndpoint: NWEndpoint?
@@ -185,9 +177,6 @@ final class StreamViewModel: ObservableObject {
             stream?.disconnect()
             connectToEndpoint(endpoint, name: name)
         } else {
-            if micCapture.isRunning {
-                micCapture.stop()
-            }
             isConnected = false
             transport = ""
             status = "USB disconnected, looking for daemon..."
@@ -200,9 +189,6 @@ final class StreamViewModel: ObservableObject {
     private func handleStreamLost() {
         stream?.disconnect()
         stream = nil
-        if micCapture.isRunning {
-            micCapture.stop()
-        }
         isConnected = false
         transport = ""
         status = "Daemon disconnected, looking..."
@@ -211,9 +197,6 @@ final class StreamViewModel: ObservableObject {
     }
 
     func disconnect() {
-        if micCapture.isRunning {
-            micCapture.stop()
-        }
         stream?.disconnect()
         stream = nil
         usbListener?.stop()
@@ -225,7 +208,6 @@ final class StreamViewModel: ObservableObject {
         audioPlayer.stop()
         lastWifiEndpoint = nil
         lastWifiName = nil
-        micSeq = 0
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
@@ -259,30 +241,6 @@ final class StreamViewModel: ObservableObject {
     func sendSpecialKey(_ code: UInt8) {
         sendKey(Data([0x02, code]))
     }
-
-    // MARK: - Mic
-
-    func toggleMic() {
-        if micCapture.isRunning {
-            micCapture.stop()
-        } else {
-            micSeq = 0
-            micCapture.onPCMFrame = { [weak self] pcm in
-                guard let self else { return }
-                let packet = MicProtocol.makePacket(seq: self.micSeq, pcmFrame: pcm)
-                self.micSeq = self.micSeq &+ 1
-                if self.usbConnected, let usb = self.usbListener {
-                    usb.sendMicPacket(packet)
-                } else if let stream = self.stream {
-                    stream.sendMicPacket(packet)
-                }
-            }
-            micCapture.start()
-        }
-        objectWillChange.send()
-    }
-
-    var isMicActive: Bool { micCapture.isRunning }
 
     // MARK: - Camera
 
@@ -386,13 +344,6 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Spacer()
                     if model.isConnected {
-                        Button { model.toggleMic() } label: {
-                            Image(systemName: model.isMicActive ? "mic.fill" : "mic")
-                                .font(.footnote)
-                                .foregroundStyle(model.isMicActive ? .green : .white)
-                                .frame(width: 32, height: 32)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
                         Image(systemName: model.isCameraActive
                               ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
                               : "video")

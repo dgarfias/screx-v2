@@ -210,7 +210,6 @@ fn read_control_loop(
 
     let mut len_buf = [0u8; 4];
     let mut msg_buf = vec![0u8; 256];
-    let mut mic_last_seq: Option<u32> = None;
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read_exact(&mut len_buf) {
@@ -258,36 +257,6 @@ fn read_control_loop(
                 let mut kb = shared.virtual_keyboard.lock().unwrap();
                 if let Some(ref mut keyboard) = *kb {
                     crate::uinput::handle_key_packet(keyboard, key_data);
-                }
-            } else if ctrl.starts_with(b"MIC") {
-                match crate::audio::parse_mic_packet(ctrl) {
-                    Ok(parsed) => {
-                        if let Some(prev) = mic_last_seq {
-                            let expected = prev.wrapping_add(1);
-                            if parsed.seq != expected {
-                                let delta = parsed.seq.wrapping_sub(expected);
-                                eprintln!(
-                                    "[mic] seq gap on USB: prev={prev} expected={expected} got={} delta={delta}",
-                                    parsed.seq
-                                );
-                            }
-                        } else {
-                            println!(
-                                "[mic] first USB packet received: seq={} bytes={}",
-                                parsed.seq,
-                                parsed.pcm.len()
-                            );
-                        }
-                        mic_last_seq = Some(parsed.seq);
-
-                        let mut mic = shared.mic_writer.lock().unwrap();
-                        if let Some(ref mut mw) = *mic {
-                            mw.write_pcm(parsed.pcm);
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("[mic] dropped malformed USB packet: {err}");
-                    }
                 }
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
                 let jpeg = &ctrl[3..];

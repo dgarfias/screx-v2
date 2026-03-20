@@ -220,17 +220,6 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn USB transport thread")?;
 
-    // Virtual mic source (iPad -> Linux input source)
-    match audio::create_virtual_mic_source() {
-        Ok(writer) => {
-            *shared.mic_writer.lock().unwrap() = Some(writer);
-            println!("[main] mic: virtual source ready");
-        }
-        Err(e) => {
-            eprintln!("[main] mic: failed to create virtual source ({e:#}), mic disabled");
-        }
-    }
-
     // Virtual camera (iPad camera -> v4l2loopback)
     match camera::load_v4l2loopback() {
         Ok(()) => match camera::create_cam_writer() {
@@ -309,8 +298,7 @@ async fn main() -> Result<()> {
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
-    // Cleanup mic/camera/audio
-    *shared.mic_writer.lock().unwrap() = None;
+    // Cleanup camera/audio
     *shared.cam_writer.lock().unwrap() = None;
     audio::remove_virtual_sink(audio_module_id);
 
