@@ -10,12 +10,14 @@ final class StreamClient {
     let audioPlayer: AudioPlayer
 
     var onStatus: ((String) -> Void)?
+    var onDisconnect: (() -> Void)?
 
     private static let headerLen = 14
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
     private static let frameTimeout: TimeInterval = 0.050
+    private static let dataTimeout: TimeInterval = 5.0
 
     private static let flagAudio: UInt8 = 0x02
 
@@ -24,6 +26,7 @@ final class StreamClient {
     private var lastCompletedFrameId: UInt32 = 0
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
+    private var dataTimeoutTimer: DispatchSourceTimer?
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
@@ -48,10 +51,12 @@ final class StreamClient {
                 self.onStatus?("Connected, registering...")
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
+                self.startDataTimeout()
                 self.receiveLoop(conn)
                 self.audioPlayer.start()
             case .failed(let error):
                 self.onStatus?("Connection failed: \(error.localizedDescription)")
+                self.handleTimeout()
             case .waiting(let error):
                 self.onStatus?("Waiting: \(error.localizedDescription)")
             default:
@@ -65,6 +70,8 @@ final class StreamClient {
     func disconnect() {
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
+        dataTimeoutTimer?.cancel()
+        dataTimeoutTimer = nil
         connection?.cancel()
         connection = nil
         audioPlayer.stop()
@@ -88,16 +95,48 @@ final class StreamClient {
         keepaliveTimer = timer
     }
 
+    private func startDataTimeout() {
+        dataTimeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.dataTimeout)
+        timer.setEventHandler { [weak self] in
+            self?.handleTimeout()
+        }
+        timer.resume()
+        dataTimeoutTimer = timer
+    }
+
+    private func resetDataTimeout() {
+        dataTimeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.dataTimeout)
+        timer.setEventHandler { [weak self] in
+            self?.handleTimeout()
+        }
+        timer.resume()
+        dataTimeoutTimer = timer
+    }
+
+    private func handleTimeout() {
+        guard connection != nil else { return }
+        print("[stream] data timeout — daemon appears gone")
+        disconnect()
+        onStatus?("Daemon disconnected")
+        onDisconnect?()
+    }
+
     private func receiveLoop(_ conn: NWConnection) {
         conn.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
             if let error {
                 self.onStatus?("Receive error: \(error.localizedDescription)")
+                self.handleTimeout()
                 return
             }
 
             if let data, data.count >= Self.headerLen {
+                self.resetDataTimeout()
                 self.handlePacket(data)
             }
 

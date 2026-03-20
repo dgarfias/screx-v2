@@ -93,6 +93,12 @@ final class StreamViewModel: ObservableObject {
                 self.connectToEndpoint(endpoint, name: ep.name)
             }
         }
+        discovery.onDaemonLost = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.handleWifiDisconnect()
+            }
+        }
         discovery.startListening()
     }
 
@@ -123,7 +129,23 @@ final class StreamViewModel: ObservableObject {
                 }
             }
         }
+        client.onDisconnect = { [weak self] in
+            Task { @MainActor in
+                self?.handleWifiDisconnect()
+            }
+        }
         client.connect()
+    }
+
+    private func handleWifiDisconnect() {
+        stream?.disconnect()
+        stream = nil
+        if !usbConnected {
+            isConnected = false
+            transport = ""
+            status = "Daemon disconnected, looking..."
+            discovery.resetKnownHost()
+        }
     }
 
     func disconnect() {

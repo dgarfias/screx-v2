@@ -14,11 +14,14 @@ final class DiscoveryService {
 
     var onStatusUpdate: ((String) -> Void)?
     var onEndpointFound: ((StreamEndpoint) -> Void)?
+    var onDaemonLost: (() -> Void)?
 
     private static let beaconPort: UInt16 = 9999
     private static let beaconMagic = Data("SCREX_BEACON".utf8)
+    private static let beaconTimeout: TimeInterval = 8.0
 
     private var knownHost: String?
+    private var beaconTimeoutTimer: DispatchSourceTimer?
 
     func startListening() {
         guard listener == nil else { return }
@@ -61,7 +64,30 @@ final class DiscoveryService {
     func stopListening() {
         listener?.cancel()
         listener = nil
+        beaconTimeoutTimer?.cancel()
+        beaconTimeoutTimer = nil
         knownHost = nil
+    }
+
+    func resetKnownHost() {
+        knownHost = nil
+    }
+
+    private func resetBeaconTimeout() {
+        beaconTimeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.beaconTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            print("[discovery] beacon timeout — daemon lost")
+            self.knownHost = nil
+            self.emit("Listening for daemon beacon...")
+            DispatchQueue.main.async { [weak self] in
+                self?.onDaemonLost?()
+            }
+        }
+        timer.resume()
+        beaconTimeoutTimer = timer
     }
 
     private func handleBeaconConnection(_ conn: NWConnection) {
@@ -97,6 +123,8 @@ final class DiscoveryService {
             print("[discovery] unexpected endpoint type: \(remoteEndpoint)")
             return
         }
+
+        resetBeaconTimeout()
 
         // Only emit once per unique host (avoid spamming on every beacon)
         if knownHost != host {
