@@ -98,18 +98,15 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // mDNS advertisement
-    let mdns_handle = match discovery::start_sender_advertisement(
-        "_screx._udp",
-        "screx-daemon",
-        config.stream_port,
-    ) {
+    // Broadcast beacon for iPad discovery
+    let beacon_stop = Arc::clone(&stop);
+    let beacon_thread = match discovery::start_beacon(config.stream_port, beacon_stop) {
         Ok(handle) => {
-            println!("[main] mDNS: advertising _screx._udp on port {}", config.stream_port);
+            println!("[main] beacon: broadcasting on port 9999");
             Some(handle)
         }
         Err(err) => {
-            eprintln!("[main] mDNS advertisement failed (continuing): {err:#}");
+            eprintln!("[main] beacon failed (continuing): {err:#}");
             None
         }
     };
@@ -250,11 +247,13 @@ async fn main() -> Result<()> {
         eprintln!("[main] client manager thread panicked: {e:?}");
     }
 
-    audio::remove_virtual_sink(audio_module_id);
-
-    if let Some(handle) = mdns_handle {
-        handle.shutdown();
+    if let Some(t) = beacon_thread {
+        if let Err(e) = t.join() {
+            eprintln!("[main] beacon thread panicked: {e:?}");
+        }
     }
+
+    audio::remove_virtual_sink(audio_module_id);
 
     println!("screx-daemon shutdown complete");
     Ok(())

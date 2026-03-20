@@ -74,7 +74,7 @@ final class StreamViewModel: ObservableObject {
         }
         usb.start()
 
-        // Start WiFi discovery
+        // Start WiFi discovery (beacon listener)
         discovery.onStatusUpdate = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
@@ -83,13 +83,17 @@ final class StreamViewModel: ObservableObject {
                 }
             }
         }
-        discovery.onEndpointsChanged = { [weak self] endpoints in
+        discovery.onEndpointFound = { [weak self] ep in
             Task { @MainActor in
-                guard let self, !self.isConnected, let ep = endpoints.first else { return }
-                self.connectToEndpoint(ep.endpoint, name: ep.name)
+                guard let self, !self.isConnected else { return }
+                let endpoint = NWEndpoint.hostPort(
+                    host: NWEndpoint.Host(ep.host),
+                    port: NWEndpoint.Port(integerLiteral: ep.port)
+                )
+                self.connectToEndpoint(endpoint, name: ep.name)
             }
         }
-        discovery.startBrowsing()
+        discovery.startListening()
     }
 
     func connectManual() {

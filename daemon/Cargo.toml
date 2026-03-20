@@ -15,7 +15,6 @@ anyhow = "1"
 ffmpeg-next = { version = "8", optional = true }
 ffmpeg-sys-next = { version = "8", optional = true }
 libc = "0.2"
-mdns-sd = { version = "0.18.2", features = ["async"] }
 rand = "0.8"
 reed-solomon-erasure = "6"
 serde = { version = "1", features = ["derive"] }

@@ -4,83 +4,116 @@ import Network
 struct StreamEndpoint: Identifiable {
     let id = UUID()
     let name: String
-    let endpoint: NWEndpoint
+    let host: String
+    let port: UInt16
 }
 
 final class DiscoveryService {
-    private var browser: NWBrowser?
+    private var listener: NWListener?
     private let queue = DispatchQueue(label: "screx.discovery", qos: .userInteractive)
 
     var onStatusUpdate: ((String) -> Void)?
-    var onEndpointsChanged: (([StreamEndpoint]) -> Void)?
+    var onEndpointFound: ((StreamEndpoint) -> Void)?
 
-    private func emitStatus(_ text: String) {
+    private static let beaconPort: UInt16 = 9999
+    private static let beaconMagic = Data("SCREX_BEACON".utf8)
+
+    private var knownHost: String?
+
+    func startListening() {
+        guard listener == nil else { return }
+
+        do {
+            let params = NWParameters.udp
+            params.allowLocalEndpointReuse = true
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: .ipv4(.any),
+                port: NWEndpoint.Port(integerLiteral: Self.beaconPort)
+            )
+
+            let l = try NWListener(using: params)
+            self.listener = l
+
+            l.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready:
+                    self?.emit("Listening for daemon beacon...")
+                    print("[discovery] beacon listener ready on port \(Self.beaconPort)")
+                case .failed(let error):
+                    print("[discovery] listener failed: \(error)")
+                    self?.emit("Discovery failed: \(error.localizedDescription)")
+                default:
+                    break
+                }
+            }
+
+            l.newConnectionHandler = { [weak self] conn in
+                self?.handleBeaconConnection(conn)
+            }
+
+            l.start(queue: queue)
+        } catch {
+            print("[discovery] failed to create beacon listener: \(error)")
+            emit("Discovery error: \(error.localizedDescription)")
+        }
+    }
+
+    func stopListening() {
+        listener?.cancel()
+        listener = nil
+        knownHost = nil
+    }
+
+    private func handleBeaconConnection(_ conn: NWConnection) {
+        conn.stateUpdateHandler = { state in
+            if case .ready = state {
+                conn.receiveMessage { [weak self] data, _, _, _ in
+                    self?.processBeacon(data: data, from: conn)
+                    conn.cancel()
+                }
+            }
+        }
+        conn.start(queue: queue)
+    }
+
+    private func processBeacon(data: Data?, from conn: NWConnection) {
+        guard let data, data.count >= Self.beaconMagic.count + 2 else { return }
+        guard data.prefix(Self.beaconMagic.count) == Self.beaconMagic else { return }
+
+        let portOffset = Self.beaconMagic.count
+        let streamPort = UInt16(data[portOffset]) << 8 | UInt16(data[portOffset + 1])
+
+        // Extract sender IP from the connection's remote endpoint
+        guard let remoteEndpoint = conn.currentPath?.remoteEndpoint else {
+            print("[discovery] beacon received but no remote endpoint")
+            return
+        }
+
+        let host: String
+        switch remoteEndpoint {
+        case .hostPort(let h, _):
+            host = "\(h)"
+        default:
+            print("[discovery] unexpected endpoint type: \(remoteEndpoint)")
+            return
+        }
+
+        // Only emit once per unique host (avoid spamming on every beacon)
+        if knownHost != host {
+            knownHost = host
+            print("[discovery] daemon found at \(host):\(streamPort)")
+            emit("Found daemon at \(host)")
+
+            let endpoint = StreamEndpoint(name: host, host: host, port: streamPort)
+            DispatchQueue.main.async { [weak self] in
+                self?.onEndpointFound?(endpoint)
+            }
+        }
+    }
+
+    private func emit(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             self?.onStatusUpdate?(text)
         }
-    }
-
-    private func emitEndpoints(_ endpoints: [StreamEndpoint]) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onEndpointsChanged?(endpoints)
-        }
-    }
-
-    func startBrowsing() {
-        guard browser == nil else { return }
-
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_screx._udp", domain: "local.")
-        let params = NWParameters()
-        params.includePeerToPeer = true
-        let browser = NWBrowser(for: descriptor, using: params)
-        self.browser = browser
-
-        browser.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.emitStatus("Discovery ready, looking for daemon...")
-                print("[discovery] browser ready")
-            case .failed(let error):
-                self?.emitStatus("Discovery failed: \(error.localizedDescription)")
-                print("[discovery] browser failed: \(error)")
-                // Restart on failure after a delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                    self?.stopBrowsing()
-                    self?.startBrowsing()
-                }
-            case .waiting(let error):
-                self?.emitStatus("Discovery waiting: \(error.localizedDescription)")
-                print("[discovery] browser waiting: \(error)")
-            default:
-                break
-            }
-        }
-
-        browser.browseResultsChangedHandler = { [weak self] results, changes in
-            let endpoints: [StreamEndpoint] = results.compactMap { result in
-                let name: String
-                switch result.endpoint {
-                case .service(let svcName, _, _, _):
-                    name = svcName
-                default:
-                    name = "\(result.endpoint)"
-                }
-                print("[discovery] found: \(name) -> \(result.endpoint)")
-                return StreamEndpoint(name: name, endpoint: result.endpoint)
-            }
-            if endpoints.isEmpty {
-                self?.emitStatus("Discovery ready, looking for daemon...")
-            } else {
-                self?.emitStatus("Found \(endpoints.count) daemon(s)")
-            }
-            self?.emitEndpoints(endpoints)
-        }
-
-        browser.start(queue: queue)
-    }
-
-    func stopBrowsing() {
-        browser?.cancel()
-        browser = nil
     }
 }
