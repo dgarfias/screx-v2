@@ -219,18 +219,31 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    func toggleOsk() {
+    func sendKey(_ keyData: Data) {
         if usbConnected, let usb = usbListener {
-            usb.sendOskToggle()
+            usb.sendKey(keyData)
         } else if let stream {
-            stream.sendOskToggle()
+            stream.sendKey(keyData)
         }
+    }
+
+    /// Builds a "text insert" key packet: type 0x01 + UTF-8 bytes
+    func sendTextInsert(_ text: String) {
+        var data = Data([0x01])
+        data.append(Data(text.utf8))
+        sendKey(data)
+    }
+
+    /// Builds a "special key" packet: type 0x02 + key code
+    func sendSpecialKey(_ code: UInt8) {
+        sendKey(Data([0x02, code]))
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
+    @State private var keyboardActive = false
 
     var body: some View {
         ZStack {
@@ -246,12 +259,21 @@ struct ContentView: View {
                 .ignoresSafeArea()
             }
 
+            KeyboardInputView(
+                isActive: keyboardActive,
+                onText: { text in model.sendTextInsert(text) },
+                onDelete: { model.sendSpecialKey(0x01) }
+            )
+            .frame(width: 0, height: 0)
+
             VStack {
                 HStack {
                     Spacer()
                     if model.isConnected {
-                        Button { model.toggleOsk() } label: {
-                            Image(systemName: "keyboard")
+                        Button {
+                            keyboardActive.toggle()
+                        } label: {
+                            Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
                                 .font(.title2)
                                 .foregroundStyle(.white)
                                 .padding(10)

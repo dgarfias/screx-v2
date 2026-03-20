@@ -334,118 +334,288 @@ unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// On-screen keyboard (OSK) via gsettings + GNOME Shell D-Bus
+// Virtual keyboard (uinput) — receives keystrokes from iPad's native keyboard
 // ---------------------------------------------------------------------------
 
-const OSK_SCHEMA: &str = "org.gnome.desktop.a11y.applications";
-const OSK_KEY: &str = "screen-keyboard-enabled";
+const KEY_ESC: u16 = 1;
+const KEY_1: u16 = 2;
+const KEY_2: u16 = 3;
+const KEY_3: u16 = 4;
+const KEY_4: u16 = 5;
+const KEY_5: u16 = 6;
+const KEY_6: u16 = 7;
+const KEY_7: u16 = 8;
+const KEY_8: u16 = 9;
+const KEY_9: u16 = 10;
+const KEY_0: u16 = 11;
+const KEY_MINUS: u16 = 12;
+const KEY_EQUAL: u16 = 13;
+const KEY_BACKSPACE: u16 = 14;
+const KEY_TAB: u16 = 15;
+const KEY_Q: u16 = 16;
+const KEY_W: u16 = 17;
+const KEY_E: u16 = 18;
+const KEY_R: u16 = 19;
+const KEY_T_KEY: u16 = 20;
+const KEY_Y: u16 = 21;
+const KEY_U: u16 = 22;
+const KEY_I: u16 = 23;
+const KEY_O: u16 = 24;
+const KEY_P: u16 = 25;
+const KEY_LEFTBRACE: u16 = 26;
+const KEY_RIGHTBRACE: u16 = 27;
+const KEY_ENTER: u16 = 28;
+const KEY_A: u16 = 30;
+const KEY_S: u16 = 31;
+const KEY_D: u16 = 32;
+const KEY_F: u16 = 33;
+const KEY_G: u16 = 34;
+const KEY_H: u16 = 35;
+const KEY_J: u16 = 36;
+const KEY_K: u16 = 37;
+const KEY_L: u16 = 38;
+const KEY_SEMICOLON: u16 = 39;
+const KEY_APOSTROPHE: u16 = 40;
+const KEY_GRAVE: u16 = 41;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_BACKSLASH: u16 = 43;
+const KEY_Z: u16 = 44;
+const KEY_X: u16 = 45;
+const KEY_C: u16 = 46;
+const KEY_V: u16 = 47;
+const KEY_B_KEY: u16 = 48;
+const KEY_N: u16 = 49;
+const KEY_M: u16 = 50;
+const KEY_COMMA: u16 = 51;
+const KEY_DOT: u16 = 52;
+const KEY_SLASH: u16 = 53;
+const KEY_SPACE: u16 = 57;
+const KEY_UP: u16 = 103;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_DOWN: u16 = 108;
+const KEY_DELETE: u16 = 111;
+const KEY_HOME: u16 = 102;
+const KEY_END: u16 = 107;
 
-fn user_session_cmd(program: &str, args: &[&str]) -> Option<String> {
-    let (sudo_user, sudo_uid) = (
-        std::env::var("SUDO_USER").ok(),
-        std::env::var("SUDO_UID").ok(),
-    );
+const ALL_KEYS: &[u16] = &[
+    KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
+    KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB,
+    KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T_KEY, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
+    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER,
+    KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
+    KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH,
+    KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
+    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
+    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_HOME, KEY_END,
+];
 
-    let output = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
-        let runtime_dir = format!("/run/user/{uid}");
-        let dbus_addr = format!("unix:path={runtime_dir}/bus");
-        let mut cmd = Command::new("runuser");
-        cmd.args(["-u", user, "--"])
-            .arg("env")
-            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_addr}"))
-            .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-            .arg(program);
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.output()
-    } else {
-        let mut cmd = Command::new(program);
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.output()
-    };
-
-    match output {
-        Ok(o) if o.status.success() => {
-            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!("[osk] {program} failed: {stderr}");
-            None
-        }
-        Err(e) => {
-            eprintln!("[osk] could not run {program}: {e}");
-            None
-        }
+fn char_to_key(c: char) -> Option<(u16, bool)> {
+    match c {
+        'a' => Some((KEY_A, false)),       'b' => Some((KEY_B_KEY, false)),
+        'c' => Some((KEY_C, false)),       'd' => Some((KEY_D, false)),
+        'e' => Some((KEY_E, false)),       'f' => Some((KEY_F, false)),
+        'g' => Some((KEY_G, false)),       'h' => Some((KEY_H, false)),
+        'i' => Some((KEY_I, false)),       'j' => Some((KEY_J, false)),
+        'k' => Some((KEY_K, false)),       'l' => Some((KEY_L, false)),
+        'm' => Some((KEY_M, false)),       'n' => Some((KEY_N, false)),
+        'o' => Some((KEY_O, false)),       'p' => Some((KEY_P, false)),
+        'q' => Some((KEY_Q, false)),       'r' => Some((KEY_R, false)),
+        's' => Some((KEY_S, false)),       't' => Some((KEY_T_KEY, false)),
+        'u' => Some((KEY_U, false)),       'v' => Some((KEY_V, false)),
+        'w' => Some((KEY_W, false)),       'x' => Some((KEY_X, false)),
+        'y' => Some((KEY_Y, false)),       'z' => Some((KEY_Z, false)),
+        'A' => Some((KEY_A, true)),        'B' => Some((KEY_B_KEY, true)),
+        'C' => Some((KEY_C, true)),        'D' => Some((KEY_D, true)),
+        'E' => Some((KEY_E, true)),        'F' => Some((KEY_F, true)),
+        'G' => Some((KEY_G, true)),        'H' => Some((KEY_H, true)),
+        'I' => Some((KEY_I, true)),        'J' => Some((KEY_J, true)),
+        'K' => Some((KEY_K, true)),        'L' => Some((KEY_L, true)),
+        'M' => Some((KEY_M, true)),        'N' => Some((KEY_N, true)),
+        'O' => Some((KEY_O, true)),        'P' => Some((KEY_P, true)),
+        'Q' => Some((KEY_Q, true)),        'R' => Some((KEY_R, true)),
+        'S' => Some((KEY_S, true)),        'T' => Some((KEY_T_KEY, true)),
+        'U' => Some((KEY_U, true)),        'V' => Some((KEY_V, true)),
+        'W' => Some((KEY_W, true)),        'X' => Some((KEY_X, true)),
+        'Y' => Some((KEY_Y, true)),        'Z' => Some((KEY_Z, true)),
+        '1' => Some((KEY_1, false)),       '2' => Some((KEY_2, false)),
+        '3' => Some((KEY_3, false)),       '4' => Some((KEY_4, false)),
+        '5' => Some((KEY_5, false)),       '6' => Some((KEY_6, false)),
+        '7' => Some((KEY_7, false)),       '8' => Some((KEY_8, false)),
+        '9' => Some((KEY_9, false)),       '0' => Some((KEY_0, false)),
+        '!' => Some((KEY_1, true)),        '@' => Some((KEY_2, true)),
+        '#' => Some((KEY_3, true)),        '$' => Some((KEY_4, true)),
+        '%' => Some((KEY_5, true)),        '^' => Some((KEY_6, true)),
+        '&' => Some((KEY_7, true)),        '*' => Some((KEY_8, true)),
+        '(' => Some((KEY_9, true)),        ')' => Some((KEY_0, true)),
+        '-' => Some((KEY_MINUS, false)),   '_' => Some((KEY_MINUS, true)),
+        '=' => Some((KEY_EQUAL, false)),   '+' => Some((KEY_EQUAL, true)),
+        '[' => Some((KEY_LEFTBRACE, false)), '{' => Some((KEY_LEFTBRACE, true)),
+        ']' => Some((KEY_RIGHTBRACE, false)), '}' => Some((KEY_RIGHTBRACE, true)),
+        ';' => Some((KEY_SEMICOLON, false)), ':' => Some((KEY_SEMICOLON, true)),
+        '\'' => Some((KEY_APOSTROPHE, false)), '"' => Some((KEY_APOSTROPHE, true)),
+        '`' => Some((KEY_GRAVE, false)),   '~' => Some((KEY_GRAVE, true)),
+        '\\' => Some((KEY_BACKSLASH, false)), '|' => Some((KEY_BACKSLASH, true)),
+        ',' => Some((KEY_COMMA, false)),   '<' => Some((KEY_COMMA, true)),
+        '.' => Some((KEY_DOT, false)),     '>' => Some((KEY_DOT, true)),
+        '/' => Some((KEY_SLASH, false)),   '?' => Some((KEY_SLASH, true)),
+        ' ' => Some((KEY_SPACE, false)),
+        '\t' => Some((KEY_TAB, false)),
+        '\n' => Some((KEY_ENTER, false)),
+        _ => None,
     }
 }
 
-fn gsettings_cmd(args: &[&str]) -> Option<String> {
-    user_session_cmd("gsettings", args)
-}
+pub const SPECIAL_BACKSPACE: u8 = 0x01;
 
-/// Read the current on-screen keyboard enabled state.
-pub fn get_osk_enabled() -> Option<bool> {
-    gsettings_cmd(&["get", OSK_SCHEMA, OSK_KEY])
-        .map(|v| v == "true")
-}
-
-/// Set the on-screen keyboard enabled state.
-pub fn set_osk_enabled(enabled: bool) {
-    let val = if enabled { "true" } else { "false" };
-    if gsettings_cmd(&["set", OSK_SCHEMA, OSK_KEY, val]).is_some() {
-        println!("[osk] screen keyboard {}", if enabled { "enabled" } else { "disabled" });
+fn special_to_keycode(code: u8) -> Option<u16> {
+    match code {
+        SPECIAL_BACKSPACE => Some(KEY_BACKSPACE),
+        0x02 => Some(KEY_ENTER),
+        0x03 => Some(KEY_TAB),
+        0x04 => Some(KEY_ESC),
+        0x05 => Some(KEY_LEFT),
+        0x06 => Some(KEY_RIGHT),
+        0x07 => Some(KEY_UP),
+        0x08 => Some(KEY_DOWN),
+        0x09 => Some(KEY_DELETE),
+        0x0A => Some(KEY_HOME),
+        0x0B => Some(KEY_END),
+        _ => None,
     }
 }
 
-/// Toggle the on-screen keyboard visibility via GNOME Shell.
-/// 1. Ensures the a11y keyboard is enabled (so GNOME Shell loads the keyboard actor)
-/// 2. Calls Shell.Eval to open or close the keyboard directly
-pub fn toggle_osk(osk_visible: &mut bool) {
-    // Make sure the OSK infrastructure is enabled
-    if get_osk_enabled() != Some(true) {
-        set_osk_enabled(true);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+pub struct VirtualKeyboard {
+    file: File,
+}
+
+impl VirtualKeyboard {
+    pub fn new() -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .context("failed to open /dev/uinput for keyboard")?;
+
+        let fd = file.as_raw_fd();
+
+        unsafe {
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
+
+            for &key in ALL_KEYS {
+                ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, key as libc::c_int))?;
+            }
+
+            let mut setup: UinputSetup = mem::zeroed();
+            setup.id.bustype = 0x03; // BUS_USB
+            setup.id.vendor = SCREX_VENDOR;
+            setup.id.product = SCREX_PRODUCT + 1;
+            setup.id.version = 1;
+            let name = b"Screx Virtual Keyboard";
+            setup.name[..name.len()].copy_from_slice(name);
+
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_setup(), &setup))?;
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_create()))?;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        println!("[keyboard] virtual keyboard created");
+
+        Ok(Self { file })
     }
 
-    *osk_visible = !*osk_visible;
-
-    let js = if *osk_visible {
-        concat!(
-            "let _ki = -1; ",
-            "for (let i = 0; i < global.display.get_n_monitors(); i++) { ",
-            "  let c = global.display.get_monitor_connector(i) || ''; ",
-            "  if (c.includes('EVDI')) { _ki = i; break; } ",
-            "} ",
-            "if (_ki >= 0) imports.ui.main.layoutManager.keyboardIndex = _ki; ",
-            "imports.ui.main.keyboard.open(imports.gi.Clutter.get_current_event_time());",
-        )
-    } else {
-        "imports.ui.main.keyboard.close();"
-    };
-
-    let result = user_session_cmd("gdbus", &[
-        "call", "--session",
-        "--dest", "org.gnome.Shell",
-        "--object-path", "/org/gnome/Shell",
-        "--method", "org.gnome.Shell.Eval",
-        js,
-    ]);
-
-    match result {
-        Some(ref out) if out.contains("true") => {
-            println!("[osk] keyboard {}", if *osk_visible { "opened" } else { "closed" });
+    pub fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            if let Some((keycode, shift)) = char_to_key(c) {
+                if shift {
+                    self.key_event(KEY_LEFTSHIFT, 1);
+                }
+                self.key_event(keycode, 1);
+                self.syn();
+                self.key_event(keycode, 0);
+                if shift {
+                    self.key_event(KEY_LEFTSHIFT, 0);
+                }
+                self.syn();
+            }
         }
-        Some(ref out) => {
-            eprintln!("[osk] Shell.Eval returned: {out}");
-            eprintln!("[osk] keyboard will auto-show when you tap text fields instead");
+    }
+
+    pub fn press_special(&mut self, code: u8) {
+        if let Some(keycode) = special_to_keycode(code) {
+            self.key_event(keycode, 1);
+            self.syn();
+            self.key_event(keycode, 0);
+            self.syn();
         }
-        None => {
-            eprintln!("[osk] Shell.Eval not available — keyboard will auto-show on text field tap");
+    }
+
+    fn key_event(&mut self, code: u16, value: i32) {
+        let ev = InputEvent {
+            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            type_: EV_KEY,
+            code,
+            value,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ev as *const InputEvent as *const u8,
+                mem::size_of::<InputEvent>(),
+            )
+        };
+        let _ = self.file.write_all(bytes);
+    }
+
+    fn syn(&mut self) {
+        let ev = InputEvent {
+            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ev as *const InputEvent as *const u8,
+                mem::size_of::<InputEvent>(),
+            )
+        };
+        let _ = self.file.write_all(bytes);
+    }
+}
+
+impl Drop for VirtualKeyboard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
+        println!("[keyboard] virtual keyboard destroyed");
+    }
+}
+
+pub const KEY_TYPE_TEXT: u8 = 0x01;
+pub const KEY_TYPE_SPECIAL: u8 = 0x02;
+
+/// Parse and handle a key packet from the iPad.
+/// Format: type(1) + payload(variable)
+pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let key_type = data[0];
+    let payload = &data[1..];
+
+    match key_type {
+        KEY_TYPE_TEXT => {
+            if let Ok(text) = std::str::from_utf8(payload) {
+                kb.type_text(text);
+            }
+        }
+        KEY_TYPE_SPECIAL => {
+            if !payload.is_empty() {
+                kb.press_special(payload[0]);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -1,5 +1,49 @@
 import SwiftUI
 import AVFoundation
+import UIKit
+
+// MARK: - Keyboard input proxy (captures iOS native keyboard and forwards to daemon)
+
+struct KeyboardInputView: UIViewRepresentable {
+    let isActive: Bool
+    let onText: (String) -> Void
+    let onDelete: () -> Void
+
+    func makeUIView(context: Context) -> KeyInputProxyView {
+        let view = KeyInputProxyView()
+        view.onText = onText
+        view.onDelete = onDelete
+        return view
+    }
+
+    func updateUIView(_ uiView: KeyInputProxyView, context: Context) {
+        uiView.onText = onText
+        uiView.onDelete = onDelete
+        if isActive && !uiView.isFirstResponder {
+            DispatchQueue.main.async { uiView.becomeFirstResponder() }
+        } else if !isActive && uiView.isFirstResponder {
+            DispatchQueue.main.async { uiView.resignFirstResponder() }
+        }
+    }
+}
+
+final class KeyInputProxyView: UIView, UIKeyInput {
+    var onText: ((String) -> Void)?
+    var onDelete: (() -> Void)?
+
+    override var canBecomeFirstResponder: Bool { true }
+    var hasText: Bool { true }
+
+    var autocorrectionType: UITextAutocorrectionType { .no }
+
+    func insertText(_ text: String) {
+        onText?(text)
+    }
+
+    func deleteBackward() {
+        onDelete?()
+    }
+}
 
 struct VideoDisplayView: UIViewRepresentable {
     let layer: AVSampleBufferDisplayLayer

@@ -252,15 +252,12 @@ fn read_control_loop(
                 if let Some(ref mut ts) = *touch {
                     crate::uinput::handle_touch_packet(ts, touch_data);
                 }
-            } else if ctrl.starts_with(b"OSK") {
-                {
-                    let mut saved = shared.osk_was_enabled.lock().unwrap();
-                    if saved.is_none() {
-                        *saved = crate::uinput::get_osk_enabled();
-                    }
+            } else if ctrl.starts_with(b"KEY") && ctrl.len() > 3 {
+                let key_data = &ctrl[3..];
+                let mut kb = shared.virtual_keyboard.lock().unwrap();
+                if let Some(ref mut keyboard) = *kb {
+                    crate::uinput::handle_key_packet(keyboard, key_data);
                 }
-                let mut visible = shared.osk_visible.lock().unwrap();
-                crate::uinput::toggle_osk(&mut visible);
             }
         }
     }

@@ -224,21 +224,21 @@ final class USBListener {
         })
     }
 
-    /// Sends an OSK toggle request over USB TCP.
-    func sendOskToggle() {
+    /// Sends a keyboard event over USB TCP. Framed control: "KEY" + type(1) + payload.
+    func sendKey(_ keyData: Data) {
         guard let conn = connection else { return }
 
-        let oskPayload = Data("OSK".utf8)
-        let payloadLen = UInt32(1 + oskPayload.count)
+        let keyPayload = Data("KEY".utf8) + keyData
+        let payloadLen = UInt32(1 + keyPayload.count)
 
         var frame = Data()
         withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
         frame.append(Self.msgControl)
-        frame.append(oskPayload)
+        frame.append(keyPayload)
 
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
-                print("[usb] OSK toggle send error: \(error)")
+                print("[usb] key send error: \(error)")
             }
         })
     }

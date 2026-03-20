@@ -124,6 +124,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Virtual keyboard (for iOS native keyboard forwarding)
+    match uinput::VirtualKeyboard::new() {
+        Ok(kb) => {
+            *shared.virtual_keyboard.lock().unwrap() = Some(kb);
+            println!("[main] virtual keyboard ready");
+        }
+        Err(e) => {
+            eprintln!("[main] virtual keyboard failed (keyboard disabled): {e:#}");
+        }
+    }
+
     // Client manager thread (handles SCREX register + PLI packets)
     let client_socket = socket.try_clone().context("clone socket for client mgr")?;
     let client_shared = Arc::clone(&shared);
@@ -266,13 +277,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Restore OSK state if we changed it
-    if let Some(original) = *shared.osk_was_enabled.lock().unwrap() {
-        println!("[main] restoring on-screen keyboard to original state: {original}");
-        uinput::set_osk_enabled(original);
-    }
-
-    // Destroy virtual touchscreen
+    // Destroy virtual input devices
+    *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
     audio::remove_virtual_sink(audio_module_id);

@@ -297,12 +297,14 @@ final class StreamClient {
         })
     }
 
-    /// Sends an OSK toggle request over UDP.
-    func sendOskToggle() {
+    /// Sends a keyboard event over UDP. Packet: "KEY" + type(1) + payload.
+    func sendKey(_ keyData: Data) {
         guard let conn = connection else { return }
-        conn.send(content: Data("OSK".utf8), completion: .contentProcessed { error in
+        var packet = Data("KEY".utf8)
+        packet.append(keyData)
+        conn.send(content: packet, completion: .contentProcessed { error in
             if let error {
-                print("[stream] OSK toggle send error: \(error)")
+                print("[stream] key send error: \(error)")
             }
         })
     }

@@ -7,7 +7,7 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::encode::EncodedAccessUnit;
-use crate::uinput::VirtualTouchscreen;
+use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
 use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
@@ -15,7 +15,7 @@ const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
-const OSK_MAGIC: &[u8] = b"OSK";
+const KEY_MAGIC: &[u8] = b"KEY";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -27,10 +27,7 @@ pub struct SharedState {
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
-    /// Original OSK a11y setting before we touched it, so we can restore on shutdown.
-    pub osk_was_enabled: Mutex<Option<bool>>,
-    /// Tracks whether the OSK is currently visible (toggled via Shell.Eval).
-    pub osk_visible: Mutex<bool>,
+    pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
 }
 
 impl SharedState {
@@ -41,8 +38,7 @@ impl SharedState {
             usb_sender: Mutex::new(None),
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
-            osk_was_enabled: Mutex::new(None),
-            osk_visible: Mutex::new(false),
+            virtual_keyboard: Mutex::new(None),
         }
     }
 }
@@ -116,8 +112,12 @@ pub fn run_client_manager(
                     }
                 }
 
-                if len >= OSK_MAGIC.len() && &recv_buf[..OSK_MAGIC.len()] == OSK_MAGIC {
-                    handle_osk_toggle(&shared);
+                if len > KEY_MAGIC.len() && &recv_buf[..KEY_MAGIC.len()] == KEY_MAGIC {
+                    let key_data = &recv_buf[KEY_MAGIC.len()..len];
+                    let mut kb = shared.virtual_keyboard.lock().unwrap();
+                    if let Some(ref mut keyboard) = *kb {
+                        crate::uinput::handle_key_packet(keyboard, key_data);
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -138,17 +138,6 @@ pub fn run_client_manager(
 
     println!("[client] manager stopped");
     Ok(())
-}
-
-fn handle_osk_toggle(shared: &SharedState) {
-    {
-        let mut saved = shared.osk_was_enabled.lock().unwrap();
-        if saved.is_none() {
-            *saved = crate::uinput::get_osk_enabled();
-        }
-    }
-    let mut visible = shared.osk_visible.lock().unwrap();
-    crate::uinput::toggle_osk(&mut visible);
 }
 
 // ---------------------------------------------------------------------------
