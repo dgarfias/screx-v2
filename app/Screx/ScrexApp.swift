@@ -285,6 +285,12 @@ final class StreamViewModel: ObservableObject {
     }
 
     var isCameraActive: Bool { cameraCapture.isRunning }
+    var isCameraFront: Bool { cameraCapture.usingFront }
+
+    func flipCamera() {
+        cameraCapture.flipCamera()
+        objectWillChange.send()
+    }
 }
 
 struct ContentView: View {
@@ -367,12 +373,19 @@ struct ContentView: View {
                                 .background(.ultraThinMaterial, in: Circle())
                         }
                         Button { model.toggleCamera() } label: {
-                            Image(systemName: model.isCameraActive ? "video.fill" : "video")
+                            Image(systemName: model.isCameraActive
+                                  ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
+                                  : "video")
                                 .font(.footnote)
                                 .foregroundStyle(model.isCameraActive ? .green : .white)
                                 .frame(width: 32, height: 32)
                                 .background(.ultraThinMaterial, in: Circle())
                         }
+                        .simultaneousGesture(
+                            LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                                model.flipCamera()
+                            }
+                        )
                         Button { keyboardActive.toggle() } label: {
                             Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
                                 .font(.footnote)

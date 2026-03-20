@@ -6,16 +6,21 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let outputQueue = DispatchQueue(label: "screx.camera", qos: .userInitiated)
     private var running = false
     private var frameCount: UInt32 = 0
+    private(set) var usingFront = false
 
     var onJPEG: ((Data) -> Void)?
 
     func start() {
         guard !running else { return }
+        startSession(front: usingFront)
+    }
 
+    private func startSession(front: Bool) {
         session.sessionPreset = .hd1280x720
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-            print("[camera] no back camera available")
+        let position: AVCaptureDevice.Position = front ? .front : .back
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
+            print("[camera] no \(front ? "front" : "back") camera available")
             return
         }
 
@@ -38,7 +43,6 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             session.addOutput(output)
         }
 
-        // Target ~15fps to limit bandwidth
         do {
             try device.lockForConfiguration()
             device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
@@ -50,7 +54,8 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         session.startRunning()
         running = true
-        print("[camera] capture started (720p, ~15fps)")
+        usingFront = front
+        print("[camera] capture started (720p, ~15fps, \(front ? "front" : "back"))")
     }
 
     func stop() {
@@ -61,6 +66,13 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         running = false
         frameCount = 0
         print("[camera] capture stopped")
+    }
+
+    func flipCamera() {
+        let wasRunning = running
+        if wasRunning { stop() }
+        usingFront.toggle()
+        if wasRunning { startSession(front: usingFront) }
     }
 
     var isRunning: Bool { running }

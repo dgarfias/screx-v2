@@ -10,6 +10,14 @@ const CARD_LABEL: &str = "Screx iPad Camera";
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
+extern "C" {
+    fn screx_v4l2_open_output(
+        device: *const libc::c_char,
+        width: libc::c_int,
+        height: libc::c_int,
+    ) -> libc::c_int;
+}
+
 
 pub struct CamWriter {
     file: File,
@@ -60,37 +68,23 @@ pub fn load_v4l2loopback() -> Result<()> {
 }
 
 pub fn create_cam_writer() -> Result<CamWriter> {
-    // Give the driver a moment to fully initialize after modprobe
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Use v4l2-ctl with --set-fmt-video-out (VIDEO_OUTPUT, not CAPTURE)
-    let status = Command::new("v4l2-ctl")
-        .args([
-            &format!("--device={VIDEO_DEVICE}"),
-            &format!("--set-fmt-video-out=width={WIDTH},height={HEIGHT},pixelformat=MJPG"),
-        ])
-        .status()
-        .context("v4l2-ctl not found — install v4l-utils")?;
-
-    if !status.success() {
-        anyhow::bail!("v4l2-ctl --set-fmt-video-out failed");
-    }
-
+    let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
     let fd = unsafe {
-        let path = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
-        libc::open(path.as_ptr(), libc::O_RDWR)
+        screx_v4l2_open_output(device.as_ptr(), WIDTH as libc::c_int, HEIGHT as libc::c_int)
     };
-    if fd < 0 {
-        anyhow::bail!(
-            "failed to open {VIDEO_DEVICE}: {}",
-            std::io::Error::last_os_error()
-        );
+
+    match fd {
+        -1 => anyhow::bail!("failed to open {VIDEO_DEVICE}: {}", std::io::Error::last_os_error()),
+        -2 => anyhow::bail!("VIDIOC_S_FMT failed on {VIDEO_DEVICE}: {}", std::io::Error::last_os_error()),
+        fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
+        fd => {
+            let file = unsafe { File::from_raw_fd(fd) };
+            println!("[camera] writer ready: {WIDTH}x{HEIGHT} MJPEG -> {VIDEO_DEVICE}");
+            Ok(CamWriter { file })
+        }
     }
-
-    let file = unsafe { File::from_raw_fd(fd) };
-
-    println!("[camera] writer ready: {WIDTH}x{HEIGHT} MJPEG -> {VIDEO_DEVICE}");
-    Ok(CamWriter { file })
 }
 
 /// Reassembles chunked camera frames from UDP.
