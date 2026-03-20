@@ -30,17 +30,27 @@ final class DiscoveryService {
         guard browser == nil else { return }
 
         let descriptor = NWBrowser.Descriptor.bonjour(type: "_screx._udp", domain: "local.")
-        let browser = NWBrowser(for: descriptor, using: .init())
+        let params = NWParameters()
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: descriptor, using: params)
         self.browser = browser
 
         browser.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 self?.emitStatus("Discovery ready, looking for daemon...")
+                print("[discovery] browser ready")
             case .failed(let error):
                 self?.emitStatus("Discovery failed: \(error.localizedDescription)")
+                print("[discovery] browser failed: \(error)")
+                // Restart on failure after a delay
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.stopBrowsing()
+                    self?.startBrowsing()
+                }
             case .waiting(let error):
                 self?.emitStatus("Discovery waiting: \(error.localizedDescription)")
+                print("[discovery] browser waiting: \(error)")
             default:
                 break
             }
@@ -55,9 +65,14 @@ final class DiscoveryService {
                 default:
                     name = "\(result.endpoint)"
                 }
+                print("[discovery] found: \(name) -> \(result.endpoint)")
                 return StreamEndpoint(name: name, endpoint: result.endpoint)
             }
-            self?.emitStatus("Found \(endpoints.count) daemon(s)")
+            if endpoints.isEmpty {
+                self?.emitStatus("Discovery ready, looking for daemon...")
+            } else {
+                self?.emitStatus("Found \(endpoints.count) daemon(s)")
+            }
             self?.emitEndpoints(endpoints)
         }
 

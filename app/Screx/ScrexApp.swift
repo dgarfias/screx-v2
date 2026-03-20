@@ -85,7 +85,7 @@ final class StreamViewModel: ObservableObject {
         }
         discovery.onEndpointsChanged = { [weak self] endpoints in
             Task { @MainActor in
-                guard let self, self.stream == nil, let ep = endpoints.first else { return }
+                guard let self, !self.isConnected, let ep = endpoints.first else { return }
                 self.connectToEndpoint(ep.endpoint, name: ep.name)
             }
         }

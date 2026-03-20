@@ -34,6 +34,23 @@ impl AdvertisementHandle {
     }
 }
 
+fn get_hostname() -> String {
+    let mut buf = [0u8; 256];
+    unsafe {
+        if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(&buf[..len]).to_string();
+            if name.ends_with(".local.") {
+                name
+            } else {
+                format!("{name}.local.")
+            }
+        } else {
+            "screx-daemon.local.".to_string()
+        }
+    }
+}
+
 pub fn start_sender_advertisement(
     service_type: &str,
     instance_name: &str,
@@ -47,8 +64,7 @@ pub fn start_sender_advertisement(
         format!("{service_type}.local.")
     };
 
-    // mdns-sd fills interface addresses when given empty addrs.
-    let host_name = format!("{instance_name}.local.");
+    let host_name = get_hostname();
     let info = ServiceInfo::new(&qualified, instance_name, &host_name, "", port, None)
         .map_err(|e| anyhow::anyhow!("failed to build mdns service info: {e}"))?;
     let fullname = info.get_fullname().to_string();
@@ -57,8 +73,8 @@ pub fn start_sender_advertisement(
         .map_err(|e| anyhow::anyhow!("failed to register mdns service: {e}"))?;
 
     println!(
-        "[discovery] advertising sender '{}' on {} (port {})",
-        instance_name, qualified, port
+        "[discovery] advertising sender '{}' on {} (port {}) hostname={}",
+        instance_name, qualified, port, host_name
     );
 
     Ok(AdvertisementHandle { daemon: mdns, fullname })
