@@ -430,6 +430,12 @@ const ALL_KEYS: &[u16] = &[
     KEY_DOWN, KEY_PAGEDOWN, KEY_DELETE, KEY_LEFTMETA,
 ];
 
+// Modifier flag bits (sent inline in key packets from iPad)
+const MOD_CTRL: u8  = 0x01;
+const MOD_ALT: u8   = 0x02;
+const MOD_SUPER: u8 = 0x04;
+const MOD_SHIFT: u8 = 0x08;
+
 fn char_to_key(c: char) -> Option<(u16, bool)> {
     match c {
         'a' => Some((KEY_A, false)),       'b' => Some((KEY_B_KEY, false)),
@@ -519,16 +525,6 @@ fn special_to_keycode(code: u8) -> Option<u16> {
     }
 }
 
-fn modifier_to_keycode(id: u8) -> Option<u16> {
-    match id {
-        0x01 => Some(KEY_LEFTCTRL),
-        0x02 => Some(KEY_LEFTALT),
-        0x03 => Some(KEY_LEFTMETA),
-        0x04 => Some(KEY_LEFTSHIFT),
-        _ => None,
-    }
-}
-
 pub struct VirtualKeyboard {
     file: File,
 }
@@ -568,9 +564,15 @@ impl VirtualKeyboard {
         Ok(Self { file })
     }
 
-    pub fn type_text(&mut self, text: &str) {
+    pub fn type_text(&mut self, text: &str, mods: u8) {
+        let has_non_ascii = text.chars().any(|c| char_to_key(c).is_none());
+        if has_non_ascii {
+            self.paste_via_clipboard(text, mods);
+            return;
+        }
         for c in text.chars() {
             if let Some((keycode, shift)) = char_to_key(c) {
+                self.press_modifiers(mods);
                 if shift {
                     self.key_event(KEY_LEFTSHIFT, 1);
                 }
@@ -580,60 +582,82 @@ impl VirtualKeyboard {
                 if shift {
                     self.key_event(KEY_LEFTSHIFT, 0);
                 }
+                self.release_modifiers(mods);
                 self.syn();
-            } else {
-                self.type_unicode_char(c);
             }
         }
     }
 
-    /// Types a non-ASCII character using IBus/GTK Ctrl+Shift+U hex input.
-    fn type_unicode_char(&mut self, c: char) {
-        let hex = format!("{:04x}", c as u32);
-
-        // Ctrl+Shift+U to enter hex mode
-        self.key_event(KEY_LEFTCTRL, 1);
-        self.key_event(KEY_LEFTSHIFT, 1);
-        self.key_event(KEY_U, 1);
-        self.syn();
-        self.key_event(KEY_U, 0);
-        self.key_event(KEY_LEFTSHIFT, 0);
-        self.key_event(KEY_LEFTCTRL, 0);
-        self.syn();
-
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        for h in hex.chars() {
-            if let Some((kc, _)) = char_to_key(h) {
-                self.key_event(kc, 1);
-                self.syn();
-                self.key_event(kc, 0);
-                self.syn();
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        }
-
-        // Confirm with Return
-        self.key_event(KEY_ENTER, 1);
-        self.syn();
-        self.key_event(KEY_ENTER, 0);
-        self.syn();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-
-    pub fn press_special(&mut self, code: u8) {
+    pub fn press_special(&mut self, code: u8, mods: u8) {
         if let Some(keycode) = special_to_keycode(code) {
+            self.press_modifiers(mods);
             self.key_event(keycode, 1);
             self.syn();
             self.key_event(keycode, 0);
+            self.release_modifiers(mods);
             self.syn();
         }
     }
 
-    pub fn set_modifier(&mut self, id: u8, pressed: bool) {
-        if let Some(keycode) = modifier_to_keycode(id) {
-            self.key_event(keycode, if pressed { 1 } else { 0 });
-            self.syn();
+    fn press_modifiers(&mut self, mods: u8) {
+        if mods & MOD_CTRL != 0  { self.key_event(KEY_LEFTCTRL, 1); }
+        if mods & MOD_ALT != 0   { self.key_event(KEY_LEFTALT, 1); }
+        if mods & MOD_SUPER != 0 { self.key_event(KEY_LEFTMETA, 1); }
+        if mods & MOD_SHIFT != 0 { self.key_event(KEY_LEFTSHIFT, 1); }
+        if mods != 0 { self.syn(); }
+    }
+
+    fn release_modifiers(&mut self, mods: u8) {
+        if mods & MOD_SHIFT != 0 { self.key_event(KEY_LEFTSHIFT, 0); }
+        if mods & MOD_SUPER != 0 { self.key_event(KEY_LEFTMETA, 0); }
+        if mods & MOD_ALT != 0   { self.key_event(KEY_LEFTALT, 0); }
+        if mods & MOD_CTRL != 0  { self.key_event(KEY_LEFTCTRL, 0); }
+        if mods != 0 { self.syn(); }
+    }
+
+    /// Paste non-ASCII text via wl-copy + Ctrl+V (works universally on Wayland).
+    fn paste_via_clipboard(&mut self, text: &str, extra_mods: u8) {
+        let (sudo_user, sudo_uid) = (
+            std::env::var("SUDO_USER").ok(),
+            std::env::var("SUDO_UID").ok(),
+        );
+
+        let result = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
+            let runtime_dir = format!("/run/user/{uid}");
+            Command::new("runuser")
+                .args(["-u", user, "--"])
+                .arg("env")
+                .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+                .arg("WAYLAND_DISPLAY=wayland-0")
+                .arg("wl-copy")
+                .arg("--")
+                .arg(text)
+                .output()
+        } else {
+            Command::new("wl-copy")
+                .arg("--")
+                .arg(text)
+                .output()
+        };
+
+        match result {
+            Ok(out) if out.status.success() => {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let mods = extra_mods | MOD_CTRL;
+                self.press_modifiers(mods);
+                self.key_event(KEY_V, 1);
+                self.syn();
+                self.key_event(KEY_V, 0);
+                self.release_modifiers(mods);
+                self.syn();
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("[keyboard] wl-copy failed: {stderr}");
+            }
+            Err(e) => {
+                eprintln!("[keyboard] could not run wl-copy: {e}");
+            }
         }
     }
 
@@ -681,34 +705,31 @@ impl Drop for VirtualKeyboard {
 
 pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
-pub const KEY_TYPE_MODIFIER: u8 = 0x03;
 
 /// Parse and handle a key packet from the iPad.
-/// Format: type(1) + payload(variable)
-///   0x01 (text):     UTF-8 bytes
-///   0x02 (special):  code(1)
-///   0x03 (modifier): modifier_id(1) + state(1)  (1=press, 0=release)
+///
+/// Format:
+///   0x01 (text):    modifier_flags(1) + UTF-8 bytes
+///   0x02 (special): modifier_flags(1) + code(1)
+///
+/// modifier_flags bitmask: 0x01=Ctrl, 0x02=Alt, 0x04=Super, 0x08=Shift
 pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
-    if data.is_empty() {
+    if data.len() < 2 {
         return;
     }
     let key_type = data[0];
-    let payload = &data[1..];
+    let mods = data[1];
+    let payload = &data[2..];
 
     match key_type {
         KEY_TYPE_TEXT => {
             if let Ok(text) = std::str::from_utf8(payload) {
-                kb.type_text(text);
+                kb.type_text(text, mods);
             }
         }
         KEY_TYPE_SPECIAL => {
             if !payload.is_empty() {
-                kb.press_special(payload[0]);
-            }
-        }
-        KEY_TYPE_MODIFIER => {
-            if payload.len() >= 2 {
-                kb.set_modifier(payload[0], payload[1] != 0);
+                kb.press_special(payload[0], mods);
             }
         }
         _ => {}

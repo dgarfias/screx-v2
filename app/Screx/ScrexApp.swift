@@ -45,7 +45,6 @@ final class StreamViewModel: ObservableObject {
     let audioPlayer: AudioPlayer
     let cameraCapture = CameraCapture()
     let micCapture = MicCapture()
-    let modifierBar = ModifierBarState()
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
@@ -66,13 +65,6 @@ final class StreamViewModel: ObservableObject {
     func startDiscovery() {
         guard !discoveryStarted else { return }
         discoveryStarted = true
-
-        modifierBar.onModifier = { [weak self] id, pressed in
-            self?.sendModifier(id, pressed: pressed)
-        }
-        modifierBar.onSpecialKey = { [weak self] code in
-            self?.sendSpecialKey(code)
-        }
 
         // Start USB listener
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
@@ -215,7 +207,6 @@ final class StreamViewModel: ObservableObject {
         status = "Daemon disconnected, looking..."
         audioPlayer.stop()
         micCapture.stop()
-        modifierBar.releaseAll()
         discovery.resetKnownHost()
     }
 
@@ -230,7 +221,6 @@ final class StreamViewModel: ObservableObject {
         status = "Disconnected"
         audioPlayer.stop()
         micCapture.stop()
-        modifierBar.releaseAll()
         lastWifiEndpoint = nil
         lastWifiName = nil
     }
@@ -255,27 +245,16 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    /// Sends a modifier press/release: type 0x03 + id(1) + state(1)
-    func sendModifier(_ id: UInt8, pressed: Bool) {
-        sendKey(Data([0x03, id, pressed ? 1 : 0]))
-    }
-
-    /// Builds a "text insert" key packet: type 0x01 + UTF-8 bytes.
-    /// Wraps the key event with one-shot modifier press/release.
-    func sendTextInsert(_ text: String) {
-        let oneShot = modifierBar.pressOneShotModifiers()
-        var data = Data([0x01])
+    /// Builds a "text insert" key packet: type(1) + modifiers(1) + UTF-8 bytes
+    func sendTextInsert(_ text: String, mods: UInt8 = 0) {
+        var data = Data([0x01, mods])
         data.append(Data(text.utf8))
         sendKey(data)
-        modifierBar.releaseOneShotModifiers(oneShot)
     }
 
-    /// Builds a "special key" packet: type 0x02 + key code.
-    /// Wraps the key event with one-shot modifier press/release.
-    func sendSpecialKey(_ code: UInt8) {
-        let oneShot = modifierBar.pressOneShotModifiers()
-        sendKey(Data([0x02, code]))
-        modifierBar.releaseOneShotModifiers(oneShot)
+    /// Builds a "special key" packet: type(1) + modifiers(1) + code(1)
+    func sendSpecialKey(_ code: UInt8, mods: UInt8 = 0) {
+        sendKey(Data([0x02, mods, code]))
     }
 
     // MARK: - Camera
@@ -358,9 +337,8 @@ struct ContentView: View {
 
             KeyboardInputView(
                 isActive: $keyboardActive,
-                onText: { text in model.sendTextInsert(text) },
-                onDelete: { model.sendSpecialKey(0x01) },
-                modifierBar: model.modifierBar
+                onText: { text, mods in model.sendTextInsert(text, mods: mods) },
+                onSpecial: { code, mods in model.sendSpecialKey(code, mods: mods) }
             )
             .frame(width: 0, height: 0)
 
