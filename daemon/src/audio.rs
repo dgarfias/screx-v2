@@ -146,13 +146,14 @@ pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
         }
     }
 
-    // Create a null-sink — its .monitor acts as a source for apps
+    // Create a null-sink with media.class=Audio/Source/Virtual so PipeWire
+    // presents it as an input device (microphone) rather than an output.
     let result = pactl_cmd()
         .args([
             "load-module",
             "module-null-sink",
             &format!("sink_name={MIC_SINK_NAME}"),
-            &format!("sink_properties=device.description=\"Screx\\ iPad\\ Mic\""),
+            &format!("sink_properties=device.description=\"Screx\\ iPad\\ Mic\"\\ media.class=Audio/Source/Virtual"),
             &format!("rate={MIC_RATE}"),
             &format!("channels={MIC_CHANNELS}"),
             "format=s16le",

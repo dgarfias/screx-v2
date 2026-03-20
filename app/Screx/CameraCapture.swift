@@ -69,10 +69,33 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     func flipCamera() {
-        let wasRunning = running
-        if wasRunning { stop() }
+        guard running else {
+            usingFront.toggle()
+            return
+        }
+        session.beginConfiguration()
+        session.inputs.forEach { session.removeInput($0) }
+
+        let position: AVCaptureDevice.Position = usingFront ? .back : .front
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            session.commitConfiguration()
+            print("[camera] flip failed — no \(position == .front ? "front" : "back") camera")
+            return
+        }
+        session.addInput(input)
+        session.commitConfiguration()
+
+        do {
+            try device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 15)
+            device.unlockForConfiguration()
+        } catch {}
+
         usingFront.toggle()
-        if wasRunning { startSession(front: usingFront) }
+        print("[camera] flipped to \(usingFront ? "front" : "back")")
     }
 
     var isRunning: Bool { running }
