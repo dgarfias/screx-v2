@@ -365,6 +365,7 @@ const KEY_P: u16 = 25;
 const KEY_LEFTBRACE: u16 = 26;
 const KEY_RIGHTBRACE: u16 = 27;
 const KEY_ENTER: u16 = 28;
+const KEY_LEFTCTRL: u16 = 29;
 const KEY_A: u16 = 30;
 const KEY_S: u16 = 31;
 const KEY_D: u16 = 32;
@@ -389,25 +390,44 @@ const KEY_M: u16 = 50;
 const KEY_COMMA: u16 = 51;
 const KEY_DOT: u16 = 52;
 const KEY_SLASH: u16 = 53;
+const KEY_LEFTALT: u16 = 56;
 const KEY_SPACE: u16 = 57;
+const KEY_F1: u16 = 59;
+const KEY_F2: u16 = 60;
+const KEY_F3: u16 = 61;
+const KEY_F4: u16 = 62;
+const KEY_F5: u16 = 63;
+const KEY_F6: u16 = 64;
+const KEY_F7: u16 = 65;
+const KEY_F8: u16 = 66;
+const KEY_F9: u16 = 67;
+const KEY_F10: u16 = 68;
+const KEY_F11: u16 = 87;
+const KEY_F12: u16 = 88;
+const KEY_HOME: u16 = 102;
 const KEY_UP: u16 = 103;
+const KEY_PAGEUP: u16 = 104;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
-const KEY_DOWN: u16 = 108;
-const KEY_DELETE: u16 = 111;
-const KEY_HOME: u16 = 102;
 const KEY_END: u16 = 107;
+const KEY_DOWN: u16 = 108;
+const KEY_PAGEDOWN: u16 = 109;
+const KEY_DELETE: u16 = 111;
+const KEY_LEFTMETA: u16 = 125;
 
 const ALL_KEYS: &[u16] = &[
     KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
     KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB,
     KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T_KEY, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
-    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER,
+    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER, KEY_LEFTCTRL,
     KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
     KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH,
     KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
-    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
-    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_HOME, KEY_END,
+    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_LEFTALT, KEY_SPACE,
+    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
+    KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+    KEY_HOME, KEY_UP, KEY_PAGEUP, KEY_LEFT, KEY_RIGHT, KEY_END,
+    KEY_DOWN, KEY_PAGEDOWN, KEY_DELETE, KEY_LEFTMETA,
 ];
 
 fn char_to_key(c: char) -> Option<(u16, bool)> {
@@ -481,6 +501,30 @@ fn special_to_keycode(code: u8) -> Option<u16> {
         0x09 => Some(KEY_DELETE),
         0x0A => Some(KEY_HOME),
         0x0B => Some(KEY_END),
+        0x10 => Some(KEY_F1),
+        0x11 => Some(KEY_F2),
+        0x12 => Some(KEY_F3),
+        0x13 => Some(KEY_F4),
+        0x14 => Some(KEY_F5),
+        0x15 => Some(KEY_F6),
+        0x16 => Some(KEY_F7),
+        0x17 => Some(KEY_F8),
+        0x18 => Some(KEY_F9),
+        0x19 => Some(KEY_F10),
+        0x1A => Some(KEY_F11),
+        0x1B => Some(KEY_F12),
+        0x1C => Some(KEY_PAGEUP),
+        0x1D => Some(KEY_PAGEDOWN),
+        _ => None,
+    }
+}
+
+fn modifier_to_keycode(id: u8) -> Option<u16> {
+    match id {
+        0x01 => Some(KEY_LEFTCTRL),
+        0x02 => Some(KEY_LEFTALT),
+        0x03 => Some(KEY_LEFTMETA),
+        0x04 => Some(KEY_LEFTSHIFT),
         _ => None,
     }
 }
@@ -537,8 +581,42 @@ impl VirtualKeyboard {
                     self.key_event(KEY_LEFTSHIFT, 0);
                 }
                 self.syn();
+            } else {
+                self.type_unicode_char(c);
             }
         }
+    }
+
+    /// Types a non-ASCII character using IBus/GTK Ctrl+Shift+U hex input.
+    fn type_unicode_char(&mut self, c: char) {
+        let hex = format!("{:04x}", c as u32);
+
+        // Ctrl+Shift+U to enter hex mode
+        self.key_event(KEY_LEFTCTRL, 1);
+        self.key_event(KEY_LEFTSHIFT, 1);
+        self.key_event(KEY_U, 1);
+        self.syn();
+        self.key_event(KEY_U, 0);
+        self.key_event(KEY_LEFTSHIFT, 0);
+        self.key_event(KEY_LEFTCTRL, 0);
+        self.syn();
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        for h in hex.chars() {
+            if let Some((kc, _)) = char_to_key(h) {
+                self.key_event(kc, 1);
+                self.syn();
+                self.key_event(kc, 0);
+                self.syn();
+            }
+        }
+
+        // Confirm with Return
+        self.key_event(KEY_ENTER, 1);
+        self.syn();
+        self.key_event(KEY_ENTER, 0);
+        self.syn();
     }
 
     pub fn press_special(&mut self, code: u8) {
@@ -546,6 +624,13 @@ impl VirtualKeyboard {
             self.key_event(keycode, 1);
             self.syn();
             self.key_event(keycode, 0);
+            self.syn();
+        }
+    }
+
+    pub fn set_modifier(&mut self, id: u8, pressed: bool) {
+        if let Some(keycode) = modifier_to_keycode(id) {
+            self.key_event(keycode, if pressed { 1 } else { 0 });
             self.syn();
         }
     }
@@ -594,9 +679,13 @@ impl Drop for VirtualKeyboard {
 
 pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
+pub const KEY_TYPE_MODIFIER: u8 = 0x03;
 
 /// Parse and handle a key packet from the iPad.
 /// Format: type(1) + payload(variable)
+///   0x01 (text):     UTF-8 bytes
+///   0x02 (special):  code(1)
+///   0x03 (modifier): modifier_id(1) + state(1)  (1=press, 0=release)
 pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -613,6 +702,11 @@ pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
         KEY_TYPE_SPECIAL => {
             if !payload.is_empty() {
                 kb.press_special(payload[0]);
+            }
+        }
+        KEY_TYPE_MODIFIER => {
+            if payload.len() >= 2 {
+                kb.set_modifier(payload[0], payload[1] != 0);
             }
         }
         _ => {}
