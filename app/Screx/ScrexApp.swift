@@ -11,7 +11,9 @@ struct ScrexApp: App {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
+            try session.setPreferredSampleRate(48000)
             try session.setActive(true)
+            print("[app] audio session: rate=\(session.sampleRate)Hz, ioBufferDuration=\(session.ioBufferDuration)")
         } catch {
             print("[app] audio session setup failed: \(error)")
         }
