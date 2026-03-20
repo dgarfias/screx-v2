@@ -12,6 +12,9 @@ final class StreamClient {
     var onStatus: ((String) -> Void)?
     var onDisconnect: (() -> Void)?
 
+    /// When true, suppresses the data timeout (e.g. USB is active and no WiFi data is expected)
+    var suppressTimeout = false
+
     private static let headerLen = 14
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
@@ -117,6 +120,10 @@ final class StreamClient {
 
     private func handleTimeout() {
         guard connection != nil else { return }
+        if suppressTimeout {
+            resetDataTimeout()
+            return
+        }
         print("[stream] data timeout — daemon appears gone")
         disconnect()
         onStatus?("Daemon disconnected")

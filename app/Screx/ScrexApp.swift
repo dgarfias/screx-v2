@@ -42,6 +42,10 @@ final class StreamViewModel: ObservableObject {
     private var discoveryStarted = false
     private var usbConnected = false
 
+    /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
+    private var lastWifiEndpoint: NWEndpoint?
+    private var lastWifiName: String?
+
     func startDiscovery() {
         guard !discoveryStarted else { return }
         discoveryStarted = true
@@ -52,7 +56,10 @@ final class StreamViewModel: ObservableObject {
 
         usb.onStatus = { [weak self] msg in
             Task { @MainActor in
-                self?.status = msg
+                guard let self else { return }
+                if self.usbConnected || !self.isConnected {
+                    self.status = msg
+                }
             }
         }
         usb.onConnected = { [weak self] in
@@ -61,6 +68,7 @@ final class StreamViewModel: ObservableObject {
                 self.usbConnected = true
                 self.isConnected = true
                 self.transport = "USB"
+                self.stream?.suppressTimeout = true
                 self.audioPlayer.start()
             }
         }
@@ -68,12 +76,8 @@ final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.usbConnected = false
-                if self.stream == nil {
-                    self.isConnected = false
-                    self.transport = ""
-                    self.status = "USB disconnected, looking for WiFi..."
-                    self.audioPlayer.stop()
-                }
+                self.stream?.suppressTimeout = false
+                self.fallbackToWifi()
             }
         }
         usb.start()
@@ -82,25 +86,34 @@ final class StreamViewModel: ObservableObject {
         discovery.onStatusUpdate = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
-                if !self.usbConnected {
+                if !self.usbConnected && !self.isConnected {
                     self.status = msg
                 }
             }
         }
         discovery.onEndpointFound = { [weak self] ep in
             Task { @MainActor in
-                guard let self, !self.isConnected else { return }
+                guard let self else { return }
                 let endpoint = NWEndpoint.hostPort(
                     host: NWEndpoint.Host(ep.host),
                     port: NWEndpoint.Port(integerLiteral: ep.port)
                 )
-                self.connectToEndpoint(endpoint, name: ep.name)
+                self.lastWifiEndpoint = endpoint
+                self.lastWifiName = ep.name
+
+                if !self.isConnected {
+                    self.connectToEndpoint(endpoint, name: ep.name)
+                }
             }
         }
         discovery.onDaemonLost = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                self.handleWifiDisconnect()
+                self.lastWifiEndpoint = nil
+                self.lastWifiName = nil
+                if !self.usbConnected {
+                    self.handleStreamLost()
+                }
             }
         }
         discovery.startListening()
@@ -111,12 +124,17 @@ final class StreamViewModel: ObservableObject {
         guard !ip.isEmpty else { return }
         let host = NWEndpoint.Host(ip)
         let port = NWEndpoint.Port(integerLiteral: 9000)
-        connectToEndpoint(.hostPort(host: host, port: port), name: ip)
+        let endpoint = NWEndpoint.hostPort(host: host, port: port)
+        lastWifiEndpoint = endpoint
+        lastWifiName = ip
+        connectToEndpoint(endpoint, name: ip)
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
         stream?.disconnect()
-        status = "Connecting to \(name)..."
+        if !usbConnected {
+            status = "Connecting to \(name)..."
+        }
 
         let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer)
         self.stream = client
@@ -127,8 +145,8 @@ final class StreamViewModel: ObservableObject {
                 if !self.usbConnected {
                     self.status = msg
                     let nowConnected = msg.contains("Streaming")
-                    self.isConnected = nowConnected
-                    if nowConnected {
+                    if nowConnected && !self.isConnected {
+                        self.isConnected = true
                         self.transport = "WiFi"
                         self.audioPlayer.start()
                     }
@@ -137,22 +155,42 @@ final class StreamViewModel: ObservableObject {
         }
         client.onDisconnect = { [weak self] in
             Task { @MainActor in
-                self?.handleWifiDisconnect()
+                guard let self else { return }
+                self.stream = nil
+                if !self.usbConnected {
+                    self.handleStreamLost()
+                }
             }
         }
         client.connect()
     }
 
-    private func handleWifiDisconnect() {
-        stream?.disconnect()
-        stream = nil
-        if !usbConnected {
+    /// Called when USB disconnects — try to resume WiFi immediately
+    private func fallbackToWifi() {
+        if let endpoint = lastWifiEndpoint, let name = lastWifiName {
+            status = "USB disconnected, switching to WiFi..."
+            transport = "WiFi"
+            // Reconnect WiFi using the remembered endpoint
+            stream?.disconnect()
+            connectToEndpoint(endpoint, name: name)
+        } else {
             isConnected = false
             transport = ""
-            status = "Daemon disconnected, looking..."
+            status = "USB disconnected, looking for daemon..."
             audioPlayer.stop()
             discovery.resetKnownHost()
         }
+    }
+
+    /// Called when we've lost all streams and need to start looking again
+    private func handleStreamLost() {
+        stream?.disconnect()
+        stream = nil
+        isConnected = false
+        transport = ""
+        status = "Daemon disconnected, looking..."
+        audioPlayer.stop()
+        discovery.resetKnownHost()
     }
 
     func disconnect() {
@@ -165,6 +203,8 @@ final class StreamViewModel: ObservableObject {
         transport = ""
         status = "Disconnected"
         audioPlayer.stop()
+        lastWifiEndpoint = nil
+        lastWifiName = nil
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {

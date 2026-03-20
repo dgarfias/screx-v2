@@ -1,174 +1,201 @@
-# screx-v2
+# Screx v2
 
-Screx V2 is a low-latency Linux-to-iPad screen streaming MVP with a Rust daemon sender and a Swift receiver.
+Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
+
+The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with VA-API H.264, and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
+
+## Features
+
+- **Virtual second display** via EVDI kernel module — appears as a real monitor in GNOME
+- **Hardware-accelerated H.264 encoding** via VA-API (`h264_vaapi` through ffmpeg)
+- **Dual transport backends**:
+  - **WiFi**: UDP with Reed-Solomon FEC, chunked and paced for reliability
+  - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
+  - Automatic detection and failover (USB preferred when connected)
+- **Audio streaming**: Virtual PulseAudio/PipeWire sink ("Screx iPad") captured via `parec`, streamed alongside video
+- **Auto-discovery**: UDP broadcast beacon (no mDNS dependency), iPad auto-connects within seconds
+- **Disconnect detection**: Data timeouts and beacon monitoring for automatic reconnection
+
+## Architecture
+
+```
+┌─────────────────── Linux Daemon ───────────────────┐
+│                                                     │
+│  EVDI ──► VA-API H.264 ──► Transport Router ──┬──► UDP (WiFi)
+│                                                │
+│  parec (audio) ──────────────► Transport Router ┴──► TCP (USB)
+│                                                     │
+│  Beacon broadcaster (port 9999)                     │
+└─────────────────────────────────────────────────────┘
+          │ WiFi (UDP :9000)        │ USB (iproxy :9001 → :9000)
+          ▼                        ▼
+┌─────────────────── iPad App ───────────────────────┐
+│                                                     │
+│  StreamClient (UDP) ─── ──┬──► H264Decoder ──► AVSampleBufferDisplayLayer
+│                           │
+│  USBListener (TCP :9000) ─┘──► AudioPlayer ──► AVAudioEngine
+│                                                     │
+│  Beacon listener (port 9999) → auto-connect         │
+└─────────────────────────────────────────────────────┘
+```
 
 ## Repository Layout
 
-```text
+```
 screx-v2/
-├── daemon/                    # Rust Linux daemon
+├── daemon/                        # Rust Linux daemon
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs            # CLI entry and orchestration
-│       ├── capture.rs         # Portal flow scaffold + frame producer
-│       ├── encode.rs          # HEVC access-unit generator + control hooks
-│       ├── transport.rs       # RTP packetization + UDP transport + control socket
-│       └── discovery.rs       # Avahi advertisement wrapper
-└── app/                       # Swift iPad companion source files
-    ├── ScrexApp.swift
-    ├── Discovery.swift
-    ├── Transport.swift
-    ├── Decoder.swift
-    └── DisplayView.swift
+│       ├── main.rs                # Entry point, thread orchestration, shutdown
+│       ├── capture.rs             # EVDI virtual display capture (+ synthetic fallback)
+│       ├── encode.rs              # VA-API H.264 encoder (ffmpeg-next)
+│       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state
+│       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
+│       ├── discovery.rs           # UDP broadcast beacon
+│       ├── audio.rs               # PulseAudio virtual sink + parec capture
+│       └── doctor.rs              # Host readiness checks
+└── app/                           # Swift iPad app
+    └── Screx/
+        ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView
+        ├── Discovery.swift        # UDP beacon listener for auto-discovery
+        ├── StreamClient.swift     # WiFi UDP client, FEC reassembly, keepalive
+        ├── USBListener.swift      # USB TCP listener, framed message parsing
+        ├── Decoder.swift          # H.264 Annex-B → VideoToolbox → display layer
+        ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
+        ├── DisplayView.swift      # UIViewRepresentable for AVSampleBufferDisplayLayer
+        └── FEC.swift              # Reed-Solomon decoder for WiFi FEC recovery
 ```
-
-## MVP Technical Targets
-
-- Glass-to-glass latency: `< 35ms` median
-- Frame rate: `60fps` sustained
-- Linux daemon CPU: `< 5%` target on representative hardware
-- Resolution: `1080p` (MVP), `1440p` (stretch)
-- Bitrate: `8-15 Mbps` for 1080p
 
 ## Linux Dependencies
 
-Install runtime/build prerequisites:
+### Arch Linux
 
 ```bash
 sudo pacman -S --needed \
-  pipewire libpipewire libspa libclang \
   ffmpeg libva mesa \
-  avahi
+  pulseaudio-utils \
+  libimobiledevice
 ```
 
-For Debian/Ubuntu-style systems:
+### Debian / Ubuntu
 
 ```bash
 sudo apt-get install -y \
-  libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
-  libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev \
-  libva-dev mesa-va-drivers avahi-daemon
+  libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev \
+  libva-dev mesa-va-drivers \
+  pulseaudio-utils \
+  libimobiledevice-utils
 ```
 
-## Build and Run (Daemon)
+### EVDI
 
-From repo root:
+The [EVDI](https://github.com/DisplayLink/evdi) kernel module must be installed for virtual display support:
+
+```bash
+# Install from AUR (Arch) or build from source
+yay -S evdi-git
+sudo modprobe evdi
+```
+
+### USB Transport (optional)
+
+For USB streaming, `idevice_id` and `iproxy` must be available (provided by `libimobiledevice-utils`). The daemon auto-detects USB devices and manages iproxy automatically.
+
+## Build
+
+### Daemon (Linux)
 
 ```bash
 cd daemon
+
+# Development build (synthetic capture + bootstrap encoder)
 cargo build
+
+# Release build with real EVDI capture and VA-API encoding
+cargo build --release --features real-capture,real-encode
 ```
 
-Build with real capture/encode feature toggles:
+### iPad App
+
+Open `app/Screx.xcodeproj` in Xcode and build to your iPad (Cmd+R). Requires iOS 16+.
+
+## Run
 
 ```bash
 cd daemon
-cargo build --features real-capture,real-encode
-```
 
-Run host readiness checks:
+# Basic — uses default resolution (2160x1620) and settings
+sudo ./target/release/screx-daemon
 
-```bash
-cd daemon
+# Custom resolution and bitrate
+sudo SCREX_WIDTH=1600 SCREX_HEIGHT=1200 SCREX_FPS=60 SCREX_GOP=60 \
+     SCREX_BITRATE_BPS=10000000 ./target/release/screx-daemon
+
+# Run host readiness checks
 cargo run -- doctor
 ```
 
-Run with defaults:
+The daemon requires `sudo` because EVDI needs root access to create virtual displays.
 
-```bash
-SCREX_TARGET_IP=192.168.1.20 \
-SCREX_TARGET_PORT=5004 \
-SCREX_WIDTH=1920 \
-SCREX_HEIGHT=1080 \
-SCREX_FPS=60 \
-SCREX_BITRATE_BPS=10000000 \
-SCREX_CAPTURE_BACKEND=auto \
-SCREX_CAPTURE_SOURCE=virtual \
-SCREX_ENCODER_BACKEND=auto \
-cargo run
-```
+### Environment Variables
 
-Environment variables:
+| Variable | Default | Description |
+|---|---|---|
+| `SCREX_WIDTH` | `2160` | Virtual display width |
+| `SCREX_HEIGHT` | `1620` | Virtual display height |
+| `SCREX_FPS` | `30` | Target framerate |
+| `SCREX_GOP` | `30` | Keyframe interval (frames) |
+| `SCREX_BITRATE_BPS` | `8000000` | H.264 encoder bitrate |
+| `SCREX_STREAM_PORT` | `9000` | UDP/TCP streaming port |
+| `SCREX_ENCODER_BACKEND` | `auto` | `auto`, `vaapi`, or `bootstrap` |
 
-- `SCREX_TARGET_IP` / `SCREX_TARGET_PORT`: iPad receiver destination
-- `SCREX_CONTROL_PORT`: daemon UDP control channel bind (defaults to `SCREX_TARGET_PORT`)
-- `SCREX_COMMAND`: set to `doctor` to run readiness checks without streaming
-- `SCREX_DISCOVERY_NAME`: mDNS service instance name (default `screx-daemon`)
-- `SCREX_DISCOVERY_SERVICE`: mDNS service type (default `_screenstream._udp`)
-- `SCREX_CAPTURE_BACKEND`: `auto`, `portal-pipewire`, or `synthetic`
-- `SCREX_CAPTURE_SOURCE`: `virtual` (default) or `monitor`
-- `SCREX_ENCODER_BACKEND`: `auto`, `vaapi`, or `bootstrap`
-- `SCREX_WIDTH`, `SCREX_HEIGHT`, `SCREX_FPS`, `SCREX_BITRATE_BPS`, `SCREX_MTU`
+## Protocols
 
-Notes:
+### WiFi Transport (UDP)
 
-- `SCREX_CAPTURE_SOURCE=virtual` requests a second virtual display source from portal.
-- In virtual mode, capture resolution is locked to `1920x1080` for MVP consistency.
+Each UDP packet has a 14-byte header:
 
-### Control Channel Commands
+| Field | Size | Description |
+|---|---|---|
+| `frame_id` | u32 BE | Frame sequence number |
+| `chunk_idx` | u16 BE | Chunk index within frame |
+| `total_data` | u16 BE | Number of data chunks |
+| `total_parity` | u16 BE | Number of FEC parity chunks |
+| `flags` | u8 | Bit 0 = IDR, Bit 1 = audio |
+| `reserved` | u8 | — |
+| `payload_len` | u16 BE | Actual payload bytes in this chunk |
 
-Send commands to `SCREX_CONTROL_PORT`:
+Video frames are split into 1400-byte chunks with Reed-Solomon FEC parity shards. Audio is sent without FEC (small enough for single packets).
 
-- `IDR`
-- `BITRATE:12000000`
-- `RES:1280x720`
-- `{"type":"resolution","resolution":{"width":1280,"height":720}}`
+### USB Transport (TCP)
 
-## iPad Receiver (Swift)
+Length-framed messages over TCP (via iproxy USB tunnel):
 
-The repository includes iPad app source modules under `app/`:
+| Field | Size | Description |
+|---|---|---|
+| `length` | u32 BE | Payload length (excludes this header) |
+| `type` | u8 | `0x01` = video, `0x02` = audio, `0x03` = control |
+| payload | variable | Raw Annex-B (video), raw PCM (audio), ASCII (control) |
 
-- `DiscoveryService` browses `_screenstream._udp` with `NWBrowser`
-- `TransportService` receives UDP RTP packets and reassembles HEVC FU packets
-- `DecoderService` tracks VPS/SPS/PPS, converts Annex-B NALU payloads to AVCC, and enqueues samples to `AVSampleBufferDisplayLayer`
+Video messages include an additional `is_idr` byte (u8) after the type byte.
 
-Minimum iOS target is intended to be iOS 16+.
+### Discovery (UDP Broadcast)
 
-## Current Implementation State
+The daemon broadcasts a 14-byte beacon to `255.255.255.255:9999` every 2 seconds:
 
-This MVP bootstrap includes:
+| Field | Size | Description |
+|---|---|---|
+| magic | 12 bytes | `"SCREX_BEACON"` |
+| port | u16 BE | Streaming port number |
 
-- Daemon orchestration with capture -> encode -> transport pipeline
-- Real capture path for `real-capture` builds: `ashpd` screencast session + PipeWire stream consumer connected with portal remote fd
-- Real encode path for `real-encode` builds: persistent `ffmpeg` `hevc_vaapi` worker fed by raw BGRA frames
-- RTP packetization logic for HEVC single-NAL and FU fragmentation
-- UDP control channel for IDR and bitrate/resolution update messages
-- Avahi advertisement wrapper (`avahi-publish-service`) with graceful fallback
-- Swift receiver modules for discovery, RTP ingest, depacketization, decode surface wiring, and status UI
+The iPad listens on port 9999 and extracts the daemon's IP from the packet source address.
 
-Known limitations in this bootstrap:
+## How It Works
 
-- Real `ashpd` + `PipeWire` and VA-API paths are feature-gated and include fallback behavior for environments where portal permission is denied or unsupported frame memory types are returned
-- Capture falls back to synthetic frames if portal/PipeWire setup is unavailable in `auto` mode
-- Encode falls back to bootstrap Annex-B access units if VA-API init or encoder worker startup is unavailable in `auto` mode
-- Full VA-API zero-copy DMA-BUF path and production-grade jitter buffering are the next hardening steps
-
-Daemon crate dependency notes:
-
-- `ashpd = "0.13"` with `screencast` feature for portal integration
-- `pipewire = "0.9"` for PipeWire runtime initialization
-- `ffmpeg-next = "8"` for VA-API capability probing and encode-path integration
-
-## Validation and Smoke Tests
-
-Run Rust tests:
-
-```bash
-cd daemon
-cargo test
-```
-
-Suggested manual smoke test:
-
-1. Launch daemon on Linux with iPad IP configured.
-2. Start iPad app and verify Bonjour discovery.
-3. Confirm status changes to connected and display layer starts receiving samples.
-4. Send control message `IDR` and verify decoder recovery path is exercised.
-
-## Launch Checklist
-
-- Confirm buildability on target Linux hardware.
-- Validate 30-minute `1080p60` session stability.
-- Measure end-to-end latency under idle and motion-heavy scenes.
-- Verify reconnect behavior after Wi-Fi disruption and sender restarts.
-- Document known MVP limitations (no virtual display creation, no input remoting yet).
+1. **Daemon starts** → creates EVDI virtual display → GNOME sees a new monitor
+2. **Beacon broadcasts** → iPad discovers daemon automatically
+3. **iPad connects** (WiFi UDP or USB TCP, whichever is available)
+4. **Capture loop**: EVDI damage events trigger framebuffer reads → VA-API encodes to H.264 → transport sends to iPad
+5. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM sent alongside video
+6. **iPad decodes**: VideoToolbox hardware H.264 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
+7. **Disconnect detection**: data timeouts (WiFi) and TCP close (USB) trigger automatic reconnection
