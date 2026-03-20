@@ -224,6 +224,44 @@ final class USBListener {
         })
     }
 
+    /// Sends mic PCM audio over USB TCP.
+    func sendMicAudio(_ pcm: Data) {
+        guard let conn = connection else { return }
+
+        let micPayload = Data("MIC".utf8) + pcm
+        let payloadLen = UInt32(1 + micPayload.count)
+
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(micPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] mic send error: \(error)")
+            }
+        })
+    }
+
+    /// Sends a camera JPEG frame over USB TCP. Single framed control message.
+    func sendCameraFrame(_ jpeg: Data) {
+        guard let conn = connection else { return }
+
+        let camPayload = Data("CAM".utf8) + jpeg
+        let payloadLen = UInt32(1 + camPayload.count)
+
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(camPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] cam send error: \(error)")
+            }
+        })
+    }
+
     /// Sends a keyboard event over USB TCP. Framed control: "KEY" + type(1) + payload.
     func sendKey(_ keyData: Data) {
         guard let conn = connection else { return }

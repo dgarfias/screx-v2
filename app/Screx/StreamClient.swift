@@ -297,6 +297,44 @@ final class StreamClient {
         })
     }
 
+    /// Sends mic PCM audio over UDP. Packet: "MIC" + raw PCM data.
+    func sendMicAudio(_ pcm: Data) {
+        guard let conn = connection else { return }
+        var packet = Data("MIC".utf8)
+        packet.append(pcm)
+        conn.send(content: packet, completion: .contentProcessed { error in
+            if let error {
+                print("[stream] mic send error: \(error)")
+            }
+        })
+    }
+
+    /// Sends a camera JPEG frame over UDP, chunked.
+    /// Header per chunk: "CAM" + frame_id(4 BE) + chunk_idx(2 BE) + total(2 BE) + jpeg_data
+    func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
+        guard let conn = connection else { return }
+        let chunkSize = 1300
+        let totalChunks = (jpeg.count + chunkSize - 1) / chunkSize
+
+        for i in 0..<totalChunks {
+            let start = i * chunkSize
+            let end = min(start + chunkSize, jpeg.count)
+            let chunk = jpeg.subdata(in: start..<end)
+
+            var packet = Data("CAM".utf8)
+            withUnsafeBytes(of: frameId.bigEndian) { packet.append(contentsOf: $0) }
+            withUnsafeBytes(of: UInt16(i).bigEndian) { packet.append(contentsOf: $0) }
+            withUnsafeBytes(of: UInt16(totalChunks).bigEndian) { packet.append(contentsOf: $0) }
+            packet.append(chunk)
+
+            conn.send(content: packet, completion: .contentProcessed { error in
+                if let error {
+                    print("[stream] cam send error: \(error)")
+                }
+            })
+        }
+    }
+
     /// Sends a keyboard event over UDP. Packet: "KEY" + type(1) + payload.
     func sendKey(_ keyData: Data) {
         guard let conn = connection else { return }

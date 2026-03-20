@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
+use crate::audio::MicWriter;
+use crate::camera::{CamReassembler, CamWriter};
 use crate::encode::EncodedAccessUnit;
 use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
 use crate::usb::TcpFramedSender;
@@ -16,6 +18,8 @@ const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEY_MAGIC: &[u8] = b"KEY";
+const MIC_MAGIC: &[u8] = b"MIC";
+const CAM_MAGIC: &[u8] = b"CAM";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -28,6 +32,8 @@ pub struct SharedState {
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
+    pub mic_writer: Mutex<Option<MicWriter>>,
+    pub cam_writer: Mutex<Option<CamWriter>>,
 }
 
 impl SharedState {
@@ -39,6 +45,8 @@ impl SharedState {
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
+            mic_writer: Mutex::new(None),
+            cam_writer: Mutex::new(None),
         }
     }
 }
@@ -80,7 +88,8 @@ pub fn run_client_manager(
         .ok();
 
     let mut last_keepalive = Instant::now();
-    let mut recv_buf = [0u8; 256];
+    let mut recv_buf = vec![0u8; 4096];
+    let mut cam_reassembler = CamReassembler::new();
 
     println!("[client] listening for iPad registration...");
 
@@ -117,6 +126,24 @@ pub fn run_client_manager(
                     let mut kb = shared.virtual_keyboard.lock().unwrap();
                     if let Some(ref mut keyboard) = *kb {
                         crate::uinput::handle_key_packet(keyboard, key_data);
+                    }
+                }
+
+                if len > MIC_MAGIC.len() && &recv_buf[..MIC_MAGIC.len()] == MIC_MAGIC {
+                    let pcm = &recv_buf[MIC_MAGIC.len()..len];
+                    let mut mic = shared.mic_writer.lock().unwrap();
+                    if let Some(ref mut mw) = *mic {
+                        mw.write_pcm(pcm);
+                    }
+                }
+
+                if len > CAM_MAGIC.len() && &recv_buf[..CAM_MAGIC.len()] == CAM_MAGIC {
+                    let cam_data = &recv_buf[CAM_MAGIC.len()..len];
+                    if let Some(jpeg) = cam_reassembler.feed(cam_data) {
+                        let mut cam = shared.cam_writer.lock().unwrap();
+                        if let Some(ref mut cw) = *cam {
+                            cw.write_frame(&jpeg);
+                        }
                     }
                 }
             }

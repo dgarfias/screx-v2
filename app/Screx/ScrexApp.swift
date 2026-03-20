@@ -35,12 +35,15 @@ final class StreamViewModel: ObservableObject {
 
     let decoder = H264Decoder()
     let audioPlayer = AudioPlayer()
+    let micCapture = MicCapture()
+    let cameraCapture = CameraCapture()
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
     private var usbListener: USBListener?
     private var discoveryStarted = false
     private var usbConnected = false
+    private var camFrameId: UInt32 = 0
 
     /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
     private var lastWifiEndpoint: NWEndpoint?
@@ -238,6 +241,50 @@ final class StreamViewModel: ObservableObject {
     func sendSpecialKey(_ code: UInt8) {
         sendKey(Data([0x02, code]))
     }
+
+    // MARK: - Mic
+
+    func toggleMic() {
+        if micCapture.isRunning {
+            micCapture.stop()
+        } else {
+            micCapture.onPCM = { [weak self] pcm in
+                guard let self else { return }
+                if self.usbConnected, let usb = self.usbListener {
+                    usb.sendMicAudio(pcm)
+                } else if let stream = self.stream {
+                    stream.sendMicAudio(pcm)
+                }
+            }
+            micCapture.start()
+        }
+        objectWillChange.send()
+    }
+
+    var isMicActive: Bool { micCapture.isRunning }
+
+    // MARK: - Camera
+
+    func toggleCamera() {
+        if cameraCapture.isRunning {
+            cameraCapture.stop()
+        } else {
+            cameraCapture.onJPEG = { [weak self] jpeg in
+                guard let self else { return }
+                let fid = self.camFrameId
+                self.camFrameId = self.camFrameId &+ 1
+                if self.usbConnected, let usb = self.usbListener {
+                    usb.sendCameraFrame(jpeg)
+                } else if let stream = self.stream {
+                    stream.sendCameraFrame(jpeg, frameId: fid)
+                }
+            }
+            cameraCapture.start()
+        }
+        objectWillChange.send()
+    }
+
+    var isCameraActive: Bool { cameraCapture.isRunning }
 }
 
 struct ContentView: View {
@@ -309,12 +356,24 @@ struct ContentView: View {
 
                 Spacer()
 
-                HStack {
+                HStack(spacing: 6) {
                     Spacer()
                     if model.isConnected {
-                        Button {
-                            keyboardActive.toggle()
-                        } label: {
+                        Button { model.toggleMic() } label: {
+                            Image(systemName: model.isMicActive ? "mic.fill" : "mic")
+                                .font(.footnote)
+                                .foregroundStyle(model.isMicActive ? .green : .white)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        Button { model.toggleCamera() } label: {
+                            Image(systemName: model.isCameraActive ? "video.fill" : "video")
+                                .font(.footnote)
+                                .foregroundStyle(model.isCameraActive ? .green : .white)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        Button { keyboardActive.toggle() } label: {
                             Image(systemName: keyboardActive ? "keyboard.fill" : "keyboard")
                                 .font(.footnote)
                                 .foregroundStyle(.white)

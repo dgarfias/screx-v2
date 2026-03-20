@@ -1,5 +1,7 @@
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::net::UdpSocket;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,6 +94,115 @@ pub fn remove_virtual_sink(module_id: u32) {
         .output();
     println!("[audio] removed virtual sink (module {module_id})");
 }
+
+// ---------------------------------------------------------------------------
+// Virtual mic source — receives PCM from iPad mic, exposes as PulseAudio source
+// ---------------------------------------------------------------------------
+
+const MIC_SOURCE_NAME: &str = "screx_ipad_mic";
+const MIC_FIFO_PATH: &str = "/tmp/screx_mic";
+const MIC_RATE: u32 = 48000;
+const MIC_CHANNELS: u16 = 1;
+
+pub struct MicWriter {
+    file: std::fs::File,
+}
+
+impl MicWriter {
+    pub fn write_pcm(&mut self, data: &[u8]) {
+        let _ = self.file.write_all(data);
+    }
+}
+
+pub fn create_virtual_mic_source() -> Result<(u32, MicWriter)> {
+    // Check if already loaded
+    let existing = pactl_cmd()
+        .args(["list", "short", "modules"])
+        .output()
+        .context("pactl not found")?;
+
+    let output = String::from_utf8_lossy(&existing.stdout);
+    for line in output.lines() {
+        if line.contains(MIC_SOURCE_NAME) {
+            let module_id: u32 = line
+                .split_whitespace()
+                .next()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            pactl_cmd()
+                .args(["unload-module", &module_id.to_string()])
+                .output()
+                .ok();
+            println!("[mic] removed stale mic source (module {module_id})");
+        }
+    }
+
+    // Remove stale FIFO
+    let _ = fs::remove_file(MIC_FIFO_PATH);
+
+    // Create FIFO
+    let path = std::ffi::CString::new(MIC_FIFO_PATH).unwrap();
+    let ret = unsafe { libc::mkfifo(path.as_ptr(), 0o666) };
+    if ret != 0 {
+        anyhow::bail!(
+            "mkfifo({MIC_FIFO_PATH}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Load module-pipe-source (reads from the FIFO)
+    let result = pactl_cmd()
+        .args([
+            "load-module",
+            "module-pipe-source",
+            &format!("source_name={MIC_SOURCE_NAME}"),
+            &format!("source_properties=device.description=\"Screx\\ iPad\\ Mic\""),
+            &format!("file={MIC_FIFO_PATH}"),
+            &format!("rate={MIC_RATE}"),
+            &format!("channels={MIC_CHANNELS}"),
+            "format=s16le",
+        ])
+        .output()
+        .context("failed to load module-pipe-source")?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let _ = fs::remove_file(MIC_FIFO_PATH);
+        anyhow::bail!("pactl load-module module-pipe-source failed: {stderr}");
+    }
+
+    let module_id: u32 = String::from_utf8_lossy(&result.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    // Open the FIFO for writing (non-blocking to avoid deadlock if nothing reads yet)
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(MIC_FIFO_PATH)
+        .context("failed to open mic FIFO for writing")?;
+
+    println!("[mic] virtual mic source created (module {module_id})");
+
+    Ok((module_id, MicWriter { file }))
+}
+
+pub fn remove_virtual_mic_source(module_id: u32) {
+    if module_id == 0 {
+        return;
+    }
+    let _ = pactl_cmd()
+        .args(["unload-module", &module_id.to_string()])
+        .output();
+    let _ = fs::remove_file(MIC_FIFO_PATH);
+    println!("[mic] removed virtual mic source (module {module_id})");
+}
+
+// ---------------------------------------------------------------------------
+// Audio capture — reads from virtual sink monitor, sends to iPad
+// ---------------------------------------------------------------------------
 
 pub fn run_audio_capture(
     socket: UdpSocket,

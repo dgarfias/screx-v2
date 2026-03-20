@@ -258,6 +258,18 @@ fn read_control_loop(
                 if let Some(ref mut keyboard) = *kb {
                     crate::uinput::handle_key_packet(keyboard, key_data);
                 }
+            } else if ctrl.starts_with(b"MIC") && ctrl.len() > 3 {
+                let pcm = &ctrl[3..];
+                let mut mic = shared.mic_writer.lock().unwrap();
+                if let Some(ref mut mw) = *mic {
+                    mw.write_pcm(pcm);
+                }
+            } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
+                let jpeg = &ctrl[3..];
+                let mut cam = shared.cam_writer.lock().unwrap();
+                if let Some(ref mut cw) = *cam {
+                    cw.write_frame(jpeg);
+                }
             }
         }
     }

@@ -1,4 +1,5 @@
 mod audio;
+mod camera;
 mod capture;
 mod discovery;
 mod doctor;
@@ -219,6 +220,35 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn USB transport thread")?;
 
+    // Virtual mic source (iPad mic -> Linux PulseAudio source)
+    let mic_module_id = match audio::create_virtual_mic_source() {
+        Ok((id, writer)) => {
+            *shared.mic_writer.lock().unwrap() = Some(writer);
+            println!("[main] mic: virtual source ready (module {id})");
+            id
+        }
+        Err(e) => {
+            eprintln!("[main] mic: failed to create virtual source ({e:#}), mic disabled");
+            0
+        }
+    };
+
+    // Virtual camera (iPad camera -> v4l2loopback)
+    match camera::load_v4l2loopback() {
+        Ok(()) => match camera::create_cam_writer() {
+            Ok(writer) => {
+                *shared.cam_writer.lock().unwrap() = Some(writer);
+                println!("[main] camera: virtual webcam ready");
+            }
+            Err(e) => {
+                eprintln!("[main] camera: failed to open v4l2loopback ({e:#}), camera disabled");
+            }
+        },
+        Err(e) => {
+            eprintln!("[main] camera: v4l2loopback not available ({e:#}), camera disabled");
+        }
+    }
+
     // Audio capture thread
     let audio_socket = socket.try_clone().context("clone socket for audio")?;
     let audio_shared = Arc::clone(&shared);
@@ -281,6 +311,10 @@ async fn main() -> Result<()> {
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
+    // Cleanup mic/camera/audio
+    *shared.mic_writer.lock().unwrap() = None;
+    *shared.cam_writer.lock().unwrap() = None;
+    audio::remove_virtual_mic_source(mic_module_id);
     audio::remove_virtual_sink(audio_module_id);
 
     println!("screx-daemon shutdown complete");
