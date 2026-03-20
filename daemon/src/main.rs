@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
     let capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
-            capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
+            if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
                 let force_idr = capture_shared.force_idr.swap(false, Ordering::Relaxed);
 
                 match encoder.encode_frame(&frame, force_idr) {
@@ -206,7 +206,11 @@ async fn main() -> Result<()> {
                         eprintln!("[pipeline] encode error: {e:#}");
                     }
                 }
-            })
+            }) {
+                eprintln!("[capture] fatal: {e:#}");
+                std::process::exit(1);
+            }
+            Ok(())
         })
         .context("failed to spawn capture thread")?;
 
@@ -233,6 +237,17 @@ async fn main() -> Result<()> {
         },
         Err(e) => {
             eprintln!("[main] camera: v4l2loopback not available ({e:#}), camera disabled");
+        }
+    }
+
+    // Virtual microphone (iPad mic → PipeWire source)
+    match audio::create_virtual_mic() {
+        Ok(writer) => {
+            *shared.mic_writer.lock().unwrap() = Some(writer);
+            println!("[main] mic: virtual microphone ready");
+        }
+        Err(e) => {
+            eprintln!("[main] mic: failed to create virtual mic ({e:#}), mic disabled");
         }
     }
 
@@ -298,8 +313,12 @@ async fn main() -> Result<()> {
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
-    // Cleanup camera/audio
+    // Cleanup camera/audio/mic
     *shared.cam_writer.lock().unwrap() = None;
+    if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
+        audio::remove_virtual_mic(mic);
+    }
+    *shared.mic_writer.lock().unwrap() = None;
     audio::remove_virtual_sink(audio_module_id);
 
     println!("screx-daemon shutdown complete");

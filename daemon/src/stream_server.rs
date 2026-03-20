@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
+use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter};
 use crate::encode::EncodedAccessUnit;
 use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
@@ -18,6 +19,7 @@ const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEY_MAGIC: &[u8] = b"KEY";
 const CAM_MAGIC: &[u8] = b"CAM";
+const MIC_MAGIC: &[u8] = b"MIC";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -31,6 +33,7 @@ pub struct SharedState {
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
+    pub mic_writer: Mutex<Option<MicWriter>>,
 }
 
 impl SharedState {
@@ -43,6 +46,7 @@ impl SharedState {
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
             cam_writer: Mutex::new(None),
+            mic_writer: Mutex::new(None),
         }
     }
 }
@@ -131,6 +135,17 @@ pub fn run_client_manager(
                         let mut cam = shared.cam_writer.lock().unwrap();
                         if let Some(ref mut cw) = *cam {
                             cw.write_frame(&jpeg);
+                        }
+                    }
+                }
+
+                // MIC packets: "MIC" + seq(4 BE) + opus_data
+                if len > MIC_MAGIC.len() + 4 && &recv_buf[..MIC_MAGIC.len()] == MIC_MAGIC {
+                    let opus_data = &recv_buf[MIC_MAGIC.len() + 4..len];
+                    let mut mic = shared.mic_writer.lock().unwrap();
+                    if let Some(ref mut mw) = *mic {
+                        if let Err(e) = mw.write_opus_packet(opus_data) {
+                            eprintln!("[mic] write error: {e}");
                         }
                     }
                 }

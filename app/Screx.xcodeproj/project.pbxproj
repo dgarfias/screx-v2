@@ -78,6 +78,7 @@
 			);
 			name = Screx;
 			packageProductDependencies = (
+				6C8487112F7B0002003D958E /* Opus */,
 			);
 			productName = Screx;
 			productReference = 6C8486822F6C68D4003D958E /* Screx.app */;
@@ -107,6 +108,9 @@
 			);
 			mainGroup = 6C8486792F6C68D4003D958E;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				6C8487102F7B0001003D958E /* XCRemoteSwiftPackageReference "swift-opus" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6C8486832F6C68D4003D958E /* Products */;
 			projectDirPath = "";
@@ -349,6 +353,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		6C8487102F7B0001003D958E /* XCRemoteSwiftPackageReference "swift-opus" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/alta/swift-opus";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.0.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		6C8487112F7B0002003D958E /* Opus */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6C8487102F7B0001003D958E /* XCRemoteSwiftPackageReference "swift-opus" */;
+			productName = Opus;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 6C84867A2F6C68D4003D958E /* Project object */;
 }

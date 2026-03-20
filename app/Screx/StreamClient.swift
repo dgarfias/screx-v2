@@ -334,6 +334,16 @@ final class StreamClient {
             }
         })
     }
+
+    /// Sends a mic Opus packet over UDP. Packet is pre-built: "MIC" + seq(4) + opus_data.
+    func sendMicPacket(_ packet: Data) {
+        guard let conn = connection else { return }
+        conn.send(content: packet, completion: .contentProcessed { error in
+            if let error {
+                print("[stream] mic send error: \(error)")
+            }
+        })
+    }
 }
 
 private final class FrameAssembly {

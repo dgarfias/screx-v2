@@ -10,7 +10,13 @@ struct ScrexApp: App {
     init() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
+            )
+            try session.setPreferredSampleRate(48000)
+            try session.setPreferredIOBufferDuration(0.01)
             try session.setActive(true)
             print("[app] audio session: rate=\(session.sampleRate)Hz, ioBufferDuration=\(session.ioBufferDuration)")
         } catch {
@@ -37,6 +43,7 @@ final class StreamViewModel: ObservableObject {
     let decoder = H264Decoder()
     let audioPlayer = AudioPlayer()
     let cameraCapture = CameraCapture()
+    let micCapture = MicCapture()
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
@@ -48,6 +55,7 @@ final class StreamViewModel: ObservableObject {
     /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
     private var lastWifiEndpoint: NWEndpoint?
     private var lastWifiName: String?
+    private var micSeq: UInt32 = 0
 
     func startDiscovery() {
         guard !discoveryStarted else { return }
@@ -193,6 +201,7 @@ final class StreamViewModel: ObservableObject {
         transport = ""
         status = "Daemon disconnected, looking..."
         audioPlayer.stop()
+        micCapture.stop()
         discovery.resetKnownHost()
     }
 
@@ -206,6 +215,7 @@ final class StreamViewModel: ObservableObject {
         transport = ""
         status = "Disconnected"
         audioPlayer.stop()
+        micCapture.stop()
         lastWifiEndpoint = nil
         lastWifiName = nil
     }
@@ -270,6 +280,35 @@ final class StreamViewModel: ObservableObject {
         cameraCapture.flipCamera()
         objectWillChange.send()
     }
+
+    // MARK: - Microphone
+
+    func toggleMic() {
+        if micCapture.isRunning {
+            micCapture.stop()
+        } else {
+            micCapture.onOpusPacket = { [weak self] opusData in
+                guard let self else { return }
+                let seq = self.micSeq
+                self.micSeq = self.micSeq &+ 1
+
+                // Build MIC packet: "MIC" + seq(4 BE) + opus_data
+                var packet = Data("MIC".utf8)
+                withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
+                packet.append(opusData)
+
+                if self.usbConnected, let usb = self.usbListener {
+                    usb.sendMicPacket(packet)
+                } else if let stream = self.stream {
+                    stream.sendMicPacket(packet)
+                }
+            }
+            micCapture.start()
+        }
+        objectWillChange.send()
+    }
+
+    var isMicActive: Bool { micCapture.isRunning }
 }
 
 struct ContentView: View {
@@ -344,6 +383,12 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Spacer()
                     if model.isConnected {
+                        Image(systemName: model.isMicActive ? "mic.fill" : "mic")
+                            .font(.footnote)
+                            .foregroundStyle(model.isMicActive ? .red : .white)
+                            .frame(width: 32, height: 32)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .onTapGesture { model.toggleMic() }
                         Image(systemName: model.isCameraActive
                               ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
                               : "video")

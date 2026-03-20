@@ -264,6 +264,15 @@ fn read_control_loop(
                 if let Some(ref mut cw) = *cam {
                     cw.write_frame(jpeg);
                 }
+            } else if ctrl.starts_with(b"MIC") && ctrl.len() > 7 {
+                // "MIC"(3) + seq(4) + opus_data
+                let opus_data = &ctrl[7..];
+                let mut mic = shared.mic_writer.lock().unwrap();
+                if let Some(ref mut mw) = *mic {
+                    if let Err(e) = mw.write_opus_packet(opus_data) {
+                        eprintln!("[mic] USB write error: {e}");
+                    }
+                }
             }
         }
     }

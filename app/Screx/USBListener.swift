@@ -262,6 +262,24 @@ final class USBListener {
         })
     }
 
+    /// Sends a mic Opus packet over USB TCP. Pre-built: "MIC" + seq(4) + opus_data.
+    func sendMicPacket(_ micData: Data) {
+        guard let conn = connection else { return }
+
+        let payloadLen = UInt32(1 + micData.count)
+
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(micData)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] mic send error: \(error)")
+            }
+        })
+    }
+
     var isConnected: Bool {
         connection != nil
     }

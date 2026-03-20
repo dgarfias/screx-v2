@@ -1,10 +1,15 @@
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::UdpSocket;
-use std::process::{Command, Stdio};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use opus_decoder::OpusDecoder;
 
 use crate::stream_server::{AudioSender, SharedState};
 
@@ -14,6 +19,12 @@ const CHANNELS: u16 = 2;
 const CHUNK_DURATION_MS: u32 = 10;
 const SAMPLES_PER_CHUNK: usize = (SAMPLE_RATE / 1000 * CHUNK_DURATION_MS) as usize;
 const BYTES_PER_CHUNK: usize = SAMPLES_PER_CHUNK * CHANNELS as usize * 2;
+
+const MIC_FIFO_PATH: &str = "/tmp/screx_mic";
+const MIC_SOURCE_NAME: &str = "screx_mic";
+const MIC_SINK_NAME: &str = "screx_mic_sink";
+const MIC_RATE: u32 = 48000;
+const MIC_MAX_FRAME: usize = 5760; // 120ms at 48kHz (max Opus frame)
 
 fn pulse_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
@@ -171,4 +182,290 @@ pub fn run_audio_capture(
     let _ = child.wait();
     println!("[audio] capture stopped");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Virtual microphone — receives Opus from iPad, decodes, feeds to PipeWire
+// ---------------------------------------------------------------------------
+
+enum MicOutput {
+    Fifo(File),
+    Pacat(ChildStdin),
+}
+
+pub struct MicWriter {
+    decoder: OpusDecoder,
+    output: MicOutput,
+    pub module_ids: Vec<u32>,
+    pub fifo_path: Option<String>,
+    pacat_child: Option<Child>,
+    pcm_buf: Vec<i16>,
+    byte_buf: Vec<u8>,
+}
+
+// OpusDecoder is Send (pure Rust, no thread-local state)
+unsafe impl Send for MicWriter {}
+
+impl MicWriter {
+    pub fn write_opus_packet(&mut self, opus_data: &[u8]) -> Result<()> {
+        let samples = self
+            .decoder
+            .decode(opus_data, &mut self.pcm_buf, false)
+            .map_err(|e| anyhow::anyhow!("opus decode: {e:?}"))?;
+
+        self.byte_buf.clear();
+        for &sample in &self.pcm_buf[..samples] {
+            self.byte_buf.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        match &mut self.output {
+            MicOutput::Fifo(f) => f.write_all(&self.byte_buf)?,
+            MicOutput::Pacat(stdin) => stdin.write_all(&self.byte_buf)?,
+        }
+
+        Ok(())
+    }
+}
+
+pub fn create_virtual_mic() -> Result<MicWriter> {
+    match try_pipe_source() {
+        Ok(w) => return Ok(w),
+        Err(e) => {
+            println!("[mic] pipe-source failed ({e:#}), trying null-sink fallback...");
+        }
+    }
+    try_null_sink_mic()
+}
+
+fn try_pipe_source() -> Result<MicWriter> {
+    let _ = fs::remove_file(MIC_FIFO_PATH);
+
+    // Create FIFO ourselves so the module can open it for reading immediately
+    let status = Command::new("mkfifo")
+        .arg(MIC_FIFO_PATH)
+        .status()
+        .context("mkfifo not found")?;
+    if !status.success() {
+        anyhow::bail!("mkfifo failed");
+    }
+
+    // Make world-readable so PipeWire (user process) can read it
+    let _ = Command::new("chmod").args(["666", MIC_FIFO_PATH]).status();
+
+    let result = pactl_cmd()
+        .args([
+            "load-module",
+            "module-pipe-source",
+            &format!("source_name={MIC_SOURCE_NAME}"),
+            &format!("file={MIC_FIFO_PATH}"),
+            "format=s16le",
+            &format!("rate={MIC_RATE}"),
+            "channels=1",
+            &format!("source_properties=device.description=\"Screx\\ Microphone\""),
+        ])
+        .output()
+        .context("pactl not found")?;
+
+    if !result.status.success() {
+        let _ = fs::remove_file(MIC_FIFO_PATH);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        anyhow::bail!("module-pipe-source: {}", stderr.trim());
+    }
+
+    let module_id: u32 = String::from_utf8_lossy(&result.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    println!("[mic] module-pipe-source loaded (module {module_id})");
+
+    // Open FIFO for writing with O_NONBLOCK to avoid hanging if module
+    // hasn't started reading yet. Retry for up to 2 seconds.
+    let mut fifo = None;
+    for attempt in 0..20 {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(MIC_FIFO_PATH)
+        {
+            Ok(f) => {
+                fifo = Some(f);
+                break;
+            }
+            Err(e) => {
+                if attempt == 19 {
+                    let _ = pactl_cmd()
+                        .args(["unload-module", &module_id.to_string()])
+                        .output();
+                    let _ = fs::remove_file(MIC_FIFO_PATH);
+                    anyhow::bail!("FIFO open failed after 2s: {e}");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    let fifo = fifo.unwrap();
+    // Switch to blocking mode for reliable writes
+    unsafe {
+        let flags = libc::fcntl(fifo.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(fifo.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+
+    let decoder = OpusDecoder::new(MIC_RATE, 1)
+        .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
+
+    println!("[mic] virtual mic ready via pipe-source (FIFO)");
+
+    Ok(MicWriter {
+        decoder,
+        output: MicOutput::Fifo(fifo),
+        module_ids: vec![module_id],
+        fifo_path: Some(MIC_FIFO_PATH.to_string()),
+        pacat_child: None,
+        pcm_buf: vec![0i16; MIC_MAX_FRAME],
+        byte_buf: Vec::with_capacity(MIC_MAX_FRAME * 2),
+    })
+}
+
+fn try_null_sink_mic() -> Result<MicWriter> {
+    // 1. Internal null-sink (receives decoded PCM via pacat)
+    let sink_out = pactl_cmd()
+        .args([
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={MIC_SINK_NAME}"),
+            &format!("rate={MIC_RATE}"),
+            "channels=1",
+            "channel_map=front-left",
+            "format=s16le",
+            "sink_properties=device.description=\"Screx\\ Mic\\ (internal)\"",
+        ])
+        .output()
+        .context("pactl not found")?;
+
+    if !sink_out.status.success() {
+        let stderr = String::from_utf8_lossy(&sink_out.stderr);
+        anyhow::bail!("null-sink for mic failed: {}", stderr.trim());
+    }
+
+    let sink_mod: u32 = String::from_utf8_lossy(&sink_out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    println!("[mic] internal sink loaded (module {sink_mod})");
+
+    // 2. Virtual source (visible as microphone in GNOME/pavucontrol)
+    let src_out = pactl_cmd()
+        .args([
+            "load-module",
+            "module-null-sink",
+            "media.class=Audio/Source/Virtual",
+            &format!("sink_name={MIC_SOURCE_NAME}"),
+            &format!("rate={MIC_RATE}"),
+            "channels=1",
+            "channel_map=front-left",
+            "sink_properties=device.description=\"Screx\\ Microphone\"",
+        ])
+        .output()
+        .context("pactl not found")?;
+
+    if !src_out.status.success() {
+        let _ = pactl_cmd()
+            .args(["unload-module", &sink_mod.to_string()])
+            .output();
+        let stderr = String::from_utf8_lossy(&src_out.stderr);
+        anyhow::bail!("virtual source for mic failed: {}", stderr.trim());
+    }
+
+    let src_mod: u32 = String::from_utf8_lossy(&src_out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    println!("[mic] virtual source loaded (module {src_mod})");
+
+    // 3. Link sink monitor → virtual source input
+    std::thread::sleep(Duration::from_millis(200));
+    let mut link_cmd = Command::new("pw-link");
+    for (k, v) in pulse_env() {
+        link_cmd.env(&k, &v);
+    }
+    let link_out = link_cmd
+        .args([
+            &format!("{MIC_SINK_NAME}:monitor_FL"),
+            &format!("{MIC_SOURCE_NAME}:input_FL"),
+        ])
+        .output();
+    if let Ok(ref r) = link_out {
+        if !r.status.success() {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            eprintln!("[mic] pw-link warning (may still work): {}", stderr.trim());
+        } else {
+            println!("[mic] linked monitor → source");
+        }
+    }
+
+    // 4. Spawn pacat to feed decoded PCM to the internal sink
+    let mut pacat = Command::new("pacat");
+    for (k, v) in pulse_env() {
+        pacat.env(&k, &v);
+    }
+    let mut child = pacat
+        .args([
+            "--playback",
+            &format!("--device={MIC_SINK_NAME}"),
+            "--format=s16le",
+            &format!("--rate={MIC_RATE}"),
+            "--channels=1",
+            "--latency-msec=10",
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start pacat for mic")?;
+
+    let stdin = child.stdin.take().context("no stdin from pacat")?;
+    println!("[mic] pacat started (pid {})", child.id());
+
+    let decoder = OpusDecoder::new(MIC_RATE, 1)
+        .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
+
+    println!("[mic] virtual mic ready via null-sink + virtual-source");
+
+    Ok(MicWriter {
+        decoder,
+        output: MicOutput::Pacat(stdin),
+        module_ids: vec![sink_mod, src_mod],
+        fifo_path: None,
+        pacat_child: Some(child),
+        pcm_buf: vec![0i16; MIC_MAX_FRAME],
+        byte_buf: Vec::with_capacity(MIC_MAX_FRAME * 2),
+    })
+}
+
+pub fn remove_virtual_mic(mic: &mut MicWriter) {
+    // Close the output first
+    match &mut mic.output {
+        MicOutput::Fifo(_) => {} // dropped when MicWriter is dropped
+        MicOutput::Pacat(_) => {}
+    }
+
+    if let Some(ref mut child) = mic.pacat_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    for &mid in &mic.module_ids {
+        if mid > 0 {
+            let _ = pactl_cmd()
+                .args(["unload-module", &mid.to_string()])
+                .output();
+        }
+    }
+
+    if let Some(ref path) = mic.fifo_path {
+        let _ = fs::remove_file(path);
+    }
+
+    println!("[mic] virtual mic removed");
 }

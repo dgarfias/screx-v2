@@ -1,6 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+#[cfg(not(feature = "real-capture"))]
+use std::sync::atomic::Ordering;
+#[cfg(not(feature = "real-capture"))]
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -34,11 +39,12 @@ pub struct CaptureConfig {
 #[cfg(feature = "real-capture")]
 mod evdi {
     use std::os::raw::{c_int, c_uint, c_void};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     use super::{CaptureConfig, CaptureFrame, PixelFormat};
 
@@ -304,7 +310,34 @@ mod evdi {
         None
     }
 
+    fn ensure_evdi_module_loaded() -> Result<()> {
+        if std::path::Path::new("/sys/module/evdi").exists() {
+            return Ok(());
+        }
+
+        println!("[capture] evdi module not loaded; trying to load it via modprobe...");
+        let status = Command::new("modprobe")
+            .arg("evdi")
+            .status()
+            .context("failed to run modprobe evdi")?;
+        if !status.success() {
+            anyhow::bail!("modprobe evdi failed with status {status}");
+        }
+
+        for _ in 0..20 {
+            if std::path::Path::new("/sys/module/evdi").exists() {
+                println!("[capture] evdi module loaded");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        anyhow::bail!("modprobe evdi reported success but /sys/module/evdi is still missing");
+    }
+
     fn find_or_create_device() -> Result<c_int> {
+        ensure_evdi_module_loaded()?;
+
         if let Some(dev) = find_available_device() {
             println!("[capture] found existing EVDI device at card {dev}");
             return Ok(dev);
@@ -319,16 +352,23 @@ mod evdi {
             );
         }
 
+        // Best effort: wait for udev to settle newly created DRM node.
+        let _ = Command::new("udevadm")
+            .args(["settle", "--timeout=10"])
+            .status();
+
         // Wait for udev to create the device node, then rescan
-        for attempt in 0..10 {
-            std::thread::sleep(Duration::from_millis(300));
+        for attempt in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
             if let Some(dev) = find_available_device() {
                 println!("[capture] EVDI device created at card {dev} (attempt {attempt})");
                 return Ok(dev);
             }
         }
 
-        anyhow::bail!("evdi_add_device succeeded but no EVDI card appeared in /dev/dri/ after 3s");
+        anyhow::bail!(
+            "evdi_add_device succeeded but no EVDI card became available after 10s"
+        );
     }
 
     // -- Public capture entry point ----------------------------------------
@@ -511,6 +551,7 @@ mod evdi {
 // Synthetic capture (fallback when real-capture is unavailable)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "real-capture"))]
 fn run_synthetic_capture(
     config: &CaptureConfig,
     stop: &Arc<AtomicBool>,
@@ -578,19 +619,14 @@ pub fn run_capture_loop(
 ) -> Result<()> {
     #[cfg(feature = "real-capture")]
     {
-        match evdi::run_capture(&config, &stop, &mut on_frame) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                eprintln!("[capture] EVDI capture failed: {e:#}");
-                eprintln!("[capture] falling back to synthetic source");
-            }
-        }
+        // In production builds we require real EVDI capture. If EVDI fails,
+        // fail the capture loop instead of silently switching to synthetic.
+        return evdi::run_capture(&config, &stop, &mut on_frame);
     }
 
     #[cfg(not(feature = "real-capture"))]
     {
         println!("[capture] built without real-capture feature, using synthetic source");
+        return run_synthetic_capture(&config, &stop, &mut on_frame);
     }
-
-    run_synthetic_capture(&config, &stop, &mut on_frame)
 }
