@@ -32,17 +32,17 @@ final class AudioPlayer {
                 self.ringBuffer.removeFirst(bytesNeeded)
                 self.lock.unlock()
 
-                for buffer in ablPointer {
-                    guard let dest = buffer.mData else { continue }
+                for i in 0..<ablPointer.count {
+                    guard let dest = ablPointer[i].mData else { continue }
                     chunk.copyBytes(to: dest.assumingMemoryBound(to: UInt8.self), count: bytesNeeded)
-                    buffer.mDataByteSize = UInt32(bytesNeeded)
+                    ablPointer[i].mDataByteSize = UInt32(bytesNeeded)
                 }
             } else {
                 self.lock.unlock()
-                for buffer in ablPointer {
-                    guard let dest = buffer.mData else { continue }
+                for i in 0..<ablPointer.count {
+                    guard let dest = ablPointer[i].mData else { continue }
                     memset(dest, 0, bytesNeeded)
-                    buffer.mDataByteSize = UInt32(bytesNeeded)
+                    ablPointer[i].mDataByteSize = UInt32(bytesNeeded)
                 }
             }
 
