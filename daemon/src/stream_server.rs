@@ -7,13 +7,11 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::encode::EncodedAccessUnit;
-use crate::uinput::{self, VirtualInput};
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
-const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -22,7 +20,6 @@ const PACING_DELAY: Duration = Duration::from_micros(10);
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
     pub force_idr: AtomicBool,
-    pub virtual_input: Mutex<Option<VirtualInput>>,
 }
 
 impl SharedState {
@@ -30,7 +27,6 @@ impl SharedState {
         Self {
             client_addr: Mutex::new(None),
             force_idr: AtomicBool::new(false),
-            virtual_input: Mutex::new(None),
         }
     }
 }
@@ -90,19 +86,10 @@ pub fn run_client_manager(
                         println!("[client] registered: {addr}");
                         shared.force_idr.store(true, Ordering::Relaxed);
                     }
-                } else if len >= PLI_MAGIC.len() && &recv_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
+                }
+
+                if len >= PLI_MAGIC.len() && &recv_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
                     shared.force_idr.store(true, Ordering::Relaxed);
-                } else if len >= TOUCH_MAGIC.len() && &recv_buf[..TOUCH_MAGIC.len()] == TOUCH_MAGIC {
-                    if let Some((event_type, x, y, dx, dy)) =
-                        uinput::parse_touch_packet(&recv_buf, len)
-                    {
-                        if let Ok(mut vi) = shared.virtual_input.lock() {
-                            if let Some(ref mut input) = *vi {
-                                handle_touch(input, event_type, x, y, dx, dy);
-                            }
-                        }
-                    }
-                    last_keepalive = Instant::now();
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -305,31 +292,5 @@ impl AudioSender {
 
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Touch event handler
-// ---------------------------------------------------------------------------
-
-fn handle_touch(
-    input: &mut VirtualInput,
-    event_type: uinput::TouchEventType,
-    x: u16,
-    y: u16,
-    dx: i16,
-    dy: i16,
-) {
-    use uinput::TouchEventType::*;
-    match event_type {
-        Tap => input.click(x, y),
-        Down => input.button_down(x, y, 0x110),
-        Move => input.drag(x, y),
-        Up => input.button_up(0x110),
-        Scroll => input.scroll(x, y, dx as i32, dy as i32),
-        RightClick => {
-            input.button_down(x, y, 0x111);
-            input.button_up(0x111);
-        }
     }
 }
