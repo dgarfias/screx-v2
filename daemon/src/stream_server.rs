@@ -15,6 +15,7 @@ const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
+const OSK_MAGIC: &[u8] = b"OSK";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -26,6 +27,8 @@ pub struct SharedState {
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
+    /// Original OSK state before we touched it, so we can restore on shutdown.
+    pub osk_was_enabled: Mutex<Option<bool>>,
 }
 
 impl SharedState {
@@ -36,6 +39,7 @@ impl SharedState {
             usb_sender: Mutex::new(None),
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
+            osk_was_enabled: Mutex::new(None),
         }
     }
 }
@@ -108,6 +112,10 @@ pub fn run_client_manager(
                         crate::uinput::handle_touch_packet(ts, touch_data);
                     }
                 }
+
+                if len >= OSK_MAGIC.len() && &recv_buf[..OSK_MAGIC.len()] == OSK_MAGIC {
+                    handle_osk_toggle(&shared);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -127,6 +135,16 @@ pub fn run_client_manager(
 
     println!("[client] manager stopped");
     Ok(())
+}
+
+fn handle_osk_toggle(shared: &SharedState) {
+    {
+        let mut saved = shared.osk_was_enabled.lock().unwrap();
+        if saved.is_none() {
+            *saved = crate::uinput::get_osk_enabled();
+        }
+    }
+    crate::uinput::toggle_osk();
 }
 
 // ---------------------------------------------------------------------------

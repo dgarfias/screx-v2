@@ -218,6 +218,14 @@ final class StreamViewModel: ObservableObject {
             stream.sendTouch(data)
         }
     }
+
+    func toggleOsk() {
+        if usbConnected, let usb = usbListener {
+            usb.sendOskToggle()
+        } else if let stream {
+            stream.sendOskToggle()
+        }
+    }
 }
 
 struct ContentView: View {
@@ -241,6 +249,15 @@ struct ContentView: View {
             VStack {
                 HStack {
                     Spacer()
+                    if model.isConnected {
+                        Button { model.toggleOsk() } label: {
+                            Image(systemName: "keyboard")
+                                .font(.title2)
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
                     } label: {

@@ -224,6 +224,25 @@ final class USBListener {
         })
     }
 
+    /// Sends an OSK toggle request over USB TCP.
+    func sendOskToggle() {
+        guard let conn = connection else { return }
+
+        let oskPayload = Data("OSK".utf8)
+        let payloadLen = UInt32(1 + oskPayload.count)
+
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(oskPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] OSK toggle send error: \(error)")
+            }
+        })
+    }
+
     var isConnected: Bool {
         connection != nil
     }

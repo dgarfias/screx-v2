@@ -172,48 +172,69 @@ impl VirtualTouchscreen {
     }
 
     /// Maps this virtual touchscreen to the EVDI "Screx Virtual" output via gsettings.
+    /// Must be called after device creation. Needs ~1s for mutter to detect the device.
     pub fn map_to_output(&self) {
+        // Wait for mutter to detect the new uinput device
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
         let vendor_product = format!(
             "{:04x}:{:04x}",
             SCREX_VENDOR, SCREX_PRODUCT
         );
-        let path = format!(
-            "/org/gnome/desktop/peripherals/touchscreens/{vendor_product}/"
+        let schema_path = format!(
+            "org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/{vendor_product}/"
+        );
+        let output_value = "['SRX', 'Screx Virtual', '001']";
+
+        // When running under sudo, we must run gsettings as the real user
+        // with access to their DBUS session, otherwise dconf can't talk to
+        // the GNOME session and the mapping silently fails.
+        let (sudo_user, sudo_uid) = (
+            std::env::var("SUDO_USER").ok(),
+            std::env::var("SUDO_UID").ok(),
         );
 
-        let mut cmd = Command::new("gsettings");
-        // If running under sudo, use the real user's dbus session
-        if let Ok(uid) = std::env::var("SUDO_UID") {
+        let result = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
             let runtime_dir = format!("/run/user/{uid}");
-            cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
-            cmd.env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={runtime_dir}/bus"),
-            );
-        }
+            let dbus_addr = format!("unix:path={runtime_dir}/bus");
 
-        let result = cmd
-            .args([
-                "set",
-                &format!(
-                    "org.gnome.desktop.peripherals.touchscreen:{}",
-                    path
-                ),
-                "output",
-                "['SRX', 'Screx Virtual', '001']",
-            ])
-            .output();
+            println!(
+                "[touch] running gsettings as user '{user}' (uid={uid}) to map {vendor_product} -> EVDI output"
+            );
+
+            Command::new("runuser")
+                .args(["-u", user, "--"])
+                .arg("env")
+                .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_addr}"))
+                .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+                .arg("gsettings")
+                .arg("set")
+                .arg(&schema_path)
+                .arg("output")
+                .arg(output_value)
+                .output()
+        } else {
+            println!("[touch] running gsettings directly (not under sudo)");
+            Command::new("gsettings")
+                .args(["set", &schema_path, "output", output_value])
+                .output()
+        };
 
         match result {
             Ok(output) if output.status.success() => {
-                println!("[touch] mapped touchscreen to EVDI output via gsettings");
+                println!("[touch] mapped touchscreen {vendor_product} to EVDI output via gsettings");
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("[touch] gsettings mapping failed (non-fatal): {stderr}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                eprintln!("[touch] gsettings mapping failed: stderr={stderr} stdout={stdout}");
+                eprintln!("[touch] you can map manually: gsettings set {schema_path} output \"{output_value}\"");
             }
             Err(e) => {
-                eprintln!("[touch] gsettings not available (non-fatal): {e}");
+                eprintln!("[touch] could not run gsettings/runuser: {e}");
+                eprintln!(
+                    "[touch] map manually: gsettings set {schema_path} output \"{output_value}\""
+                );
             }
         }
     }
@@ -311,6 +332,82 @@ unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// On-screen keyboard (OSK) toggle via gsettings
+// ---------------------------------------------------------------------------
+
+const OSK_SCHEMA: &str = "org.gnome.desktop.a11y.applications";
+const OSK_KEY: &str = "screen-keyboard-enabled";
+
+fn gsettings_cmd(args: &[&str]) -> Option<String> {
+    let (sudo_user, sudo_uid) = (
+        std::env::var("SUDO_USER").ok(),
+        std::env::var("SUDO_UID").ok(),
+    );
+
+    let output = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
+        let runtime_dir = format!("/run/user/{uid}");
+        let dbus_addr = format!("unix:path={runtime_dir}/bus");
+        let mut cmd = Command::new("runuser");
+        cmd.args(["-u", user, "--"])
+            .arg("env")
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_addr}"))
+            .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
+            .arg("gsettings");
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.output()
+    } else {
+        let mut cmd = Command::new("gsettings");
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.output()
+    };
+
+    match output {
+        Ok(o) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!("[osk] gsettings failed: {stderr}");
+            None
+        }
+        Err(e) => {
+            eprintln!("[osk] could not run gsettings: {e}");
+            None
+        }
+    }
+}
+
+/// Read the current on-screen keyboard enabled state.
+pub fn get_osk_enabled() -> Option<bool> {
+    gsettings_cmd(&["get", OSK_SCHEMA, OSK_KEY])
+        .map(|v| v == "true")
+}
+
+/// Set the on-screen keyboard enabled state.
+pub fn set_osk_enabled(enabled: bool) {
+    let val = if enabled { "true" } else { "false" };
+    if gsettings_cmd(&["set", OSK_SCHEMA, OSK_KEY, val]).is_some() {
+        println!("[osk] screen keyboard {}", if enabled { "enabled" } else { "disabled" });
+    }
+}
+
+/// Toggle the on-screen keyboard and return the new state.
+pub fn toggle_osk() -> bool {
+    let current = get_osk_enabled().unwrap_or(false);
+    let new_val = !current;
+    set_osk_enabled(new_val);
+    new_val
+}
+
+// ---------------------------------------------------------------------------
+// Touch packet parsing
+// ---------------------------------------------------------------------------
 
 /// Parse a batch of touch contacts from a raw buffer.
 /// Format: count(1) + N * [slot(1) + event_type(1) + x(u16 BE) + y(u16 BE) + padding(2)]

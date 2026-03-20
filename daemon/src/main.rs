@@ -266,6 +266,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Restore OSK state if we changed it
+    if let Some(original) = *shared.osk_was_enabled.lock().unwrap() {
+        println!("[main] restoring on-screen keyboard to original state: {original}");
+        uinput::set_osk_enabled(original);
+    }
+
     // Destroy virtual touchscreen
     *shared.virtual_touch.lock().unwrap() = None;
 

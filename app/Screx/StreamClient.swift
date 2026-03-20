@@ -296,6 +296,16 @@ final class StreamClient {
             }
         })
     }
+
+    /// Sends an OSK toggle request over UDP.
+    func sendOskToggle() {
+        guard let conn = connection else { return }
+        conn.send(content: Data("OSK".utf8), completion: .contentProcessed { error in
+            if let error {
+                print("[stream] OSK toggle send error: \(error)")
+            }
+        })
+    }
 }
 
 private final class FrameAssembly {
