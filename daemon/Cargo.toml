@@ -7,15 +7,14 @@ license = "MIT"
 
 [features]
 default = []
-real-capture = ["dep:libc"]
+real-capture = []
 real-encode = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
 
 [dependencies]
 anyhow = "1"
-cpal = "0.17.3"
 ffmpeg-next = { version = "8", optional = true }
 ffmpeg-sys-next = { version = "8", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 mdns-sd = { version = "0.18.2", features = ["async"] }
 rand = "0.8"
 reed-solomon-erasure = "6"

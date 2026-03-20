@@ -16,38 +16,68 @@ final class H264Decoder {
     private var framesDisplayed: UInt64 = 0
     private var statsWindowStart = CACurrentMediaTime()
 
+    private let renderQueue = DispatchQueue(label: "screx.render", qos: .userInteractive)
+    private var naluBuf = [UInt8]()
+
     init() {
         displayLayer.videoGravity = .resizeAspect
     }
 
     func decodeAccessUnit(_ data: Data) {
-        let nalus = splitAnnexBNalus(data)
+        let bytes = [UInt8](data)
+        let count = bytes.count
+        var i = 0
 
-        for nalu in nalus {
-            guard nalu.count > 0 else { continue }
-            let naluType = nalu[0] & 0x1F
+        while i < count {
+            var startCodeLen = 0
+            if i + 3 < count && bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 0 && bytes[i+3] == 1 {
+                startCodeLen = 4
+            } else if i + 2 < count && bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 1 {
+                startCodeLen = 3
+            }
+
+            guard startCodeLen > 0 else { i += 1; continue }
+
+            let naluStart = i + startCodeLen
+            var naluEnd = count
+            var j = naluStart + 1
+            while j < count - 2 {
+                if bytes[j] == 0 && bytes[j+1] == 0 &&
+                    (bytes[j+2] == 1 || (j + 3 < count && bytes[j+2] == 0 && bytes[j+3] == 1)) {
+                    naluEnd = j
+                    break
+                }
+                j += 1
+            }
+
+            let length = naluEnd - naluStart
+            guard length > 0 else { i = naluEnd; continue }
+
+            let naluType = bytes[naluStart] & 0x1F
             naluCount += 1
 
             if naluCount <= 5 {
-                print("[decoder] NALU #\(naluCount) type=\(naluType) len=\(nalu.count)")
+                print("[decoder] NALU #\(naluCount) type=\(naluType) len=\(length)")
             }
 
             switch naluType {
             case 7:
-                sps = nalu
+                sps = Data(bytes[naluStart..<naluEnd])
                 tryBuildFormatDescription()
             case 8:
-                pps = nalu
+                pps = Data(bytes[naluStart..<naluEnd])
                 tryBuildFormatDescription()
             case 1, 5:
                 if formatDescription != nil {
-                    enqueueNalu(nalu)
+                    enqueueSlice(bytes: bytes, offset: naluStart, length: length)
                 } else if naluCount <= 10 {
                     print("[decoder] dropping slice type=\(naluType), no format description yet")
                 }
             default:
                 break
             }
+
+            i = naluEnd
         }
     }
 
@@ -84,28 +114,38 @@ final class H264Decoder {
         }
     }
 
-    private func enqueueNalu(_ nalu: Data) {
+    private func enqueueSlice(bytes: [UInt8], offset: Int, length: Int) {
         guard let formatDescription else { return }
 
-        var naluWithLength = Data(count: 4 + nalu.count)
-        let length = UInt32(nalu.count).bigEndian
-        naluWithLength.replaceSubrange(0..<4, with: withUnsafeBytes(of: length) { Data($0) })
-        naluWithLength.replaceSubrange(4..<(4 + nalu.count), with: nalu)
+        let totalLen = 4 + length
 
-        let frameData = naluWithLength
-        let dataLength = frameData.count
+        if naluBuf.count < totalLen {
+            naluBuf = [UInt8](repeating: 0, count: max(totalLen, naluBuf.count * 2))
+        }
+
+        let len32 = UInt32(length)
+        naluBuf[0] = UInt8((len32 >> 24) & 0xFF)
+        naluBuf[1] = UInt8((len32 >> 16) & 0xFF)
+        naluBuf[2] = UInt8((len32 >> 8) & 0xFF)
+        naluBuf[3] = UInt8(len32 & 0xFF)
+
+        naluBuf.withUnsafeMutableBufferPointer { dst in
+            bytes.withUnsafeBufferPointer { src in
+                (dst.baseAddress! + 4).update(from: src.baseAddress! + offset, count: length)
+            }
+        }
 
         var blockBuffer: CMBlockBuffer?
-        frameData.withUnsafeBytes { rawBuf in
-            let ptr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        naluBuf.withUnsafeBufferPointer { bufPtr in
+            let ptr = bufPtr.baseAddress!
             CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: nil,
-                blockLength: dataLength,
+                blockLength: totalLen,
                 blockAllocator: kCFAllocatorDefault,
                 customBlockSource: nil,
                 offsetToData: 0,
-                dataLength: dataLength,
+                dataLength: totalLen,
                 flags: 0,
                 blockBufferOut: &blockBuffer
             )
@@ -114,7 +154,7 @@ final class H264Decoder {
                     with: ptr,
                     blockBuffer: bb,
                     offsetIntoDestination: 0,
-                    dataLength: dataLength
+                    dataLength: totalLen
                 )
             }
         }
@@ -122,7 +162,7 @@ final class H264Decoder {
         guard let blockBuffer else { return }
 
         var sampleBuffer: CMSampleBuffer?
-        var sampleSize = dataLength
+        var sampleSize = totalLen
         var timing = CMSampleTimingInfo(
             duration: .invalid,
             presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
@@ -150,11 +190,9 @@ final class H264Decoder {
 
         framesReceived += 1
 
-        DispatchQueue.main.async { [weak self] in
+        renderQueue.async { [weak self] in
             guard let self else { return }
             if self.displayLayer.status == .failed {
-                let err = self.displayLayer.error
-                print("[decoder] display layer FAILED: \(err?.localizedDescription ?? "unknown"), flushing")
                 self.displayLayer.flush()
             }
             self.displayLayer.enqueue(sampleBuffer)
@@ -171,42 +209,5 @@ final class H264Decoder {
                 self.statsWindowStart = now
             }
         }
-    }
-
-    private func splitAnnexBNalus(_ data: Data) -> [Data] {
-        var nalus: [Data] = []
-        var i = 0
-        let bytes = [UInt8](data)
-        let count = bytes.count
-
-        while i < count {
-            var startCodeLen = 0
-            if i + 3 < count && bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 0 && bytes[i+3] == 1 {
-                startCodeLen = 4
-            } else if i + 2 < count && bytes[i] == 0 && bytes[i+1] == 0 && bytes[i+2] == 1 {
-                startCodeLen = 3
-            }
-
-            if startCodeLen > 0 {
-                let naluStart = i + startCodeLen
-                var naluEnd = count
-                var j = naluStart + 1
-                while j < count - 2 {
-                    if bytes[j] == 0 && bytes[j+1] == 0 && (bytes[j+2] == 1 || (j + 3 < count && bytes[j+2] == 0 && bytes[j+3] == 1)) {
-                        naluEnd = j
-                        break
-                    }
-                    j += 1
-                }
-                if naluStart < naluEnd {
-                    nalus.append(Data(bytes[naluStart..<naluEnd]))
-                }
-                i = naluEnd
-            } else {
-                i += 1
-            }
-        }
-
-        return nalus
     }
 }

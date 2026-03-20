@@ -123,6 +123,7 @@ pub struct UdpSender {
     stats_start: Instant,
     stats_frames: u64,
     stats_bytes: u64,
+    shard_pool: Vec<Vec<u8>>,
 }
 
 impl UdpSender {
@@ -134,6 +135,7 @@ impl UdpSender {
             stats_start: Instant::now(),
             stats_frames: 0,
             stats_bytes: 0,
+            shard_pool: Vec::new(),
         }
     }
 
@@ -143,7 +145,6 @@ impl UdpSender {
 
         let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
-        // FEC: 20% for small frames, 30% for large bursts (>50 chunks)
         let parity_count = if data_count <= 1 {
             0
         } else if data_count > 50 {
@@ -156,32 +157,39 @@ impl UdpSender {
         let actual_parity = if use_fec { parity_count } else { 0 };
         let total_shards = data_count + actual_parity;
 
-        // Build data shards (padded to CHUNK_PAYLOAD for RS)
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
+        // Grow shard pool if needed (buffers persist across frames)
+        while self.shard_pool.len() < total_shards {
+            self.shard_pool.push(vec![0u8; CHUNK_PAYLOAD]);
+        }
+
+        // Fill data shards (zero-pad for RS alignment)
         for i in 0..data_count {
+            let shard = &mut self.shard_pool[i];
             let start = i * CHUNK_PAYLOAD;
             let end = (start + CHUNK_PAYLOAD).min(payload.len());
-            let mut shard = vec![0u8; CHUNK_PAYLOAD];
-            shard[..(end - start)].copy_from_slice(&payload[start..end]);
-            shards.push(shard);
+            let actual = end - start;
+            shard[..actual].copy_from_slice(&payload[start..end]);
+            if actual < CHUNK_PAYLOAD {
+                shard[actual..].fill(0);
+            }
         }
 
         // Generate parity shards
         if actual_parity > 0 {
-            for _ in 0..actual_parity {
-                shards.push(vec![0u8; CHUNK_PAYLOAD]);
+            for i in data_count..total_shards {
+                self.shard_pool[i].fill(0);
             }
             let rs = ReedSolomon::new(data_count, actual_parity)
                 .map_err(|e| anyhow::anyhow!("RS init: {e:?}"))?;
-            rs.encode(&mut shards)
+            rs.encode(&mut self.shard_pool[..total_shards])
                 .map_err(|e| anyhow::anyhow!("RS encode: {e:?}"))?;
         }
 
-        // Send all shards with pacing for large frames
-        let needs_pacing = shards.len() > PACING_THRESHOLD;
+        let needs_pacing = total_shards > PACING_THRESHOLD;
         let mut frame_bytes = 0_u64;
+        let flags = if is_idr { FLAG_IDR } else { 0 };
 
-        for (idx, shard) in shards.iter().enumerate() {
+        for idx in 0..total_shards {
             let actual_payload_len = if idx < data_count {
                 let start = idx * CHUNK_PAYLOAD;
                 let end = (start + CHUNK_PAYLOAD).min(payload.len());
@@ -190,7 +198,6 @@ impl UdpSender {
                 CHUNK_PAYLOAD as u16
             };
 
-            let flags = if is_idr { FLAG_IDR } else { 0 };
             let header = build_header(
                 self.frame_id,
                 idx as u16,
@@ -200,9 +207,10 @@ impl UdpSender {
                 actual_payload_len,
             );
 
-            let pkt_len = HEADER_LEN + shard.len();
+            let pkt_len = HEADER_LEN + CHUNK_PAYLOAD;
             self.send_buf[..HEADER_LEN].copy_from_slice(&header);
-            self.send_buf[HEADER_LEN..HEADER_LEN + shard.len()].copy_from_slice(shard);
+            self.send_buf[HEADER_LEN..pkt_len]
+                .copy_from_slice(&self.shard_pool[idx]);
 
             if let Err(e) = self.socket.send_to(&self.send_buf[..pkt_len], client_addr) {
                 eprintln!("[stream] send error: {e}");
@@ -242,6 +250,7 @@ impl UdpSender {
 pub struct AudioSender {
     socket: UdpSocket,
     frame_id: u32,
+    send_buf: Vec<u8>,
 }
 
 impl AudioSender {
@@ -249,6 +258,7 @@ impl AudioSender {
         Self {
             socket,
             frame_id: 0,
+            send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD],
         }
     }
 
@@ -271,11 +281,10 @@ impl AudioSender {
             );
 
             let pkt_len = HEADER_LEN + chunk.len();
-            let mut buf = vec![0u8; pkt_len];
-            buf[..HEADER_LEN].copy_from_slice(&header);
-            buf[HEADER_LEN..].copy_from_slice(chunk);
+            self.send_buf[..HEADER_LEN].copy_from_slice(&header);
+            self.send_buf[HEADER_LEN..pkt_len].copy_from_slice(chunk);
 
-            if let Err(e) = self.socket.send_to(&buf, client_addr) {
+            if let Err(e) = self.socket.send_to(&self.send_buf[..pkt_len], client_addr) {
                 eprintln!("[audio] send error: {e}");
                 break;
             }

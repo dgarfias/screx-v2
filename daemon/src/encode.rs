@@ -198,6 +198,10 @@ mod vaapi {
         ctx: *mut ffi::AVCodecContext,
         hw_device_ctx: *mut ffi::AVBufferRef,
         sws: *mut ffi::SwsContext,
+        sw_bgra: *mut ffi::AVFrame,
+        sw_nv12: *mut ffi::AVFrame,
+        hw_frame: *mut ffi::AVFrame,
+        pkt: *mut ffi::AVPacket,
         width: i32,
         height: i32,
         frame_index: u64,
@@ -314,6 +318,40 @@ mod vaapi {
                     bail!("failed to create swscale context");
                 }
 
+                // Pre-allocate BGRA wrapper frame (no pixel buffer, just points at input)
+                let sw_bgra = ffi::av_frame_alloc();
+                if sw_bgra.is_null() {
+                    bail!("failed to allocate persistent BGRA frame");
+                }
+                (*sw_bgra).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+                (*sw_bgra).width = width;
+                (*sw_bgra).height = height;
+                (*sw_bgra).linesize[0] = width * 4;
+
+                // Pre-allocate NV12 frame with pixel buffer
+                let sw_nv12 = ffi::av_frame_alloc();
+                if sw_nv12.is_null() {
+                    bail!("failed to allocate persistent NV12 frame");
+                }
+                (*sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                (*sw_nv12).width = width;
+                (*sw_nv12).height = height;
+                let ret = ffi::av_frame_get_buffer(sw_nv12, 0);
+                if ret < 0 {
+                    bail!("failed to allocate persistent NV12 buffer (error {ret})");
+                }
+
+                // Pre-allocate HW frame struct (surface obtained per-frame from pool)
+                let hw_frame = ffi::av_frame_alloc();
+                if hw_frame.is_null() {
+                    bail!("failed to allocate persistent HW frame");
+                }
+
+                let pkt = ffi::av_packet_alloc();
+                if pkt.is_null() {
+                    bail!("failed to allocate persistent packet");
+                }
+
                 println!(
                     "[encode] VA-API H.264 encoder: {}x{}@{} bitrate={} gop={} async_depth=1",
                     width, height, config.fps, config.bitrate_bps, config.gop
@@ -323,6 +361,10 @@ mod vaapi {
                     ctx,
                     hw_device_ctx,
                     sws,
+                    sw_bgra,
+                    sw_nv12,
+                    hw_frame,
+                    pkt,
                     width,
                     height,
                     frame_index: 0,
@@ -339,91 +381,64 @@ mod vaapi {
             is_idr: bool,
         ) -> Result<Vec<EncodedAccessUnit>> {
             unsafe {
-                let sw_bgra = ffi::av_frame_alloc();
-                if sw_bgra.is_null() {
-                    bail!("failed to allocate BGRA frame");
-                }
-                (*sw_bgra).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
-                (*sw_bgra).width = self.width;
-                (*sw_bgra).height = self.height;
-                (*sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
-                (*sw_bgra).linesize[0] = self.width * 4;
+                // Point pre-allocated BGRA wrapper at the input data (zero-copy)
+                (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
 
-                let sw_nv12 = ffi::av_frame_alloc();
-                if sw_nv12.is_null() {
-                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
-                    bail!("failed to allocate NV12 frame");
-                }
-                (*sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
-                (*sw_nv12).width = self.width;
-                (*sw_nv12).height = self.height;
-                let ret = ffi::av_frame_get_buffer(sw_nv12, 0);
-                if ret < 0 {
-                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
-                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
-                    bail!("failed to allocate NV12 buffer (error {ret})");
-                }
-
+                // BGRA → NV12 into pre-allocated buffer
                 ffi::sws_scale(
                     self.sws,
-                    (*sw_bgra).data.as_ptr() as *const *const u8,
-                    (*sw_bgra).linesize.as_ptr(),
+                    (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                    (*self.sw_bgra).linesize.as_ptr(),
                     0,
                     self.height,
-                    (*sw_nv12).data.as_mut_ptr(),
-                    (*sw_nv12).linesize.as_mut_ptr(),
+                    (*self.sw_nv12).data.as_mut_ptr(),
+                    (*self.sw_nv12).linesize.as_mut_ptr(),
                 );
 
-                let hw_frame = ffi::av_frame_alloc();
-                if hw_frame.is_null() {
-                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
-                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
-                    bail!("failed to allocate hw frame");
-                }
-                let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, hw_frame, 0);
+                // Get a VA-API surface from the pool into pre-allocated hw_frame
+                let ret = ffi::av_hwframe_get_buffer(
+                    (*self.ctx).hw_frames_ctx,
+                    self.hw_frame,
+                    0,
+                );
                 if ret < 0 {
-                    ffi::av_frame_free(&mut (sw_bgra as *mut _));
-                    ffi::av_frame_free(&mut (sw_nv12 as *mut _));
-                    ffi::av_frame_free(&mut (hw_frame as *mut _));
                     bail!("failed to get hw frame buffer (error {ret})");
                 }
 
-                let ret = ffi::av_hwframe_transfer_data(hw_frame, sw_nv12, 0);
-                ffi::av_frame_free(&mut (sw_bgra as *mut _));
-                ffi::av_frame_free(&mut (sw_nv12 as *mut _));
+                // Upload NV12 → VA-API surface
+                let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
                 if ret < 0 {
-                    ffi::av_frame_free(&mut (hw_frame as *mut _));
+                    ffi::av_frame_unref(self.hw_frame);
                     bail!("failed to upload frame to VA-API surface (error {ret})");
                 }
 
                 let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
-                (*hw_frame).pts = pts;
+                (*self.hw_frame).pts = pts;
+                (*self.hw_frame).pict_type = if is_idr {
+                    ffi::AVPictureType::AV_PICTURE_TYPE_I
+                } else {
+                    ffi::AVPictureType::AV_PICTURE_TYPE_NONE
+                };
 
-                if is_idr {
-                    (*hw_frame).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                }
-
-                let ret = ffi::avcodec_send_frame(self.ctx, hw_frame);
-                ffi::av_frame_free(&mut (hw_frame as *mut _));
+                let ret = ffi::avcodec_send_frame(self.ctx, self.hw_frame);
+                ffi::av_frame_unref(self.hw_frame);
                 if ret < 0 {
                     bail!("avcodec_send_frame failed (error {ret})");
                 }
 
                 let mut output = Vec::new();
-                let pkt = ffi::av_packet_alloc();
                 loop {
-                    let ret = ffi::avcodec_receive_packet(self.ctx, pkt);
+                    let ret = ffi::avcodec_receive_packet(self.ctx, self.pkt);
                     if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
                         break;
                     }
                     if ret < 0 {
-                        ffi::av_packet_free(&mut (pkt as *mut _));
                         bail!("avcodec_receive_packet failed (error {ret})");
                     }
 
                     let encoded =
-                        std::slice::from_raw_parts((*pkt).data, (*pkt).size as usize);
-                    let is_key = ((*pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
+                        std::slice::from_raw_parts((*self.pkt).data, (*self.pkt).size as usize);
+                    let is_key = ((*self.pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
 
                     let annex_b = if is_key && !self.extradata.is_empty() {
                         let mut buf = Vec::with_capacity(self.extradata.len() + encoded.len());
@@ -435,9 +450,8 @@ mod vaapi {
                     };
 
                     output.push(EncodedAccessUnit { is_idr: is_key, annex_b });
-                    ffi::av_packet_unref(pkt);
+                    ffi::av_packet_unref(self.pkt);
                 }
-                ffi::av_packet_free(&mut (pkt as *mut _));
 
                 self.frame_index += 1;
                 Ok(output)
@@ -448,6 +462,18 @@ mod vaapi {
     impl Drop for DirectVaapiEncoder {
         fn drop(&mut self) {
             unsafe {
+                if !self.pkt.is_null() {
+                    ffi::av_packet_free(&mut self.pkt);
+                }
+                if !self.hw_frame.is_null() {
+                    ffi::av_frame_free(&mut self.hw_frame);
+                }
+                if !self.sw_nv12.is_null() {
+                    ffi::av_frame_free(&mut self.sw_nv12);
+                }
+                if !self.sw_bgra.is_null() {
+                    ffi::av_frame_free(&mut self.sw_bgra);
+                }
                 if !self.sws.is_null() {
                     ffi::sws_freeContext(self.sws);
                 }

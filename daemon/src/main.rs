@@ -7,6 +7,7 @@ mod stream_server;
 
 use std::env;
 use std::net::UdpSocket;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -81,6 +82,19 @@ async fn main() -> Result<()> {
     // UDP socket for streaming
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
         .with_context(|| format!("failed to bind UDP port {}", config.stream_port))?;
+
+    // Enlarge kernel send buffer to absorb IDR frame bursts
+    unsafe {
+        let sndbuf: libc::c_int = 2 * 1024 * 1024;
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sndbuf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
     // mDNS advertisement
