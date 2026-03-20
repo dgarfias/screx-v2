@@ -596,6 +596,19 @@ pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
 pub const KEY_TYPE_OSK_TOGGLE: u8 = 0x03;
 
+/// Handles a key packet, dispatching OSK toggle separately since it doesn't need a keyboard.
+/// Returns true if the packet was fully handled (no keyboard needed).
+pub fn handle_key_packet_no_kb(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    if data[0] == KEY_TYPE_OSK_TOGGLE {
+        toggle_gnome_osk();
+        return true;
+    }
+    false
+}
+
 /// Parse and handle a key packet from the iPad.
 /// Format: type(1) + payload(variable)
 pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
@@ -625,33 +638,33 @@ pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
 
 /// Toggles GNOME's on-screen keyboard via gsettings.
 fn toggle_gnome_osk() {
+    println!("[osk] toggle requested");
+
     let (sudo_user, sudo_uid) = (
         std::env::var("SUDO_USER").ok(),
         std::env::var("SUDO_UID").ok(),
     );
 
+    println!("[osk] SUDO_USER={:?} SUDO_UID={:?}", sudo_user, sudo_uid);
+
     let schema = "org.gnome.desktop.a11y.applications";
     let key = "screen-keyboard-enabled";
 
-    let current = run_gsettings_get(&sudo_user, &sudo_uid, schema, key);
-    let new_val = if current.trim() == "true" { "false" } else { "true" };
+    let current = run_gsettings(&sudo_user, &sudo_uid, &["get", schema, key]);
+    let is_enabled = current.trim().contains("true");
+    let new_val = if is_enabled { "false" } else { "true" };
 
-    let result = run_gsettings_set(&sudo_user, &sudo_uid, schema, key, new_val);
-    match result {
-        Ok(out) if out.status.success() => {
-            println!("[osk] GNOME on-screen keyboard: {new_val}");
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("[osk] gsettings set failed: {stderr}");
-        }
-        Err(e) => {
-            eprintln!("[osk] could not run gsettings: {e}");
-        }
+    println!("[osk] current={:?} -> setting to {new_val}", current.trim());
+
+    let result = run_gsettings(&sudo_user, &sudo_uid, &["set", schema, key, new_val]);
+    if result.is_empty() {
+        println!("[osk] GNOME on-screen keyboard: {new_val}");
+    } else {
+        eprintln!("[osk] gsettings failed: {result}");
     }
 }
 
-fn run_gsettings_get(user: &Option<String>, uid: &Option<String>, schema: &str, key: &str) -> String {
+fn run_gsettings(user: &Option<String>, uid: &Option<String>, args: &[&str]) -> String {
     let output = if let (Some(ref u), Some(ref id)) = (user, uid) {
         let rt = format!("/run/user/{id}");
         let dbus = format!("unix:path={rt}/bus");
@@ -660,37 +673,24 @@ fn run_gsettings_get(user: &Option<String>, uid: &Option<String>, schema: &str, 
             .arg("env")
             .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
             .arg(format!("XDG_RUNTIME_DIR={rt}"))
-            .args(["gsettings", "get", schema, key])
+            .arg("gsettings")
+            .args(args)
             .output()
     } else {
-        Command::new("gsettings")
-            .args(["get", schema, key])
-            .output()
+        Command::new("gsettings").args(args).output()
     };
     match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => String::new(),
-    }
-}
-
-fn run_gsettings_set(
-    user: &Option<String>, uid: &Option<String>,
-    schema: &str, key: &str, value: &str,
-) -> std::io::Result<std::process::Output> {
-    if let (Some(ref u), Some(ref id)) = (user, uid) {
-        let rt = format!("/run/user/{id}");
-        let dbus = format!("unix:path={rt}/bus");
-        Command::new("runuser")
-            .args(["-u", u, "--"])
-            .arg("env")
-            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
-            .arg(format!("XDG_RUNTIME_DIR={rt}"))
-            .args(["gsettings", "set", schema, key, value])
-            .output()
-    } else {
-        Command::new("gsettings")
-            .args(["set", schema, key, value])
-            .output()
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            eprintln!("[osk] gsettings {:?} failed: stderr={stderr} stdout={stdout}", args);
+            format!("ERROR: {stderr}")
+        }
+        Err(e) => {
+            eprintln!("[osk] could not run gsettings: {e}");
+            format!("ERROR: {e}")
+        }
     }
 }
 

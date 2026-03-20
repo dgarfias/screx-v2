@@ -258,9 +258,11 @@ fn read_control_loop(
                 }
             } else if ctrl.starts_with(b"KEY") && ctrl.len() > 3 {
                 let key_data = &ctrl[3..];
-                let mut kb = shared.virtual_keyboard.lock().unwrap();
-                if let Some(ref mut keyboard) = *kb {
-                    crate::uinput::handle_key_packet(keyboard, key_data);
+                if !crate::uinput::handle_key_packet_no_kb(key_data) {
+                    let mut kb = shared.virtual_keyboard.lock().unwrap();
+                    if let Some(ref mut keyboard) = *kb {
+                        crate::uinput::handle_key_packet(keyboard, key_data);
+                    }
                 }
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
                 let jpeg = &ctrl[3..];

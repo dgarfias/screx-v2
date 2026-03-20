@@ -127,9 +127,11 @@ pub fn run_client_manager(
 
                 if len > KEY_MAGIC.len() && &recv_buf[..KEY_MAGIC.len()] == KEY_MAGIC {
                     let key_data = &recv_buf[KEY_MAGIC.len()..len];
-                    let mut kb = shared.virtual_keyboard.lock().unwrap();
-                    if let Some(ref mut keyboard) = *kb {
-                        crate::uinput::handle_key_packet(keyboard, key_data);
+                    if !crate::uinput::handle_key_packet_no_kb(key_data) {
+                        let mut kb = shared.virtual_keyboard.lock().unwrap();
+                        if let Some(ref mut keyboard) = *kb {
+                            crate::uinput::handle_key_packet(keyboard, key_data);
+                        }
                     }
                 }
 
