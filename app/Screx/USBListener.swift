@@ -136,7 +136,7 @@ final class USBListener {
     private func processBuffer() {
         while recvBuffer.count >= 4 {
             let msgLen = recvBuffer.withUnsafeBytes { buf -> UInt32 in
-                buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian
+                buf.loadUnaligned(fromByteOffset: 0, as: UInt32.self).bigEndian
             }
 
             let totalNeeded = 4 + Int(msgLen)
