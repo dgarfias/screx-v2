@@ -6,6 +6,8 @@ import CoreMedia
 final class H264Decoder {
     let displayLayer = AVSampleBufferDisplayLayer()
     var hasReportedFirstFrame = false
+    private(set) var videoWidth: Int = 1920
+    private(set) var videoHeight: Int = 1080
 
     private var formatDescription: CMVideoFormatDescription?
     private var sps: Data?
@@ -105,8 +107,10 @@ final class H264Decoder {
 
         if status == noErr, let newFmt {
             formatDescription = newFmt
+            let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
+            videoWidth = Int(dims.width)
+            videoHeight = Int(dims.height)
             if naluCount <= 20 {
-                let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
                 print("[decoder] format description created: \(dims.width)x\(dims.height)")
             }
         } else if naluCount <= 20 {

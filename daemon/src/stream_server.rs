@@ -7,12 +7,14 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::encode::EncodedAccessUnit;
+use crate::uinput::VirtualTouchscreen;
 use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 14;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
+const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
@@ -23,6 +25,7 @@ pub struct SharedState {
     pub force_idr: AtomicBool,
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
+    pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
 }
 
 impl SharedState {
@@ -32,6 +35,7 @@ impl SharedState {
             force_idr: AtomicBool::new(false),
             usb_sender: Mutex::new(None),
             usb_active: AtomicBool::new(false),
+            virtual_touch: Mutex::new(None),
         }
     }
 }
@@ -73,7 +77,7 @@ pub fn run_client_manager(
         .ok();
 
     let mut last_keepalive = Instant::now();
-    let mut recv_buf = [0u8; 64];
+    let mut recv_buf = [0u8; 256];
 
     println!("[client] listening for iPad registration...");
 
@@ -95,6 +99,14 @@ pub fn run_client_manager(
 
                 if len >= PLI_MAGIC.len() && &recv_buf[..PLI_MAGIC.len()] == PLI_MAGIC {
                     shared.force_idr.store(true, Ordering::Relaxed);
+                }
+
+                if len > TOUCH_MAGIC.len() && &recv_buf[..TOUCH_MAGIC.len()] == TOUCH_MAGIC {
+                    let touch_data = &recv_buf[TOUCH_MAGIC.len()..len];
+                    let mut touch = shared.virtual_touch.lock().unwrap();
+                    if let Some(ref mut ts) = *touch {
+                        crate::uinput::handle_touch_packet(ts, touch_data);
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}

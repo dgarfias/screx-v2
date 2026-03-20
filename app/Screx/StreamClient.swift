@@ -284,6 +284,18 @@ final class StreamClient {
             }
         })
     }
+
+    /// Sends touch contacts over UDP. Packet: "TOUCH" + raw contact data.
+    func sendTouch(_ contactData: Data) {
+        guard let conn = connection else { return }
+        var packet = Data("TOUCH".utf8)
+        packet.append(contactData)
+        conn.send(content: packet, completion: .contentProcessed { error in
+            if let error {
+                print("[stream] touch send error: \(error)")
+            }
+        })
+    }
 }
 
 private final class FrameAssembly {

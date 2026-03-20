@@ -242,10 +242,16 @@ fn read_control_loop(
             }
         }
 
-        if msg_buf[0] == MSG_CONTROL && msg_len >= 4 {
+        if msg_buf[0] == MSG_CONTROL && msg_len >= 2 {
             let ctrl = &msg_buf[1..msg_len];
             if ctrl.starts_with(b"PLI") {
                 shared.force_idr.store(true, Ordering::Relaxed);
+            } else if ctrl.starts_with(b"TOUCH") && ctrl.len() > 5 {
+                let touch_data = &ctrl[5..];
+                let mut touch = shared.virtual_touch.lock().unwrap();
+                if let Some(ref mut ts) = *touch {
+                    crate::uinput::handle_touch_packet(ts, touch_data);
+                }
             }
         }
     }

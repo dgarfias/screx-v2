@@ -4,6 +4,7 @@ mod discovery;
 mod doctor;
 mod encode;
 mod stream_server;
+mod uinput;
 mod usb;
 
 use std::env;
@@ -110,6 +111,18 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Virtual touchscreen
+    match uinput::VirtualTouchscreen::new(config.width, config.height) {
+        Ok(ts) => {
+            ts.map_to_output();
+            *shared.virtual_touch.lock().unwrap() = Some(ts);
+            println!("[main] virtual touchscreen ready");
+        }
+        Err(e) => {
+            eprintln!("[main] virtual touchscreen failed (touch disabled): {e:#}");
+        }
+    }
 
     // Client manager thread (handles SCREX register + PLI packets)
     let client_socket = socket.try_clone().context("clone socket for client mgr")?;
@@ -252,6 +265,9 @@ async fn main() -> Result<()> {
             eprintln!("[main] beacon thread panicked: {e:?}");
         }
     }
+
+    // Destroy virtual touchscreen
+    *shared.virtual_touch.lock().unwrap() = None;
 
     audio::remove_virtual_sink(audio_module_id);
 

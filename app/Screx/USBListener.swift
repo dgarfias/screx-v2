@@ -205,6 +205,25 @@ final class USBListener {
         })
     }
 
+    /// Sends touch contacts over USB TCP. Framed control message: "TOUCH" + raw contact data.
+    func sendTouch(_ contactData: Data) {
+        guard let conn = connection else { return }
+
+        let touchPayload = Data("TOUCH".utf8) + contactData
+        let payloadLen = UInt32(1 + touchPayload.count) // type byte + "TOUCH" + contacts
+
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(touchPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] touch send error: \(error)")
+            }
+        })
+    }
+
     var isConnected: Bool {
         connection != nil
     }

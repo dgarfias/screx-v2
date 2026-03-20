@@ -210,6 +210,14 @@ final class StreamViewModel: ObservableObject {
     var displayLayer: AVSampleBufferDisplayLayer? {
         decoder.displayLayer
     }
+
+    func sendTouch(_ data: Data) {
+        if usbConnected, let usb = usbListener {
+            usb.sendTouch(data)
+        } else if let stream {
+            stream.sendTouch(data)
+        }
+    }
 }
 
 struct ContentView: View {
@@ -221,8 +229,13 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
 
             if let layer = model.displayLayer {
-                VideoDisplayView(layer: layer)
-                    .ignoresSafeArea()
+                VideoDisplayView(
+                    layer: layer,
+                    videoWidth: model.decoder.videoWidth,
+                    videoHeight: model.decoder.videoHeight,
+                    onTouch: { data in model.sendTouch(data) }
+                )
+                .ignoresSafeArea()
             }
 
             VStack {
