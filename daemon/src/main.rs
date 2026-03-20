@@ -220,18 +220,16 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn USB transport thread")?;
 
-    // Virtual mic source (iPad mic -> Linux PulseAudio source)
-    let (mic_feed_module, mic_remap_module) = match audio::create_virtual_mic_source() {
-        Ok((feed_id, remap_id, writer)) => {
+    // Virtual mic source (iPad mic -> PipeWire source via pw-loopback)
+    match audio::create_virtual_mic_source() {
+        Ok(writer) => {
             *shared.mic_writer.lock().unwrap() = Some(writer);
             println!("[main] mic: virtual source ready");
-            (feed_id, remap_id)
         }
         Err(e) => {
             eprintln!("[main] mic: failed to create virtual source ({e:#}), mic disabled");
-            (0, 0)
         }
-    };
+    }
 
     // Virtual camera (iPad camera -> v4l2loopback)
     match camera::load_v4l2loopback() {
@@ -311,10 +309,9 @@ async fn main() -> Result<()> {
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
-    // Cleanup mic/camera/audio
+    // Cleanup mic/camera/audio (Drop kills pw-loopback + pacat)
     *shared.mic_writer.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
-    audio::remove_virtual_mic_source(mic_feed_module, mic_remap_module);
     audio::remove_virtual_sink(audio_module_id);
 
     println!("screx-daemon shutdown complete");

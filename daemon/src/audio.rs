@@ -101,18 +101,22 @@ pub fn remove_virtual_sink(module_id: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Virtual mic source — receives PCM from iPad mic, exposes as PulseAudio source
+// Virtual mic source — receives s16le/48kHz/mono PCM from iPad, exposes as
+// a PipeWire source (microphone) via pw-loopback.
+//
+// pw-loopback creates two nodes:
+//   capture side  → media.class=Audio/Sink   (pacat writes PCM here)
+//   playback side → media.class=Audio/Source  (apps record from here)
 // ---------------------------------------------------------------------------
 
-// Internal null-sink that pacat feeds PCM into (hidden from user)
-const MIC_FEED_SINK: &str = "screx_mic_feed";
-// Remap-source that GNOME sees as a proper microphone
-const MIC_SOURCE_NAME: &str = "screx_ipad_mic";
+const MIC_SINK_NODE: &str = "screx_mic_sink";
+const MIC_SOURCE_NODE: &str = "screx_ipad_mic";
 const MIC_RATE: u32 = 48000;
 const MIC_CHANNELS: u16 = 1;
 
 pub struct MicWriter {
-    child: Child,
+    loopback: Child,
+    pacat: Child,
     stdin: std::process::ChildStdin,
 }
 
@@ -124,98 +128,50 @@ impl MicWriter {
 
 impl Drop for MicWriter {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        println!("[mic] pacat playback stopped");
+        let _ = self.pacat.kill();
+        let _ = self.pacat.wait();
+        let _ = self.loopback.kill();
+        let _ = self.loopback.wait();
+        println!("[mic] pw-loopback + pacat stopped");
     }
 }
 
-/// Two modules: a hidden null-sink (feeder) + a remap-source (proper mic input).
-/// Returns (feeder_module_id, remap_module_id, MicWriter).
-pub fn create_virtual_mic_source() -> Result<(u32, u32, MicWriter)> {
-    // Remove stale modules
-    let existing = pactl_cmd()
-        .args(["list", "short", "modules"])
-        .output()
-        .context("pactl not found")?;
-
-    let output = String::from_utf8_lossy(&existing.stdout);
-    for line in output.lines() {
-        if line.contains(MIC_FEED_SINK) || line.contains(MIC_SOURCE_NAME) {
-            let module_id: u32 = line
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            pactl_cmd()
-                .args(["unload-module", &module_id.to_string()])
-                .output()
-                .ok();
-            println!("[mic] removed stale module {module_id}");
-        }
+pub fn create_virtual_mic_source() -> Result<MicWriter> {
+    let mut loopback = Command::new("pw-loopback");
+    for (k, v) in pulse_env() {
+        loopback.env(&k, &v);
     }
-
-    // 1) Hidden null-sink — pacat writes PCM here
-    let result = pactl_cmd()
+    let loopback_child = loopback
         .args([
-            "load-module",
-            "module-null-sink",
-            &format!("sink_name={MIC_FEED_SINK}"),
-            "sink_properties=device.description=screx_mic_internal\\ node.passive=true",
-            &format!("rate={MIC_RATE}"),
-            "channel_map=mono",
-            "format=s16le",
+            "--channel-map", "MONO",
+            "--capture-props",
+            &format!(
+                "media.class=Audio/Sink node.name={MIC_SINK_NODE} node.description=\"Screx Mic Internal\""
+            ),
+            "--playback-props",
+            &format!(
+                "media.class=Audio/Source node.name={MIC_SOURCE_NODE} node.description=\"Screx iPad Mic\""
+            ),
         ])
-        .output()
-        .context("failed to create mic feeder sink")?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start pw-loopback (is pipewire-utils installed?)")?;
 
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        anyhow::bail!("mic feeder null-sink failed: {stderr}");
-    }
+    println!("[mic] pw-loopback started (pid {}), waiting for sink to appear...", loopback_child.id());
 
-    let feed_module_id: u32 = String::from_utf8_lossy(&result.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    // Give PipeWire a moment to register the nodes
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // 2) Remap-source — exposes the feeder's monitor as a real microphone
-    let result = pactl_cmd()
-        .args([
-            "load-module",
-            "module-remap-source",
-            &format!("source_name={MIC_SOURCE_NAME}"),
-            &format!("master={MIC_FEED_SINK}.monitor"),
-            "source_properties=device.description=Screx\\ iPad\\ Mic",
-            &format!("rate={MIC_RATE}"),
-            "channel_map=mono",
-            "format=s16le",
-        ])
-        .output()
-        .context("failed to create mic remap-source")?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        // Clean up the feeder sink
-        pactl_cmd().args(["unload-module", &feed_module_id.to_string()]).output().ok();
-        anyhow::bail!("mic remap-source failed: {stderr}");
-    }
-
-    let remap_module_id: u32 = String::from_utf8_lossy(&result.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-
-    // 3) pacat feeds raw PCM into the feeder sink
     let mut pacat = Command::new("pacat");
     for (k, v) in pulse_env() {
         pacat.env(&k, &v);
     }
-    let mut child = pacat
+    let mut pacat_child = pacat
         .args([
             "--playback",
-            &format!("--device={MIC_FEED_SINK}"),
+            &format!("--device={MIC_SINK_NODE}"),
             "--format=s16le",
             &format!("--rate={MIC_RATE}"),
             &format!("--channels={MIC_CHANNELS}"),
@@ -225,27 +181,21 @@ pub fn create_virtual_mic_source() -> Result<(u32, u32, MicWriter)> {
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to start pacat")?;
+        .context("failed to start pacat for mic feed")?;
 
-    let stdin = child.stdin.take().context("no stdin from pacat")?;
+    let stdin = pacat_child.stdin.take().context("no stdin from pacat")?;
 
     println!(
-        "[mic] virtual mic ready: feeder module={feed_module_id}, source module={remap_module_id}, pacat pid={}",
-        child.id()
+        "[mic] virtual mic ready: pw-loopback pid={}, pacat pid={}, sink={MIC_SINK_NODE}, source={MIC_SOURCE_NODE}",
+        loopback_child.id(),
+        pacat_child.id(),
     );
 
-    Ok((feed_module_id, remap_module_id, MicWriter { child, stdin }))
-}
-
-pub fn remove_virtual_mic_source(feed_module: u32, remap_module: u32) {
-    for id in [remap_module, feed_module] {
-        if id > 0 {
-            let _ = pactl_cmd()
-                .args(["unload-module", &id.to_string()])
-                .output();
-        }
-    }
-    println!("[mic] removed virtual mic modules");
+    Ok(MicWriter {
+        loopback: loopback_child,
+        pacat: pacat_child,
+        stdin,
+    })
 }
 
 // ---------------------------------------------------------------------------
