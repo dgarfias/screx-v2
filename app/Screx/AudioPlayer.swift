@@ -2,9 +2,7 @@ import AVFoundation
 
 final class AudioPlayer {
     private let engine = AVAudioEngine()
-    private let sourceNode: AVAudioSourceNode
-    private let sampleRate: Double = 48000
-    private let channelCount: UInt32 = 2
+    private var sourceNode: AVAudioSourceNode?
 
     private let lock = NSLock()
     private var ringBuffer = Data()
@@ -18,11 +16,11 @@ final class AudioPlayer {
             interleaved: true
         )!
 
-        sourceNode = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
+        let node = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
             guard let self else { return noErr }
 
             let ablPointer = UnsafeMutableAudioBufferListPointer(bufferList)
-            let bytesNeeded = Int(frameCount) * 2 * 2 // frameCount * channels * sizeof(Int16)
+            let bytesNeeded = Int(frameCount) * 2 * 2
 
             self.lock.lock()
             let available = self.ringBuffer.count
@@ -49,8 +47,9 @@ final class AudioPlayer {
             return noErr
         }
 
-        engine.attach(sourceNode)
-        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
+        self.sourceNode = node
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
     }
 
     func start() {
