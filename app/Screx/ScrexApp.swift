@@ -10,8 +10,13 @@ struct ScrexApp: App {
     init() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
-            try session.setPreferredSampleRate(48000)
+            try session.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+            )
+            try session.setPreferredSampleRate(Double(MicProtocol.sampleRate))
+            try session.setPreferredIOBufferDuration(0.01)
             try session.setActive(true)
             print("[app] audio session: rate=\(session.sampleRate)Hz, ioBufferDuration=\(session.ioBufferDuration)")
         } catch {
@@ -46,6 +51,7 @@ final class StreamViewModel: ObservableObject {
     private var discoveryStarted = false
     private var usbConnected = false
     private var camFrameId: UInt32 = 0
+    private var micSeq: UInt32 = 0
 
     /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
     private var lastWifiEndpoint: NWEndpoint?
@@ -179,6 +185,9 @@ final class StreamViewModel: ObservableObject {
             stream?.disconnect()
             connectToEndpoint(endpoint, name: name)
         } else {
+            if micCapture.isRunning {
+                micCapture.stop()
+            }
             isConnected = false
             transport = ""
             status = "USB disconnected, looking for daemon..."
@@ -191,6 +200,9 @@ final class StreamViewModel: ObservableObject {
     private func handleStreamLost() {
         stream?.disconnect()
         stream = nil
+        if micCapture.isRunning {
+            micCapture.stop()
+        }
         isConnected = false
         transport = ""
         status = "Daemon disconnected, looking..."
@@ -199,6 +211,9 @@ final class StreamViewModel: ObservableObject {
     }
 
     func disconnect() {
+        if micCapture.isRunning {
+            micCapture.stop()
+        }
         stream?.disconnect()
         stream = nil
         usbListener?.stop()
@@ -210,6 +225,7 @@ final class StreamViewModel: ObservableObject {
         audioPlayer.stop()
         lastWifiEndpoint = nil
         lastWifiName = nil
+        micSeq = 0
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
@@ -250,12 +266,15 @@ final class StreamViewModel: ObservableObject {
         if micCapture.isRunning {
             micCapture.stop()
         } else {
-            micCapture.onPCM = { [weak self] pcm in
+            micSeq = 0
+            micCapture.onPCMFrame = { [weak self] pcm in
                 guard let self else { return }
+                let packet = MicProtocol.makePacket(seq: self.micSeq, pcmFrame: pcm)
+                self.micSeq = self.micSeq &+ 1
                 if self.usbConnected, let usb = self.usbListener {
-                    usb.sendMicAudio(pcm)
+                    usb.sendMicPacket(packet)
                 } else if let stream = self.stream {
-                    stream.sendMicAudio(pcm)
+                    stream.sendMicPacket(packet)
                 }
             }
             micCapture.start()

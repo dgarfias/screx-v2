@@ -224,17 +224,15 @@ final class USBListener {
         })
     }
 
-    /// Sends mic PCM audio over USB TCP.
-    func sendMicAudio(_ pcm: Data) {
+    /// Sends microphone packet over USB TCP control channel.
+    func sendMicPacket(_ micPacket: Data) {
         guard let conn = connection else { return }
-
-        let micPayload = Data("MIC".utf8) + pcm
-        let payloadLen = UInt32(1 + micPayload.count)
+        let payloadLen = UInt32(1 + micPacket.count)
 
         var frame = Data()
         withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
         frame.append(Self.msgControl)
-        frame.append(micPayload)
+        frame.append(micPacket)
 
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {

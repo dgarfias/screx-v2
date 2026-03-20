@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn USB transport thread")?;
 
-    // Virtual mic source (iPad mic -> PipeWire source via pw-loopback)
+    // Virtual mic source (iPad -> Linux input source)
     match audio::create_virtual_mic_source() {
         Ok(writer) => {
             *shared.mic_writer.lock().unwrap() = Some(writer);
@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
 
-    // Cleanup mic/camera/audio (Drop kills pw-loopback + pacat)
+    // Cleanup mic/camera/audio
     *shared.mic_writer.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
     audio::remove_virtual_sink(audio_module_id);

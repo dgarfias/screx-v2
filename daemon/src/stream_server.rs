@@ -90,7 +90,7 @@ pub fn run_client_manager(
     let mut last_keepalive = Instant::now();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
-    let mut mic_pkt_count: u64 = 0;
+    let mut mic_last_seq: Option<u32> = None;
 
     println!("[client] listening for iPad registration...");
 
@@ -131,14 +131,35 @@ pub fn run_client_manager(
                 }
 
                 if len > MIC_MAGIC.len() && &recv_buf[..MIC_MAGIC.len()] == MIC_MAGIC {
-                    let pcm = &recv_buf[MIC_MAGIC.len()..len];
-                    mic_pkt_count += 1;
-                    if mic_pkt_count == 1 {
-                        println!("[mic] first packet received ({} bytes PCM)", pcm.len());
-                    }
-                    let mut mic = shared.mic_writer.lock().unwrap();
-                    if let Some(ref mut mw) = *mic {
-                        mw.write_pcm(pcm);
+                    let mic_pkt = &recv_buf[..len];
+                    match crate::audio::parse_mic_packet(mic_pkt) {
+                        Ok(parsed) => {
+                            if let Some(prev) = mic_last_seq {
+                                let expected = prev.wrapping_add(1);
+                                if parsed.seq != expected {
+                                    let delta = parsed.seq.wrapping_sub(expected);
+                                    eprintln!(
+                                        "[mic] seq gap on UDP: prev={prev} expected={expected} got={} delta={delta}",
+                                        parsed.seq
+                                    );
+                                }
+                            } else {
+                                println!(
+                                    "[mic] first packet received: seq={} bytes={}",
+                                    parsed.seq,
+                                    parsed.pcm.len()
+                                );
+                            }
+                            mic_last_seq = Some(parsed.seq);
+
+                            let mut mic = shared.mic_writer.lock().unwrap();
+                            if let Some(ref mut mw) = *mic {
+                                mw.write_pcm(parsed.pcm);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[mic] dropped malformed UDP packet: {err}");
+                        }
                     }
                 }
 

@@ -297,12 +297,10 @@ final class StreamClient {
         })
     }
 
-    /// Sends mic PCM audio over UDP. Packet: "MIC" + raw PCM data.
-    func sendMicAudio(_ pcm: Data) {
+    /// Sends microphone packet over UDP.
+    func sendMicPacket(_ micPacket: Data) {
         guard let conn = connection else { return }
-        var packet = Data("MIC".utf8)
-        packet.append(pcm)
-        conn.send(content: packet, completion: .contentProcessed { error in
+        conn.send(content: micPacket, completion: .contentProcessed { error in
             if let error {
                 print("[stream] mic send error: \(error)")
             }
