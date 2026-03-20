@@ -228,6 +228,14 @@ final class StreamClient {
         }
     }
 
+    func sendTouch(_ event: TouchEvent) {
+        connection?.send(content: event.serialize(), completion: .contentProcessed { error in
+            if let error {
+                print("[stream] touch send error: \(error)")
+            }
+        })
+    }
+
     private func sendPli() {
         let now = CACurrentMediaTime()
         guard now - lastPliTime >= Self.pliMinInterval else { return }

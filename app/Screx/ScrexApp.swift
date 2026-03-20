@@ -85,6 +85,10 @@ final class StreamViewModel: ObservableObject {
     var displayLayer: AVSampleBufferDisplayLayer? {
         stream?.decoder.displayLayer
     }
+
+    func sendTouch(_ event: TouchEvent) {
+        stream?.sendTouch(event)
+    }
 }
 
 struct ContentView: View {
@@ -96,8 +100,10 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
 
             if let layer = model.displayLayer {
-                VideoDisplayView(layer: layer)
-                    .ignoresSafeArea()
+                VideoDisplayView(layer: layer) { event in
+                    model.sendTouch(event)
+                }
+                .ignoresSafeArea()
             }
 
             VStack {

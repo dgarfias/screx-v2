@@ -4,6 +4,7 @@ mod discovery;
 mod doctor;
 mod encode;
 mod stream_server;
+mod uinput;
 
 use std::env;
 use std::net::UdpSocket;
@@ -78,6 +79,17 @@ async fn main() -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(stream_server::SharedState::new());
+
+    // Virtual input device for touch forwarding
+    match uinput::VirtualInput::new(config.width, config.height) {
+        Ok(vi) => {
+            *shared.virtual_input.lock().unwrap() = Some(vi);
+            println!("[main] virtual input device ready ({}x{})", config.width, config.height);
+        }
+        Err(e) => {
+            eprintln!("[main] virtual input unavailable ({e:#}), touch disabled");
+        }
+    }
 
     // UDP socket for streaming
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
