@@ -41,13 +41,18 @@ final class StreamViewModel: ObservableObject {
     @Published var transport: String = ""
 
     let decoder = H264Decoder()
-    let audioPlayer = AudioPlayer()
+    let avSync = AVSyncState()
+    let audioPlayer: AudioPlayer
     let cameraCapture = CameraCapture()
     let micCapture = MicCapture()
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
     private var usbListener: USBListener?
+
+    nonisolated init() {
+        self.audioPlayer = AudioPlayer(avSync: avSync)
+    }
     private var discoveryStarted = false
     private var usbConnected = false
     private var camFrameId: UInt32 = 0
@@ -62,7 +67,7 @@ final class StreamViewModel: ObservableObject {
         discoveryStarted = true
 
         // Start USB listener
-        let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer)
+        let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.usbListener = usb
 
         usb.onStatus = { [weak self] msg in
@@ -147,7 +152,7 @@ final class StreamViewModel: ObservableObject {
             status = "Connecting to \(name)..."
         }
 
-        let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer)
+        let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.stream = client
 
         client.onStatus = { [weak self] msg in
@@ -385,7 +390,7 @@ struct ContentView: View {
                     if model.isConnected {
                         Image(systemName: model.isMicActive ? "mic.fill" : "mic")
                             .font(.footnote)
-                            .foregroundStyle(model.isMicActive ? .red : .white)
+                            .foregroundStyle(model.isMicActive ? .green : .white)
                             .frame(width: 32, height: 32)
                             .background(.ultraThinMaterial, in: Circle())
                             .onTapGesture { model.toggleMic() }

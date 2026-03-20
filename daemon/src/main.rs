@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
 
     // Broadcast beacon for iPad discovery
     let beacon_stop = Arc::clone(&stop);
-    let beacon_thread = match discovery::start_beacon(config.stream_port, beacon_stop) {
+    let _beacon_thread = match discovery::start_beacon(config.stream_port, beacon_stop) {
         Ok(handle) => {
             println!("[main] beacon: broadcasting on port 9999");
             Some(handle)
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     let client_socket = socket.try_clone().context("clone socket for client mgr")?;
     let client_shared = Arc::clone(&shared);
     let client_stop = Arc::clone(&stop);
-    let client_thread = thread::Builder::new()
+    let _client_thread = thread::Builder::new()
         .name("client-mgr".into())
         .spawn(move || {
             if let Err(e) =
@@ -172,11 +172,13 @@ async fn main() -> Result<()> {
 
     let mut sender = stream_server::UdpSender::new(send_socket);
 
-    let capture_thread = thread::Builder::new()
+    let _capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
             if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
                 let force_idr = capture_shared.force_idr.swap(false, Ordering::Relaxed);
+
+                let ts = capture_shared.start_time.elapsed().as_millis() as u32;
 
                 match encoder.encode_frame(&frame, force_idr) {
                     Ok(aus) => {
@@ -185,7 +187,7 @@ async fn main() -> Result<()> {
                             if capture_shared.usb_active.load(Ordering::Relaxed) {
                                 let mut usb = capture_shared.usb_sender.lock().unwrap();
                                 if let Some(ref mut tcp) = *usb {
-                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr) {
+                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr, ts) {
                                         eprintln!("[pipeline] USB send error: {e:#}");
                                         drop(usb);
                                         capture_shared.usb_active.store(false, Ordering::SeqCst);
@@ -196,7 +198,7 @@ async fn main() -> Result<()> {
                             // Fall back to WiFi UDP
                             let client_addr = *capture_shared.client_addr.lock().unwrap();
                             if let Some(addr) = client_addr {
-                                if let Err(e) = sender.send_frame(au, addr) {
+                                if let Err(e) = sender.send_frame(au, addr, ts) {
                                     eprintln!("[pipeline] send error: {e:#}");
                                 }
                             }
@@ -217,7 +219,7 @@ async fn main() -> Result<()> {
     // USB transport thread (auto-detects iOS device, manages iproxy + TCP)
     let usb_shared = Arc::clone(&shared);
     let usb_stop = Arc::clone(&stop);
-    let usb_thread = thread::Builder::new()
+    let _usb_thread = thread::Builder::new()
         .name("usb".into())
         .spawn(move || {
             usb::run_usb_transport(usb_shared, usb_stop);
@@ -266,7 +268,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let audio_thread = if audio_module_id > 0 {
+    let _audio_thread = if audio_module_id > 0 {
         Some(
             thread::Builder::new()
                 .name("audio".into())
@@ -288,32 +290,11 @@ async fn main() -> Result<()> {
     println!("\nshutdown requested (ctrl-c)");
     stop.store(true, Ordering::SeqCst);
 
-    if let Err(e) = capture_thread.join() {
-        eprintln!("[main] capture thread panicked: {e:?}");
-    }
-    if let Some(t) = audio_thread {
-        if let Err(e) = t.join() {
-            eprintln!("[main] audio thread panicked: {e:?}");
-        }
-    }
-    if let Err(e) = usb_thread.join() {
-        eprintln!("[main] USB thread panicked: {e:?}");
-    }
-    if let Err(e) = client_thread.join() {
-        eprintln!("[main] client manager thread panicked: {e:?}");
-    }
-
-    if let Some(t) = beacon_thread {
-        if let Err(e) = t.join() {
-            eprintln!("[main] beacon thread panicked: {e:?}");
-        }
-    }
-
-    // Destroy virtual input devices
+    // Cleanup resources FIRST — before joining threads, because threads
+    // may be stuck in blocking I/O (EVDI read, FIFO write, parec read).
+    // Unloading modules and removing devices is safe even while threads run.
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
-
-    // Cleanup camera/audio/mic
     *shared.cam_writer.lock().unwrap() = None;
     if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
         audio::remove_virtual_mic(mic);
@@ -321,6 +302,6 @@ async fn main() -> Result<()> {
     *shared.mic_writer.lock().unwrap() = None;
     audio::remove_virtual_sink(audio_module_id);
 
-    println!("screx-daemon shutdown complete");
-    Ok(())
+    println!("screx-daemon cleanup complete, exiting");
+    std::process::exit(0);
 }

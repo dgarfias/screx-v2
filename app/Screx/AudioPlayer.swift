@@ -1,14 +1,27 @@
 import AVFoundation
+import QuartzCore
 
 final class AudioPlayer {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
+    private let avSync: AVSyncState
 
     private let lock = NSLock()
     private var ringBuffer = Data()
     private static let maxBufferSize = 48000 * 2 * 2 // ~500ms at 48kHz stereo i16
 
-    init() {
+    // 48kHz stereo s16le = 192000 bytes/sec = 192 bytes/ms
+    private static let bytesPerMs = 192
+    // Target buffer: ~30ms of audio for jitter absorption
+    private static let targetBufferMs = 30
+    private static let targetBufferBytes = targetBufferMs * bytesPerMs
+    // Drift thresholds (ms) before corrective action
+    private static let driftDropThresholdMs: Int32 = -40
+    private static let driftTrimThresholdMs: Int32 = 60
+
+    init(avSync: AVSyncState) {
+        self.avSync = avSync
+
         let format = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: 48000,
@@ -69,9 +82,32 @@ final class AudioPlayer {
         print("[audio] playback engine stopped")
     }
 
-    func enqueueAudio(_ data: Data) {
+    func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
         lock.lock()
         ringBuffer.append(data)
+
+        if avSync.isValid {
+            let expectedTs = avSync.expectedDaemonTimeNow()
+            let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
+
+            if drift < Self.driftDropThresholdMs {
+                // Audio is behind video — drop oldest audio to catch up
+                let dropBytes = min(ringBuffer.count, Int(-drift) * Self.bytesPerMs)
+                // Keep aligned to frame boundary (4 bytes = one stereo s16 sample)
+                let aligned = (dropBytes / 4) * 4
+                if aligned > 0 {
+                    ringBuffer.removeFirst(aligned)
+                }
+            } else if drift > Self.driftTrimThresholdMs {
+                // Audio is ahead of video — trim if buffer grew too large
+                let excess = ringBuffer.count - Self.targetBufferBytes
+                if excess > 0 {
+                    let aligned = (excess / 4) * 4
+                    ringBuffer.removeFirst(aligned)
+                }
+            }
+        }
+
         if ringBuffer.count > Self.maxBufferSize {
             let excess = ringBuffer.count - Self.maxBufferSize
             ringBuffer.removeFirst(excess)

@@ -73,25 +73,29 @@ impl TcpFramedSender {
         })
     }
 
-    pub fn send_video(&mut self, annex_b: &[u8], is_idr: bool) -> Result<()> {
-        let payload_len = 1 + 1 + annex_b.len(); // type + is_idr + data
+    pub fn send_video(&mut self, annex_b: &[u8], is_idr: bool, timestamp_ms: u32) -> Result<()> {
+        let payload_len = 1 + 1 + 4 + annex_b.len(); // type + is_idr + ts + data
         self.write_buf.clear();
         self.write_buf
             .extend_from_slice(&(payload_len as u32).to_be_bytes());
         self.write_buf.push(MSG_VIDEO);
         self.write_buf.push(if is_idr { 1 } else { 0 });
+        self.write_buf
+            .extend_from_slice(&timestamp_ms.to_be_bytes());
         self.write_buf.extend_from_slice(annex_b);
         self.stream
             .write_all(&self.write_buf)
             .context("USB TCP write (video)")
     }
 
-    pub fn send_audio(&mut self, pcm: &[u8]) -> Result<()> {
-        let payload_len = 1 + pcm.len(); // type + data
+    pub fn send_audio(&mut self, pcm: &[u8], timestamp_ms: u32) -> Result<()> {
+        let payload_len = 1 + 4 + pcm.len(); // type + ts + data
         self.write_buf.clear();
         self.write_buf
             .extend_from_slice(&(payload_len as u32).to_be_bytes());
         self.write_buf.push(MSG_AUDIO);
+        self.write_buf
+            .extend_from_slice(&timestamp_ms.to_be_bytes());
         self.write_buf.extend_from_slice(pcm);
         self.stream
             .write_all(&self.write_buf)

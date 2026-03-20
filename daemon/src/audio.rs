@@ -144,14 +144,18 @@ pub fn run_audio_capture(
     let mut sender = AudioSender::new(socket);
     let mut buf = vec![0u8; BYTES_PER_CHUNK];
 
+    let start_time = shared.start_time;
+
     while !stop.load(Ordering::Relaxed) {
         match stdout.read_exact(&mut buf) {
             Ok(()) => {
+                let ts = start_time.elapsed().as_millis() as u32;
+
                 // Prefer USB if active
                 if shared.usb_active.load(Ordering::Relaxed) {
                     let mut usb = shared.usb_sender.lock().unwrap();
                     if let Some(ref mut tcp) = *usb {
-                        if let Err(e) = tcp.send_audio(&buf) {
+                        if let Err(e) = tcp.send_audio(&buf, ts) {
                             eprintln!("[audio] USB send error: {e}");
                             drop(usb);
                             shared.usb_active.store(false, Ordering::SeqCst);
@@ -162,7 +166,7 @@ pub fn run_audio_capture(
                 // Fall back to WiFi UDP
                 let client_addr = *shared.client_addr.lock().unwrap();
                 if let Some(addr) = client_addr {
-                    if let Err(e) = sender.send_audio(&buf, addr) {
+                    if let Err(e) = sender.send_audio(&buf, addr, ts) {
                         eprintln!("[audio] send error: {e}");
                     }
                 }
@@ -207,6 +211,9 @@ pub struct MicWriter {
 unsafe impl Send for MicWriter {}
 
 impl MicWriter {
+    /// Decode an Opus packet and write PCM to the virtual mic output.
+    /// Uses non-blocking I/O — silently drops the frame if the output
+    /// buffer is momentarily full (< PIPE_BUF writes are atomic on Linux).
     pub fn write_opus_packet(&mut self, opus_data: &[u8]) -> Result<()> {
         let samples = self
             .decoder
@@ -218,12 +225,16 @@ impl MicWriter {
             self.byte_buf.extend_from_slice(&sample.to_le_bytes());
         }
 
-        match &mut self.output {
-            MicOutput::Fifo(f) => f.write_all(&self.byte_buf)?,
-            MicOutput::Pacat(stdin) => stdin.write_all(&self.byte_buf)?,
-        }
+        let result = match &mut self.output {
+            MicOutput::Fifo(f) => f.write(&self.byte_buf),
+            MicOutput::Pacat(stdin) => stdin.write(&self.byte_buf),
+        };
 
-        Ok(())
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -306,11 +317,9 @@ fn try_pipe_source() -> Result<MicWriter> {
     }
 
     let fifo = fifo.unwrap();
-    // Switch to blocking mode for reliable writes
-    unsafe {
-        let flags = libc::fcntl(fifo.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(fifo.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
+    // Keep O_NONBLOCK — writes < PIPE_BUF (4096) are atomic on Linux,
+    // and our frames are ~1920 bytes. Non-blocking prevents stalling
+    // the control thread that also handles touch/key events.
 
     let decoder = OpusDecoder::new(MIC_RATE, 1)
         .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
@@ -425,6 +434,11 @@ fn try_null_sink_mic() -> Result<MicWriter> {
         .context("failed to start pacat for mic")?;
 
     let stdin = child.stdin.take().context("no stdin from pacat")?;
+    // Non-blocking so mic writes never stall the control thread
+    unsafe {
+        let flags = libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
     println!("[mic] pacat started (pid {})", child.id());
 
     let decoder = OpusDecoder::new(MIC_RATE, 1)

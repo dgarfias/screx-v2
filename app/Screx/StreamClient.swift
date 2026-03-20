@@ -8,6 +8,7 @@ final class StreamClient {
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
     let decoder: H264Decoder
     let audioPlayer: AudioPlayer
+    let avSync: AVSyncState
 
     var onStatus: ((String) -> Void)?
     var onDisconnect: (() -> Void)?
@@ -15,7 +16,7 @@ final class StreamClient {
     /// When true, suppresses the data timeout (e.g. USB is active and no WiFi data is expected)
     var suppressTimeout = false
 
-    private static let headerLen = 14
+    private static let headerLen = 18
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
@@ -34,10 +35,11 @@ final class StreamClient {
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
 
-    init(endpoint: NWEndpoint, decoder: H264Decoder, audioPlayer: AudioPlayer) {
+    init(endpoint: NWEndpoint, decoder: H264Decoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
         self.decoder = decoder
         self.audioPlayer = audioPlayer
+        self.avSync = avSync
     }
 
     func connect() {
@@ -166,6 +168,9 @@ final class StreamClient {
         let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
             buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
         }
+        let timestampMs = data.withUnsafeBytes { buf -> UInt32 in
+            buf.load(fromByteOffset: 14, as: UInt32.self).bigEndian
+        }
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
@@ -174,7 +179,7 @@ final class StreamClient {
         if isAudio {
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
                               totalData: Int(totalData), payload: payload,
-                              actualLen: Int(payloadLen))
+                              actualLen: Int(payloadLen), timestampMs: timestampMs)
             return
         }
 
@@ -187,23 +192,24 @@ final class StreamClient {
             totalData: Int(totalData),
             totalParity: Int(totalParity),
             isIdr: isIdr,
-            createdAt: CACurrentMediaTime()
+            createdAt: CACurrentMediaTime(),
+            timestampMs: timestampMs
         )
         reassembly[frameId] = assembly
 
         assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen))
 
         if assembly.isComplete {
-            deliverFrame(frameId: frameId, assembly: assembly)
+            deliverFrame(frameId: frameId, assembly: assembly, timestampMs: assembly.timestampMs)
         }
 
         pruneOldFrames()
     }
 
     private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
-                                   payload: Data, actualLen: Int) {
+                                   payload: Data, actualLen: Int, timestampMs: UInt32) {
         if totalData == 1 {
-            audioPlayer.enqueueAudio(payload.prefix(actualLen))
+            audioPlayer.enqueueAudio(payload.prefix(actualLen), timestampMs: timestampMs)
             return
         }
 
@@ -213,7 +219,7 @@ final class StreamClient {
 
         if assembly.isComplete {
             if let pcm = assembly.reassemble() {
-                audioPlayer.enqueueAudio(pcm)
+                audioPlayer.enqueueAudio(pcm, timestampMs: timestampMs)
             }
             audioReassembly.removeValue(forKey: frameId)
         }
@@ -227,7 +233,7 @@ final class StreamClient {
         }
     }
 
-    private func deliverFrame(frameId: UInt32, assembly: FrameAssembly) {
+    private func deliverFrame(frameId: UInt32, assembly: FrameAssembly, timestampMs: UInt32 = 0) {
         guard let accessUnit = assembly.reassemble() else {
             reassembly.removeValue(forKey: frameId)
             return
@@ -246,6 +252,7 @@ final class StreamClient {
         lastCompletedFrameId = frameId
         hasReceivedFirstFrame = true
 
+        avSync.updateVideo(timestamp: timestampMs)
         decoder.decodeAccessUnit(accessUnit)
 
         if !decoder.hasReportedFirstFrame {
@@ -260,7 +267,7 @@ final class StreamClient {
         for (fid, assembly) in reassembly {
             if now - assembly.createdAt > Self.frameTimeout {
                 if assembly.canRecover {
-                    deliverFrame(frameId: fid, assembly: assembly)
+                    deliverFrame(frameId: fid, assembly: assembly, timestampMs: assembly.timestampMs)
                 } else {
                     expired.append(fid)
                 }
@@ -352,17 +359,19 @@ private final class FrameAssembly {
     let totalShards: Int
     let isIdr: Bool
     let createdAt: TimeInterval
+    let timestampMs: UInt32
 
     private var receivedShards: [Int: Data]
     private var actualLengths: [Int: Int]
     private var receivedCount: Int = 0
 
-    init(totalData: Int, totalParity: Int, isIdr: Bool, createdAt: TimeInterval) {
+    init(totalData: Int, totalParity: Int, isIdr: Bool, createdAt: TimeInterval, timestampMs: UInt32 = 0) {
         self.totalData = totalData
         self.totalParity = totalParity
         self.totalShards = totalData + totalParity
         self.isIdr = isIdr
         self.createdAt = createdAt
+        self.timestampMs = timestampMs
         self.receivedShards = [:]
         self.actualLengths = [:]
     }

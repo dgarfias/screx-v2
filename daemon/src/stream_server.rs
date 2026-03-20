@@ -13,7 +13,7 @@ use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
 use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
-const HEADER_LEN: usize = 14;
+const HEADER_LEN: usize = 18;
 const REGISTER_MAGIC: &[u8] = b"SCREX";
 const PLI_MAGIC: &[u8] = b"PLI";
 const TOUCH_MAGIC: &[u8] = b"TOUCH";
@@ -34,6 +34,7 @@ pub struct SharedState {
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
     pub mic_writer: Mutex<Option<MicWriter>>,
+    pub start_time: Instant,
 }
 
 impl SharedState {
@@ -47,6 +48,7 @@ impl SharedState {
             virtual_keyboard: Mutex::new(None),
             cam_writer: Mutex::new(None),
             mic_writer: Mutex::new(None),
+            start_time: Instant::now(),
         }
     }
 }
@@ -54,7 +56,7 @@ impl SharedState {
 pub const FLAG_IDR: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
 
-/// 14-byte packet header
+/// 18-byte packet header (14 original + 4 byte timestamp_ms)
 fn build_header(
     frame_id: u32,
     chunk_idx: u16,
@@ -62,6 +64,7 @@ fn build_header(
     total_parity: u16,
     flags: u8,
     payload_len: u16,
+    timestamp_ms: u32,
 ) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..4].copy_from_slice(&frame_id.to_be_bytes());
@@ -71,6 +74,7 @@ fn build_header(
     h[10] = flags;
     h[11] = 0;
     h[12..14].copy_from_slice(&payload_len.to_be_bytes());
+    h[14..18].copy_from_slice(&timestamp_ms.to_be_bytes());
     h
 }
 
@@ -197,7 +201,7 @@ impl UdpSender {
         }
     }
 
-    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr) -> Result<()> {
+    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr, timestamp_ms: u32) -> Result<()> {
         let payload = &au.annex_b;
         let is_idr = au.is_idr;
 
@@ -263,6 +267,7 @@ impl UdpSender {
                 actual_parity as u16,
                 flags,
                 actual_payload_len,
+                timestamp_ms,
             );
 
             let pkt_len = HEADER_LEN + CHUNK_PAYLOAD;
@@ -320,7 +325,7 @@ impl AudioSender {
         }
     }
 
-    pub fn send_audio(&mut self, pcm: &[u8], client_addr: SocketAddr) -> Result<()> {
+    pub fn send_audio(&mut self, pcm: &[u8], client_addr: SocketAddr, timestamp_ms: u32) -> Result<()> {
         let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
         for i in 0..data_count {
@@ -336,6 +341,7 @@ impl AudioSender {
                 0,
                 FLAG_AUDIO,
                 payload_len,
+                timestamp_ms,
             );
 
             let pkt_len = HEADER_LEN + chunk.len();
