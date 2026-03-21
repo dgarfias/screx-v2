@@ -2,11 +2,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(not(feature = "real-capture"))]
-use std::sync::atomic::Ordering;
-#[cfg(not(feature = "real-capture"))]
-use std::time::Duration;
-
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy)]
@@ -32,11 +27,6 @@ pub struct CaptureConfig {
     pub fps: u32,
 }
 
-// ---------------------------------------------------------------------------
-// EVDI capture (real-capture feature)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "real-capture")]
 mod evdi {
     use std::os::raw::{c_int, c_uint, c_void};
     use std::process::Command;
@@ -547,86 +537,10 @@ mod evdi {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Synthetic capture (fallback when real-capture is unavailable)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(feature = "real-capture"))]
-fn run_synthetic_capture(
-    config: &CaptureConfig,
-    stop: &Arc<AtomicBool>,
-    on_frame: &mut impl FnMut(CaptureFrame<'_>),
-) -> Result<()> {
-    let frame_interval = Duration::from_micros(1_000_000 / config.fps.max(1) as u64);
-    let mut frame_index = 0_u64;
-    let mut stats_start = Instant::now();
-    let mut stats_frames = 0_u64;
-    let start = Instant::now();
-    let pixel_count = (config.width as usize) * (config.height as usize);
-
-    println!(
-        "[capture] using synthetic source: {}x{}@{}fps",
-        config.width, config.height, config.fps
-    );
-
-    while !stop.load(Ordering::Relaxed) {
-        let mut data = vec![0u8; pixel_count * 4];
-        let t = (frame_index % 255) as u8;
-        for px in data.chunks_exact_mut(4).step_by(97) {
-            px[0] = t;
-            px[1] = t.wrapping_add(80);
-            px[2] = t.wrapping_add(160);
-            px[3] = 255;
-        }
-
-        let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
-        on_frame(CaptureFrame {
-            frame_index,
-            timestamp_90k,
-            width: config.width,
-            height: config.height,
-            format: PixelFormat::Bgra8888,
-            data: &data,
-            captured_at: Instant::now(),
-        });
-
-        frame_index += 1;
-        stats_frames += 1;
-        if stats_start.elapsed() >= Duration::from_secs(1) {
-            let fps = stats_frames as f64 / stats_start.elapsed().as_secs_f64();
-            println!(
-                "[capture] fps={fps:.1} resolution={}x{} uptime={}s (synthetic)",
-                config.width, config.height, start.elapsed().as_secs()
-            );
-            stats_start = Instant::now();
-            stats_frames = 0;
-        }
-
-        std::thread::sleep(frame_interval);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 pub fn run_capture_loop(
     config: CaptureConfig,
     stop: Arc<AtomicBool>,
     mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    #[cfg(feature = "real-capture")]
-    {
-        // In production builds we require real EVDI capture. If EVDI fails,
-        // fail the capture loop instead of silently switching to synthetic.
-        return evdi::run_capture(&config, &stop, &mut on_frame);
-    }
-
-    #[cfg(not(feature = "real-capture"))]
-    {
-        println!("[capture] built without real-capture feature, using synthetic source");
-        return run_synthetic_capture(&config, &stop, &mut on_frame);
-    }
+    evdi::run_capture(&config, &stop, &mut on_frame)
 }

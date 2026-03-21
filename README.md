@@ -2,12 +2,12 @@
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
-The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with VA-API H.264, and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
+The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 (VA-API, NVENC, or libx264), and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
 
 ## Features
 
 - **Virtual second display** via EVDI kernel module — appears as a real monitor in GNOME
-- **Hardware-accelerated H.264 encoding** via VA-API (`h264_vaapi` through ffmpeg)
+- **H.264 encoding** with multiple backends: VA-API (Intel/AMD), NVENC (NVIDIA), or software (libx264)
 - **Dual transport backends**:
   - **WiFi**: UDP with Reed-Solomon FEC, chunked and paced for reliability
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
@@ -27,7 +27,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ```
 ┌──────────────────── Linux Daemon ─────────────────────┐
 │                                                       │
-│  EVDI ──► VA-API H.264 ──► Transport Router         ──┬──► UDP (WiFi)
+│  EVDI ──► H.264 encode ──► Transport Router         ──┬──► UDP (WiFi)
 │                                                       │
 │  parec (audio) ──────────────► Transport Router       ┴──► TCP (USB)
 │                                                       │
@@ -63,8 +63,8 @@ screx-v2/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs                # Entry point, thread orchestration, shutdown
-│       ├── capture.rs             # EVDI virtual display capture (+ synthetic fallback)
-│       ├── encode.rs              # VA-API H.264 encoder (ffmpeg-next)
+│       ├── capture.rs             # EVDI virtual display capture
+│       ├── encode.rs              # H.264 encoder: VA-API, NVENC, or libx264 (ffmpeg-next)
 │       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
 │       ├── transport.rs           # Transport abstraction layer
@@ -159,12 +159,7 @@ The daemon uses `pactl`, `parec`, and `pacat` (from `pulseaudio-utils`) to creat
 
 ```bash
 cd daemon
-
-# Development build (synthetic capture + bootstrap encoder)
-cargo build
-
-# Release build with real EVDI capture and VA-API encoding
-cargo build --release --features real-capture,real-encode
+cargo build --release
 ```
 
 ### iPad App
@@ -199,7 +194,7 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `SCREX_GOP` | `30` | Keyframe interval (frames) |
 | `SCREX_BITRATE_BPS` | `8000000` | H.264 encoder bitrate |
 | `SCREX_STREAM_PORT` | `9000` | UDP/TCP streaming port |
-| `SCREX_ENCODER_BACKEND` | `auto` | `auto`, `vaapi`, or `bootstrap` |
+| `SCREX_ENCODER_BACKEND` | `auto` | `auto`, `vaapi`, `nvenc`, or `software` |
 
 ## iPad App Controls
 
@@ -281,7 +276,7 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
 2. **Beacon broadcasts** → iPad discovers daemon automatically
 3. **iPad connects** (WiFi UDP or USB TCP, whichever is available)
-4. **Capture loop**: EVDI damage events trigger framebuffer reads → VA-API encodes to H.264 → transport sends to iPad
+4. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264 encode (VA-API / NVENC / libx264) → transport sends to iPad
 5. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM sent alongside video
 6. **Input loop**: iPad sends touch, keyboard, mic, and camera data back to daemon → injected via uinput, PipeWire, and v4l2loopback
 7. **iPad decodes**: VideoToolbox hardware H.264 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio

@@ -5,16 +5,11 @@ edition = "2021"
 description = "Low-latency Linux screen streaming daemon for Screx V2"
 license = "MIT"
 
-[features]
-default = ["real-capture", "real-encode"]
-real-capture = []
-real-encode = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next"]
-
 [dependencies]
 anyhow = "1"
 opus-decoder = "0.1"
-ffmpeg-next = { version = "8", optional = true }
-ffmpeg-sys-next = { version = "8", optional = true }
+ffmpeg-next = "8"
+ffmpeg-sys-next = "8"
 libc = "0.2"
 rand = "0.8"
 reed-solomon-erasure = "6"
