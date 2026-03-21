@@ -242,6 +242,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Clean up any stale Screx audio modules from a previous crash
+    audio::cleanup_stale_modules();
+
     // Virtual microphone (iPad mic → PipeWire source)
     match audio::create_virtual_mic() {
         Ok(writer) => {

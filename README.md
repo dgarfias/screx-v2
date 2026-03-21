@@ -1,4 +1,4 @@
-öod# Screx v2
+# Screx v2
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
@@ -13,30 +13,46 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
   - Automatic detection and failover (USB preferred when connected)
 - **Audio streaming**: Virtual PulseAudio/PipeWire sink ("Screx iPad") captured via `parec`, streamed alongside video
+- **Microphone forwarding**: iPad microphone → Opus-encoded → Linux virtual PipeWire source ("Screx Microphone")
+- **Camera forwarding**: iPad camera → JPEG frames → Linux v4l2loopback virtual webcam
+- **Touch input**: Multi-touch from iPad mapped to a Linux virtual touchscreen via uinput
+- **Keyboard input**: iPad native keyboard forwarded to Linux via uinput virtual keyboard, with `Ctrl+Shift+U` Unicode input for accented/special characters (ñ, á, ö, etc.)
+- **Modifier keys**: Accessory bar above the iPad keyboard with Esc, Tab, Ctrl, Alt, Super, Home, End, Ins, Del, and arrow keys — modifiers are sticky one-shot (tap to arm, next key sends the combo)
 - **Auto-discovery**: UDP broadcast beacon (no mDNS dependency), iPad auto-connects within seconds
 - **Disconnect detection**: Data timeouts and beacon monitoring for automatic reconnection
+- **Crash recovery**: Stale PulseAudio/PipeWire modules from previous runs are cleaned up on startup
 
 ## Architecture
 
 ```
-┌─────────────────── Linux Daemon ───────────────────┐
-│                                                     │
+┌──────────────────── Linux Daemon ────────────────────┐
+│                                                       │
 │  EVDI ──► VA-API H.264 ──► Transport Router ──┬──► UDP (WiFi)
 │                                                │
 │  parec (audio) ──────────────► Transport Router ┴──► TCP (USB)
-│                                                     │
-│  Beacon broadcaster (port 9999)                     │
-└─────────────────────────────────────────────────────┘
+│                                                       │
+│  Virtual touchscreen (uinput)  ◄── touch events       │
+│  Virtual keyboard (uinput)     ◄── key events         │
+│  Virtual mic (PipeWire source) ◄── Opus audio         │
+│  Virtual webcam (v4l2loopback) ◄── JPEG frames        │
+│                                                       │
+│  Beacon broadcaster (port 9999)                       │
+└───────────────────────────────────────────────────────┘
           │ WiFi (UDP :9000)        │ USB (iproxy :9001 → :9000)
-          ▼                        ▼
-┌─────────────────── iPad App ───────────────────────┐
-│                                                     │
-│  StreamClient (UDP) ─── ──┬──► H264Decoder ──► AVSampleBufferDisplayLayer
-│                           │
-│  USBListener (TCP :9000) ─┘──► AudioPlayer ──► AVAudioEngine
-│                                                     │
-│  Beacon listener (port 9999) → auto-connect         │
-└─────────────────────────────────────────────────────┘
+          ▼                         ▼
+┌──────────────────── iPad App ────────────────────────┐
+│                                                       │
+│  StreamClient (UDP) ────┬──► H264Decoder ──► Display  │
+│                          │                             │
+│  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
+│                                                       │
+│  Touch ──────────────────────────────────► daemon      │
+│  Keyboard + modifier bar ────────────────► daemon      │
+│  Microphone (Opus) ──────────────────────► daemon      │
+│  Camera (JPEG) ──────────────────────────► daemon      │
+│                                                       │
+│  Beacon listener (port 9999) → auto-connect           │
+└───────────────────────────────────────────────────────┘
 ```
 
 ## Repository Layout
@@ -51,20 +67,27 @@ screx-v2/
 │       ├── encode.rs              # VA-API H.264 encoder (ffmpeg-next)
 │       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
+│       ├── transport.rs           # Transport abstraction layer
 │       ├── discovery.rs           # UDP broadcast beacon
-│       ├── audio.rs               # PulseAudio virtual sink + parec capture
-│       ├── uinput.rs              # Virtual touchscreen/keyboard
-│       └── doctor.rs              # Host readiness checks
-├── app/                           # Swift iPad app
+│       ├── audio.rs               # Virtual sink + parec capture, virtual mic (pipe-source / null-sink)
+│       ├── camera.rs              # v4l2loopback virtual webcam writer
+│       ├── uinput.rs              # Virtual touchscreen + keyboard, modifier combos, Unicode input
+│       ├── doctor.rs              # Host readiness checks
+│       ├── signaling.rs           # Signaling helpers
+│       └── webrtc_sender.rs       # WebRTC sender (experimental)
+├── app/                           # Swift iPad app (iOS 16+)
 │   └── Screx/
-│       ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView
+│       ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView, floating toolbar
 │       ├── Discovery.swift        # UDP beacon listener for auto-discovery
 │       ├── StreamClient.swift     # WiFi UDP client, FEC reassembly, keepalive
 │       ├── USBListener.swift      # USB TCP listener, framed message parsing
 │       ├── Decoder.swift          # H.264 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
-│       ├── DisplayView.swift      # UIViewRepresentable for AVSampleBufferDisplayLayer
-│       └── FEC.swift              # Reed-Solomon decoder for WiFi FEC recovery
+│       ├── AVSyncState.swift      # Audio/video synchronization state
+│       ├── DisplayView.swift      # Video display, touch forwarding, keyboard input + modifier bar
+│       ├── FEC.swift              # Reed-Solomon decoder for WiFi FEC recovery
+│       ├── MicCapture.swift       # iPad microphone capture → Opus encoding
+│       └── CameraCapture.swift    # iPad camera capture → JPEG frames
 ```
 
 ## Linux Dependencies
@@ -150,7 +173,41 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `SCREX_STREAM_PORT` | `9000` | UDP/TCP streaming port |
 | `SCREX_ENCODER_BACKEND` | `auto` | `auto`, `vaapi`, or `bootstrap` |
 
+## iPad App Controls
+
+The floating toolbar pill can be dragged anywhere on screen. Drag to the left edge to switch to vertical layout, drag to the top or bottom edge to switch back to horizontal. Position and orientation are persisted across launches.
+
+| Button | Action |
+|---|---|
+| Mic | Toggle iPad microphone forwarding (green when active) |
+| Camera | Toggle iPad camera forwarding; long-press to flip front/rear |
+| Keyboard | Toggle iPad native keyboard with modifier accessory bar |
+| Info (ⓘ) | Toggle connection status overlay; drag from anywhere on pill to reposition |
+
+### Keyboard Accessory Bar
+
+When the keyboard is active, an accessory bar appears above the iPad keyboard:
+
+```
+[ Esc ] [ Tab ] [ Ctrl ] [ Alt ] [ Super ] [ Home ] [ End ] [ Ins ] [ Del ] [ ← ] [ ↑ ] [ ↓ ] [ → ]
+```
+
+- **Ctrl, Alt, Super** are sticky one-shot modifiers: tap to arm (turns blue), then the next key you type sends the combo (e.g., Ctrl + C). Tap again while armed to send the modifier key alone (e.g., Super to open GNOME Activities).
+- Accented characters from the iPad's native long-press keyboard (ñ, á, ö, etc.) are automatically handled via the `Ctrl+Shift+U` Unicode input method on Linux.
+
 ## Protocols
+
+### Keyboard Packets
+
+Keyboard events are sent as `"KEY" + type(1) + payload`:
+
+| Type | Byte | Payload | Description |
+|---|---|---|---|
+| TEXT | `0x01` | UTF-8 string | Regular character input |
+| SPECIAL | `0x02` | key code (1) | Esc, Tab, arrows, Home, End, Del, Ins, standalone modifiers |
+| COMBO | `0x04` | mods(1) + inner_type(1) + inner_payload | Key with modifiers held (Ctrl/Alt/Super + key) |
+
+Modifier mask bits: `0x01` = Ctrl, `0x02` = Alt, `0x04` = Super.
 
 ### WiFi Transport (UDP)
 
@@ -193,10 +250,11 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 
 ## How It Works
 
-1. **Daemon starts** → creates EVDI virtual display → GNOME sees a new monitor
+1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
 2. **Beacon broadcasts** → iPad discovers daemon automatically
 3. **iPad connects** (WiFi UDP or USB TCP, whichever is available)
 4. **Capture loop**: EVDI damage events trigger framebuffer reads → VA-API encodes to H.264 → transport sends to iPad
 5. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM sent alongside video
-6. **iPad decodes**: VideoToolbox hardware H.264 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
-7. **Disconnect detection**: data timeouts (WiFi) and TCP close (USB) trigger automatic reconnection
+6. **Input loop**: iPad sends touch, keyboard, mic, and camera data back to daemon → injected via uinput, PipeWire, and v4l2loopback
+7. **iPad decodes**: VideoToolbox hardware H.264 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
+8. **Disconnect detection**: data timeouts (WiFi) and TCP close (USB) trigger automatic reconnection

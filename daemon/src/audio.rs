@@ -47,6 +47,35 @@ fn pactl_cmd() -> Command {
     cmd
 }
 
+/// Remove any leftover Screx PulseAudio/PipeWire modules from a previous crash.
+pub fn cleanup_stale_modules() {
+    let output = match pactl_cmd().args(["list", "short", "modules"]).output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let screx_names = [
+        &format!("sink_name={SINK_NAME}"),
+        &format!("source_name={MIC_SOURCE_NAME}"),
+        &format!("sink_name={MIC_SINK_NAME}"),
+    ];
+
+    for line in listing.lines() {
+        if screx_names.iter().any(|n| line.contains(n.as_str())) {
+            if let Some(id_str) = line.split_whitespace().next() {
+                if let Ok(id) = id_str.parse::<u32>() {
+                    let _ = pactl_cmd()
+                        .args(["unload-module", &id.to_string()])
+                        .output();
+                    println!("[audio] cleaned up stale module {id}: {}", line.trim());
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_file(MIC_FIFO_PATH);
+}
+
 pub fn create_virtual_sink() -> Result<u32> {
     let existing = pactl_cmd()
         .args(["list", "short", "modules"])
