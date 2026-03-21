@@ -366,6 +366,7 @@ mod evdi {
     pub(super) fn run_capture(
         config: &CaptureConfig,
         stop: &Arc<AtomicBool>,
+        force_refresh: &Arc<AtomicBool>,
         on_frame: &mut impl FnMut(CaptureFrame<'_>),
     ) -> Result<()> {
         let dev = find_or_create_device()?;
@@ -452,6 +453,7 @@ mod evdi {
 
         let mut pending_request = false;
         let mut no_update_count: u64 = 0;
+        let mut has_first_frame = false;
 
         while !stop.load(Ordering::Relaxed) {
             // Request an update if we don't have one pending
@@ -504,12 +506,29 @@ mod evdi {
                 on_frame(frame);
                 frame_index += 1;
                 stats_frames += 1;
+                has_first_frame = true;
             } else {
                 no_update_count += 1;
                 // If we've been waiting a long time, re-request
                 if no_update_count > 60 {
                     pending_request = false;
                     no_update_count = 0;
+                }
+
+                // New client on a static screen — resend the last buffer once
+                if has_first_frame && force_refresh.swap(false, Ordering::Relaxed) {
+                    let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
+                    let frame = CaptureFrame {
+                        frame_index,
+                        timestamp_90k,
+                        width: config.width,
+                        height: config.height,
+                        format: PixelFormat::Bgra8888,
+                        data: &pixel_buf,
+                        captured_at: Instant::now(),
+                    };
+                    on_frame(frame);
+                    frame_index += 1;
                 }
             }
 
@@ -540,7 +559,8 @@ mod evdi {
 pub fn run_capture_loop(
     config: CaptureConfig,
     stop: Arc<AtomicBool>,
+    force_refresh: Arc<AtomicBool>,
     mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    evdi::run_capture(&config, &stop, &mut on_frame)
+    evdi::run_capture(&config, &stop, &force_refresh, &mut on_frame)
 }

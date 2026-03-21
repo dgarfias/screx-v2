@@ -7,6 +7,28 @@ use ffmpeg_sys_next as ffi;
 
 use crate::capture::CaptureFrame;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    H264,
+    H265,
+}
+
+impl VideoCodec {
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "h265" | "hevc" | "h.265" => Self::H265,
+            _ => Self::H264,
+        }
+    }
+
+    pub fn transport_id(self) -> u8 {
+        match self {
+            Self::H264 => 0x00,
+            Self::H265 => 0x01,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub bitrate_bps: u32,
@@ -15,6 +37,7 @@ pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
     pub backend: EncoderBackend,
+    pub codec: VideoCodec,
 }
 
 #[derive(Debug, Clone)]
@@ -32,11 +55,11 @@ pub enum EncoderBackend {
 }
 
 impl EncoderBackend {
-    pub fn from_env(value: &str) -> Self {
+    pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "vaapi" => Self::Vaapi,
             "nvenc" | "nvidia" | "cuda" => Self::Nvenc,
-            "software" | "sw" | "x264" | "libx264" => Self::Software,
+            "software" | "sw" | "x264" | "libx264" | "x265" | "libx265" => Self::Software,
             _ => Self::Auto,
         }
     }
@@ -62,6 +85,10 @@ pub struct Encoder {
 impl Encoder {
     const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_secs(3);
 
+    pub fn codec(&self) -> VideoCodec {
+        self.config.codec
+    }
+
     pub fn new(config: EncoderConfig) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
 
@@ -79,14 +106,18 @@ impl Encoder {
                 ActiveEncoder::Software(enc)
             }
             EncoderBackend::Auto => {
+                let codec_name = match config.codec {
+                    VideoCodec::H264 => "H.264",
+                    VideoCodec::H265 => "H.265",
+                };
                 if let Ok(enc) = HwEncoder::new_vaapi(&config) {
-                    println!("[encode] auto-selected: vaapi");
+                    println!("[encode] auto-selected: vaapi ({codec_name})");
                     ActiveEncoder::HwAccel(enc)
                 } else if let Ok(enc) = HwEncoder::new_nvenc(&config) {
-                    println!("[encode] auto-selected: nvenc");
+                    println!("[encode] auto-selected: nvenc ({codec_name})");
                     ActiveEncoder::HwAccel(enc)
                 } else {
-                    println!("[encode] no hw encoder available, using software (libx264)");
+                    println!("[encode] no hw encoder available, using software ({codec_name})");
                     let enc = SwEncoder::new(&config)?;
                     ActiveEncoder::Software(enc)
                 }
@@ -209,15 +240,27 @@ impl HwEncoder {
         let width = config.width as i32;
         let height = config.height as i32;
 
-        let (codec_name, hw_type, hw_pix_fmt, device_path) = match kind {
-            HwKind::Vaapi => (
+        let (codec_name, hw_type, hw_pix_fmt, device_path) = match (kind, config.codec) {
+            (HwKind::Vaapi, VideoCodec::H264) => (
                 "h264_vaapi",
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
                 ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
                 "/dev/dri/renderD128",
             ),
-            HwKind::Nvenc => (
+            (HwKind::Vaapi, VideoCodec::H265) => (
+                "hevc_vaapi",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                "/dev/dri/renderD128",
+            ),
+            (HwKind::Nvenc, VideoCodec::H264) => (
                 "h264_nvenc",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+                ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+                "0",
+            ),
+            (HwKind::Nvenc, VideoCodec::H265) => (
+                "hevc_nvenc",
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
                 ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
                 "0",
@@ -537,11 +580,25 @@ impl SwEncoder {
         let width = config.width as i32;
         let height = config.height as i32;
 
+        let (enc_name, opts): (&str, Vec<(&str, &str)>) = match config.codec {
+            VideoCodec::H264 => ("libx264", vec![
+                ("preset", "ultrafast"),
+                ("tune", "zerolatency"),
+                ("forced-idr", "1"),
+                ("profile", "baseline"),
+            ]),
+            VideoCodec::H265 => ("libx265", vec![
+                ("preset", "ultrafast"),
+                ("tune", "zerolatency"),
+                ("forced-idr", "1"),
+            ]),
+        };
+
         unsafe {
-            let codec_name = std::ffi::CString::new("libx264").unwrap();
+            let codec_name = std::ffi::CString::new(enc_name).unwrap();
             let codec = ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
             if codec.is_null() {
-                bail!("libx264 encoder not found (is ffmpeg built with --enable-libx264?)");
+                bail!("{enc_name} encoder not found");
             }
 
             let ctx = ffi::avcodec_alloc_context3(codec);
@@ -564,13 +621,7 @@ impl SwEncoder {
             (*ctx).thread_count = 1;
             (*ctx).flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
 
-            let opts: &[(&str, &str)] = &[
-                ("preset", "ultrafast"),
-                ("tune", "zerolatency"),
-                ("forced-idr", "1"),
-                ("profile", "baseline"),
-            ];
-            for (k, v) in opts {
+            for (k, v) in &opts {
                 let key = std::ffi::CString::new(*k).unwrap();
                 let val = std::ffi::CString::new(*v).unwrap();
                 ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), val.as_ptr(), 0);
@@ -579,7 +630,7 @@ impl SwEncoder {
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to open libx264 encoder (error {ret})");
+                bail!("failed to open {enc_name} encoder (error {ret})");
             }
 
             let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
@@ -636,7 +687,7 @@ impl SwEncoder {
             }
 
             println!(
-                "[encode] software H.264 encoder (libx264): {}x{}@{} bitrate={} gop={} preset=ultrafast tune=zerolatency",
+                "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={}",
                 width, height, config.fps, config.bitrate_bps, config.gop
             );
 

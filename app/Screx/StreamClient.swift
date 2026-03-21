@@ -6,7 +6,7 @@ final class StreamClient {
     private let endpoint: NWEndpoint
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
-    let decoder: H264Decoder
+    let decoder: VideoDecoder
     let audioPlayer: AudioPlayer
     let avSync: AVSyncState
 
@@ -35,7 +35,7 @@ final class StreamClient {
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
 
-    init(endpoint: NWEndpoint, decoder: H264Decoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
+    init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
         self.decoder = decoder
         self.audioPlayer = audioPlayer
@@ -167,6 +167,7 @@ final class StreamClient {
             buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian
         }
         let flags = data[10]
+        let codecId = data[11]
         let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
             buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
         }
@@ -174,6 +175,13 @@ final class StreamClient {
                                | UInt32(data[16]) << 8  | UInt32(data[17])
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
+
+        if !isAudio {
+            let wantCodec: VideoCodecType = codecId == 0x01 ? .h265 : .h264
+            if wantCodec != decoder.codec {
+                decoder.setCodec(wantCodec)
+            }
+        }
 
         let payload = data.subdata(in: Self.headerLen..<data.count)
 

@@ -40,7 +40,7 @@ final class StreamViewModel: ObservableObject {
     @Published var manualIP: String = ""
     @Published var transport: String = ""
 
-    let decoder = H264Decoder()
+    let decoder = VideoDecoder()
     let avSync = AVSyncState()
     let audioPlayer: AudioPlayer
     let cameraCapture = CameraCapture()
@@ -147,7 +147,11 @@ final class StreamViewModel: ObservableObject {
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
+        // Detach old stream's callbacks so stale async events can't interfere
+        stream?.onStatus = nil
+        stream?.onDisconnect = nil
         stream?.disconnect()
+
         if !usbConnected {
             status = "Connecting to \(name)..."
         }
@@ -158,9 +162,10 @@ final class StreamViewModel: ObservableObject {
         let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.stream = client
 
-        client.onStatus = { [weak self] msg in
+        client.onStatus = { [weak self, weak client] msg in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, let client else { return }
+                guard self.stream === client else { return }
                 if !self.usbConnected {
                     self.status = msg
                     let nowConnected = msg.contains("Streaming")
@@ -172,9 +177,10 @@ final class StreamViewModel: ObservableObject {
                 }
             }
         }
-        client.onDisconnect = { [weak self] in
+        client.onDisconnect = { [weak self, weak client] in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, let client else { return }
+                guard self.stream === client else { return }
                 self.stream = nil
                 if !self.usbConnected {
                     self.handleStreamLost()
@@ -203,14 +209,23 @@ final class StreamViewModel: ObservableObject {
 
     /// Called when we've lost all streams and need to start looking again
     private func handleStreamLost() {
+        stream?.onStatus = nil
+        stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
         isConnected = false
         transport = ""
-        status = "Daemon disconnected, looking..."
         audioPlayer.stop()
         micCapture.stop()
-        discovery.resetKnownHost()
+
+        // Try to reconnect immediately using the last known endpoint
+        if let endpoint = lastWifiEndpoint, let name = lastWifiName {
+            status = "Reconnecting to \(name)..."
+            connectToEndpoint(endpoint, name: name)
+        } else {
+            status = "Daemon disconnected, looking..."
+            discovery.resetKnownHost()
+        }
     }
 
     func disconnect() {

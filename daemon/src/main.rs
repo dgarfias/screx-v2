@@ -8,7 +8,6 @@ mod stream_server;
 mod uinput;
 mod usb;
 
-use std::env;
 use std::net::UdpSocket;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,10 +15,57 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+#[derive(Parser, Debug)]
+#[command(name = "screx", about = "Low-latency Linux-to-iPad screen streaming daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Virtual display width
+    #[arg(short, long, default_value_t = 2160)]
+    width: u32,
+
+    /// Virtual display height (uses -H to avoid conflict with --help)
+    #[arg(short = 'H', long, default_value_t = 1620)]
+    height: u32,
+
+    /// Target framerate
+    #[arg(short, long, default_value_t = 30)]
+    framerate: u32,
+
+    /// Keyframe interval (in frames)
+    #[arg(short, long, default_value_t = 30)]
+    keyframe: u32,
+
+    /// Encoder bitrate in bps
+    #[arg(short = 'r', long, default_value_t = 8_000_000)]
+    bitrate: u32,
+
+    /// UDP/TCP streaming port
+    #[arg(short, long, default_value_t = 9000)]
+    port: u16,
+
+    /// Encoder backend: auto, vaapi, nvenc, software
+    #[arg(short, long, default_value = "auto")]
+    backend: String,
+
+    /// Video codec: h264, h265
+    #[arg(short, long, default_value = "h264")]
+    codec: String,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run host readiness checks
+    Doctor,
+}
 
 #[derive(Debug, Clone)]
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
+    codec: encode::VideoCodec,
     width: u32,
     height: u32,
     fps: u32,
@@ -29,54 +75,29 @@ struct AppConfig {
 }
 
 impl AppConfig {
-    fn from_env() -> Result<Self> {
-        let width = read_env("SCREX_WIDTH", "2160")
-            .parse::<u32>()
-            .context("invalid SCREX_WIDTH")?;
-        let height = read_env("SCREX_HEIGHT", "1620")
-            .parse::<u32>()
-            .context("invalid SCREX_HEIGHT")?;
-        let fps = read_env("SCREX_FPS", "30")
-            .parse::<u32>()
-            .context("invalid SCREX_FPS")?;
-        let gop = read_env("SCREX_GOP", "30")
-            .parse::<u32>()
-            .context("invalid SCREX_GOP")?;
-        let bitrate_bps = read_env("SCREX_BITRATE_BPS", "8000000")
-            .parse::<u32>()
-            .context("invalid SCREX_BITRATE_BPS")?;
-        let stream_port = read_env("SCREX_STREAM_PORT", "9000")
-            .parse::<u16>()
-            .context("invalid SCREX_STREAM_PORT")?;
-
-        Ok(Self {
-            encoder_backend: encode::EncoderBackend::from_env(&read_env(
-                "SCREX_ENCODER_BACKEND",
-                "auto",
-            )),
-            width,
-            height,
-            fps,
-            gop: gop.max(10),
-            bitrate_bps,
-            stream_port,
-        })
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
+            codec: encode::VideoCodec::from_str(&cli.codec),
+            width: cli.width,
+            height: cli.height,
+            fps: cli.framerate,
+            gop: cli.keyframe.max(10),
+            bitrate_bps: cli.bitrate,
+            stream_port: cli.port,
+        }
     }
-}
-
-fn read_env(key: &str, fallback: &str) -> String {
-    env::var(key).unwrap_or_else(|_| fallback.to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if read_env("SCREX_COMMAND", "").eq_ignore_ascii_case("doctor")
-        || std::env::args().any(|arg| arg == "doctor" || arg == "--doctor")
-    {
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::Doctor)) {
         return doctor::run_doctor();
     }
 
-    let config = AppConfig::from_env()?;
+    let config = AppConfig::from_cli(&cli);
     println!("screx-daemon v2 (EVDI) config: {config:?}");
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -168,14 +189,22 @@ async fn main() -> Result<()> {
         width: config.width,
         height: config.height,
         backend: config.encoder_backend,
+        codec: config.codec,
     })?;
 
+    let codec_id = encoder.codec().transport_id();
+
     let mut sender = stream_server::UdpSender::new(send_socket);
+
+    let force_refresh = Arc::new(AtomicBool::new(false));
+    let capture_force_refresh = Arc::clone(&force_refresh);
+    // Also store in shared state so the client manager can set it
+    shared.force_refresh_handle.lock().unwrap().replace(Arc::clone(&force_refresh));
 
     let capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
-            if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
+            if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), capture_force_refresh, |frame| {
                 let force_idr = capture_shared.force_idr.swap(false, Ordering::Relaxed);
 
                 let ts = capture_shared.start_time.elapsed().as_millis() as u32;
@@ -187,7 +216,7 @@ async fn main() -> Result<()> {
                             if capture_shared.usb_active.load(Ordering::Relaxed) {
                                 let mut usb = capture_shared.usb_sender.lock().unwrap();
                                 if let Some(ref mut tcp) = *usb {
-                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr, ts) {
+                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr, ts, codec_id) {
                                         eprintln!("[pipeline] USB send error: {e:#}");
                                         drop(usb);
                                         capture_shared.usb_active.store(false, Ordering::SeqCst);
@@ -198,7 +227,7 @@ async fn main() -> Result<()> {
                             // Fall back to WiFi UDP
                             let client_addr = *capture_shared.client_addr.lock().unwrap();
                             if let Some(addr) = client_addr {
-                                if let Err(e) = sender.send_frame(au, addr, ts) {
+                                if let Err(e) = sender.send_frame(au, addr, ts, codec_id) {
                                     eprintln!("[pipeline] send error: {e:#}");
                                 }
                             }

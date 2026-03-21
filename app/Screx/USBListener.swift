@@ -7,7 +7,7 @@ final class USBListener {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.usb", qos: .userInteractive)
 
-    private let decoder: H264Decoder
+    private let decoder: VideoDecoder
     private let audioPlayer: AudioPlayer
     private let avSync: AVSyncState
 
@@ -25,7 +25,7 @@ final class USBListener {
     private var hasReportedFirstFrame = false
     private var recvBuffer = Data()
 
-    init(decoder: H264Decoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
+    init(decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.decoder = decoder
         self.audioPlayer = audioPlayer
         self.avSync = avSync
@@ -162,12 +162,17 @@ final class USBListener {
 
             switch msgType {
             case Self.msgVideo:
-                // type(1) + is_idr(1) + timestamp_ms(4) + annex_b
-                guard msgData.count >= 6 else { continue }
-                let o = msgData.startIndex + 2
+                // type(1) + is_idr(1) + codec_id(1) + timestamp_ms(4) + annex_b
+                guard msgData.count >= 7 else { continue }
+                let codecId = msgData[msgData.startIndex + 2]
+                let wantCodec: VideoCodecType = codecId == 0x01 ? .h265 : .h264
+                if wantCodec != decoder.codec {
+                    decoder.setCodec(wantCodec)
+                }
+                let o = msgData.startIndex + 3
                 let tsMs: UInt32 = UInt32(msgData[o]) << 24 | UInt32(msgData[o+1]) << 16
                                  | UInt32(msgData[o+2]) << 8 | UInt32(msgData[o+3])
-                let annexB = Data(msgData.dropFirst(6))
+                let annexB = Data(msgData.dropFirst(7))
                 avSync.updateVideo(timestamp: tsMs)
                 decoder.decodeAccessUnit(annexB)
 

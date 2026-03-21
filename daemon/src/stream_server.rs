@@ -30,6 +30,7 @@ const PACING_DELAY: Duration = Duration::from_micros(10);
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
     pub force_idr: AtomicBool,
+    pub force_refresh_handle: Mutex<Option<Arc<AtomicBool>>>,
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
@@ -44,6 +45,7 @@ impl SharedState {
         Self {
             client_addr: Mutex::new(None),
             force_idr: AtomicBool::new(false),
+            force_refresh_handle: Mutex::new(None),
             usb_sender: Mutex::new(None),
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
@@ -59,12 +61,14 @@ pub const FLAG_IDR: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
 
 /// 18-byte packet header (14 original + 4 byte timestamp_ms)
+/// Byte 11 = codec_id: 0x00=H.264, 0x01=H.265
 fn build_header(
     frame_id: u32,
     chunk_idx: u16,
     total_data: u16,
     total_parity: u16,
     flags: u8,
+    codec_id: u8,
     payload_len: u16,
     timestamp_ms: u32,
 ) -> [u8; HEADER_LEN] {
@@ -74,7 +78,7 @@ fn build_header(
     h[6..8].copy_from_slice(&total_data.to_be_bytes());
     h[8..10].copy_from_slice(&total_parity.to_be_bytes());
     h[10] = flags;
-    h[11] = 0;
+    h[11] = codec_id;
     h[12..14].copy_from_slice(&payload_len.to_be_bytes());
     h[14..18].copy_from_slice(&timestamp_ms.to_be_bytes());
     h
@@ -113,6 +117,9 @@ pub fn run_client_manager(
                     if is_new {
                         println!("[client] registered: {addr}");
                         shared.force_idr.store(true, Ordering::Relaxed);
+                        if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
+                            fr.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -213,7 +220,7 @@ impl UdpSender {
         }
     }
 
-    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr, timestamp_ms: u32) -> Result<()> {
+    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr, timestamp_ms: u32, codec_id: u8) -> Result<()> {
         let payload = &au.annex_b;
         let is_idr = au.is_idr;
 
@@ -278,6 +285,7 @@ impl UdpSender {
                 data_count as u16,
                 actual_parity as u16,
                 flags,
+                codec_id,
                 actual_payload_len,
                 timestamp_ms,
             );
@@ -352,6 +360,7 @@ impl AudioSender {
                 data_count as u16,
                 0,
                 FLAG_AUDIO,
+                0,
                 payload_len,
                 timestamp_ms,
             );

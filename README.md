@@ -2,12 +2,12 @@
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
-The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 (VA-API, NVENC, or libx264), and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
+The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 or H.265/HEVC (VA-API, NVENC, or software), and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
 
 ## Features
 
 - **Virtual second display** via EVDI kernel module — appears as a real monitor in GNOME
-- **H.264 encoding** with multiple backends: VA-API (Intel/AMD), NVENC (NVIDIA), or software (libx264)
+- **H.264 and H.265/HEVC encoding** with multiple backends: VA-API (Intel/AMD), NVENC (NVIDIA), or software (libx264/libx265)
 - **Dual transport backends**:
   - **WiFi**: UDP with Reed-Solomon FEC, chunked and paced for reliability
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
@@ -27,7 +27,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ```
 ┌──────────────────── Linux Daemon ─────────────────────┐
 │                                                       │
-│  EVDI ──► H.264 encode ──► Transport Router         ──┬──► UDP (WiFi)
+│  EVDI ──► H.264/H.265 encode ──► Transport Router   ──┬──► UDP (WiFi)
 │                                                       │
 │  parec (audio) ──────────────► Transport Router       ┴──► TCP (USB)
 │                                                       │
@@ -42,7 +42,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
           ▼                         ▼
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
-│  StreamClient (UDP) ────┬──► H264Decoder ──► Display  │
+│  StreamClient (UDP) ────┬──► VideoDecoder ──► Display  │
 │                         │                             │
 │  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
 │                                                       │
@@ -64,7 +64,7 @@ screx-v2/
 │   └── src/
 │       ├── main.rs                # Entry point, thread orchestration, shutdown
 │       ├── capture.rs             # EVDI virtual display capture
-│       ├── encode.rs              # H.264 encoder: VA-API, NVENC, or libx264 (ffmpeg-next)
+│       ├── encode.rs              # H.264/H.265 encoder: VA-API, NVENC, or software (ffmpeg-next)
 │       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
 │       ├── transport.rs           # Transport abstraction layer
@@ -81,7 +81,7 @@ screx-v2/
 │       ├── Discovery.swift        # UDP beacon listener for auto-discovery
 │       ├── StreamClient.swift     # WiFi UDP client, FEC reassembly, keepalive
 │       ├── USBListener.swift      # USB TCP listener, framed message parsing
-│       ├── Decoder.swift          # H.264 Annex-B → VideoToolbox → display layer
+│       ├── Decoder.swift          # H.264/H.265 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
 │       ├── AVSyncState.swift      # Audio/video synchronization state
 │       ├── DisplayView.swift      # Video display, touch forwarding, keyboard input + modifier bar
@@ -172,29 +172,32 @@ Open `app/Screx.xcodeproj` in Xcode and build to your iPad (Cmd+R). Requires iOS
 cd daemon
 
 # Basic — uses default resolution (2160x1620) and settings
-sudo ./target/release/screx-daemon
+sudo ./target/release/screx
 
-# Custom resolution and bitrate
-sudo SCREX_WIDTH=1600 SCREX_HEIGHT=1200 SCREX_FPS=60 SCREX_GOP=60 \
-     SCREX_BITRATE_BPS=10000000 ./target/release/screx-daemon
+# Custom resolution, framerate, and codec
+sudo ./target/release/screx -w 1920 -H 1080 -f 60 -k 60 -b vaapi -c h264
+
+# H.265 with NVENC at 10 Mbps
+sudo ./target/release/screx --codec h265 --backend nvenc --bitrate 10000000
 
 # Run host readiness checks
-cargo run -- doctor
+sudo ./target/release/screx doctor
 ```
 
 The daemon requires `sudo` because EVDI needs root access to create virtual displays.
 
-### Environment Variables
+### Options
 
-| Variable | Default | Description |
-|---|---|---|
-| `SCREX_WIDTH` | `2160` | Virtual display width |
-| `SCREX_HEIGHT` | `1620` | Virtual display height |
-| `SCREX_FPS` | `30` | Target framerate |
-| `SCREX_GOP` | `30` | Keyframe interval (frames) |
-| `SCREX_BITRATE_BPS` | `8000000` | H.264 encoder bitrate |
-| `SCREX_STREAM_PORT` | `9000` | UDP/TCP streaming port |
-| `SCREX_ENCODER_BACKEND` | `auto` | `auto`, `vaapi`, `nvenc`, or `software` |
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--width` | `-w` | `2160` | Virtual display width |
+| `--height` | `-H` | `1620` | Virtual display height |
+| `--framerate` | `-f` | `30` | Target framerate |
+| `--keyframe` | `-k` | `30` | Keyframe interval (in frames) |
+| `--bitrate` | `-r` | `8000000` | Encoder bitrate in bps |
+| `--port` | `-p` | `9000` | UDP/TCP streaming port |
+| `--backend` | `-b` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
+| `--codec` | `-c` | `h264` | Video codec: `h264`, `h265` |
 
 ## iPad App Controls
 
@@ -234,7 +237,7 @@ Modifier mask bits: `0x01` = Ctrl, `0x02` = Alt, `0x04` = Super.
 
 ### WiFi Transport (UDP)
 
-Each UDP packet has a 14-byte header:
+Each UDP packet has an 18-byte header:
 
 | Field | Size | Description |
 |---|---|---|
@@ -243,8 +246,9 @@ Each UDP packet has a 14-byte header:
 | `total_data` | u16 BE | Number of data chunks |
 | `total_parity` | u16 BE | Number of FEC parity chunks |
 | `flags` | u8 | Bit 0 = IDR, Bit 1 = audio |
-| `reserved` | u8 | — |
+| `codec_id` | u8 | `0x00` = H.264, `0x01` = H.265 |
 | `payload_len` | u16 BE | Actual payload bytes in this chunk |
+| `timestamp_ms` | u32 BE | Daemon-side timestamp (milliseconds) |
 
 Video frames are split into 1400-byte chunks with Reed-Solomon FEC parity shards. Audio is sent without FEC (small enough for single packets).
 
@@ -258,7 +262,7 @@ Length-framed messages over TCP (via iproxy USB tunnel):
 | `type` | u8 | `0x01` = video, `0x02` = audio, `0x03` = control |
 | payload | variable | Raw Annex-B (video), raw PCM (audio), ASCII (control) |
 
-Video messages include an additional `is_idr` byte (u8) after the type byte.
+Video messages include `is_idr` (u8) and `codec_id` (u8: `0x00`=H.264, `0x01`=H.265) after the type byte.
 
 ### Discovery (UDP Broadcast)
 
@@ -276,8 +280,8 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
 2. **Beacon broadcasts** → iPad discovers daemon automatically
 3. **iPad connects** (WiFi UDP or USB TCP, whichever is available)
-4. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264 encode (VA-API / NVENC / libx264) → transport sends to iPad
+4. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → transport sends to iPad
 5. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM sent alongside video
 6. **Input loop**: iPad sends touch, keyboard, mic, and camera data back to daemon → injected via uinput, PipeWire, and v4l2loopback
-7. **iPad decodes**: VideoToolbox hardware H.264 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
+7. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
 8. **Disconnect detection**: data timeouts (WiFi) and TCP close (USB) trigger automatic reconnection
