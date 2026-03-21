@@ -524,7 +524,6 @@ struct SwEncoder {
     sw_bgra: *mut ffi::AVFrame,
     sw_yuv: *mut ffi::AVFrame,
     pkt: *mut ffi::AVPacket,
-    width: i32,
     height: i32,
     frame_index: u64,
     fps: u32,
@@ -562,15 +561,20 @@ impl SwEncoder {
             (*ctx).gop_size = config.gop as i32;
             (*ctx).max_b_frames = 0;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
-            (*ctx).thread_count = 2;
+            (*ctx).thread_count = 1;
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
 
-            let preset = std::ffi::CString::new("preset").unwrap();
-            let ultrafast = std::ffi::CString::new("ultrafast").unwrap();
-            ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), ultrafast.as_ptr(), 0);
-
-            let tune = std::ffi::CString::new("tune").unwrap();
-            let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
-            ffi::av_opt_set((*ctx).priv_data, tune.as_ptr(), zerolatency.as_ptr(), 0);
+            let opts: &[(&str, &str)] = &[
+                ("preset", "ultrafast"),
+                ("tune", "zerolatency"),
+                ("forced-idr", "1"),
+                ("profile", "baseline"),
+            ];
+            for (k, v) in opts {
+                let key = std::ffi::CString::new(*k).unwrap();
+                let val = std::ffi::CString::new(*v).unwrap();
+                ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), val.as_ptr(), 0);
+            }
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
@@ -579,8 +583,11 @@ impl SwEncoder {
             }
 
             let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
-                std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize)
-                    .to_vec()
+                std::slice::from_raw_parts(
+                    (*ctx).extradata,
+                    (*ctx).extradata_size as usize,
+                )
+                .to_vec()
             } else {
                 Vec::new()
             };
@@ -639,7 +646,6 @@ impl SwEncoder {
                 sw_bgra,
                 sw_yuv,
                 pkt,
-                width,
                 height,
                 frame_index: 0,
                 fps: config.fps.max(1),
@@ -654,6 +660,13 @@ impl SwEncoder {
         is_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
         unsafe {
+            // Ensure we have exclusive ownership of the YUV buffer
+            // (libx264 may still hold a ref from the previous frame)
+            let ret = ffi::av_frame_make_writable(self.sw_yuv);
+            if ret < 0 {
+                bail!("av_frame_make_writable failed (error {ret})");
+            }
+
             (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
 
             ffi::sws_scale(
