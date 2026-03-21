@@ -398,6 +398,7 @@ const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
 const KEY_DELETE: u16 = 111;
+const KEY_INSERT: u16 = 110;
 const KEY_HOME: u16 = 102;
 const KEY_END: u16 = 107;
 
@@ -411,7 +412,7 @@ const ALL_KEYS: &[u16] = &[
     KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
     KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
     KEY_LEFTALT, KEY_LEFTMETA,
-    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_HOME, KEY_END,
+    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_INSERT, KEY_HOME, KEY_END,
 ];
 
 fn char_to_key(c: char) -> Option<(u16, bool)> {
@@ -488,6 +489,7 @@ fn special_to_keycode(code: u8) -> Option<u16> {
         0x0C => Some(KEY_LEFTCTRL),
         0x0D => Some(KEY_LEFTALT),
         0x0E => Some(KEY_LEFTMETA),
+        0x0F => Some(KEY_INSERT),
         _ => None,
     }
 }
@@ -553,7 +555,6 @@ impl VirtualKeyboard {
     fn type_unicode(&mut self, c: char) {
         let hex = format!("{:x}", c as u32);
 
-        // Ctrl+Shift+U triggers IBus Unicode input mode
         self.key_event(KEY_LEFTCTRL, 1);
         self.key_event(KEY_LEFTSHIFT, 1);
         self.key_event(KEY_U, 1);
