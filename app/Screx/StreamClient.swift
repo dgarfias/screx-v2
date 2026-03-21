@@ -142,9 +142,11 @@ final class StreamClient {
                 return
             }
 
-            if let data, data.count >= Self.headerLen {
+            if let data, !data.isEmpty {
                 self.resetDataTimeout()
-                self.handlePacket(data)
+                if data.count >= Self.headerLen {
+                    self.handlePacket(data)
+                }
             }
 
             self.receiveLoop(conn)

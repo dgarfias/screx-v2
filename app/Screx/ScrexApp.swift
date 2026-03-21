@@ -152,6 +152,9 @@ final class StreamViewModel: ObservableObject {
             status = "Connecting to \(name)..."
         }
 
+        // Reset so "Streaming" status fires again for this connection
+        decoder.hasReportedFirstFrame = false
+
         let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.stream = client
 

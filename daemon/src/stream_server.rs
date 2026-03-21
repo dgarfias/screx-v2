@@ -20,7 +20,9 @@ const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEY_MAGIC: &[u8] = b"KEY";
 const CAM_MAGIC: &[u8] = b"CAM";
 const MIC_MAGIC: &[u8] = b"MIC";
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
 const PACING_DELAY: Duration = Duration::from_micros(10);
@@ -92,6 +94,7 @@ pub fn run_client_manager(
         .ok();
 
     let mut last_keepalive = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
 
@@ -159,6 +162,15 @@ pub fn run_client_manager(
             Err(e) => {
                 eprintln!("[client] recv error: {e}");
             }
+        }
+
+        // Send heartbeat to registered client so it knows we're alive
+        // (EVDI may produce 0 fps for long stretches on static screens)
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            if let Some(addr) = *shared.client_addr.lock().unwrap() {
+                let _ = socket.send_to(HEARTBEAT_MAGIC, addr);
+            }
+            last_heartbeat = Instant::now();
         }
 
         // Keepalive timeout check
