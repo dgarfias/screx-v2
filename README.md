@@ -43,7 +43,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  StreamClient (UDP) ────┬──► H264Decoder ──► Display  │
-│                         │                            │
+│                         │                             │
 │  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
 │                                                       │
 │  Touch ──────────────────────────────────► daemon     │
