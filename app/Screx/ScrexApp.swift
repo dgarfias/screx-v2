@@ -522,7 +522,6 @@ struct ContentView: View {
                         x: barPosition.x + value.translation.width,
                         y: barPosition.y + value.translation.height
                     )
-                    dragOffset = .zero
 
                     var newOrientation = barOrientation
                     if newPos.x < Self.edgeThreshold {
@@ -545,9 +544,13 @@ struct ContentView: View {
                         preKeyboardY = nil
                     }
 
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        barPosition = newPos
-                        barOrientation = newOrientation
+                    barPosition = newPos
+                    dragOffset = .zero
+
+                    if newOrientation != barOrientation {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            barOrientation = newOrientation
+                        }
                     }
 
                     Self.saveBarPosition(newPos)
