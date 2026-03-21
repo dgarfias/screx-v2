@@ -335,7 +335,7 @@ impl HwEncoder {
                 width,
                 height,
                 ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                ffi::SwsFlags::SWS_FAST_BILINEAR as i32,
+                1, // SWS_FAST_BILINEAR
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null(),
@@ -599,7 +599,7 @@ impl SwEncoder {
                 width,
                 height,
                 ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-                ffi::SwsFlags::SWS_FAST_BILINEAR as i32,
+                1, // SWS_FAST_BILINEAR
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null(),
