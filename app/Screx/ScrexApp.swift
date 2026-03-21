@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import CryptoKit
 import Network
 
 @main
@@ -54,7 +55,7 @@ final class StreamViewModel: ObservableObject {
     private var usbListener: USBListener?
     private var pairingService: PairingService?
     private var pendingPinCompletion: ((String) -> Void)?
-    private var sessionKey: CryptoKit.SymmetricKey?
+    private var sessionKey: SymmetricKey?
 
     nonisolated init() {
         self.audioPlayer = AudioPlayer(avSync: avSync)
@@ -236,7 +237,7 @@ final class StreamViewModel: ObservableObject {
         status = "Pairing cancelled"
     }
 
-    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: CryptoKit.SymmetricKey) {
+    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey) {
         if !usbConnected {
             status = "Connecting to \(name)..."
         }
