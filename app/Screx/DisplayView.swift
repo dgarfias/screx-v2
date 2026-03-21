@@ -8,11 +8,17 @@ struct KeyboardInputView: UIViewRepresentable {
     @Binding var isActive: Bool
     let onText: (String) -> Void
     let onDelete: () -> Void
+    let onSpecial: (UInt8) -> Void
+    let onCombo: (UInt8, String) -> Void
+    let onModSpecial: (UInt8, UInt8) -> Void
 
     func makeUIView(context: Context) -> KeyInputProxyView {
         let view = KeyInputProxyView()
         view.onText = onText
         view.onDelete = onDelete
+        view.onSpecial = onSpecial
+        view.onCombo = onCombo
+        view.onModSpecial = onModSpecial
         view.onResign = { context.coordinator.deactivate() }
         view.isUserInteractionEnabled = false
         return view
@@ -21,6 +27,9 @@ struct KeyboardInputView: UIViewRepresentable {
     func updateUIView(_ uiView: KeyInputProxyView, context: Context) {
         uiView.onText = onText
         uiView.onDelete = onDelete
+        uiView.onSpecial = onSpecial
+        uiView.onCombo = onCombo
+        uiView.onModSpecial = onModSpecial
         uiView.onResign = { context.coordinator.deactivate() }
         uiView.allowFirstResponder = isActive
         uiView.isUserInteractionEnabled = isActive
@@ -45,20 +54,38 @@ struct KeyboardInputView: UIViewRepresentable {
 final class KeyInputProxyView: UIView, UIKeyInput {
     var onText: ((String) -> Void)?
     var onDelete: (() -> Void)?
+    var onSpecial: ((UInt8) -> Void)?
+    var onCombo: ((UInt8, String) -> Void)?
+    var onModSpecial: ((UInt8, UInt8) -> Void)?
     var onResign: (() -> Void)?
     var allowFirstResponder = false
+
+    private var activeModifiers: UInt8 = 0
+    private var modifierButtons: [UInt8: UIButton] = [:]
 
     override var canBecomeFirstResponder: Bool { allowFirstResponder }
     var hasText: Bool { true }
 
     var autocorrectionType: UITextAutocorrectionType { .no }
 
+    override var inputAccessoryView: UIView? { accessoryBar }
+
     func insertText(_ text: String) {
-        onText?(text)
+        if activeModifiers != 0 {
+            onCombo?(activeModifiers, text)
+            clearModifiers()
+        } else {
+            onText?(text)
+        }
     }
 
     func deleteBackward() {
-        onDelete?()
+        if activeModifiers != 0 {
+            onModSpecial?(activeModifiers, 0x01)
+            clearModifiers()
+        } else {
+            onDelete?()
+        }
     }
 
     @discardableResult
@@ -66,9 +93,130 @@ final class KeyInputProxyView: UIView, UIKeyInput {
         let result = super.resignFirstResponder()
         if result {
             allowFirstResponder = false
+            clearModifiers()
             onResign?()
         }
         return result
+    }
+
+    // MARK: - Modifier state
+
+    private static let modSpecialCodes: [UInt8: UInt8] = [
+        0x01: 0x0C, // Ctrl
+        0x02: 0x0D, // Alt
+        0x04: 0x0E, // Super
+    ]
+
+    private func toggleModifier(_ mask: UInt8) {
+        if (activeModifiers & mask) != 0 {
+            // Already active → send lone keypress and deactivate
+            activeModifiers &= ~mask
+            updateModifierAppearance()
+            if let code = Self.modSpecialCodes[mask] {
+                onSpecial?(code)
+            }
+        } else {
+            activeModifiers |= mask
+            updateModifierAppearance()
+        }
+    }
+
+    private func clearModifiers() {
+        activeModifiers = 0
+        updateModifierAppearance()
+    }
+
+    private func updateModifierAppearance() {
+        for (mask, btn) in modifierButtons {
+            let isOn = (activeModifiers & mask) != 0
+            btn.backgroundColor = isOn
+                ? UIColor.systemBlue
+                : UIColor(white: 0.4, alpha: 1)
+        }
+    }
+
+    private func handleSpecialKey(_ code: UInt8) {
+        if activeModifiers != 0 {
+            onModSpecial?(activeModifiers, code)
+            clearModifiers()
+        } else {
+            onSpecial?(code)
+        }
+    }
+
+    // MARK: - Accessory bar
+
+    private lazy var accessoryBar: UIInputView = {
+        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 0, height: 44),
+                              inputViewStyle: .keyboard)
+
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 5
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let spacer = { () -> UIView in
+            let v = UIView()
+            v.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            return v
+        }
+
+        let items: [(String, AccessoryAction)] = [
+            ("Esc",   .special(0x04)),
+            ("Tab",   .special(0x03)),
+            ("Ctrl",  .modifier(0x01)),
+            ("Alt",   .modifier(0x02)),
+            ("Super", .modifier(0x04)),
+            ("←",     .special(0x05)),
+            ("↑",     .special(0x07)),
+            ("↓",     .special(0x08)),
+            ("→",     .special(0x06)),
+        ]
+
+        for (label, action) in items {
+            let btn = makeKeyButton(label)
+            switch action {
+            case .special(let code):
+                btn.addAction(UIAction { [weak self] _ in
+                    self?.handleSpecialKey(code)
+                }, for: .touchUpInside)
+            case .modifier(let mask):
+                modifierButtons[mask] = btn
+                btn.addAction(UIAction { [weak self] _ in
+                    self?.toggleModifier(mask)
+                }, for: .touchUpInside)
+            }
+            stack.addArrangedSubview(btn)
+        }
+
+        stack.addArrangedSubview(spacer())
+
+        bar.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 6),
+            stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -6),
+            stack.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+        ])
+
+        return bar
+    }()
+
+    private func makeKeyButton(_ title: String) -> UIButton {
+        let btn = UIButton(type: .system)
+        btn.setTitle(title, for: .normal)
+        btn.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        btn.setTitleColor(.white, for: .normal)
+        btn.backgroundColor = UIColor(white: 0.4, alpha: 1)
+        btn.layer.cornerRadius = 6
+        btn.clipsToBounds = true
+        btn.contentEdgeInsets = UIEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
+        return btn
+    }
+
+    private enum AccessoryAction {
+        case special(UInt8)
+        case modifier(UInt8)
     }
 }
 

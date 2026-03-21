@@ -257,9 +257,16 @@ final class StreamViewModel: ObservableObject {
         sendKey(Data([0x02, code]))
     }
 
-    /// Tells the daemon to toggle the GNOME on-screen keyboard
-    func toggleOSK() {
-        sendKey(Data([0x03]))
+    /// Sends a modifier combo with text: type 0x04 + mods(1) + inner_type 0x01 + UTF-8
+    func sendComboText(mods: UInt8, text: String) {
+        var data = Data([0x04, mods, 0x01])
+        data.append(Data(text.utf8))
+        sendKey(data)
+    }
+
+    /// Sends a modifier combo with special key: type 0x04 + mods(1) + inner_type 0x02 + code(1)
+    func sendComboSpecial(mods: UInt8, code: UInt8) {
+        sendKey(Data([0x04, mods, 0x02, code]))
     }
 
     // MARK: - Camera
@@ -333,6 +340,7 @@ struct ContentView: View {
     @State private var barOrientation: ToolbarOrientation = Self.loadBarOrientation()
     @State private var dragOffset: CGSize = .zero
     @State private var isDragging = false
+    @State private var isKeyboardActive = false
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -394,6 +402,16 @@ struct ContentView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
+                KeyboardInputView(
+                    isActive: $isKeyboardActive,
+                    onText: { model.sendTextInsert($0) },
+                    onDelete: { model.sendSpecialKey(0x01) },
+                    onSpecial: { model.sendSpecialKey($0) },
+                    onCombo: { mods, text in model.sendComboText(mods: mods, text: text) },
+                    onModSpecial: { mods, code in model.sendComboSpecial(mods: mods, code: code) }
+                )
+                .frame(width: 0, height: 0)
+
                 floatingBar(in: geo)
             }
             .onAppear {
@@ -436,7 +454,11 @@ struct ContentView: View {
                 ) { model.toggleCamera() }
                     .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
 
-                toolbarButton(icon: "keyboard", color: .white) { model.toggleOSK() }
+                toolbarButton(
+                    icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
+                    active: isKeyboardActive,
+                    color: isKeyboardActive ? .green : .white
+                ) { isKeyboardActive.toggle() }
             }
 
             dragHandle(in: geo)

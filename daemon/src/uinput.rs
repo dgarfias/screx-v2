@@ -365,6 +365,7 @@ const KEY_P: u16 = 25;
 const KEY_LEFTBRACE: u16 = 26;
 const KEY_RIGHTBRACE: u16 = 27;
 const KEY_ENTER: u16 = 28;
+const KEY_LEFTCTRL: u16 = 29;
 const KEY_A: u16 = 30;
 const KEY_S: u16 = 31;
 const KEY_D: u16 = 32;
@@ -390,6 +391,8 @@ const KEY_COMMA: u16 = 51;
 const KEY_DOT: u16 = 52;
 const KEY_SLASH: u16 = 53;
 const KEY_SPACE: u16 = 57;
+const KEY_LEFTALT: u16 = 56;
+const KEY_LEFTMETA: u16 = 125;
 const KEY_UP: u16 = 103;
 const KEY_LEFT: u16 = 105;
 const KEY_RIGHT: u16 = 106;
@@ -402,11 +405,12 @@ const ALL_KEYS: &[u16] = &[
     KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
     KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB,
     KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T_KEY, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
-    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER,
+    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER, KEY_LEFTCTRL,
     KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
     KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH,
     KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
     KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
+    KEY_LEFTALT, KEY_LEFTMETA,
     KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_HOME, KEY_END,
 ];
 
@@ -481,6 +485,9 @@ fn special_to_keycode(code: u8) -> Option<u16> {
         0x09 => Some(KEY_DELETE),
         0x0A => Some(KEY_HOME),
         0x0B => Some(KEY_END),
+        0x0C => Some(KEY_LEFTCTRL),
+        0x0D => Some(KEY_LEFTALT),
+        0x0E => Some(KEY_LEFTMETA),
         _ => None,
     }
 }
@@ -537,8 +544,45 @@ impl VirtualKeyboard {
                     self.key_event(KEY_LEFTSHIFT, 0);
                 }
                 self.syn();
+            } else {
+                self.type_unicode(c);
             }
         }
+    }
+
+    fn type_unicode(&mut self, c: char) {
+        let hex = format!("{:x}", c as u32);
+
+        // Ctrl+Shift+U triggers IBus Unicode input mode
+        self.key_event(KEY_LEFTCTRL, 1);
+        self.key_event(KEY_LEFTSHIFT, 1);
+        self.key_event(KEY_U, 1);
+        self.syn();
+        self.key_event(KEY_U, 0);
+        self.key_event(KEY_LEFTSHIFT, 0);
+        self.key_event(KEY_LEFTCTRL, 0);
+        self.syn();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        for b in hex.bytes() {
+            let key = match b {
+                b'0' => KEY_0, b'1' => KEY_1, b'2' => KEY_2, b'3' => KEY_3,
+                b'4' => KEY_4, b'5' => KEY_5, b'6' => KEY_6, b'7' => KEY_7,
+                b'8' => KEY_8, b'9' => KEY_9, b'a' => KEY_A, b'b' => KEY_B_KEY,
+                b'c' => KEY_C, b'd' => KEY_D, b'e' => KEY_E, b'f' => KEY_F,
+                _ => continue,
+            };
+            self.key_event(key, 1);
+            self.syn();
+            self.key_event(key, 0);
+            self.syn();
+        }
+
+        self.key_event(KEY_ENTER, 1);
+        self.syn();
+        self.key_event(KEY_ENTER, 0);
+        self.syn();
     }
 
     pub fn press_special(&mut self, code: u8) {
@@ -548,6 +592,41 @@ impl VirtualKeyboard {
             self.key_event(keycode, 0);
             self.syn();
         }
+    }
+
+    pub fn type_with_modifiers(&mut self, mods: u8, text: &str) {
+        self.press_mod_keys(mods, 1);
+        self.syn();
+        for c in text.chars() {
+            if let Some((keycode, shift)) = char_to_key(c) {
+                if shift { self.key_event(KEY_LEFTSHIFT, 1); }
+                self.key_event(keycode, 1);
+                self.syn();
+                self.key_event(keycode, 0);
+                if shift { self.key_event(KEY_LEFTSHIFT, 0); }
+                self.syn();
+            }
+        }
+        self.press_mod_keys(mods, 0);
+        self.syn();
+    }
+
+    pub fn press_special_with_modifiers(&mut self, mods: u8, code: u8) {
+        if let Some(keycode) = special_to_keycode(code) {
+            self.press_mod_keys(mods, 1);
+            self.syn();
+            self.key_event(keycode, 1);
+            self.syn();
+            self.key_event(keycode, 0);
+            self.press_mod_keys(mods, 0);
+            self.syn();
+        }
+    }
+
+    fn press_mod_keys(&mut self, mods: u8, value: i32) {
+        if mods & 0x01 != 0 { self.key_event(KEY_LEFTCTRL, value); }
+        if mods & 0x02 != 0 { self.key_event(KEY_LEFTALT, value); }
+        if mods & 0x04 != 0 { self.key_event(KEY_LEFTMETA, value); }
     }
 
     fn key_event(&mut self, code: u16, value: i32) {
@@ -594,20 +673,7 @@ impl Drop for VirtualKeyboard {
 
 pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
-pub const KEY_TYPE_OSK_TOGGLE: u8 = 0x03;
-
-/// Handles a key packet, dispatching OSK toggle separately since it doesn't need a keyboard.
-/// Returns true if the packet was fully handled (no keyboard needed).
-pub fn handle_key_packet_no_kb(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    if data[0] == KEY_TYPE_OSK_TOGGLE {
-        toggle_gnome_osk();
-        return true;
-    }
-    false
-}
+pub const KEY_TYPE_COMBO: u8 = 0x04;
 
 /// Parse and handle a key packet from the iPad.
 /// Format: type(1) + payload(variable)
@@ -629,65 +695,27 @@ pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
                 kb.press_special(payload[0]);
             }
         }
-        KEY_TYPE_OSK_TOGGLE => {
-            toggle_gnome_osk();
+        KEY_TYPE_COMBO => {
+            if payload.len() >= 2 {
+                let mods = payload[0];
+                let inner_type = payload[1];
+                let inner_payload = &payload[2..];
+                match inner_type {
+                    KEY_TYPE_TEXT => {
+                        if let Ok(text) = std::str::from_utf8(inner_payload) {
+                            kb.type_with_modifiers(mods, text);
+                        }
+                    }
+                    KEY_TYPE_SPECIAL => {
+                        if !inner_payload.is_empty() {
+                            kb.press_special_with_modifiers(mods, inner_payload[0]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         _ => {}
-    }
-}
-
-/// Toggles the Screx OSK GNOME Shell extension via dconf.
-fn toggle_gnome_osk() {
-    println!("[osk] toggle requested");
-
-    let dconf_key = "/org/gnome/shell/extensions/screxosk/indicator/keyboard-visible";
-
-    let current = run_dconf(&["read", dconf_key]);
-    let is_visible = current.trim() == "true";
-    let new_val = if is_visible { "false" } else { "true" };
-
-    println!("[osk] current={:?} -> setting to {new_val}", current.trim());
-
-    let result = run_dconf(&["write", dconf_key, new_val]);
-    if result.is_empty() {
-        println!("[osk] Screx OSK: {new_val}");
-    } else {
-        eprintln!("[osk] dconf failed: {result}");
-    }
-}
-
-fn run_dconf(args: &[&str]) -> String {
-    let (sudo_user, sudo_uid) = (
-        std::env::var("SUDO_USER").ok(),
-        std::env::var("SUDO_UID").ok(),
-    );
-
-    let output = if let (Some(ref u), Some(ref id)) = (sudo_user, sudo_uid) {
-        let rt = format!("/run/user/{id}");
-        let dbus = format!("unix:path={rt}/bus");
-        Command::new("runuser")
-            .args(["-u", u, "--"])
-            .arg("env")
-            .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus}"))
-            .arg(format!("XDG_RUNTIME_DIR={rt}"))
-            .arg("dconf")
-            .args(args)
-            .output()
-    } else {
-        Command::new("dconf").args(args).output()
-    };
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            eprintln!("[osk] dconf {:?} failed: stderr={stderr} stdout={stdout}", args);
-            format!("ERROR: {stderr}")
-        }
-        Err(e) => {
-            eprintln!("[osk] could not run dconf: {e}");
-            format!("ERROR: {e}")
-        }
     }
 }
 

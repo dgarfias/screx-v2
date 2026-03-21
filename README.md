@@ -1,4 +1,4 @@
-# Screx v2
+öod# Screx v2
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
@@ -53,7 +53,7 @@ screx-v2/
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
 │       ├── discovery.rs           # UDP broadcast beacon
 │       ├── audio.rs               # PulseAudio virtual sink + parec capture
-│       ├── uinput.rs              # Virtual touchscreen/keyboard, OSK toggle
+│       ├── uinput.rs              # Virtual touchscreen/keyboard
 │       └── doctor.rs              # Host readiness checks
 ├── app/                           # Swift iPad app
 │   └── Screx/
@@ -65,8 +65,6 @@ screx-v2/
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
 │       ├── DisplayView.swift      # UIViewRepresentable for AVSampleBufferDisplayLayer
 │       └── FEC.swift              # Reed-Solomon decoder for WiFi FEC recovery
-└── gnome-extension/               # Screx OSK — GNOME Shell on-screen keyboard
-    └── screx-osk@screx/           # (fork of GJS OSK, GPL-3.0)
 ```
 
 ## Linux Dependencies
@@ -99,29 +97,6 @@ The [EVDI](https://github.com/DisplayLink/evdi) kernel module must be installed 
 yay -S evdi-git
 sudo modprobe evdi
 ```
-
-### On-Screen Keyboard (Screx OSK)
-
-The repo includes a forked GNOME Shell extension (based on [GJS OSK](https://github.com/Vishram1123/gjs-osk)) that provides a tablet-optimized on-screen keyboard displayed on the Screx virtual display. It supports modifier keys (Ctrl, Alt, Super), long-press for accented characters, and auto-shows when text fields are focused.
-
-```bash
-# Copy the extension
-cp -r gnome-extension/screx-osk@screx ~/.local/share/gnome-shell/extensions/
-
-# Compile the GSettings schema
-glib-compile-schemas ~/.local/share/gnome-shell/extensions/screx-osk@screx/schemas/
-
-# Enable the extension (log out and back in, or restart GNOME Shell)
-gnome-extensions enable screx-osk@screx
-```
-
-If you have the original GJS OSK extension installed, disable it to avoid conflicts:
-
-```bash
-gnome-extensions disable gjsosk@vishram1123.com
-```
-
-The keyboard is toggled from the iPad app via the keyboard button in the floating toolbar, or automatically when a text field receives focus.
 
 ### USB Transport (optional)
 
