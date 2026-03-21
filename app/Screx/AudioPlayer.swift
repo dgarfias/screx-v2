@@ -83,6 +83,13 @@ final class AudioPlayer {
     }
 
     func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
+        // After a video gap, flush stale audio so we resync cleanly
+        if avSync.consumeGapResume() {
+            lock.lock()
+            ringBuffer.removeAll()
+            lock.unlock()
+        }
+
         lock.lock()
         ringBuffer.append(data)
 
