@@ -25,11 +25,11 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ## Architecture
 
 ```
-┌──────────────────── Linux Daemon ────────────────────┐
+┌──────────────────── Linux Daemon ─────────────────────┐
 │                                                       │
-│  EVDI ──► VA-API H.264 ──► Transport Router ──┬──► UDP (WiFi)
-│                                                │
-│  parec (audio) ──────────────► Transport Router ┴──► TCP (USB)
+│  EVDI ──► VA-API H.264 ──► Transport Router         ──┬──► UDP (WiFi)
+│                                                       │
+│  parec (audio) ──────────────► Transport Router       ┴──► TCP (USB)
 │                                                       │
 │  Virtual touchscreen (uinput)  ◄── touch events       │
 │  Virtual keyboard (uinput)     ◄── key events         │
@@ -40,16 +40,16 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 └───────────────────────────────────────────────────────┘
           │ WiFi (UDP :9000)        │ USB (iproxy :9001 → :9000)
           ▼                         ▼
-┌──────────────────── iPad App ────────────────────────┐
+┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  StreamClient (UDP) ────┬──► H264Decoder ──► Display  │
-│                          │                             │
+│                          │                            │
 │  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
 │                                                       │
-│  Touch ──────────────────────────────────► daemon      │
-│  Keyboard + modifier bar ────────────────► daemon      │
-│  Microphone (Opus) ──────────────────────► daemon      │
-│  Camera (JPEG) ──────────────────────────► daemon      │
+│  Touch ──────────────────────────────────► daemon     │
+│  Keyboard + modifier bar ────────────────► daemon     │
+│  Microphone (Opus) ──────────────────────► daemon     │
+│  Camera (JPEG) ──────────────────────────► daemon     │
 │                                                       │
 │  Beacon listener (port 9999) → auto-connect           │
 └───────────────────────────────────────────────────────┘
