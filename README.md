@@ -43,7 +43,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  StreamClient (UDP) ────┬──► H264Decoder ──► Display  │
-│                          │                            │
+│                         │                            │
 │  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
 │                                                       │
 │  Touch ──────────────────────────────────► daemon     │
@@ -95,35 +95,63 @@ screx-v2/
 ### Arch Linux
 
 ```bash
+# Build dependencies
 sudo pacman -S --needed \
+  rust pkg-config clang \
   ffmpeg libva mesa \
+  linux-headers
+
+# Runtime dependencies
+sudo pacman -S --needed \
   pulseaudio-utils \
-  libimobiledevice
+  pipewire-pulse \
+  libimobiledevice \
+  v4l2loopback-dkms \
+  udev
+
+# EVDI (virtual display — from AUR)
+yay -S evdi-git
 ```
 
 ### Debian / Ubuntu
 
 ```bash
+# Build dependencies
 sudo apt-get install -y \
-  libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev \
-  libva-dev mesa-va-drivers \
+  cargo pkg-config clang \
+  libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev \
+  libva-dev mesa-va-drivers va-driver-all \
+  linux-headers-$(uname -r)
+
+# Runtime dependencies
+sudo apt-get install -y \
   pulseaudio-utils \
-  libimobiledevice-utils
+  pipewire-pulse \
+  libimobiledevice-utils \
+  v4l2loopback-dkms v4l2loopback-utils \
+  evdi-dkms libevdi0 \
+  udev
 ```
 
-### EVDI
+### Kernel Modules
 
-The [EVDI](https://github.com/DisplayLink/evdi) kernel module must be installed for virtual display support:
+Three kernel modules are required:
 
-```bash
-# Install from AUR (Arch) or build from source
-yay -S evdi-git
-sudo modprobe evdi
-```
+| Module | Package (Arch) | Package (Debian/Ubuntu) | Purpose |
+|---|---|---|---|
+| **evdi** | `evdi-git` (AUR) | `evdi-dkms` | Virtual display (appears as real monitor in GNOME) |
+| **v4l2loopback** | `v4l2loopback-dkms` | `v4l2loopback-dkms` | Virtual webcam for iPad camera forwarding |
+| **uinput** | built-in | built-in | Virtual touchscreen and keyboard |
+
+All three are loaded automatically by the daemon when needed. If `uinput` isn't loaded on your system, run `sudo modprobe uinput`.
 
 ### USB Transport (optional)
 
-For USB streaming, `idevice_id` and `iproxy` must be available (provided by `libimobiledevice-utils`). The daemon auto-detects USB devices and manages iproxy automatically.
+For USB streaming, `idevice_id` and `iproxy` must be available (provided by `libimobiledevice` / `libimobiledevice-utils`). The daemon auto-detects USB devices and manages iproxy automatically.
+
+### PipeWire / PulseAudio
+
+The daemon uses `pactl`, `parec`, and `pacat` (from `pulseaudio-utils`) to create virtual audio sinks and sources. These work on both PulseAudio and PipeWire (via the PulseAudio compatibility layer). On PipeWire setups, `pw-link` is also used for microphone routing and is included with PipeWire.
 
 ## Build
 
