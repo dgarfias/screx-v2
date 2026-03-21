@@ -2,14 +2,14 @@
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
-The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 or H.265/HEVC (VA-API, NVENC, or software), and streams video + audio to the iPad app over WiFi (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
+The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 or H.265/HEVC (VA-API, NVENC, or software), and streams video + audio to the iPad app over the network (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
 
 ## Features
 
 - **Virtual second display** via EVDI kernel module — appears as a real monitor in GNOME
 - **H.264 and H.265/HEVC encoding** with multiple backends: VA-API (Intel/AMD), NVENC (NVIDIA), or software (libx264/libx265)
 - **Dual transport backends**:
-  - **WiFi**: UDP with Reed-Solomon FEC, chunked and paced for reliability
+  - **Network**: UDP with Reed-Solomon FEC, chunked and paced for reliability
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
   - Automatic detection and failover (USB preferred when connected)
 - **Audio streaming**: Virtual PulseAudio/PipeWire sink ("Screx iPad") captured via `parec`, streamed alongside video
@@ -27,7 +27,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ```
 ┌──────────────────── Linux Daemon ─────────────────────┐
 │                                                       │
-│  EVDI ──► H.264/H.265 encode ──► Transport Router   ──┬──► UDP (WiFi)
+│  EVDI ──► H.264/H.265 encode ──► Transport Router   ──┬──► UDP (Network)
 │                                                       │
 │  parec (audio) ──────────────► Transport Router       ┴──► TCP (USB)
 │                                                       │
@@ -38,7 +38,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 │                                                       │
 │  Beacon broadcaster (port 9999)                       │
 └───────────────────────────────────────────────────────┘
-          │ WiFi (UDP :9000)        │ USB (iproxy :9001 → :9000)
+          │ Network (UDP :9000)     │ USB (iproxy :9001 → :9000)
           ▼                         ▼
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
@@ -79,13 +79,13 @@ screx-v2/
 │   └── Screx/
 │       ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView, floating toolbar
 │       ├── Discovery.swift        # UDP beacon listener for auto-discovery
-│       ├── StreamClient.swift     # WiFi UDP client, FEC reassembly, keepalive
+│       ├── StreamClient.swift     # Network UDP client, FEC reassembly, keepalive
 │       ├── USBListener.swift      # USB TCP listener, framed message parsing
 │       ├── Decoder.swift          # H.264/H.265 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
 │       ├── AVSyncState.swift      # Audio/video synchronization state
 │       ├── DisplayView.swift      # Video display, touch forwarding, keyboard input + modifier bar
-│       ├── FEC.swift              # Reed-Solomon decoder for WiFi FEC recovery
+│       ├── FEC.swift              # Reed-Solomon decoder for network FEC recovery
 │       ├── MicCapture.swift       # iPad microphone capture → Opus encoding
 │       └── CameraCapture.swift    # iPad camera capture → JPEG frames
 ```
@@ -235,7 +235,7 @@ Keyboard events are sent as `"KEY" + type(1) + payload`:
 
 Modifier mask bits: `0x01` = Ctrl, `0x02` = Alt, `0x04` = Super.
 
-### WiFi Transport (UDP)
+### Network Transport (UDP)
 
 Each UDP packet has an 18-byte header:
 
@@ -279,9 +279,9 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 
 1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
 2. **Beacon broadcasts** → iPad discovers daemon automatically
-3. **iPad connects** (WiFi UDP or USB TCP, whichever is available)
+3. **iPad connects** (network UDP or USB TCP, whichever is available)
 4. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → transport sends to iPad
 5. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM sent alongside video
 6. **Input loop**: iPad sends touch, keyboard, mic, and camera data back to daemon → injected via uinput, PipeWire, and v4l2loopback
 7. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
-8. **Disconnect detection**: data timeouts (WiFi) and TCP close (USB) trigger automatic reconnection
+8. **Disconnect detection**: data timeouts (network) and TCP close (USB) trigger automatic reconnection

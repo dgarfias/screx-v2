@@ -181,6 +181,12 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
         }
         shared.usb_active.store(true, Ordering::SeqCst);
         shared.force_idr.store(true, Ordering::Relaxed);
+        shared.capture_start.store(true, Ordering::Release);
+        if !shared.has_active_client.swap(true, Ordering::SeqCst) {
+            if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
+                cb();
+            }
+        }
         println!("[usb] transport ACTIVE — video/audio will prefer USB");
 
         // Read control messages from iPad until disconnect
@@ -192,7 +198,16 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
             let mut usb = shared.usb_sender.lock().unwrap();
             *usb = None;
         }
-        println!("[usb] transport deactivated, falling back to WiFi");
+        println!("[usb] transport deactivated, falling back to network");
+
+        // If no network client either, fire disconnect lifecycle
+        if shared.client_addr.lock().unwrap().is_none()
+            && shared.has_active_client.swap(false, Ordering::SeqCst)
+        {
+            if let Some(ref cb) = *shared.on_client_disconnected.lock().unwrap() {
+                cb();
+            }
+        }
 
         stop_iproxy(&mut iproxy_child);
 

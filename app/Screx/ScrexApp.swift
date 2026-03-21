@@ -39,6 +39,9 @@ final class StreamViewModel: ObservableObject {
     @Published var isConnected = false
     @Published var manualIP: String = ""
     @Published var transport: String = ""
+    @Published var showPinEntry = false
+    @Published var pinInput: String = ""
+    @Published var pairingStatus: String = ""
 
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
@@ -49,6 +52,9 @@ final class StreamViewModel: ObservableObject {
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
     private var usbListener: USBListener?
+    private var pairingService: PairingService?
+    private var pendingPinCompletion: ((String) -> Void)?
+    private var sessionKey: CryptoKit.SymmetricKey?
 
     nonisolated init() {
         self.audioPlayer = AudioPlayer(avSync: avSync)
@@ -57,9 +63,8 @@ final class StreamViewModel: ObservableObject {
     private var usbConnected = false
     private var camFrameId: UInt32 = 0
 
-    /// Remembered endpoint so we can reconnect WiFi without waiting for a new beacon
-    private var lastWifiEndpoint: NWEndpoint?
-    private var lastWifiName: String?
+    private var lastNetEndpoint: NWEndpoint?
+    private var lastNetName: String?
     private var micSeq: UInt32 = 0
 
     func startDiscovery() {
@@ -93,12 +98,12 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.usbConnected = false
                 self.stream?.suppressTimeout = false
-                self.fallbackToWifi()
+                self.fallbackToNetwork()
             }
         }
         usb.start()
 
-        // Start WiFi discovery (beacon listener)
+        // Start network discovery (beacon listener)
         discovery.onStatusUpdate = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
@@ -114,8 +119,8 @@ final class StreamViewModel: ObservableObject {
                     host: NWEndpoint.Host(ep.host),
                     port: NWEndpoint.Port(integerLiteral: ep.port)
                 )
-                self.lastWifiEndpoint = endpoint
-                self.lastWifiName = ep.name
+                self.lastNetEndpoint = endpoint
+                self.lastNetName = ep.name
 
                 if !self.isConnected {
                     self.connectToEndpoint(endpoint, name: ep.name)
@@ -125,8 +130,8 @@ final class StreamViewModel: ObservableObject {
         discovery.onDaemonLost = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                self.lastWifiEndpoint = nil
-                self.lastWifiName = nil
+                self.lastNetEndpoint = nil
+                self.lastNetName = nil
                 // Don't tear down an active stream just because beacons stopped --
                 // the stream has its own data timeout for true disconnections.
                 // This allows manual IP connections (no beacons) to stay alive.
@@ -141,8 +146,8 @@ final class StreamViewModel: ObservableObject {
         let host = NWEndpoint.Host(ip)
         let port = NWEndpoint.Port(integerLiteral: 9000)
         let endpoint = NWEndpoint.hostPort(host: host, port: port)
-        lastWifiEndpoint = endpoint
-        lastWifiName = ip
+        lastNetEndpoint = endpoint
+        lastNetName = ip
         connectToEndpoint(endpoint, name: ip)
     }
 
@@ -151,15 +156,95 @@ final class StreamViewModel: ObservableObject {
         stream?.onStatus = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
+        pairingService?.cancel()
 
+        if !usbConnected {
+            status = "Pairing with \(name)..."
+        }
+
+        // Extract host string from endpoint
+        let host: String
+        switch endpoint {
+        case .hostPort(let h, _):
+            host = "\(h)"
+        default:
+            host = name
+        }
+
+        let port: UInt16
+        switch endpoint {
+        case .hostPort(_, let p):
+            port = p.rawValue
+        default:
+            port = 9000
+        }
+
+        // Step 1: TCP handshake for pairing/session key exchange
+        let ps = PairingService()
+        self.pairingService = ps
+
+        ps.onResult = { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .sessionEstablished(let key):
+                self.sessionKey = key
+                self.pairingService = nil
+                self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key)
+
+            case .pinRequired(let completion):
+                self.pendingPinCompletion = completion
+                self.pinInput = ""
+                self.showPinEntry = true
+                self.pairingStatus = "Enter the PIN shown on the daemon"
+
+            case .rejected(let reason):
+                self.status = "Pairing rejected: \(reason)"
+                self.pairingService = nil
+
+            case .error(let msg):
+                self.status = "Pairing error: \(msg)"
+                self.pairingService = nil
+                // Retry after a delay
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self, !self.isConnected else { return }
+                    self.connectToEndpoint(endpoint, name: name)
+                }
+            }
+        }
+
+        ps.pair(host: host, port: port)
+    }
+
+    func submitPin() {
+        guard let completion = pendingPinCompletion else { return }
+        let pin = pinInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pin.count == 6, pin.allSatisfy({ $0.isNumber }) else {
+            pairingStatus = "PIN must be exactly 6 digits"
+            return
+        }
+        showPinEntry = false
+        status = "Verifying PIN..."
+        completion(pin)
+        pendingPinCompletion = nil
+    }
+
+    func cancelPin() {
+        showPinEntry = false
+        pendingPinCompletion = nil
+        pairingService?.cancel()
+        pairingService = nil
+        status = "Pairing cancelled"
+    }
+
+    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: CryptoKit.SymmetricKey) {
         if !usbConnected {
             status = "Connecting to \(name)..."
         }
 
-        // Reset so "Streaming" status fires again for this connection
         decoder.hasReportedFirstFrame = false
 
         let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
+        client.sessionKey = sessionKey
         self.stream = client
 
         client.onStatus = { [weak self, weak client] msg in
@@ -171,7 +256,7 @@ final class StreamViewModel: ObservableObject {
                     let nowConnected = msg.contains("Streaming")
                     if nowConnected && !self.isConnected {
                         self.isConnected = true
-                        self.transport = "WiFi"
+                        self.transport = "Network"
                         self.audioPlayer.start()
                     }
                 }
@@ -190,12 +275,11 @@ final class StreamViewModel: ObservableObject {
         client.connect()
     }
 
-    /// Called when USB disconnects — try to resume WiFi immediately
-    private func fallbackToWifi() {
-        if let endpoint = lastWifiEndpoint, let name = lastWifiName {
-            status = "USB disconnected, switching to WiFi..."
-            transport = "WiFi"
-            // Reconnect WiFi using the remembered endpoint
+    /// Called when USB disconnects — try to resume network connection immediately
+    private func fallbackToNetwork() {
+        if let endpoint = lastNetEndpoint, let name = lastNetName {
+            status = "USB disconnected, switching to network..."
+            transport = "Network"
             stream?.disconnect()
             connectToEndpoint(endpoint, name: name)
         } else {
@@ -219,7 +303,7 @@ final class StreamViewModel: ObservableObject {
         micCapture.stop()
 
         // Try to reconnect immediately using the last known endpoint
-        if let endpoint = lastWifiEndpoint, let name = lastWifiName {
+        if let endpoint = lastNetEndpoint, let name = lastNetName {
             status = "Reconnecting to \(name)..."
             connectToEndpoint(endpoint, name: name)
         } else {
@@ -239,8 +323,8 @@ final class StreamViewModel: ObservableObject {
         status = "Disconnected"
         audioPlayer.stop()
         micCapture.stop()
-        lastWifiEndpoint = nil
-        lastWifiName = nil
+        lastNetEndpoint = nil
+        lastNetName = nil
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
@@ -464,6 +548,35 @@ struct ContentView: View {
                 }
                 preKeyboardY = nil
             }
+        }
+        .sheet(isPresented: $model.showPinEntry) {
+            VStack(spacing: 20) {
+                Text("Pairing Required")
+                    .font(.title2.bold())
+
+                Text(model.pairingStatus)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                TextField("000000", text: $model.pinInput)
+                    .font(.system(size: 32, weight: .bold, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .keyboardType(.numberPad)
+                    .frame(maxWidth: 200)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack(spacing: 16) {
+                    Button("Cancel") { model.cancelPin() }
+                        .buttonStyle(.bordered)
+
+                    Button("Pair") { model.submitPin() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.pinInput.count != 6)
+                }
+            }
+            .padding(32)
+            .interactiveDismissDisabled()
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)

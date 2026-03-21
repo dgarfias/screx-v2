@@ -177,71 +177,105 @@ pub fn run_audio_capture(
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let monitor_source = format!("{SINK_NAME}.monitor");
-
-    let mut parec = Command::new("parec");
-    for (k, v) in pulse_env() {
-        parec.env(&k, &v);
-    }
-    let mut child = parec
-        .args([
-            &format!("--device={monitor_source}"),
-            "--format=s16le",
-            &format!("--rate={SAMPLE_RATE}"),
-            &format!("--channels={CHANNELS}"),
-            "--latency-msec=10",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to start parec — is pulseaudio-utils installed?")?;
-
-    println!("[audio] capturing from {monitor_source} via parec (pid {})", child.id());
-
-    let mut stdout = child.stdout.take().context("no stdout from parec")?;
     let mut sender = AudioSender::new(socket);
     let mut buf = vec![0u8; BYTES_PER_CHUNK];
-
     let start_time = shared.start_time;
 
     while !stop.load(Ordering::Relaxed) {
-        match stdout.read_exact(&mut buf) {
-            Ok(()) => {
-                let ts = start_time.elapsed().as_millis() as u32;
+        // Wait for a client to be active (sink will exist)
+        if !shared.has_active_client.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
 
-                // Prefer USB if active
-                if shared.usb_active.load(Ordering::Relaxed) {
-                    let mut usb = shared.usb_sender.lock().unwrap();
-                    if let Some(ref mut tcp) = *usb {
-                        if let Err(e) = tcp.send_audio(&buf, ts) {
-                            eprintln!("[audio] USB send error: {e}");
-                            drop(usb);
-                            shared.usb_active.store(false, Ordering::SeqCst);
-                        }
-                        continue;
-                    }
-                }
-                // Fall back to WiFi UDP
-                let client_addr = *shared.client_addr.lock().unwrap();
-                if let Some(addr) = client_addr {
-                    if let Err(e) = sender.send_audio(&buf, addr, ts) {
-                        eprintln!("[audio] send error: {e}");
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                eprintln!("[audio] parec stream ended");
-                break;
-            }
+        let mut parec = Command::new("parec");
+        for (k, v) in pulse_env() {
+            parec.env(&k, &v);
+        }
+        let child = parec
+            .args([
+                &format!("--device={monitor_source}"),
+                "--format=s16le",
+                &format!("--rate={SAMPLE_RATE}"),
+                &format!("--channels={CHANNELS}"),
+                "--latency-msec=10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("[audio] read error: {e}");
+                eprintln!("[audio] failed to start parec: {e}");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        // Set up encryption cipher if session key is available
+        if let Some(key) = *shared.session_key.lock().unwrap() {
+            sender.set_cipher(crate::crypto::SessionCipher::new(&key));
+        }
+
+        println!(
+            "[audio] capturing from {monitor_source} via parec (pid {})",
+            child.id()
+        );
+
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                eprintln!("[audio] no stdout from parec");
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+        };
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            match stdout.read_exact(&mut buf) {
+                Ok(()) => {
+                    let ts = start_time.elapsed().as_millis() as u32;
+
+                    if shared.usb_active.load(Ordering::Relaxed) {
+                        let mut usb = shared.usb_sender.lock().unwrap();
+                        if let Some(ref mut tcp) = *usb {
+                            if let Err(e) = tcp.send_audio(&buf, ts) {
+                                eprintln!("[audio] USB send error: {e}");
+                                drop(usb);
+                                shared.usb_active.store(false, Ordering::SeqCst);
+                            }
+                            continue;
+                        }
+                    }
+                    let client_addr = *shared.client_addr.lock().unwrap();
+                    if let Some(addr) = client_addr {
+                        if let Err(e) = sender.send_audio(&buf, addr, ts) {
+                            eprintln!("[audio] send error: {e}");
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    println!("[audio] parec stream ended (sink removed?)");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[audio] read error: {e}");
+                    break;
+                }
             }
         }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("[audio] capture session stopped, waiting for next client...");
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    println!("[audio] capture stopped");
+    println!("[audio] capture thread exiting");
     Ok(())
 }
 

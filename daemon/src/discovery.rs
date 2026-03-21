@@ -12,7 +12,13 @@ const BEACON_MAGIC: &[u8] = b"SCREX_BEACON";
 /// Spawns a thread that broadcasts a UDP beacon every 2 seconds.
 /// The beacon packet is: "SCREX_BEACON" (12 bytes) + stream_port (u16 BE).
 /// iPad listens on port 9999 and extracts the daemon's IP from the source address.
-pub fn start_beacon(stream_port: u16, stop: Arc<AtomicBool>) -> Result<std::thread::JoinHandle<()>> {
+///
+/// When `pause` is true, beacon broadcasting is suppressed (e.g. during an active session).
+pub fn start_beacon(
+    stream_port: u16,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
     let sock = UdpSocket::bind("0.0.0.0:0").context("failed to bind beacon socket")?;
     sock.set_broadcast(true).context("failed to set SO_BROADCAST")?;
 
@@ -27,8 +33,10 @@ pub fn start_beacon(stream_port: u16, stop: Arc<AtomicBool>) -> Result<std::thre
             println!("[beacon] broadcasting on port {BEACON_PORT} every {BEACON_INTERVAL:?} (stream_port={stream_port})");
 
             while !stop.load(Ordering::Relaxed) {
-                if let Err(e) = sock.send_to(&packet, &dest) {
-                    eprintln!("[beacon] send error: {e}");
+                if !pause.load(Ordering::Relaxed) {
+                    if let Err(e) = sock.send_to(&packet, &dest) {
+                        eprintln!("[beacon] send error: {e}");
+                    }
                 }
                 std::thread::sleep(BEACON_INTERVAL);
             }

@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CryptoKit
 import QuartzCore
 
 final class StreamClient {
@@ -12,8 +13,9 @@ final class StreamClient {
 
     var onStatus: ((String) -> Void)?
     var onDisconnect: (() -> Void)?
+    var sessionKey: SymmetricKey?
 
-    /// When true, suppresses the data timeout (e.g. USB is active and no WiFi data is expected)
+    /// When true, suppresses the data timeout (e.g. USB is active and no network data is expected)
     var suppressTimeout = false
 
     private static let headerLen = 18
@@ -34,6 +36,7 @@ final class StreamClient {
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
+    private var sendSeq: UInt32 = 0
 
     init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
@@ -81,10 +84,38 @@ final class StreamClient {
     }
 
     private func sendRegister(_ conn: NWConnection) {
-        conn.send(content: Self.registerMagic, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] register send error: \(error)")
-            }
+        encryptAndSend(Self.registerMagic, conn: conn, label: "register")
+    }
+
+    /// Encrypt plaintext with session key, prepend 4-byte seq_num, send over UDP.
+    private func encryptAndSend(_ plaintext: Data, conn: NWConnection, label: String) {
+        guard let key = sessionKey else {
+            // Fallback: send unencrypted (shouldn't happen in normal flow)
+            conn.send(content: plaintext, completion: .contentProcessed { error in
+                if let error { print("[stream] \(label) send error: \(error)") }
+            })
+            return
+        }
+
+        let seq = sendSeq
+        sendSeq = sendSeq &+ 1
+
+        let nonce = ScrexCrypto.nonceClient(seqNum: seq)
+        var seqData = Data(count: 4)
+        seqData.withUnsafeMutableBytes { buf in
+            buf.storeBytes(of: seq.bigEndian, as: UInt32.self)
+        }
+
+        guard let encrypted = ScrexCrypto.encrypt(key: key, nonce: nonce, plaintext: plaintext, aad: seqData) else {
+            print("[stream] \(label) encrypt failed")
+            return
+        }
+
+        var packet = seqData
+        packet.append(encrypted)
+
+        conn.send(content: packet, completion: .contentProcessed { error in
+            if let error { print("[stream] \(label) send error: \(error)") }
         })
     }
 
@@ -154,6 +185,8 @@ final class StreamClient {
     }
 
     private func handlePacket(_ data: Data) {
+        guard data.count >= Self.headerLen else { return }
+
         let frameId = data.withUnsafeBytes { buf -> UInt32 in
             buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian
         }
@@ -176,6 +209,12 @@ final class StreamClient {
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
+        // Heartbeat check (frame_id 0xFFFFFFFF, totalData=0)
+        if frameId == 0xFFFF_FFFF && totalData == 0 {
+            // Encrypted heartbeat — just the fact that we received and auth-checked is enough
+            return
+        }
+
         if !isAudio {
             let wantCodec: VideoCodecType = codecId == 0x01 ? .h265 : .h264
             if wantCodec != decoder.codec {
@@ -183,7 +222,20 @@ final class StreamClient {
             }
         }
 
-        let payload = data.subdata(in: Self.headerLen..<data.count)
+        // Decrypt payload if session key is set
+        let payload: Data
+        let encryptedPayload = data.subdata(in: Self.headerLen..<data.count)
+
+        if let key = sessionKey {
+            let nonce = ScrexCrypto.nonceServer(frameId: frameId, chunkIdx: chunkIdx, flags: flags)
+            let header = data.prefix(Self.headerLen)
+            guard let decrypted = ScrexCrypto.decrypt(key: key, nonce: nonce, ciphertextAndTag: encryptedPayload, aad: header) else {
+                return // auth failed, drop packet
+            }
+            payload = decrypted
+        } else {
+            payload = encryptedPayload
+        }
 
         if isAudio {
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
@@ -294,27 +346,17 @@ final class StreamClient {
         let now = CACurrentMediaTime()
         guard now - lastPliTime >= Self.pliMinInterval else { return }
         lastPliTime = now
-        connection?.send(content: Self.pliMagic, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] PLI send error: \(error)")
-            }
-        })
+        guard let conn = connection else { return }
+        encryptAndSend(Self.pliMagic, conn: conn, label: "PLI")
     }
 
-    /// Sends touch contacts over UDP. Packet: "TOUCH" + raw contact data.
     func sendTouch(_ contactData: Data) {
         guard let conn = connection else { return }
         var packet = Data("TOUCH".utf8)
         packet.append(contactData)
-        conn.send(content: packet, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] touch send error: \(error)")
-            }
-        })
+        encryptAndSend(packet, conn: conn, label: "touch")
     }
 
-    /// Sends a camera JPEG frame over UDP, chunked.
-    /// Header per chunk: "CAM" + frame_id(4 BE) + chunk_idx(2 BE) + total(2 BE) + jpeg_data
     func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
         guard let conn = connection else { return }
         let chunkSize = 1300
@@ -331,34 +373,20 @@ final class StreamClient {
             withUnsafeBytes(of: UInt16(totalChunks).bigEndian) { packet.append(contentsOf: $0) }
             packet.append(chunk)
 
-            conn.send(content: packet, completion: .contentProcessed { error in
-                if let error {
-                    print("[stream] cam send error: \(error)")
-                }
-            })
+            encryptAndSend(packet, conn: conn, label: "cam")
         }
     }
 
-    /// Sends a keyboard event over UDP. Packet: "KEY" + type(1) + payload.
     func sendKey(_ keyData: Data) {
         guard let conn = connection else { return }
         var packet = Data("KEY".utf8)
         packet.append(keyData)
-        conn.send(content: packet, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] key send error: \(error)")
-            }
-        })
+        encryptAndSend(packet, conn: conn, label: "key")
     }
 
-    /// Sends a mic Opus packet over UDP. Packet is pre-built: "MIC" + seq(4) + opus_data.
     func sendMicPacket(_ packet: Data) {
         guard let conn = connection else { return }
-        conn.send(content: packet, completion: .contentProcessed { error in
-            if let error {
-                print("[stream] mic send error: \(error)")
-            }
-        })
+        encryptAndSend(packet, conn: conn, label: "mic")
     }
 }
 

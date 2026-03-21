@@ -367,6 +367,7 @@ mod evdi {
         config: &CaptureConfig,
         stop: &Arc<AtomicBool>,
         force_refresh: &Arc<AtomicBool>,
+        _capture_start: &Arc<AtomicBool>,
         on_frame: &mut impl FnMut(CaptureFrame<'_>),
     ) -> Result<()> {
         let dev = find_or_create_device()?;
@@ -454,8 +455,20 @@ mod evdi {
         let mut pending_request = false;
         let mut no_update_count: u64 = 0;
         let mut has_first_frame = false;
+        let mut refresh_retries: u32 = 0;
 
         while !stop.load(Ordering::Relaxed) {
+            // Pick up new force_refresh requests (keeps retrying for ~3s)
+            if force_refresh.swap(false, Ordering::Relaxed) {
+                refresh_retries = 100;
+                println!("[capture] force refresh requested, will retry for ~3s");
+            }
+
+            // While retrying, keep re-requesting updates aggressively
+            if refresh_retries > 0 {
+                pending_request = false;
+            }
+
             // Request an update if we don't have one pending
             if !pending_request {
                 let ready_now = unsafe { evdi_request_update(handle, 0) };
@@ -473,7 +486,8 @@ mod evdi {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let poll_ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms) };
+                let timeout = if refresh_retries > 0 { 30 } else { poll_timeout_ms };
+                let poll_ret = unsafe { libc::poll(&mut pollfd, 1, timeout) };
 
                 if poll_ret > 0 && (pollfd.revents & libc::POLLIN != 0) {
                     unsafe {
@@ -507,28 +521,36 @@ mod evdi {
                 frame_index += 1;
                 stats_frames += 1;
                 has_first_frame = true;
+
+                if refresh_retries > 0 {
+                    println!("[capture] force refresh: got real frame from compositor");
+                    refresh_retries = 0;
+                }
             } else {
                 no_update_count += 1;
-                // If we've been waiting a long time, re-request
                 if no_update_count > 60 {
                     pending_request = false;
                     no_update_count = 0;
                 }
 
-                // New client on a static screen — resend the last buffer once
-                if has_first_frame && force_refresh.swap(false, Ordering::Relaxed) {
-                    let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
-                    let frame = CaptureFrame {
-                        frame_index,
-                        timestamp_90k,
-                        width: config.width,
-                        height: config.height,
-                        format: PixelFormat::Bgra8888,
-                        data: &pixel_buf,
-                        captured_at: Instant::now(),
-                    };
-                    on_frame(frame);
-                    frame_index += 1;
+                if refresh_retries > 0 {
+                    refresh_retries -= 1;
+                    if refresh_retries == 0 && has_first_frame {
+                        // Retries exhausted — send the last captured buffer as fallback
+                        println!("[capture] force refresh: no new damage, sending last captured buffer");
+                        let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
+                        let frame = CaptureFrame {
+                            frame_index,
+                            timestamp_90k,
+                            width: config.width,
+                            height: config.height,
+                            format: PixelFormat::Bgra8888,
+                            data: &pixel_buf,
+                            captured_at: Instant::now(),
+                        };
+                        on_frame(frame);
+                        frame_index += 1;
+                    }
                 }
             }
 
@@ -560,7 +582,8 @@ pub fn run_capture_loop(
     config: CaptureConfig,
     stop: Arc<AtomicBool>,
     force_refresh: Arc<AtomicBool>,
+    capture_start: Arc<AtomicBool>,
     mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    evdi::run_capture(&config, &stop, &force_refresh, &mut on_frame)
+    evdi::run_capture(&config, &stop, &force_refresh, &capture_start, &mut on_frame)
 }

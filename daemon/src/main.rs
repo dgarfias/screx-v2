@@ -1,9 +1,11 @@
 mod audio;
 mod camera;
 mod capture;
+mod crypto;
 mod discovery;
 mod doctor;
 mod encode;
+mod pairing;
 mod stream_server;
 mod uinput;
 mod usb;
@@ -54,12 +56,21 @@ struct Cli {
     /// Video codec: h264, h265
     #[arg(short, long, default_value = "h264")]
     codec: String,
+
+    /// Disable beacon broadcasting (for VPS/remote use)
+    #[arg(long, default_value_t = false)]
+    no_beacon: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run host readiness checks
     Doctor,
+    /// List or remove paired devices
+    Unpair {
+        /// Device ID to unpair, or --all to remove all
+        device_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -93,12 +104,16 @@ impl AppConfig {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Some(Commands::Doctor)) {
-        return doctor::run_doctor();
+    match &cli.command {
+        Some(Commands::Doctor) => return doctor::run_doctor(),
+        Some(Commands::Unpair { device_id }) => {
+            return pairing::run_unpair(device_id.as_deref());
+        }
+        None => {}
     }
 
     let config = AppConfig::from_cli(&cli);
-    println!("screx-daemon v2 (EVDI) config: {config:?}");
+    println!("screx v2 config: {config:?}");
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(stream_server::SharedState::new());
@@ -107,7 +122,6 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
         .with_context(|| format!("failed to bind UDP port {}", config.stream_port))?;
 
-    // Enlarge kernel send buffer to absorb IDR frame bursts
     unsafe {
         let sndbuf: libc::c_int = 2 * 1024 * 1024;
         libc::setsockopt(
@@ -121,20 +135,48 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // Broadcast beacon for iPad discovery
-    let beacon_stop = Arc::clone(&stop);
-    let _beacon_thread = match discovery::start_beacon(config.stream_port, beacon_stop) {
-        Ok(handle) => {
-            println!("[main] beacon: broadcasting on port 9999");
-            Some(handle)
-        }
-        Err(err) => {
-            eprintln!("[main] beacon failed (continuing): {err:#}");
-            None
+    // Beacon for iPad discovery
+    let _beacon_thread = if cli.no_beacon {
+        println!("[main] beacon: disabled (--no-beacon)");
+        None
+    } else {
+        let beacon_stop = Arc::clone(&stop);
+        let beacon_pause = Arc::clone(&shared.beacon_pause);
+        match discovery::start_beacon(config.stream_port, beacon_stop, beacon_pause) {
+            Ok(handle) => {
+                println!("[main] beacon: broadcasting on port 9999");
+                Some(handle)
+            }
+            Err(err) => {
+                eprintln!("[main] beacon failed (continuing): {err:#}");
+                None
+            }
         }
     };
 
-    // Virtual touchscreen
+    // Pairing state + TCP handshake server
+    let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
+    let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    {
+        let ps = Arc::clone(&pairing_state);
+        let sr = Arc::clone(&session_rx);
+        let pairing_shared = Arc::clone(&shared);
+        let pairing_stop = Arc::clone(&stop);
+        let port = config.stream_port;
+        thread::Builder::new()
+            .name("pairing".into())
+            .spawn(move || {
+                if let Err(e) = pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop) {
+                    eprintln!("[pairing] server error: {e:#}");
+                }
+            })
+            .context("failed to spawn pairing thread")?;
+    }
+
+    // Virtual touchscreen + keyboard (always running — needed for input even
+    // before video starts, and uinput devices are lightweight)
     match uinput::VirtualTouchscreen::new(config.width, config.height) {
         Ok(ts) => {
             ts.map_to_output();
@@ -145,8 +187,6 @@ async fn main() -> Result<()> {
             eprintln!("[main] virtual touchscreen failed (touch disabled): {e:#}");
         }
     }
-
-    // Virtual keyboard (for iOS native keyboard forwarding)
     match uinput::VirtualKeyboard::new() {
         Ok(kb) => {
             *shared.virtual_keyboard.lock().unwrap() = Some(kb);
@@ -157,22 +197,111 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Client manager thread (handles SCREX register + PLI packets)
+    // Clean up stale audio modules from a previous crash
+    audio::cleanup_stale_modules();
+
+    // -----------------------------------------------------------------------
+    // Lifecycle callbacks — create peripherals on connect, remove on disconnect
+    // -----------------------------------------------------------------------
+
+    // State shared with the lifecycle callbacks
+    let audio_module_id = Arc::new(std::sync::Mutex::new(0u32));
+
+    {
+        let shared_c = Arc::clone(&shared);
+        let audio_id_c = Arc::clone(&audio_module_id);
+        *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
+            println!("[lifecycle] client connected — creating peripherals");
+
+            // Pause beacon so no other iPads discover us during the session
+            shared_c.beacon_pause.store(true, Ordering::Relaxed);
+
+            // Virtual camera
+            match camera::load_v4l2loopback() {
+                Ok(()) => match camera::create_cam_writer() {
+                    Ok(writer) => {
+                        *shared_c.cam_writer.lock().unwrap() = Some(writer);
+                        println!("[lifecycle] camera: virtual webcam ready");
+                    }
+                    Err(e) => eprintln!("[lifecycle] camera: {e:#}"),
+                },
+                Err(e) => eprintln!("[lifecycle] camera: v4l2loopback not available ({e:#})"),
+            }
+
+            // Virtual microphone
+            match audio::create_virtual_mic() {
+                Ok(writer) => {
+                    *shared_c.mic_writer.lock().unwrap() = Some(writer);
+                    println!("[lifecycle] mic: virtual microphone ready");
+                }
+                Err(e) => eprintln!("[lifecycle] mic: {e:#}"),
+            }
+
+            // Virtual audio sink + capture
+            match audio::create_virtual_sink() {
+                Ok(id) => {
+                    *audio_id_c.lock().unwrap() = id;
+                    println!("[lifecycle] audio: virtual sink ready (module {id})");
+                }
+                Err(e) => eprintln!("[lifecycle] audio: {e:#}"),
+            }
+        }));
+    }
+
+    {
+        let shared_d = Arc::clone(&shared);
+        let audio_id_d = Arc::clone(&audio_module_id);
+        *shared.on_client_disconnected.lock().unwrap() = Some(Box::new(move || {
+            println!("[lifecycle] client disconnected — removing peripherals");
+
+            // Camera
+            *shared_d.cam_writer.lock().unwrap() = None;
+
+            // Mic
+            if let Some(ref mut mic) = *shared_d.mic_writer.lock().unwrap() {
+                audio::remove_virtual_mic(mic);
+            }
+            *shared_d.mic_writer.lock().unwrap() = None;
+
+            // Audio sink
+            let mid = *audio_id_d.lock().unwrap();
+            if mid > 0 {
+                audio::remove_virtual_sink(mid);
+                *audio_id_d.lock().unwrap() = 0;
+            }
+
+            // Signal capture thread to stop (EVDI will be torn down)
+            shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
+            shared_d.capture_start.store(false, Ordering::Release);
+
+            // Resume beacon so new iPads can discover us
+            shared_d.beacon_pause.store(false, Ordering::Relaxed);
+        }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Client manager thread
+    // -----------------------------------------------------------------------
+
     let client_socket = socket.try_clone().context("clone socket for client mgr")?;
     let client_shared = Arc::clone(&shared);
     let client_stop = Arc::clone(&stop);
+    let client_session_rx = Arc::clone(&session_rx);
     let _client_thread = thread::Builder::new()
         .name("client-mgr".into())
         .spawn(move || {
             if let Err(e) =
-                stream_server::run_client_manager(client_socket, client_shared, client_stop)
+                stream_server::run_client_manager(client_socket, client_shared, client_stop, client_session_rx)
             {
                 eprintln!("[client] manager error: {e:#}");
             }
         })
         .context("failed to spawn client manager thread")?;
 
-    // Capture + encode + send thread (the synchronous hot path)
+    // -----------------------------------------------------------------------
+    // Capture + encode + send thread
+    // -----------------------------------------------------------------------
+
     let send_socket = socket.try_clone().context("clone socket for sender")?;
     let capture_shared = Arc::clone(&shared);
     let capture_stop = Arc::clone(&stop);
@@ -181,8 +310,7 @@ async fn main() -> Result<()> {
         height: config.height,
         fps: config.fps,
     };
-
-    let mut encoder = encode::Encoder::new(encode::EncoderConfig {
+    let enc_config = encode::EncoderConfig {
         bitrate_bps: config.bitrate_bps,
         gop: config.gop,
         fps: config.fps,
@@ -190,62 +318,156 @@ async fn main() -> Result<()> {
         height: config.height,
         backend: config.encoder_backend,
         codec: config.codec,
-    })?;
-
-    let codec_id = encoder.codec().transport_id();
-
-    let mut sender = stream_server::UdpSender::new(send_socket);
+    };
 
     let force_refresh = Arc::new(AtomicBool::new(false));
     let capture_force_refresh = Arc::clone(&force_refresh);
-    // Also store in shared state so the client manager can set it
-    shared.force_refresh_handle.lock().unwrap().replace(Arc::clone(&force_refresh));
+    shared
+        .force_refresh_handle
+        .lock()
+        .unwrap()
+        .replace(Arc::clone(&force_refresh));
+
+    let capture_start = Arc::clone(&shared.capture_start);
+    let capture_stop_flag = Arc::clone(&shared.capture_stop_flag);
 
     let capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
-            if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), capture_force_refresh, |frame| {
-                let force_idr = capture_shared.force_idr.swap(false, Ordering::Relaxed);
+            let mut sender = stream_server::UdpSender::new(send_socket);
 
-                let ts = capture_shared.start_time.elapsed().as_millis() as u32;
+            loop {
+                if capture_stop.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                match encoder.encode_frame(&frame, force_idr) {
-                    Ok(aus) => {
-                        for au in &aus {
-                            // Prefer USB if active
-                            if capture_shared.usb_active.load(Ordering::Relaxed) {
-                                let mut usb = capture_shared.usb_sender.lock().unwrap();
-                                if let Some(ref mut tcp) = *usb {
-                                    if let Err(e) = tcp.send_video(&au.annex_b, au.is_idr, ts, codec_id) {
-                                        eprintln!("[pipeline] USB send error: {e:#}");
-                                        drop(usb);
-                                        capture_shared.usb_active.store(false, Ordering::SeqCst);
+                // Wait for capture_start to be set (client connected)
+                while !capture_start.load(Ordering::Acquire) {
+                    if capture_stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+
+                // Reset the stop flag for this capture session
+                capture_stop_flag.store(false, Ordering::SeqCst);
+
+                // Create encoder fresh for each session
+                let mut encoder = match encode::Encoder::new(enc_config.clone()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("[capture] encoder init failed: {e:#}");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let codec_id = encoder.codec().transport_id();
+
+                // Set up encryption on the sender using the current session key
+                if let Some(key) = *capture_shared.session_key.lock().unwrap() {
+                    sender.set_cipher(crypto::SessionCipher::new(&key));
+                }
+
+                println!("[capture] starting EVDI capture session");
+
+                let session_shared = Arc::clone(&capture_shared);
+                let session_stop = Arc::clone(&capture_stop);
+                let session_stop_flag = Arc::clone(&capture_stop_flag);
+                let session_refresh = Arc::clone(&capture_force_refresh);
+
+                // Combined stop: global stop OR per-session stop (client disconnected)
+                let combined_stop = Arc::new(AtomicBool::new(false));
+                let cs1 = Arc::clone(&combined_stop);
+                let cs2 = Arc::clone(&combined_stop);
+                let ss = Arc::clone(&session_stop);
+                let sf = Arc::clone(&session_stop_flag);
+
+                // Watchdog thread: sets combined_stop when either flag fires
+                let watchdog = thread::Builder::new()
+                    .name("capture-wd".into())
+                    .spawn(move || {
+                        while !cs1.load(Ordering::Relaxed) {
+                            if ss.load(Ordering::Relaxed) || sf.load(Ordering::Relaxed) {
+                                cs1.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    })
+                    .ok();
+
+                if let Err(e) = capture::run_capture_loop(
+                    capture_config.clone(),
+                    cs2,
+                    Arc::clone(&session_refresh),
+                    Arc::new(AtomicBool::new(true)), // already started
+                    |frame| {
+                        let force_idr =
+                            session_shared.force_idr.swap(false, Ordering::Relaxed);
+                        let ts = session_shared.start_time.elapsed().as_millis() as u32;
+
+                        match encoder.encode_frame(&frame, force_idr) {
+                            Ok(aus) => {
+                                for au in &aus {
+                                    if session_shared.usb_active.load(Ordering::Relaxed) {
+                                        let mut usb =
+                                            session_shared.usb_sender.lock().unwrap();
+                                        if let Some(ref mut tcp) = *usb {
+                                            if let Err(e) = tcp.send_video(
+                                                &au.annex_b,
+                                                au.is_idr,
+                                                ts,
+                                                codec_id,
+                                            ) {
+                                                eprintln!(
+                                                    "[pipeline] USB send error: {e:#}"
+                                                );
+                                                drop(usb);
+                                                session_shared
+                                                    .usb_active
+                                                    .store(false, Ordering::SeqCst);
+                                            }
+                                            continue;
+                                        }
                                     }
-                                    continue;
+                                    let client_addr =
+                                        *session_shared.client_addr.lock().unwrap();
+                                    if let Some(addr) = client_addr {
+                                        if let Err(e) =
+                                            sender.send_frame(au, addr, ts, codec_id)
+                                        {
+                                            eprintln!("[pipeline] send error: {e:#}");
+                                        }
+                                    }
                                 }
                             }
-                            // Fall back to WiFi UDP
-                            let client_addr = *capture_shared.client_addr.lock().unwrap();
-                            if let Some(addr) = client_addr {
-                                if let Err(e) = sender.send_frame(au, addr, ts, codec_id) {
-                                    eprintln!("[pipeline] send error: {e:#}");
-                                }
+                            Err(e) => {
+                                eprintln!("[pipeline] encode error: {e:#}");
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("[pipeline] encode error: {e:#}");
-                    }
+                    },
+                ) {
+                    eprintln!("[capture] session error: {e:#}");
                 }
-            }) {
-                eprintln!("[capture] fatal: {e:#}");
-                std::process::exit(1);
+
+                if let Some(wd) = watchdog {
+                    let _ = wd.join();
+                }
+
+                println!("[capture] EVDI session ended, waiting for next client...");
+
+                // Reset capture_start so we wait for the next client
+                capture_start.store(false, Ordering::Release);
             }
+
             Ok(())
         })
         .context("failed to spawn capture thread")?;
 
-    // USB transport thread (auto-detects iOS device, manages iproxy + TCP)
+    // -----------------------------------------------------------------------
+    // USB transport thread
+    // -----------------------------------------------------------------------
+
     let usb_shared = Arc::clone(&shared);
     let usb_stop = Arc::clone(&stop);
     let _usb_thread = thread::Builder::new()
@@ -255,76 +477,32 @@ async fn main() -> Result<()> {
         })
         .context("failed to spawn USB transport thread")?;
 
-    // Virtual camera (iPad camera -> v4l2loopback)
-    match camera::load_v4l2loopback() {
-        Ok(()) => match camera::create_cam_writer() {
-            Ok(writer) => {
-                *shared.cam_writer.lock().unwrap() = Some(writer);
-                println!("[main] camera: virtual webcam ready");
-            }
-            Err(e) => {
-                eprintln!("[main] camera: failed to open v4l2loopback ({e:#}), camera disabled");
-            }
-        },
-        Err(e) => {
-            eprintln!("[main] camera: v4l2loopback not available ({e:#}), camera disabled");
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Audio capture thread (runs continuously, but only captures when sink exists)
+    // -----------------------------------------------------------------------
 
-    // Clean up any stale Screx audio modules from a previous crash
-    audio::cleanup_stale_modules();
-
-    // Virtual microphone (iPad mic → PipeWire source)
-    match audio::create_virtual_mic() {
-        Ok(writer) => {
-            *shared.mic_writer.lock().unwrap() = Some(writer);
-            println!("[main] mic: virtual microphone ready");
-        }
-        Err(e) => {
-            eprintln!("[main] mic: failed to create virtual mic ({e:#}), mic disabled");
-        }
-    }
-
-    // Audio capture thread
     let audio_socket = socket.try_clone().context("clone socket for audio")?;
     let audio_shared = Arc::clone(&shared);
     let audio_stop = Arc::clone(&stop);
-    let audio_module_id = match audio::create_virtual_sink() {
-        Ok(id) => {
-            println!("[main] audio: virtual sink ready (module {id})");
-            id
-        }
-        Err(e) => {
-            eprintln!("[main] audio: failed to create virtual sink ({e:#}), audio disabled");
-            0
-        }
-    };
+    let _audio_thread = thread::Builder::new()
+        .name("audio".into())
+        .spawn(move || {
+            if let Err(e) = audio::run_audio_capture(audio_socket, audio_shared, audio_stop) {
+                eprintln!("[audio] capture error: {e:#}");
+            }
+        })
+        .context("failed to spawn audio thread")?;
 
-    let _audio_thread = if audio_module_id > 0 {
-        Some(
-            thread::Builder::new()
-                .name("audio".into())
-                .spawn(move || {
-                    if let Err(e) =
-                        audio::run_audio_capture(audio_socket, audio_shared, audio_stop)
-                    {
-                        eprintln!("[audio] capture error: {e:#}");
-                    }
-                })
-                .context("failed to spawn audio thread")?,
-        )
-    } else {
-        None
-    };
-
+    // -----------------------------------------------------------------------
     // Wait for Ctrl-C
+    // -----------------------------------------------------------------------
+
     tokio::signal::ctrl_c().await?;
     println!("\nshutdown requested (ctrl-c)");
     stop.store(true, Ordering::SeqCst);
+    shared.capture_stop_flag.store(true, Ordering::SeqCst);
 
-    // Cleanup resources FIRST — before joining threads, because threads
-    // may be stuck in blocking I/O (EVDI read, FIFO write, parec read).
-    // Unloading modules and removing devices is safe even while threads run.
+    // Cleanup remaining resources
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
@@ -332,12 +510,13 @@ async fn main() -> Result<()> {
         audio::remove_virtual_mic(mic);
     }
     *shared.mic_writer.lock().unwrap() = None;
-    audio::remove_virtual_sink(audio_module_id);
+    let mid = *audio_module_id.lock().unwrap();
+    if mid > 0 {
+        audio::remove_virtual_sink(mid);
+    }
 
-    // Wait for the capture thread to stop so the encoder drops cleanly
-    // (avoids segfault from CUDA/NVENC atexit handlers accessing freed state)
     let _ = capture_thread.join();
 
-    println!("screx-daemon cleanup complete, exiting");
+    println!("screx cleanup complete, exiting");
     std::process::exit(0);
 }

@@ -279,6 +279,7 @@ impl VirtualTouchscreen {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
+
     fn emit(&mut self, type_: u16, code: u16, value: i32) {
         let ev = InputEvent {
             time: libc::timeval {
