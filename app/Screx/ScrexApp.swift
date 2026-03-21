@@ -341,6 +341,9 @@ struct ContentView: View {
     @State private var dragOffset: CGSize = .zero
     @State private var isDragging = false
     @State private var isKeyboardActive = false
+    @State private var keyboardHeight: CGFloat = 0
+    @State private var preKeyboardY: CGFloat? = nil
+    @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -416,8 +419,32 @@ struct ContentView: View {
             }
             .onAppear {
                 if barPosition == .zero {
-                    barPosition = CGPoint(x: geo.size.width - 90, y: geo.size.height - 30)
+                    let halfW = pillSize.width / 2 + 4
+                    let halfH = pillSize.height / 2 + 4
+                    barPosition = CGPoint(x: geo.size.width - halfW, y: geo.size.height - halfH)
                 }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in
+            guard let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+            let kbH = frame.height
+            keyboardHeight = kbH
+            let halfH = pillSize.height / 2 + 4
+            let maxY = UIScreen.main.bounds.height - kbH - halfH
+            if barPosition.y > maxY {
+                preKeyboardY = barPosition.y
+                withAnimation(.easeOut(duration: 0.25)) {
+                    barPosition.y = maxY
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardHeight = 0
+            if let savedY = preKeyboardY {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    barPosition.y = savedY
+                }
+                preKeyboardY = nil
             }
         }
         .statusBarHidden(true)
@@ -461,12 +488,79 @@ struct ContentView: View {
                 ) { isKeyboardActive.toggle() }
             }
 
-            dragHandle(in: geo)
+            Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
+                .font(.footnote)
+                .foregroundStyle(.white)
+                .frame(width: Self.btnSize, height: Self.btnSize)
+                .contentShape(Circle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+                }
         }
         .padding(4)
         .background(.ultraThinMaterial, in: Capsule())
+        .contentShape(Capsule())
         .opacity(isDragging ? 0.8 : 1)
+        .background(
+            GeometryReader { pillGeo in
+                Color.clear.onAppear { pillSize = pillGeo.size }
+                    .onChange(of: model.isConnected) { _ in
+                        DispatchQueue.main.async { pillSize = pillGeo.size }
+                    }
+            }
+        )
         .position(pos)
+        .gesture(
+            DragGesture(minimumDistance: 5, coordinateSpace: .global)
+                .onChanged { value in
+                    isDragging = true
+                    dragOffset = value.translation
+                }
+                .onEnded { value in
+                    isDragging = false
+                    var newPos = CGPoint(
+                        x: barPosition.x + value.translation.width,
+                        y: barPosition.y + value.translation.height
+                    )
+                    dragOffset = .zero
+
+                    let newOrientation: ToolbarOrientation
+                    if newPos.x < Self.edgeThreshold {
+                        newOrientation = .vertical
+                    } else if newPos.y > geo.size.height - Self.edgeThreshold {
+                        newOrientation = .horizontal
+                    } else {
+                        newOrientation = barOrientation
+                    }
+
+                    let halfW = (newOrientation == .vertical ? pillSize.height : pillSize.width) / 2 + 4
+                    let halfH = (newOrientation == .vertical ? pillSize.width : pillSize.height) / 2 + 4
+
+                    newPos.x = max(halfW, min(newPos.x, geo.size.width - halfW))
+                    newPos.y = max(halfH, min(newPos.y, geo.size.height - halfH))
+
+                    if newOrientation == .vertical {
+                        newPos.x = halfW
+                    }
+                    if newOrientation == .horizontal && newPos.y > geo.size.height - Self.edgeThreshold {
+                        newPos.y = geo.size.height - halfH
+                    }
+
+                    if keyboardHeight > 0 {
+                        let maxY = geo.size.height - keyboardHeight - halfH
+                        newPos.y = min(newPos.y, maxY)
+                        preKeyboardY = nil
+                    }
+
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        barPosition = newPos
+                        barOrientation = newOrientation
+                    }
+
+                    Self.saveBarPosition(newPos)
+                    Self.saveBarOrientation(newOrientation)
+                }
+        )
     }
 
     @ViewBuilder
@@ -477,60 +571,6 @@ struct ContentView: View {
             .frame(width: Self.btnSize, height: Self.btnSize)
             .contentShape(Circle())
             .onTapGesture(perform: action)
-    }
-
-    @ViewBuilder
-    private func dragHandle(in geo: GeometryProxy) -> some View {
-        Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
-            .font(.footnote)
-            .foregroundStyle(.white)
-            .frame(width: Self.btnSize, height: Self.btnSize)
-            .contentShape(Circle())
-            .gesture(
-                DragGesture(minimumDistance: 5)
-                    .onChanged { value in
-                        isDragging = true
-                        dragOffset = value.translation
-                    }
-                    .onEnded { value in
-                        isDragging = false
-                        var newPos = CGPoint(
-                            x: barPosition.x + value.translation.width,
-                            y: barPosition.y + value.translation.height
-                        )
-                        dragOffset = .zero
-
-                        let margin: CGFloat = 20
-                        newPos.x = max(margin, min(newPos.x, geo.size.width - margin))
-                        newPos.y = max(margin, min(newPos.y, geo.size.height - margin))
-
-                        let newOrientation: ToolbarOrientation
-                        if newPos.x < Self.edgeThreshold {
-                            newOrientation = .vertical
-                            newPos.x = margin
-                        } else if newPos.y > geo.size.height - Self.edgeThreshold {
-                            newOrientation = .horizontal
-                            newPos.y = geo.size.height - margin
-                        } else {
-                            newOrientation = barOrientation
-                        }
-
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            barPosition = newPos
-                            barOrientation = newOrientation
-                        }
-
-                        Self.saveBarPosition(newPos)
-                        Self.saveBarOrientation(newOrientation)
-                    }
-            )
-            .simultaneousGesture(
-                TapGesture().onEnded {
-                    if !isDragging {
-                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
-                    }
-                }
-            )
     }
 
     // MARK: - Persistence
