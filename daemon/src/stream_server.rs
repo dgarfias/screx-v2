@@ -149,20 +149,18 @@ pub fn run_client_manager(
                     continue; // too small to be valid
                 }
 
-                // Only accept packets from registered client or expected IP
-                let registered = *shared.client_addr.lock().unwrap();
-                let expected_ip = *shared.expected_client_ip.lock().unwrap();
-
-                let ip_ok = registered.map_or(false, |r| r.ip() == addr.ip())
-                    || expected_ip.map_or(false, |ip| ip == addr.ip());
-
-                if !ip_ok {
-                    continue;
-                }
-
-                // Update registered port if it changed
+                // Check IP and update port in one lock acquisition
                 {
                     let mut client = shared.client_addr.lock().unwrap();
+                    let registered_ok = client.map_or(false, |r| r.ip() == addr.ip());
+                    let expected_ok = if !registered_ok {
+                        shared.expected_client_ip.lock().unwrap().map_or(false, |ip| ip == addr.ip())
+                    } else {
+                        false
+                    };
+                    if !registered_ok && !expected_ok {
+                        continue;
+                    }
                     if let Some(ref mut r) = *client {
                         if *r != addr {
                             *r = addr;
@@ -177,16 +175,14 @@ pub fn run_client_manager(
 
                 let cipher = match local_cipher.as_ref() {
                     Some(c) => c,
-                    None => continue, // no session yet
+                    None => continue,
                 };
 
-                let aad = &recv_buf[..4]; // seq_num as AAD
-                let aad_copy = aad.to_vec();
-                let mut ct = recv_buf[4..len].to_vec();
-                let plaintext = match cipher.decrypt(&nonce, &aad_copy, &mut ct) {
+                let aad: [u8; 4] = [recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]];
+                let plaintext = match cipher.decrypt(&nonce, &aad, &mut recv_buf[4..len]) {
                     Some(pt) => pt,
                     None => {
-                        continue; // auth failed, drop silently
+                        continue;
                     }
                 };
 
@@ -270,20 +266,19 @@ pub fn run_client_manager(
             }
         }
 
-        // Send encrypted heartbeat to registered client
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             if let Some(addr) = *shared.client_addr.lock().unwrap() {
                 if let Some(ref c) = local_cipher {
                     let hb_frame_id = 0xFFFF_FFFFu32;
-                    let hb_flags: u8 = 0x80; // dedicated heartbeat flag, won't collide with data
+                    let hb_flags: u8 = 0x80;
                     let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
-                    let mut payload = HEARTBEAT_MAGIC.to_vec();
-                    c.encrypt(&nonce, &[], &mut payload);
                     let header = build_header(hb_frame_id, 0, 0, 0, hb_flags, 0, HEARTBEAT_MAGIC.len() as u16, 0);
-                    let mut pkt = Vec::with_capacity(HEADER_LEN + payload.len());
-                    pkt.extend_from_slice(&header);
-                    pkt.extend_from_slice(&payload);
-                    let _ = socket.send_to(&pkt, addr);
+                    let hb_magic_len = HEARTBEAT_MAGIC.len();
+                    let mut hb_buf = [0u8; HEADER_LEN + 64]; // enough for magic + tag
+                    hb_buf[..HEADER_LEN].copy_from_slice(&header);
+                    hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
+                    let enc_len = c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
+                    let _ = socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr);
                 }
             }
             last_heartbeat = Instant::now();
@@ -421,10 +416,12 @@ impl UdpSender {
 
             let pkt_len = if let Some(ref cipher) = self.cipher {
                 let nonce = crate::crypto::nonce_server(self.frame_id, idx as u16, flags);
-                let mut encrypted = self.shard_pool[idx].clone();
-                cipher.encrypt(&nonce, &header, &mut encrypted);
-                let enc_len = encrypted.len(); // CHUNK_PAYLOAD + TAG_LEN
-                self.send_buf[HEADER_LEN..HEADER_LEN + enc_len].copy_from_slice(&encrypted);
+                let enc_len = cipher.encrypt_slice(
+                    &nonce,
+                    &header,
+                    &mut self.send_buf[HEADER_LEN..],
+                    CHUNK_PAYLOAD,
+                );
                 HEADER_LEN + enc_len
             } else {
                 HEADER_LEN + CHUNK_PAYLOAD
@@ -507,18 +504,20 @@ impl AudioSender {
             );
 
             self.send_buf[..HEADER_LEN].copy_from_slice(&header);
+            let chunk_len = chunk.len();
+            self.send_buf[HEADER_LEN..HEADER_LEN + chunk_len].copy_from_slice(chunk);
 
             let pkt_len = if let Some(ref cipher) = self.cipher {
                 let nonce = crate::crypto::nonce_server(self.frame_id, i as u16, FLAG_AUDIO);
-                let mut encrypted = chunk.to_vec();
-                cipher.encrypt(&nonce, &header, &mut encrypted);
-                let enc_len = encrypted.len();
-                self.send_buf[HEADER_LEN..HEADER_LEN + enc_len].copy_from_slice(&encrypted);
+                let enc_len = cipher.encrypt_slice(
+                    &nonce,
+                    &header,
+                    &mut self.send_buf[HEADER_LEN..],
+                    chunk_len,
+                );
                 HEADER_LEN + enc_len
             } else {
-                let pkt_len = HEADER_LEN + chunk.len();
-                self.send_buf[HEADER_LEN..pkt_len].copy_from_slice(chunk);
-                pkt_len
+                HEADER_LEN + chunk_len
             };
 
             if let Err(e) = self.socket.send_to(&self.send_buf[..pkt_len], client_addr) {

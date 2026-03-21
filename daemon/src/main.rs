@@ -408,8 +408,15 @@ async fn main() -> Result<()> {
 
                         match encoder.encode_frame(&frame, force_idr) {
                             Ok(aus) => {
+                                let use_usb = session_shared.usb_active.load(Ordering::Relaxed);
+                                let udp_addr = if !use_usb {
+                                    *session_shared.client_addr.lock().unwrap()
+                                } else {
+                                    None
+                                };
+
                                 for au in &aus {
-                                    if session_shared.usb_active.load(Ordering::Relaxed) {
+                                    if use_usb {
                                         let mut usb =
                                             session_shared.usb_sender.lock().unwrap();
                                         if let Some(ref mut tcp) = *usb {
@@ -430,9 +437,7 @@ async fn main() -> Result<()> {
                                             continue;
                                         }
                                     }
-                                    let client_addr =
-                                        *session_shared.client_addr.lock().unwrap();
-                                    if let Some(addr) = client_addr {
+                                    if let Some(addr) = udp_addr {
                                         if let Err(e) =
                                             sender.send_frame(au, addr, ts, codec_id)
                                         {

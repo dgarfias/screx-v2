@@ -38,7 +38,7 @@ enum ReedSolomonDecoder {
         // The coding matrix for reed-solomon-erasure uses an inverted Vandermonde * Vandermonde approach.
         // Row i of the coding matrix = row usedIndices[i] of the full matrix.
         // The full matrix: top dataCount rows = identity, bottom parityCount rows = Cauchy-like.
-        let codingMatrix = buildCodingMatrix(dataCount: dataCount, parityCount: parityCount)
+        let codingMatrix = getCodingMatrix(dataCount: dataCount, parityCount: parityCount)
 
         // Extract the sub-matrix for the used indices
         var subMatrix = [[UInt8]](repeating: [UInt8](repeating: 0, count: dataCount), count: dataCount)
@@ -138,9 +138,16 @@ enum ReedSolomonDecoder {
 
     // MARK: - Coding matrix (Vandermonde / Cauchy, compatible with reed-solomon-erasure)
 
-    /// The reed-solomon-erasure crate uses a Vandermonde matrix approach:
-    /// Top dataCount rows = identity (data shards pass through unchanged)
-    /// Bottom parityCount rows = Cauchy-like parity generation
+    private static var matrixCache: [UInt64: [[UInt8]]] = [:]
+
+    private static func getCodingMatrix(dataCount: Int, parityCount: Int) -> [[UInt8]] {
+        let key = UInt64(dataCount) << 32 | UInt64(parityCount)
+        if let cached = matrixCache[key] { return cached }
+        let matrix = buildCodingMatrix(dataCount: dataCount, parityCount: parityCount)
+        matrixCache[key] = matrix
+        return matrix
+    }
+
     private static func buildCodingMatrix(dataCount: Int, parityCount: Int) -> [[UInt8]] {
         let totalCount = dataCount + parityCount
         var matrix = [[UInt8]](repeating: [UInt8](repeating: 0, count: dataCount), count: totalCount)

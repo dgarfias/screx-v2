@@ -187,31 +187,24 @@ final class StreamClient {
     private func handlePacket(_ data: Data) {
         guard data.count >= Self.headerLen else { return }
 
-        let frameId = data.withUnsafeBytes { buf -> UInt32 in
-            buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian
-        }
-        let chunkIdx = data.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 4, as: UInt16.self).bigEndian
-        }
-        let totalData = data.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 6, as: UInt16.self).bigEndian
-        }
-        let totalParity = data.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian
-        }
-        let flags = data[10]
-        let codecId = data[11]
-        let payloadLen = data.withUnsafeBytes { buf -> UInt16 in
-            buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian
-        }
-        let timestampMs: UInt32 = UInt32(data[14]) << 24 | UInt32(data[15]) << 16
-                               | UInt32(data[16]) << 8  | UInt32(data[17])
+        // Parse all header fields in one withUnsafeBytes call
+        let (frameId, chunkIdx, totalData, totalParity, flags, codecId, payloadLen, timestampMs) =
+            data.withUnsafeBytes { buf -> (UInt32, UInt16, UInt16, UInt16, UInt8, UInt8, UInt16, UInt32) in
+                (
+                    buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian,
+                    buf.load(fromByteOffset: 4, as: UInt16.self).bigEndian,
+                    buf.load(fromByteOffset: 6, as: UInt16.self).bigEndian,
+                    buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian,
+                    buf.load(fromByteOffset: 10, as: UInt8.self),
+                    buf.load(fromByteOffset: 11, as: UInt8.self),
+                    buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian,
+                    buf.load(fromByteOffset: 14, as: UInt32.self).bigEndian
+                )
+            }
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
-        // Heartbeat check (frame_id 0xFFFFFFFF, totalData=0)
         if frameId == 0xFFFF_FFFF && totalData == 0 {
-            // Encrypted heartbeat — just the fact that we received and auth-checked is enough
             return
         }
 
@@ -222,19 +215,19 @@ final class StreamClient {
             }
         }
 
-        // Decrypt payload if session key is set
+        // Decrypt payload using Data slices (COW, no copy until mutation)
         let payload: Data
-        let encryptedPayload = data.subdata(in: Self.headerLen..<data.count)
+        let encryptedPayload = data[Self.headerLen...]
 
         if let key = sessionKey {
             let nonce = ScrexCrypto.nonceServer(frameId: frameId, chunkIdx: chunkIdx, flags: flags)
-            let header = data.prefix(Self.headerLen)
+            let header = data[..<Self.headerLen]
             guard let decrypted = ScrexCrypto.decrypt(key: key, nonce: nonce, ciphertextAndTag: encryptedPayload, aad: header) else {
-                return // auth failed, drop packet
+                return
             }
             payload = decrypted
         } else {
-            payload = encryptedPayload
+            payload = Data(encryptedPayload)
         }
 
         if isAudio {
@@ -450,11 +443,20 @@ private final class FrameAssembly {
     }
 
     private func assembleFromDataShards() -> Data {
-        var result = Data()
+        var totalSize = 0
+        for i in 0..<totalData {
+            let shard = receivedShards[i]!
+            totalSize += actualLengths[i] ?? shard.count
+        }
+        var result = Data(capacity: totalSize)
         for i in 0..<totalData {
             let shard = receivedShards[i]!
             let actualLen = actualLengths[i] ?? shard.count
-            result.append(shard.prefix(actualLen))
+            if actualLen == shard.count {
+                result.append(shard)
+            } else {
+                result.append(shard[..<actualLen])
+            }
         }
         return result
     }
@@ -462,29 +464,37 @@ private final class FrameAssembly {
     private func recoverAndAssemble() -> Data? {
         let shardSize = StreamClient.chunkPayload
 
-        // Build shard array for FEC: nil = missing, Data = present
         var shards: [Data?] = Array(repeating: nil, count: totalShards)
         for (idx, data) in receivedShards {
-            // Pad to shardSize for RS
-            var padded = data
-            if padded.count < shardSize {
-                padded.append(Data(count: shardSize - padded.count))
-            } else if padded.count > shardSize {
-                padded = padded.prefix(shardSize)
+            if data.count == shardSize {
+                shards[idx] = data
+            } else if data.count < shardSize {
+                var padded = data
+                padded.append(Data(count: shardSize - data.count))
+                shards[idx] = padded
+            } else {
+                shards[idx] = data[..<shardSize]
             }
-            shards[idx] = padded
         }
 
         guard ReedSolomonDecoder.recover(shards: &shards, dataCount: totalData, parityCount: totalParity) else {
             return nil
         }
 
-        // Assemble from recovered data shards
-        var result = Data()
+        var totalSize = 0
         for i in 0..<totalData {
-            guard let shard = shards[i] else { return nil }
+            guard shards[i] != nil else { return nil }
+            totalSize += actualLengths[i] ?? shardSize
+        }
+        var result = Data(capacity: totalSize)
+        for i in 0..<totalData {
+            let shard = shards[i]!
             let actualLen = actualLengths[i] ?? shard.count
-            result.append(shard.prefix(actualLen))
+            if actualLen == shard.count {
+                result.append(shard)
+            } else {
+                result.append(shard[..<actualLen])
+            }
         }
         return result
     }
@@ -510,11 +520,20 @@ private final class AudioAssembly {
     var isComplete: Bool { receivedCount >= totalData }
 
     func reassemble() -> Data? {
-        var result = Data()
+        var totalSize = 0
         for i in 0..<totalData {
             guard let chunk = chunks[i] else { return nil }
+            totalSize += actualLengths[i] ?? chunk.count
+        }
+        var result = Data(capacity: totalSize)
+        for i in 0..<totalData {
+            let chunk = chunks[i]!
             let len = actualLengths[i] ?? chunk.count
-            result.append(chunk.prefix(len))
+            if len == chunk.count {
+                result.append(chunk)
+            } else {
+                result.append(chunk[..<len])
+            }
         }
         return result
     }

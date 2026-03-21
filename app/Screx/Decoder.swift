@@ -46,8 +46,13 @@ final class VideoDecoder {
     }
 
     func decodeAccessUnit(_ data: Data) {
-        let bytes = [UInt8](data)
-        let count = bytes.count
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            parseNALUnits(base, count: raw.count)
+        }
+    }
+
+    private func parseNALUnits(_ bytes: UnsafePointer<UInt8>, count: Int) {
         var i = 0
 
         while i < count {
@@ -90,7 +95,7 @@ final class VideoDecoder {
 
     // MARK: - H.264
 
-    private func handleH264Nalu(bytes: [UInt8], naluStart: Int, naluEnd: Int, length: Int) {
+    private func handleH264Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) {
         let naluType = bytes[naluStart] & 0x1F
 
         if naluCount <= 5 {
@@ -99,10 +104,10 @@ final class VideoDecoder {
 
         switch naluType {
         case 7:
-            sps = Data(bytes[naluStart..<naluEnd])
+            sps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
             tryBuildH264FormatDescription()
         case 8:
-            pps = Data(bytes[naluStart..<naluEnd])
+            pps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
             tryBuildH264FormatDescription()
         case 1, 5:
             if formatDescription != nil {
@@ -116,14 +121,13 @@ final class VideoDecoder {
     private func tryBuildH264FormatDescription() {
         guard let sps, let pps else { return }
 
-        let spsBytes = [UInt8](sps)
-        let ppsBytes = [UInt8](pps)
-
         var newFmt: CMVideoFormatDescription?
-        let status = spsBytes.withUnsafeBufferPointer { spsBuf in
-            ppsBytes.withUnsafeBufferPointer { ppsBuf in
-                var paramPointers: [UnsafePointer<UInt8>] = [spsBuf.baseAddress!, ppsBuf.baseAddress!]
-                var paramSizes: [Int] = [spsBytes.count, ppsBytes.count]
+        let status = sps.withUnsafeBytes { spsRaw in
+            pps.withUnsafeBytes { ppsRaw in
+                let spsPtr = spsRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                let ppsPtr = ppsRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                var paramPointers: [UnsafePointer<UInt8>] = [spsPtr, ppsPtr]
+                var paramSizes: [Int] = [spsRaw.count, ppsRaw.count]
                 return CMVideoFormatDescriptionCreateFromH264ParameterSets(
                     allocator: kCFAllocatorDefault,
                     parameterSetCount: 2,
@@ -150,7 +154,7 @@ final class VideoDecoder {
 
     // MARK: - H.265
 
-    private func handleH265Nalu(bytes: [UInt8], naluStart: Int, naluEnd: Int, length: Int) {
+    private func handleH265Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) {
         guard length >= 2 else { return }
         let naluType = (bytes[naluStart] >> 1) & 0x3F
 
@@ -160,15 +164,15 @@ final class VideoDecoder {
 
         switch naluType {
         case 32: // VPS
-            vps = Data(bytes[naluStart..<naluEnd])
+            vps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
             tryBuildH265FormatDescription()
         case 33: // SPS
-            sps = Data(bytes[naluStart..<naluEnd])
+            sps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
             tryBuildH265FormatDescription()
         case 34: // PPS
-            pps = Data(bytes[naluStart..<naluEnd])
+            pps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
             tryBuildH265FormatDescription()
-        case 0...9, 16...21: // VCL NAL units (TRAIL, TSA, STSA, RADL, RASL, BLA, IDR, CRA)
+        case 0...9, 16...21:
             if formatDescription != nil {
                 enqueueSlice(bytes: bytes, offset: naluStart, length: length)
             }
@@ -180,18 +184,15 @@ final class VideoDecoder {
     private func tryBuildH265FormatDescription() {
         guard let vps, let sps, let pps else { return }
 
-        let vpsBytes = [UInt8](vps)
-        let spsBytes = [UInt8](sps)
-        let ppsBytes = [UInt8](pps)
-
         var newFmt: CMVideoFormatDescription?
-        let status = vpsBytes.withUnsafeBufferPointer { vpsBuf in
-            spsBytes.withUnsafeBufferPointer { spsBuf in
-                ppsBytes.withUnsafeBufferPointer { ppsBuf in
-                    var paramPointers: [UnsafePointer<UInt8>] = [
-                        vpsBuf.baseAddress!, spsBuf.baseAddress!, ppsBuf.baseAddress!
-                    ]
-                    var paramSizes: [Int] = [vpsBytes.count, spsBytes.count, ppsBytes.count]
+        let status = vps.withUnsafeBytes { vpsRaw in
+            sps.withUnsafeBytes { spsRaw in
+                pps.withUnsafeBytes { ppsRaw in
+                    let vpsPtr = vpsRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    let spsPtr = spsRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    let ppsPtr = ppsRaw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    var paramPointers: [UnsafePointer<UInt8>] = [vpsPtr, spsPtr, ppsPtr]
+                    var paramSizes: [Int] = [vpsRaw.count, spsRaw.count, ppsRaw.count]
                     return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                         allocator: kCFAllocatorDefault,
                         parameterSetCount: 3,
@@ -220,7 +221,7 @@ final class VideoDecoder {
 
     // MARK: - Shared slice enqueueing
 
-    private func enqueueSlice(bytes: [UInt8], offset: Int, length: Int) {
+    private func enqueueSlice(bytes: UnsafePointer<UInt8>, offset: Int, length: Int) {
         guard let formatDescription else { return }
 
         let totalLen = 4 + length
@@ -236,9 +237,7 @@ final class VideoDecoder {
         naluBuf[3] = UInt8(len32 & 0xFF)
 
         naluBuf.withUnsafeMutableBufferPointer { dst in
-            bytes.withUnsafeBufferPointer { src in
-                (dst.baseAddress! + 4).update(from: src.baseAddress! + offset, count: length)
-            }
+            (dst.baseAddress! + 4).update(from: bytes + offset, count: length)
         }
 
         var blockBuffer: CMBlockBuffer?

@@ -17,13 +17,30 @@ impl SessionCipher {
     }
 
     /// Encrypt `plaintext` in-place, appending 16-byte auth tag.
-    /// `aad` is authenticated but not encrypted (e.g. the packet header).
-    /// `nonce_bytes` must be exactly 12 bytes and MUST NOT be reused with the same key.
     pub fn encrypt(&self, nonce_bytes: &[u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) {
         let nonce = Nonce::assume_unique_for_key(*nonce_bytes);
         self.key
             .seal_in_place_append_tag(nonce, Aad::from(aad), plaintext)
             .expect("AES-GCM encrypt");
+    }
+
+    /// Encrypt `data_len` bytes of `buf` in place, writing the 16-byte tag after.
+    /// `buf` must have at least `data_len + TAG_LEN` bytes available.
+    /// Returns the total length (data_len + TAG_LEN).
+    pub fn encrypt_slice(
+        &self,
+        nonce_bytes: &[u8; 12],
+        aad: &[u8],
+        buf: &mut [u8],
+        data_len: usize,
+    ) -> usize {
+        let nonce = Nonce::assume_unique_for_key(*nonce_bytes);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut buf[..data_len])
+            .expect("AES-GCM encrypt");
+        buf[data_len..data_len + TAG_LEN].copy_from_slice(tag.as_ref());
+        data_len + TAG_LEN
     }
 
     /// Decrypt `ciphertext_with_tag` in-place, returning a slice to the plaintext.
