@@ -524,27 +524,20 @@ struct ContentView: View {
                     )
                     dragOffset = .zero
 
-                    let newOrientation: ToolbarOrientation
+                    var newOrientation = barOrientation
                     if newPos.x < Self.edgeThreshold {
                         newOrientation = .vertical
+                    } else if newPos.y < Self.edgeThreshold {
+                        newOrientation = .horizontal
                     } else if newPos.y > geo.size.height - Self.edgeThreshold {
                         newOrientation = .horizontal
-                    } else {
-                        newOrientation = barOrientation
                     }
 
-                    let halfW = (newOrientation == .vertical ? pillSize.height : pillSize.width) / 2 + 4
-                    let halfH = (newOrientation == .vertical ? pillSize.width : pillSize.height) / 2 + 4
+                    let halfW = pillSize.width / 2 + 4
+                    let halfH = pillSize.height / 2 + 4
 
                     newPos.x = max(halfW, min(newPos.x, geo.size.width - halfW))
                     newPos.y = max(halfH, min(newPos.y, geo.size.height - halfH))
-
-                    if newOrientation == .vertical {
-                        newPos.x = halfW
-                    }
-                    if newOrientation == .horizontal && newPos.y > geo.size.height - Self.edgeThreshold {
-                        newPos.y = geo.size.height - halfH
-                    }
 
                     if keyboardHeight > 0 {
                         let maxY = geo.size.height - keyboardHeight - halfH
