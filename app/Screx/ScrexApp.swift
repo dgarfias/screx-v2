@@ -127,9 +127,9 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.lastWifiEndpoint = nil
                 self.lastWifiName = nil
-                if !self.usbConnected {
-                    self.handleStreamLost()
-                }
+                // Don't tear down an active stream just because beacons stopped --
+                // the stream has its own data timeout for true disconnections.
+                // This allows manual IP connections (no beacons) to stay alive.
             }
         }
         discovery.startListening()

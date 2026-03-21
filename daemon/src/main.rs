@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
 
     let mut sender = stream_server::UdpSender::new(send_socket);
 
-    let _capture_thread = thread::Builder::new()
+    let capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
             if let Err(e) = capture::run_capture_loop(capture_config, Arc::clone(&capture_stop), |frame| {
@@ -304,6 +304,10 @@ async fn main() -> Result<()> {
     }
     *shared.mic_writer.lock().unwrap() = None;
     audio::remove_virtual_sink(audio_module_id);
+
+    // Wait for the capture thread to stop so the encoder drops cleanly
+    // (avoids segfault from CUDA/NVENC atexit handlers accessing freed state)
+    let _ = capture_thread.join();
 
     println!("screx-daemon cleanup complete, exiting");
     std::process::exit(0);

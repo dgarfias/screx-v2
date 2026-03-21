@@ -28,14 +28,42 @@ const MIC_MAX_FRAME: usize = 5760; // 120ms at 48kHz (max Opus frame)
 
 fn pulse_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
-    if let Ok(uid) = std::env::var("SUDO_UID") {
+
+    // If PULSE_SERVER is already set, use it as-is
+    if std::env::var("PULSE_SERVER").is_ok() {
+        return env;
+    }
+
+    // SCREX_PULSE_UID > SUDO_UID > auto-detect
+    if let Ok(uid) = std::env::var("SCREX_PULSE_UID").or_else(|_| std::env::var("SUDO_UID")) {
         let runtime_dir = format!("/run/user/{uid}");
         env.push(("XDG_RUNTIME_DIR".into(), runtime_dir.clone()));
         env.push((
             "PULSE_SERVER".into(),
             format!("unix:{runtime_dir}/pulse/native"),
         ));
+        return env;
     }
+
+    // Running as root directly (no sudo) -- try to find a user PulseAudio socket
+    if unsafe { libc::getuid() } == 0 {
+        if let Ok(entries) = std::fs::read_dir("/run/user") {
+            for entry in entries.flatten() {
+                let pulse_path = entry.path().join("pulse/native");
+                if pulse_path.exists() {
+                    let runtime_dir = entry.path().to_string_lossy().to_string();
+                    println!("[audio] auto-detected PulseAudio socket at {}", pulse_path.display());
+                    env.push(("XDG_RUNTIME_DIR".into(), runtime_dir.clone()));
+                    env.push((
+                        "PULSE_SERVER".into(),
+                        format!("unix:{}", pulse_path.display()),
+                    ));
+                    return env;
+                }
+            }
+        }
+    }
+
     env
 }
 
