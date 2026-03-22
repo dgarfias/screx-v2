@@ -18,8 +18,8 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Touch input**: Multi-touch from iPad mapped to a Linux virtual touchscreen via uinput
 - **Keyboard input**: iPad native keyboard forwarded to Linux via uinput virtual keyboard, with `Ctrl+Shift+U` Unicode input for accented/special characters (ñ, á, ö, etc.)
 - **Modifier keys**: Accessory bar above the iPad keyboard with Esc, Tab, Ctrl, Alt, Super, Home, End, Ins, Del, and arrow keys — modifiers are sticky one-shot (tap to arm, next key sends the combo)
-- **Physical peripheral forwarding**: External mouse and keyboard connected to the iPad are forwarded to Linux over both Network and USB
-- **Game controller forwarding**: Up to 4 controllers connected to the iPad are forwarded as generic Linux virtual gamepads, with one virtual device created per attached controller
+- **Physical peripheral forwarding**: External mouse and keyboard connected to the iPad are detected automatically and forwarded to Linux over both Network and USB. The daemon only creates the matching Linux virtual mouse/keyboard device when the iPad reports that the peripheral is actually attached.
+- **Game controller forwarding**: Up to 4 controllers connected to the iPad are detected automatically and forwarded as generic Linux virtual gamepads. The daemon creates one Linux virtual gamepad per attached controller and removes it again when the controller disconnects.
 - **Pointer capture for external mouse**: When a physical mouse is active, iPadOS pointer input is captured for the app, the system pointer is hidden, and top status/system overlays are suppressed for a cleaner full-screen desktop view
 - **Touch/pointer separation**: Indirect pointer touches are filtered out so physical mouse clicks are not also forwarded as touchscreen taps
 - **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; network UDP media and network TCP control both use AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
@@ -94,7 +94,7 @@ screx-v2/
 │       └── webrtc_sender.rs       # WebRTC sender (experimental)
 ├── app/                           # Swift iPad app (iOS 16+)
 │   └── Screx/
-│       ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView, floating toolbar
+│       ├── ScrexApp.swift         # App entry, transport orchestration, peripheral + controller forwarding UI
 │       ├── Crypto.swift           # CryptoKit wrappers: AES-GCM, X25519 ECDH, HKDF, HMAC
 │       ├── PairingService.swift   # TCP pairing client, PIN entry callback, Keychain storage
 │       ├── NetworkControlClient.swift # Persistent encrypted TCP control client for network input
@@ -104,7 +104,7 @@ screx-v2/
 │       ├── Decoder.swift          # H.264/H.265 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
 │       ├── AVSyncState.swift      # Audio/video synchronization state
-│       ├── DisplayView.swift      # Video display, touch forwarding, indirect pointer filtering
+│       ├── DisplayView.swift      # Video display, touch forwarding, indirect pointer filtering, discrete wheel scroll capture
 │       ├── FEC.swift              # Reed-Solomon decoder for network FEC recovery
 │       ├── MicCapture.swift       # iPad microphone capture → Opus encoding
 │       └── CameraCapture.swift    # iPad camera capture → JPEG frames
@@ -165,7 +165,7 @@ Three kernel modules are required:
 |---|---|---|---|
 | **evdi** | `evdi-git` (AUR) | `evdi-dkms` | Virtual display (appears as real monitor in GNOME) |
 | **v4l2loopback** | `v4l2loopback-dkms` | `v4l2loopback-dkms` | Virtual webcam for iPad camera forwarding |
-| **uinput** | built-in | built-in | Virtual touchscreen, keyboard, and mouse |
+| **uinput** | built-in | built-in | Virtual touchscreen, keyboard, mouse, and gamepad |
 
 All three are loaded automatically by the daemon when needed. If `uinput` isn't loaded on your system, run `sudo modprobe uinput`.
 
@@ -264,6 +264,10 @@ When the keyboard is active, an accessory bar appears above the iPad keyboard:
 
 ### External Mouse and Keyboard
 
+- The iPad app watches for external mouse and keyboard connections automatically.
+- When an external mouse is detected, the app tells the daemon that a mouse exists, and the daemon creates a Linux virtual mouse for that session.
+- When an external keyboard is detected, the app tells the daemon that a keyboard exists, and Linux uses the existing virtual keyboard for raw key events from that hardware keyboard.
+- If either peripheral disconnects from the iPad, the app reports that immediately and the daemon tears down or stops using the matching Linux-side virtual device.
 - A physical mouse connected to the iPad is forwarded as a Linux virtual mouse.
 - A physical keyboard connected to the iPad is forwarded as raw key events to the Linux virtual keyboard.
 - Pointer input is captured by the app while the physical mouse is active, so indirect pointer touches are not also forwarded as touchscreen taps.
@@ -273,10 +277,12 @@ When the keyboard is active, an accessory bar appears above the iPad keyboard:
 
 ### Game Controllers
 
+- The iPad app watches for controller attach/detach events automatically.
 - Up to 4 controllers can be forwarded at the same time.
-- Each attached controller creates one Linux virtual gamepad device.
-- Linux gamepads are only created when the iPad explicitly reports that a controller is attached.
-- Current target is a generic Linux gamepad profile over `uinput`, intended to work broadly with native Linux input stacks.
+- Each attached controller is assigned its own slot and creates exactly one Linux virtual gamepad device.
+- Linux gamepads are only created when the iPad explicitly reports that a controller is attached; nothing is pre-created just in case.
+- When a controller disconnects from the iPad, the daemon removes the corresponding Linux virtual gamepad automatically.
+- Controllers are exposed as generic Linux gamepads over `uinput`, intended to work broadly with native Linux input stacks.
 - Controllers using unsupported GameController profiles are ignored rather than creating a broken virtual device.
 
 ## Protocols
