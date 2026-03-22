@@ -187,18 +187,18 @@ final class StreamClient {
     private func handlePacket(_ data: Data) {
         guard data.count >= Self.headerLen else { return }
 
-        // Parse all header fields in one withUnsafeBytes call
+        // Parse all header fields in one withUnsafeBytes call (unaligned-safe)
         let (frameId, chunkIdx, totalData, totalParity, flags, codecId, payloadLen, timestampMs) =
             data.withUnsafeBytes { buf -> (UInt32, UInt16, UInt16, UInt16, UInt8, UInt8, UInt16, UInt32) in
                 (
-                    buf.load(fromByteOffset: 0, as: UInt32.self).bigEndian,
-                    buf.load(fromByteOffset: 4, as: UInt16.self).bigEndian,
-                    buf.load(fromByteOffset: 6, as: UInt16.self).bigEndian,
-                    buf.load(fromByteOffset: 8, as: UInt16.self).bigEndian,
-                    buf.load(fromByteOffset: 10, as: UInt8.self),
-                    buf.load(fromByteOffset: 11, as: UInt8.self),
-                    buf.load(fromByteOffset: 12, as: UInt16.self).bigEndian,
-                    buf.load(fromByteOffset: 14, as: UInt32.self).bigEndian
+                    buf.loadUnaligned(fromByteOffset: 0, as: UInt32.self).bigEndian,
+                    buf.loadUnaligned(fromByteOffset: 4, as: UInt16.self).bigEndian,
+                    buf.loadUnaligned(fromByteOffset: 6, as: UInt16.self).bigEndian,
+                    buf.loadUnaligned(fromByteOffset: 8, as: UInt16.self).bigEndian,
+                    buf.loadUnaligned(fromByteOffset: 10, as: UInt8.self),
+                    buf.loadUnaligned(fromByteOffset: 11, as: UInt8.self),
+                    buf.loadUnaligned(fromByteOffset: 12, as: UInt16.self).bigEndian,
+                    buf.loadUnaligned(fromByteOffset: 14, as: UInt32.self).bigEndian
                 )
             }
         let isAudio = (flags & Self.flagAudio) != 0
