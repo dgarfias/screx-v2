@@ -115,10 +115,24 @@ final class ScrexRootViewController: GCEventViewController {
         super.viewDidAppear(animated)
         captureView.becomeFirstResponder()
         updatePhysicalMouseCapture(model.physicalMouseConnected)
+        setNeedsStatusBarAppearanceUpdate()
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
     }
 
     override var prefersPointerLocked: Bool {
         model.physicalMouseConnected
+    }
+
+    override var prefersStatusBarHidden: Bool {
+        true
+    }
+
+    override var prefersHomeIndicatorAutoHidden: Bool {
+        true
+    }
+
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
+        .all
     }
 
     private func observeModel() {
@@ -138,6 +152,8 @@ final class ScrexRootViewController: GCEventViewController {
         if #available(iOS 14.0, *) {
             setNeedsUpdateOfPrefersPointerLocked()
         }
+        setNeedsStatusBarAppearanceUpdate()
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
     }
 }
 
@@ -182,6 +198,7 @@ final class StreamViewModel: ObservableObject {
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
     private var physicalMouseButtonMask: UInt8 = 0
+    private var physicalMouseScrollAccumulator: Float = 0
 
     private func log(_ message: String) {
         print("[app] \(message)")
@@ -637,6 +654,7 @@ final class StreamViewModel: ObservableObject {
     private func attachMouse(_ mouse: GCMouse) {
         physicalMouseConnected = true
         physicalMouseButtonMask = 0
+        physicalMouseScrollAccumulator = 0
         sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
 
         guard let input = mouse.mouseInput else { return }
@@ -672,10 +690,7 @@ final class StreamViewModel: ObservableObject {
 
         input.scroll.yAxis.valueChangedHandler = { [weak self] _, value in
             guard let self else { return }
-            var data = Data([0x03]) // MOUSE_SCROLL
-            let dy = Int16(clamping: Int(value)).bigEndian
-            withUnsafeBytes(of: dy) { data.append(contentsOf: $0) }
-            Task { @MainActor in self.sendMouse(data) }
+            Task { @MainActor in self.handlePhysicalMouseScroll(value: value) }
         }
 
         print("[periph] mouse attached")
@@ -684,6 +699,7 @@ final class StreamViewModel: ObservableObject {
     private func detachMouse() {
         guard physicalMouseConnected else { return }
         physicalMouseButtonMask = 0
+        physicalMouseScrollAccumulator = 0
         sendMouse(Data([0x04, 0x00]))
         physicalMouseConnected = false
         sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
@@ -707,6 +723,27 @@ final class StreamViewModel: ObservableObject {
 
         sendMouse(Data([0x02, mouseButtonCode, pressed ? 1 : 0]))
         sendMouse(Data([0x04, physicalMouseButtonMask]))
+    }
+
+    private func handlePhysicalMouseScroll(value: Float) {
+        // GameController scroll values can be fractional; accumulate them and
+        // emit whole wheel steps so Linux receives consistent REL_WHEEL events.
+        physicalMouseScrollAccumulator += value
+
+        var wholeSteps = Int(physicalMouseScrollAccumulator.rounded(.towardZero))
+        guard wholeSteps != 0 else { return }
+
+        if wholeSteps > 0 {
+            physicalMouseScrollAccumulator -= Float(wholeSteps)
+        } else {
+            physicalMouseScrollAccumulator += Float(-wholeSteps)
+        }
+
+        wholeSteps = max(-32, min(wholeSteps, 32))
+        var data = Data([0x03]) // MOUSE_SCROLL
+        let dy = Int16(clamping: wholeSteps).bigEndian
+        withUnsafeBytes(of: dy) { data.append(contentsOf: $0) }
+        sendMouse(data)
     }
 
     private func attachKeyboard(_ kb: GCKeyboard) {
@@ -809,6 +846,7 @@ struct ContentView: View {
     @State private var keyboardHeight: CGFloat = 0
     @State private var preKeyboardY: CGFloat? = nil
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
+    @State private var toolbarMessage: String? = nil
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -870,6 +908,18 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if let toolbarMessage {
+                    Text(toolbarMessage)
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, showOverlay ? 92 : 16)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
                 KeyboardInputView(
@@ -946,6 +996,11 @@ struct ContentView: View {
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .onChange(of: model.physicalKeyboardConnected) { connected in
+            if connected {
+                isKeyboardActive = false
+            }
+        }
     }
 
     // MARK: - Floating button bar
@@ -980,9 +1035,15 @@ struct ContentView: View {
 
                 toolbarButton(
                     icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
-                    active: isKeyboardActive,
-                    color: isKeyboardActive ? .green : .white
-                ) { isKeyboardActive.toggle() }
+                    active: isKeyboardActive && !model.physicalKeyboardConnected,
+                    color: model.physicalKeyboardConnected ? .gray : (isKeyboardActive ? .green : .white)
+                ) {
+                    if model.physicalKeyboardConnected {
+                        showToolbarMessage("External keyboard detected")
+                    } else {
+                        isKeyboardActive.toggle()
+                    }
+                }
             }
 
             Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
@@ -1064,6 +1125,18 @@ struct ContentView: View {
             .frame(width: Self.btnSize, height: Self.btnSize)
             .contentShape(Circle())
             .onTapGesture(perform: action)
+    }
+
+    private func showToolbarMessage(_ message: String) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            toolbarMessage = message
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            guard toolbarMessage == message else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                toolbarMessage = nil
+            }
+        }
     }
 
     // MARK: - Persistence
