@@ -61,10 +61,17 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 }
 
+final class MouseCaptureRootView: UIView {
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+}
+
 final class ScrexRootViewController: GCEventViewController {
     private let model: StreamViewModel
     private let hostingController: UIHostingController<AnyView>
     private var cancellables = Set<AnyCancellable>()
+    private let captureView = MouseCaptureRootView()
 
     init(model: StreamViewModel) {
         self.model = model
@@ -85,6 +92,10 @@ final class ScrexRootViewController: GCEventViewController {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func loadView() {
+        view = captureView
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         addChild(hostingController)
@@ -102,12 +113,8 @@ final class ScrexRootViewController: GCEventViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        becomeFirstResponder()
+        captureView.becomeFirstResponder()
         updatePhysicalMouseCapture(model.physicalMouseConnected)
-    }
-
-    override var canBecomeFirstResponder: Bool {
-        true
     }
 
     override var prefersPointerLocked: Bool {
@@ -126,7 +133,7 @@ final class ScrexRootViewController: GCEventViewController {
     private func updatePhysicalMouseCapture(_ active: Bool) {
         controllerUserInteractionEnabled = !active
         if active {
-            _ = becomeFirstResponder()
+            _ = captureView.becomeFirstResponder()
         }
         if #available(iOS 14.0, *) {
             setNeedsUpdateOfPrefersPointerLocked()
