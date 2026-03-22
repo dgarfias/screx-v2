@@ -87,29 +87,26 @@ struct ScrexCrypto {
 
     /// Server→client nonce from packet header fields.
     static func nonceServer(frameId: UInt32, chunkIdx: UInt16, flags: UInt8) -> Data {
-        let fid = frameId.bigEndian
-        let cid = chunkIdx.bigEndian
         var n = Data(count: 12)
         n[0] = 0x00
-        n[1] = UInt8(truncatingIfNeeded: fid >> 24)
-        n[2] = UInt8(truncatingIfNeeded: fid >> 16)
-        n[3] = UInt8(truncatingIfNeeded: fid >> 8)
-        n[4] = UInt8(truncatingIfNeeded: fid)
-        n[5] = UInt8(truncatingIfNeeded: cid >> 8)
-        n[6] = UInt8(truncatingIfNeeded: cid)
+        n[1] = UInt8(truncatingIfNeeded: frameId >> 24)
+        n[2] = UInt8(truncatingIfNeeded: frameId >> 16)
+        n[3] = UInt8(truncatingIfNeeded: frameId >> 8)
+        n[4] = UInt8(truncatingIfNeeded: frameId)
+        n[5] = UInt8(truncatingIfNeeded: chunkIdx >> 8)
+        n[6] = UInt8(truncatingIfNeeded: chunkIdx)
         n[7] = flags
         return n
     }
 
     /// Client→server nonce from sequence number.
     static func nonceClient(seqNum: UInt32) -> Data {
-        let s = seqNum.bigEndian
         var n = Data(count: 12)
         n[0] = 0xFF
-        n[1] = UInt8(truncatingIfNeeded: s >> 24)
-        n[2] = UInt8(truncatingIfNeeded: s >> 16)
-        n[3] = UInt8(truncatingIfNeeded: s >> 8)
-        n[4] = UInt8(truncatingIfNeeded: s)
+        n[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
+        n[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
+        n[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
+        n[4] = UInt8(truncatingIfNeeded: seqNum)
         return n
     }
 }
