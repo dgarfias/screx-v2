@@ -16,14 +16,6 @@ impl SessionCipher {
         }
     }
 
-    /// Encrypt `plaintext` in-place, appending 16-byte auth tag.
-    pub fn encrypt(&self, nonce_bytes: &[u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) {
-        let nonce = Nonce::assume_unique_for_key(*nonce_bytes);
-        self.key
-            .seal_in_place_append_tag(nonce, Aad::from(aad), plaintext)
-            .expect("AES-GCM encrypt");
-    }
-
     /// Encrypt `data_len` bytes of `buf` in place, writing the 16-byte tag after.
     /// `buf` must have at least `data_len + TAG_LEN` bytes available.
     /// Returns the total length (data_len + TAG_LEN).
@@ -79,12 +71,6 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(tag.as_ref());
     out
-}
-
-/// Verify an HMAC-SHA256 tag.
-pub fn hmac_sha256_verify(key: &[u8], data: &[u8], tag: &[u8]) -> bool {
-    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
-    hmac::verify(&k, data, tag).is_ok()
 }
 
 /// Build a 12-byte nonce for daemon→client packets from header fields.

@@ -1,23 +1,13 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 
-#[derive(Debug, Clone, Copy)]
-pub enum PixelFormat {
-    Bgra8888,
-}
-
 #[derive(Debug)]
 pub struct CaptureFrame<'a> {
-    pub frame_index: u64,
-    pub timestamp_90k: u32,
     pub width: u32,
     pub height: u32,
-    pub format: PixelFormat,
     pub data: &'a [u8],
-    pub captured_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +26,7 @@ mod evdi {
 
     use anyhow::{Context, Result};
 
-    use super::{CaptureConfig, CaptureFrame, PixelFormat};
+    use super::{CaptureConfig, CaptureFrame};
 
     // -- FFI declarations --------------------------------------------------
 
@@ -444,7 +434,6 @@ mod evdi {
 
         let frame_interval = Duration::from_micros(1_000_000 / config.fps.max(1) as u64);
         let poll_timeout_ms = frame_interval.as_millis().max(1).min(100) as i32;
-        let mut frame_index: u64 = 0;
         let mut stats_start = Instant::now();
         let mut stats_frames: u64 = 0;
         let start_time = Instant::now();
@@ -506,19 +495,13 @@ mod evdi {
                     evdi_grab_pixels(handle, rects.as_mut_ptr(), &mut num_rects);
                 }
 
-                let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
                 let frame = CaptureFrame {
-                    frame_index,
-                    timestamp_90k,
                     width: config.width,
                     height: config.height,
-                    format: PixelFormat::Bgra8888,
                     data: &pixel_buf,
-                    captured_at: Instant::now(),
                 };
 
                 on_frame(frame);
-                frame_index += 1;
                 stats_frames += 1;
                 has_first_frame = true;
 
@@ -538,18 +521,12 @@ mod evdi {
                     if refresh_retries == 0 && has_first_frame {
                         // Retries exhausted — send the last captured buffer as fallback
                         println!("[capture] force refresh: no new damage, sending last captured buffer");
-                        let timestamp_90k = ((frame_index * 90_000) / config.fps.max(1) as u64) as u32;
                         let frame = CaptureFrame {
-                            frame_index,
-                            timestamp_90k,
                             width: config.width,
                             height: config.height,
-                            format: PixelFormat::Bgra8888,
                             data: &pixel_buf,
-                            captured_at: Instant::now(),
                         };
                         on_frame(frame);
-                        frame_index += 1;
                     }
                 }
             }

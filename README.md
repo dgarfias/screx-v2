@@ -90,8 +90,7 @@ screx-v2/
 │       ├── camera.rs              # v4l2loopback virtual webcam writer
 │       ├── uinput.rs              # Virtual touchscreen, keyboard, mouse, and gamepad injection
 │       ├── doctor.rs              # Host readiness checks
-│       ├── signaling.rs           # Signaling helpers
-│       └── webrtc_sender.rs       # WebRTC sender (experimental)
+│       └── logging.rs             # Verbose logging helpers
 ├── app/                           # Swift iPad app (iOS 16+)
 │   └── Screx/
 │       ├── ScrexApp.swift         # App entry, transport orchestration, peripheral + controller forwarding UI
