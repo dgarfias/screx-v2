@@ -688,9 +688,9 @@ final class StreamViewModel: ObservableObject {
             }
         }
 
-        input.scroll.yAxis.valueChangedHandler = { [weak self] _, value in
+        input.scroll.valueChangedHandler = { [weak self] _, _, deltaY in
             guard let self else { return }
-            Task { @MainActor in self.handlePhysicalMouseScroll(value: value) }
+            Task { @MainActor in self.handlePhysicalMouseScroll(value: deltaY) }
         }
 
         print("[periph] mouse attached")
