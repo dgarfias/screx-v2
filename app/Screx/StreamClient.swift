@@ -187,20 +187,16 @@ final class StreamClient {
     private func handlePacket(_ data: Data) {
         guard data.count >= Self.headerLen else { return }
 
-        // Parse all header fields in one withUnsafeBytes call (unaligned-safe)
-        let (frameId, chunkIdx, totalData, totalParity, flags, codecId, payloadLen, timestampMs) =
-            data.withUnsafeBytes { buf -> (UInt32, UInt16, UInt16, UInt16, UInt8, UInt8, UInt16, UInt32) in
-                (
-                    buf.loadUnaligned(fromByteOffset: 0, as: UInt32.self).bigEndian,
-                    buf.loadUnaligned(fromByteOffset: 4, as: UInt16.self).bigEndian,
-                    buf.loadUnaligned(fromByteOffset: 6, as: UInt16.self).bigEndian,
-                    buf.loadUnaligned(fromByteOffset: 8, as: UInt16.self).bigEndian,
-                    buf.loadUnaligned(fromByteOffset: 10, as: UInt8.self),
-                    buf.loadUnaligned(fromByteOffset: 11, as: UInt8.self),
-                    buf.loadUnaligned(fromByteOffset: 12, as: UInt16.self).bigEndian,
-                    buf.loadUnaligned(fromByteOffset: 14, as: UInt32.self).bigEndian
-                )
-            }
+        let frameId: UInt32 = UInt32(data[0]) << 24 | UInt32(data[1]) << 16
+                           | UInt32(data[2]) << 8  | UInt32(data[3])
+        let chunkIdx: UInt16 = UInt16(data[4]) << 8 | UInt16(data[5])
+        let totalData: UInt16 = UInt16(data[6]) << 8 | UInt16(data[7])
+        let totalParity: UInt16 = UInt16(data[8]) << 8 | UInt16(data[9])
+        let flags = data[10]
+        let codecId = data[11]
+        let payloadLen: UInt16 = UInt16(data[12]) << 8 | UInt16(data[13])
+        let timestampMs: UInt32 = UInt32(data[14]) << 24 | UInt32(data[15]) << 16
+                               | UInt32(data[16]) << 8  | UInt32(data[17])
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
