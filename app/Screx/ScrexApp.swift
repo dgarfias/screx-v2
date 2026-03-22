@@ -138,15 +138,23 @@ final class ScrexRootViewController: GCEventViewController {
     private func observeModel() {
         model.$physicalMouseConnected
             .removeDuplicates()
-            .sink { [weak self] active in
-                self?.updatePhysicalMouseCapture(active)
+            .sink { [weak self] _ in
+                self?.updatePhysicalMouseCapture()
+            }
+            .store(in: &cancellables)
+
+        model.$physicalControllerConnectedCount
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.updatePhysicalMouseCapture()
             }
             .store(in: &cancellables)
     }
 
-    private func updatePhysicalMouseCapture(_ active: Bool) {
-        controllerUserInteractionEnabled = !active
-        if active {
+    private func updatePhysicalMouseCapture() {
+        let captureActive = model.physicalMouseConnected || model.physicalControllerConnectedCount > 0
+        controllerUserInteractionEnabled = !captureActive
+        if captureActive {
             _ = captureView.becomeFirstResponder()
         }
         if #available(iOS 14.0, *) {
@@ -195,8 +203,11 @@ final class StreamViewModel: ObservableObject {
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
+    @Published var physicalControllerConnectedCount = 0
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
+    private var controllerObservers: [Any] = []
+    private var controllerSlots: [ObjectIdentifier: UInt8] = [:]
     private var physicalMouseButtonMask: UInt8 = 0
     private var physicalMouseScrollAccumulator: Float = 0
 
@@ -602,6 +613,14 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
+    func sendGamepad(_ gamepadData: Data) {
+        if usbConnected, let usb = usbListener {
+            usb.sendGamepad(gamepadData)
+        } else if let control = networkControl {
+            control.sendGamepad(gamepadData)
+        }
+    }
+
     // MARK: - Peripheral Monitoring (GCMouse / GCKeyboard)
 
     func startPeripheralMonitoring() {
@@ -612,6 +631,9 @@ final class StreamViewModel: ObservableObject {
         }
         if let kb = GCKeyboard.coalesced {
             attachKeyboard(kb)
+        }
+        for controller in GCController.controllers() {
+            attachController(controller)
         }
 
         let mc = NotificationCenter.default.addObserver(
@@ -638,17 +660,33 @@ final class StreamViewModel: ObservableObject {
             guard let self else { return }
             Task { @MainActor in self.detachKeyboard() }
         }
+        let cc = NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let controller = note.object as? GCController else { return }
+            Task { @MainActor in self.attachController(controller) }
+        }
+        let cd = NotificationCenter.default.addObserver(
+            forName: .GCControllerDidDisconnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let controller = note.object as? GCController else { return }
+            Task { @MainActor in self.detachController(controller) }
+        }
         mouseObservers = [mc, md]
         keyboardObservers = [kc, kd]
+        controllerObservers = [cc, cd]
     }
 
     func stopPeripheralMonitoring() {
         for obs in mouseObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in keyboardObservers { NotificationCenter.default.removeObserver(obs) }
+        for obs in controllerObservers { NotificationCenter.default.removeObserver(obs) }
         mouseObservers.removeAll()
         keyboardObservers.removeAll()
+        controllerObservers.removeAll()
         detachMouse()
         detachKeyboard()
+        detachAllControllers()
     }
 
     private func attachMouse(_ mouse: GCMouse) {
@@ -771,6 +809,172 @@ final class StreamViewModel: ObservableObject {
         physicalKeyboardConnected = false
         sendPeripheral(Data([0x02, 0x00])) // PERIPH_KEYBOARD, DETACHED
         print("[periph] keyboard detached")
+    }
+
+    private func attachController(_ controller: GCController) {
+        let id = ObjectIdentifier(controller)
+        guard controllerSlots[id] == nil else { return }
+        guard controller.extendedGamepad != nil || controller.microGamepad != nil else {
+            print("[gamepad] unsupported controller profile ignored")
+            return
+        }
+
+        guard let slot = nextAvailableControllerSlot() else {
+            print("[gamepad] no free virtual gamepad slot (max 4)")
+            return
+        }
+
+        controllerSlots[id] = slot
+        physicalControllerConnectedCount = controllerSlots.count
+        sendGamepad(Data([slot, 0x01])) // ATTACHED
+
+        if let gamepad = controller.extendedGamepad {
+            gamepad.valueChangedHandler = { [weak self, weak controller] gamepad, _ in
+                guard let self, let controller else { return }
+                Task { @MainActor in self.sendExtendedGamepadState(controller: controller, gamepad: gamepad) }
+            }
+            sendExtendedGamepadState(controller: controller, gamepad: gamepad)
+            print("[gamepad] controller attached in slot \(slot + 1) (extended)")
+        } else if let gamepad = controller.microGamepad {
+            gamepad.valueChangedHandler = { [weak self, weak controller] gamepad, _ in
+                guard let self, let controller else { return }
+                Task { @MainActor in self.sendMicroGamepadState(controller: controller, gamepad: gamepad) }
+            }
+            sendMicroGamepadState(controller: controller, gamepad: gamepad)
+            print("[gamepad] controller attached in slot \(slot + 1) (micro)")
+        }
+    }
+
+    private func detachController(_ controller: GCController) {
+        let id = ObjectIdentifier(controller)
+        guard let slot = controllerSlots.removeValue(forKey: id) else { return }
+
+        controller.extendedGamepad?.valueChangedHandler = nil
+        controller.microGamepad?.valueChangedHandler = nil
+
+        sendGamepad(Data([slot, 0x00])) // DETACHED
+        physicalControllerConnectedCount = controllerSlots.count
+        print("[gamepad] controller detached from slot \(slot + 1)")
+    }
+
+    private func detachAllControllers() {
+        for controller in GCController.controllers() {
+            controller.extendedGamepad?.valueChangedHandler = nil
+            controller.microGamepad?.valueChangedHandler = nil
+        }
+        for slot in controllerSlots.values {
+            sendGamepad(Data([slot, 0x00]))
+        }
+        controllerSlots.removeAll()
+        physicalControllerConnectedCount = 0
+    }
+
+    private func nextAvailableControllerSlot() -> UInt8? {
+        let used = Set(controllerSlots.values)
+        for slot in 0..<4 {
+            let candidate = UInt8(slot)
+            if !used.contains(candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func sendExtendedGamepadState(controller: GCController, gamepad: GCExtendedGamepad) {
+        let id = ObjectIdentifier(controller)
+        guard let slot = controllerSlots[id] else { return }
+
+        var buttons: UInt16 = 0
+        if gamepad.buttonA.isPressed { buttons |= 0x0001 }
+        if gamepad.buttonB.isPressed { buttons |= 0x0002 }
+        if gamepad.buttonX.isPressed { buttons |= 0x0004 }
+        if gamepad.buttonY.isPressed { buttons |= 0x0008 }
+        if gamepad.leftShoulder.isPressed { buttons |= 0x0010 }
+        if gamepad.rightShoulder.isPressed { buttons |= 0x0020 }
+        if gamepad.leftThumbstickButton?.isPressed == true { buttons |= 0x0040 }
+        if gamepad.rightThumbstickButton?.isPressed == true { buttons |= 0x0080 }
+        if gamepad.buttonOptions?.isPressed == true { buttons |= 0x0100 }
+        if gamepad.buttonMenu.isPressed { buttons |= 0x0200 }
+        if gamepad.buttonHome?.isPressed == true { buttons |= 0x0400 }
+
+        let hatX: Int8 = gamepad.dpad.left.isPressed ? -1 : (gamepad.dpad.right.isPressed ? 1 : 0)
+        let hatY: Int8 = gamepad.dpad.up.isPressed ? -1 : (gamepad.dpad.down.isPressed ? 1 : 0)
+
+        sendGamepadState(
+            slot: slot,
+            buttons: buttons,
+            lx: gamepad.leftThumbstick.xAxis.value,
+            ly: -gamepad.leftThumbstick.yAxis.value,
+            rx: gamepad.rightThumbstick.xAxis.value,
+            ry: -gamepad.rightThumbstick.yAxis.value,
+            lt: gamepad.leftTrigger.value,
+            rt: gamepad.rightTrigger.value,
+            hatX: hatX,
+            hatY: hatY
+        )
+    }
+
+    private func sendMicroGamepadState(controller: GCController, gamepad: GCMicroGamepad) {
+        let id = ObjectIdentifier(controller)
+        guard let slot = controllerSlots[id] else { return }
+
+        var buttons: UInt16 = 0
+        if gamepad.buttonA.isPressed { buttons |= 0x0001 }
+        if gamepad.buttonX.isPressed { buttons |= 0x0004 }
+        if gamepad.buttonMenu.isPressed { buttons |= 0x0200 }
+
+        let hatX: Int8 = gamepad.dpad.left.isPressed ? -1 : (gamepad.dpad.right.isPressed ? 1 : 0)
+        let hatY: Int8 = gamepad.dpad.up.isPressed ? -1 : (gamepad.dpad.down.isPressed ? 1 : 0)
+
+        sendGamepadState(
+            slot: slot,
+            buttons: buttons,
+            lx: 0,
+            ly: 0,
+            rx: 0,
+            ry: 0,
+            lt: 0,
+            rt: 0,
+            hatX: hatX,
+            hatY: hatY
+        )
+    }
+
+    private func sendGamepadState(
+        slot: UInt8,
+        buttons: UInt16,
+        lx: Float,
+        ly: Float,
+        rx: Float,
+        ry: Float,
+        lt: Float,
+        rt: Float,
+        hatX: Int8,
+        hatY: Int8
+    ) {
+        var data = Data([slot, 0x02]) // STATE
+        withUnsafeBytes(of: buttons.bigEndian) { data.append(contentsOf: $0) }
+        appendGamepadAxis(&data, lx)
+        appendGamepadAxis(&data, ly)
+        appendGamepadAxis(&data, rx)
+        appendGamepadAxis(&data, ry)
+        appendGamepadTrigger(&data, lt)
+        appendGamepadTrigger(&data, rt)
+        data.append(UInt8(bitPattern: hatX))
+        data.append(UInt8(bitPattern: hatY))
+        sendGamepad(data)
+    }
+
+    private func appendGamepadAxis(_ data: inout Data, _ value: Float) {
+        let clamped = max(-1.0, min(1.0, value))
+        let scaled = Int16(clamping: Int((clamped * 32767.0).rounded())).bigEndian
+        withUnsafeBytes(of: scaled) { data.append(contentsOf: $0) }
+    }
+
+    private func appendGamepadTrigger(_ data: inout Data, _ value: Float) {
+        let clamped = max(0.0, min(1.0, value))
+        let scaled = UInt16((clamped * 1023.0).rounded()).bigEndian
+        withUnsafeBytes(of: scaled) { data.append(contentsOf: $0) }
     }
 
     // MARK: - Camera

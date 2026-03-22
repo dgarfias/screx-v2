@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ const MIC_MAGIC: &[u8] = b"MIC";
 const MOUSE_MAGIC: &[u8] = b"MOUSE";
 const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
 const PERIPH_MAGIC: &[u8] = b"PERIPH";
+const GPAD_MAGIC: &[u8] = b"GPAD";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -52,6 +54,7 @@ pub struct SharedState {
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
     pub virtual_mouse: Mutex<Option<crate::uinput::VirtualMouse>>,
+    pub virtual_gamepads: Mutex<HashMap<u8, crate::uinput::VirtualGamepad>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
     pub mic_writer: Mutex<Option<MicWriter>>,
     pub start_time: Instant,
@@ -78,6 +81,7 @@ impl SharedState {
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
             virtual_mouse: Mutex::new(None),
+            virtual_gamepads: Mutex::new(HashMap::new()),
             cam_writer: Mutex::new(None),
             mic_writer: Mutex::new(None),
             on_client_connected: Mutex::new(None),
@@ -209,6 +213,65 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     if ctrl.starts_with(PERIPH_MAGIC) && ctrl.len() > PERIPH_MAGIC.len() {
         let periph_data = &ctrl[PERIPH_MAGIC.len()..];
         handle_periph_packet_data(shared, periph_data);
+        return;
+    }
+
+    if ctrl.starts_with(GPAD_MAGIC) && ctrl.len() > GPAD_MAGIC.len() {
+        let gamepad_data = &ctrl[GPAD_MAGIC.len()..];
+        handle_gamepad_packet_data(shared, gamepad_data);
+    }
+}
+
+const GPAD_DETACHED: u8 = 0x00;
+const GPAD_ATTACHED: u8 = 0x01;
+const GPAD_STATE: u8 = 0x02;
+
+pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
+    if data.len() < 2 {
+        return;
+    }
+
+    let controller_id = data[0];
+    let msg_type = data[1];
+
+    match msg_type {
+        GPAD_ATTACHED => {
+            let mut pads = shared.virtual_gamepads.lock().unwrap();
+            if pads.contains_key(&controller_id) {
+                return;
+            }
+            match crate::uinput::VirtualGamepad::new(controller_id) {
+                Ok(pad) => {
+                    pads.insert(controller_id, pad);
+                    println!("[gamepad] controller {} attached — virtual gamepad created", controller_id + 1);
+                }
+                Err(e) => eprintln!("[gamepad] failed to create virtual gamepad {}: {e}", controller_id + 1),
+            }
+        }
+        GPAD_DETACHED => {
+            let mut pads = shared.virtual_gamepads.lock().unwrap();
+            if let Some(mut pad) = pads.remove(&controller_id) {
+                pad.release_all();
+                println!("[gamepad] controller {} detached — virtual gamepad destroyed", controller_id + 1);
+            }
+        }
+        GPAD_STATE if data.len() >= 18 => {
+            let buttons_mask = u16::from_be_bytes([data[2], data[3]]);
+            let lx = i16::from_be_bytes([data[4], data[5]]);
+            let ly = i16::from_be_bytes([data[6], data[7]]);
+            let rx = i16::from_be_bytes([data[8], data[9]]);
+            let ry = i16::from_be_bytes([data[10], data[11]]);
+            let lt = u16::from_be_bytes([data[12], data[13]]);
+            let rt = u16::from_be_bytes([data[14], data[15]]);
+            let hat_x = data[16] as i8;
+            let hat_y = data[17] as i8;
+
+            let mut pads = shared.virtual_gamepads.lock().unwrap();
+            if let Some(ref mut pad) = pads.get_mut(&controller_id) {
+                pad.set_state(buttons_mask, lx, ly, rx, ry, lt, rt, hat_x, hat_y);
+            }
+        }
+        _ => {}
     }
 }
 

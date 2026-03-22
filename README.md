@@ -19,7 +19,9 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Keyboard input**: iPad native keyboard forwarded to Linux via uinput virtual keyboard, with `Ctrl+Shift+U` Unicode input for accented/special characters (ñ, á, ö, etc.)
 - **Modifier keys**: Accessory bar above the iPad keyboard with Esc, Tab, Ctrl, Alt, Super, Home, End, Ins, Del, and arrow keys — modifiers are sticky one-shot (tap to arm, next key sends the combo)
 - **Physical peripheral forwarding**: External mouse and keyboard connected to the iPad are forwarded to Linux over both Network and USB
-- **Pointer capture for external mouse**: When a physical mouse is active, iPadOS pointer input is captured for the app, the system pointer is hidden, and indirect pointer touches are not forwarded as touchscreen input
+- **Game controller forwarding**: Up to 4 controllers connected to the iPad are forwarded as generic Linux virtual gamepads, with one virtual device created per attached controller
+- **Pointer capture for external mouse**: When a physical mouse is active, iPadOS pointer input is captured for the app, the system pointer is hidden, and top status/system overlays are suppressed for a cleaner full-screen desktop view
+- **Touch/pointer separation**: Indirect pointer touches are filtered out so physical mouse clicks are not also forwarded as touchscreen taps
 - **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; network UDP media and network TCP control both use AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
 - **Single-client mode**: Only one iPad can connect at a time; additional connection attempts receive a `SCREX_BUSY` rejection
 - **Auto-discovery**: UDP broadcast beacon (no mDNS dependency), iPad auto-connects within seconds. Beacon pauses during active sessions and resumes on disconnect
@@ -50,7 +52,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  PairingService (TCP) ── PIN entry + Keychain storage │
-│  NetworkControlClient (TCP) ─ touch/keys/mouse/periph │
+│  NetworkControlClient (TCP) ─ touch/keys/mouse/gamepad│
 │                           └─ PLI + control messages   │
 │                                                       │
 │  StreamClient (UDP) ────┬──► VideoDecoder ──► Display │
@@ -60,6 +62,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 │  Touch / Pencil ─────────────────────────► daemon     │
 │  Keyboard + modifier bar ────────────────► daemon     │
 │  External mouse / keyboard ──────────────► daemon     │
+│  Up to 4 game controllers ───────────────► daemon     │
 │  Microphone (Opus) ──────────────────────► daemon     │
 │  Camera (JPEG) ──────────────────────────► daemon     │
 │                                                       │
@@ -85,7 +88,7 @@ screx-v2/
 │       ├── discovery.rs           # UDP broadcast beacon (pauses during active sessions)
 │       ├── audio.rs               # Virtual sink + parec capture, virtual mic (pipe-source / null-sink)
 │       ├── camera.rs              # v4l2loopback virtual webcam writer
-│       ├── uinput.rs              # Virtual touchscreen, keyboard, and mouse injection
+│       ├── uinput.rs              # Virtual touchscreen, keyboard, mouse, and gamepad injection
 │       ├── doctor.rs              # Host readiness checks
 │       ├── signaling.rs           # Signaling helpers
 │       └── webrtc_sender.rs       # WebRTC sender (experimental)
@@ -114,17 +117,19 @@ screx-v2/
 ```bash
 # Build dependencies
 sudo pacman -S --needed \
-  rust pkg-config clang \
+  rust pkgconf clang \
   ffmpeg libva mesa \
   linux-headers
 
 # Runtime dependencies
 sudo pacman -S --needed \
-  pulseaudio-utils \
+  libpulse \
   pipewire-pulse \
+  pipewire \
   libimobiledevice \
+  libusbmuxd \
   v4l2loopback-dkms \
-  udev
+  systemd
 
 # EVDI (virtual display — from AUR)
 yay -S evdi-git
@@ -144,9 +149,11 @@ sudo apt-get install -y \
 sudo apt-get install -y \
   pulseaudio-utils \
   pipewire-pulse \
+  pipewire-bin \
   libimobiledevice-utils \
-  v4l2loopback-dkms v4l2loopback-utils \
-  evdi-dkms libevdi0 \
+  libusbmuxd-tools \
+  v4l2loopback-dkms \
+  evdi-dkms libevdi1 \
   udev
 ```
 
@@ -164,11 +171,11 @@ All three are loaded automatically by the daemon when needed. If `uinput` isn't 
 
 ### USB Transport (optional)
 
-For USB streaming, `idevice_id` and `iproxy` must be available (provided by `libimobiledevice` / `libimobiledevice-utils`). The daemon auto-detects USB devices and manages iproxy automatically.
+For USB streaming, `idevice_id` and `iproxy` must be available. On Arch, they come from `libimobiledevice` and `libusbmuxd`. On Debian/Ubuntu, they come from `libimobiledevice-utils` and `libusbmuxd-tools`. The daemon auto-detects USB devices and manages iproxy automatically.
 
 ### PipeWire / PulseAudio
 
-The daemon uses `pactl`, `parec`, and `pacat` (from `pulseaudio-utils`) to create virtual audio sinks and sources. These work on both PulseAudio and PipeWire (via the PulseAudio compatibility layer). On PipeWire setups, `pw-link` is also used for microphone routing and is included with PipeWire.
+The daemon uses `pactl`, `parec`, and `pacat` to create virtual audio sinks and sources. On Arch, those commands are provided by `libpulse`; on Debian/Ubuntu they are provided by `pulseaudio-utils`. These work on both PulseAudio and PipeWire (via the PulseAudio compatibility layer). On PipeWire setups, `pw-link` is also used for microphone routing; on Arch it is provided by `pipewire`, and on Debian/Ubuntu by `pipewire-bin`.
 
 ## Build
 
@@ -241,7 +248,7 @@ The floating toolbar pill can be dragged anywhere on screen. Drag to the left ed
 |---|---|
 | Mic | Toggle iPad microphone forwarding (green when active) |
 | Camera | Toggle iPad camera forwarding; long-press to flip front/rear |
-| Keyboard | Toggle iPad native keyboard with modifier accessory bar; grays out when an external keyboard is connected |
+| Keyboard | Toggle iPad native keyboard with modifier accessory bar; grays out when an external keyboard is connected and shows `External keyboard detected` if tapped |
 | Info (ⓘ) | Toggle connection status overlay; drag from anywhere on pill to reposition |
 
 ### Keyboard Accessory Bar
@@ -260,9 +267,17 @@ When the keyboard is active, an accessory bar appears above the iPad keyboard:
 - A physical mouse connected to the iPad is forwarded as a Linux virtual mouse.
 - A physical keyboard connected to the iPad is forwarded as raw key events to the Linux virtual keyboard.
 - Pointer input is captured by the app while the physical mouse is active, so indirect pointer touches are not also forwarded as touchscreen taps.
-- Mouse wheel scrolling is forwarded separately from button clicks.
-- Middle click is supported as a click action; middle-button hold semantics are not guaranteed.
+- Mouse wheel scrolling is forwarded separately from button clicks and uses the iPad display surface's discrete scroll input path.
+- Left and right click preserve normal press/release semantics. Middle click is supported as a click action; middle-button hold semantics are not guaranteed.
 - When an external keyboard is connected, the on-screen keyboard button is disabled visually and tapping it shows `External keyboard detected`.
+
+### Game Controllers
+
+- Up to 4 controllers can be forwarded at the same time.
+- Each attached controller creates one Linux virtual gamepad device.
+- Linux gamepads are only created when the iPad explicitly reports that a controller is attached.
+- Current target is a generic Linux gamepad profile over `uinput`, intended to work broadly with native Linux input stacks.
+- Controllers using unsupported GameController profiles are ignored rather than creating a broken virtual device.
 
 ## Protocols
 
@@ -290,7 +305,7 @@ On first connection, the iPad and daemon perform a PIN-based pairing handshake o
 Once the session key is established, network traffic is split:
 
 - **UDP media path**: video/audio from daemon to iPad plus mic/camera from iPad to daemon, encrypted with **AES-256-GCM**
-- **TCP control path**: touch, keyboard, physical mouse/keyboard, peripheral attach/detach, and PLI/control messages, encrypted with **AES-256-GCM**
+- **TCP control path**: touch, keyboard, physical mouse/keyboard, gamepad attach/state/detach, peripheral attach/detach, and PLI/control messages, encrypted with **AES-256-GCM**
 
 The UDP media header remains plaintext but authenticated as AAD. TCP control frames are length-prefixed and include a per-frame sequence number used as AAD and as part of nonce construction.
 
@@ -335,7 +350,7 @@ Network control/input uses the same paired TCP socket established during pairing
 | `seq` | u32 BE | Per-frame sequence number |
 | `ciphertext+tag` | variable | AES-256-GCM encrypted control payload |
 
-Plaintext control payloads reuse the existing message prefixes: `PLI`, `TOUCH`, `KEY`, `MOUSE`, `RAWKEY`, and `PERIPH`.
+Plaintext control payloads reuse the existing message prefixes: `PLI`, `TOUCH`, `KEY`, `MOUSE`, `RAWKEY`, `PERIPH`, and `GPAD`.
 
 ### USB Transport (TCP)
 
@@ -369,6 +384,6 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 5. **iPad connects** (network UDP media + TCP control, or USB TCP)
 6. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → encrypted UDP media sends to iPad
 7. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM encrypted and sent alongside video
-8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, and control traffic over TCP; indirect pointer touches are filtered out so physical mouse clicks do not also become touchscreen taps. Mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
+8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, gamepad state, and control traffic over TCP; indirect pointer touches are filtered out so physical mouse clicks do not also become touchscreen taps. Mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
 9. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
 10. **Disconnect detection**: data timeouts (network) and TCP close (USB) trigger automatic reconnection; beacon resumes for rediscovery

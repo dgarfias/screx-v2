@@ -290,6 +290,9 @@ async fn main() -> Result<()> {
             // Virtual mouse (physical peripheral)
             *shared_d.virtual_mouse.lock().unwrap() = None;
 
+            // Virtual gamepads
+            shared_d.virtual_gamepads.lock().unwrap().clear();
+
             // Audio sink
             let mid = *audio_id_d.lock().unwrap();
             if mid > 0 {

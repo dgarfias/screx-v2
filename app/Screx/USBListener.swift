@@ -335,6 +335,19 @@ final class USBListener {
         })
     }
 
+    func sendGamepad(_ gamepadData: Data) {
+        guard let conn = connection else { return }
+        let payload = Data("GPAD".utf8) + gamepadData
+        let payloadLen = UInt32(1 + payload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error { print("[usb] gpad send error: \(error)") }
+        })
+    }
+
     var isConnected: Bool {
         connection != nil
     }

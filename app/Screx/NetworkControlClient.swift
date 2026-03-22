@@ -149,4 +149,10 @@ final class NetworkControlClient {
         payload.append(periphData)
         sendFrame(payload, label: "periph")
     }
+
+    func sendGamepad(_ gamepadData: Data) {
+        var payload = Data("GPAD".utf8)
+        payload.append(gamepadData)
+        sendFrame(payload, label: "gpad")
+    }
 }

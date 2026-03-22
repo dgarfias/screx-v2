@@ -360,6 +360,27 @@ const BTN_EXTRA: u16 = 0x114;
 const BTN_FORWARD: u16 = 0x115;
 const BTN_BACK: u16 = 0x116;
 const BTN_TASK: u16 = 0x117;
+const BTN_SOUTH: u16 = 0x130;
+const BTN_EAST: u16 = 0x131;
+const BTN_C: u16 = 0x132;
+const BTN_NORTH: u16 = 0x133;
+const BTN_WEST: u16 = 0x134;
+const BTN_Z: u16 = 0x135;
+const BTN_TL: u16 = 0x136;
+const BTN_TR: u16 = 0x137;
+const BTN_TL2: u16 = 0x138;
+const BTN_TR2: u16 = 0x139;
+const BTN_SELECT: u16 = 0x13a;
+const BTN_START: u16 = 0x13b;
+const BTN_MODE: u16 = 0x13c;
+const BTN_THUMBL: u16 = 0x13d;
+const BTN_THUMBR: u16 = 0x13e;
+const ABS_Z: u16 = 0x02;
+const ABS_RX: u16 = 0x03;
+const ABS_RY: u16 = 0x04;
+const ABS_RZ: u16 = 0x05;
+const ABS_HAT0X: u16 = 0x10;
+const ABS_HAT0Y: u16 = 0x11;
 const UI_SET_RELBIT: libc::c_ulong = 0x40045566; // _IOW('U', 102, int)
 
 pub struct VirtualMouse {
@@ -482,6 +503,162 @@ impl Drop for VirtualMouse {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
         println!("[mouse] virtual mouse destroyed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual gamepad (uinput) — receives controller input from iPad
+// ---------------------------------------------------------------------------
+
+const GPAD_BTN_SOUTH: u16 = 0x0001;
+const GPAD_BTN_EAST: u16 = 0x0002;
+const GPAD_BTN_WEST: u16 = 0x0004;
+const GPAD_BTN_NORTH: u16 = 0x0008;
+const GPAD_BTN_TL: u16 = 0x0010;
+const GPAD_BTN_TR: u16 = 0x0020;
+const GPAD_BTN_THUMBL: u16 = 0x0040;
+const GPAD_BTN_THUMBR: u16 = 0x0080;
+const GPAD_BTN_SELECT: u16 = 0x0100;
+const GPAD_BTN_START: u16 = 0x0200;
+const GPAD_BTN_MODE: u16 = 0x0400;
+
+pub struct VirtualGamepad {
+    file: File,
+    buttons_mask: u16,
+}
+
+impl VirtualGamepad {
+    pub fn new(slot: u8) -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .context("failed to open /dev/uinput for gamepad")?;
+
+        let fd = file.as_raw_fd();
+
+        unsafe {
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_ABS as libc::c_int))?;
+
+            for &btn in &[
+                BTN_SOUTH, BTN_EAST, BTN_C, BTN_NORTH, BTN_WEST, BTN_Z,
+                BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
+                BTN_SELECT, BTN_START, BTN_MODE,
+                BTN_THUMBL, BTN_THUMBR,
+            ] {
+                ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, btn as libc::c_int))?;
+            }
+
+            for &abs in &[
+                ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
+            ] {
+                ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, abs as libc::c_int))?;
+            }
+
+            set_abs(fd, ABS_X, -32768, 32767)?;
+            set_abs(fd, ABS_Y, -32768, 32767)?;
+            set_abs(fd, ABS_RX, -32768, 32767)?;
+            set_abs(fd, ABS_RY, -32768, 32767)?;
+            set_abs(fd, ABS_Z, 0, 1023)?;
+            set_abs(fd, ABS_RZ, 0, 1023)?;
+            set_abs(fd, ABS_HAT0X, -1, 1)?;
+            set_abs(fd, ABS_HAT0Y, -1, 1)?;
+
+            let mut setup: UinputSetup = mem::zeroed();
+            setup.id.bustype = 0x03; // BUS_USB
+            setup.id.vendor = SCREX_VENDOR;
+            setup.id.product = SCREX_PRODUCT + 10 + slot as u16;
+            setup.id.version = 1;
+            let name = format!("Screx Virtual Gamepad {}", slot + 1);
+            let name_bytes = name.as_bytes();
+            setup.name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_setup(), &setup))?;
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_create()))?;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        println!("[gamepad] virtual gamepad {} created", slot + 1);
+
+        Ok(Self {
+            file,
+            buttons_mask: 0,
+        })
+    }
+
+    pub fn set_state(
+        &mut self,
+        buttons_mask: u16,
+        lx: i16,
+        ly: i16,
+        rx: i16,
+        ry: i16,
+        lt: u16,
+        rt: u16,
+        hat_x: i8,
+        hat_y: i8,
+    ) {
+        self.sync_button(BTN_SOUTH, GPAD_BTN_SOUTH, buttons_mask);
+        self.sync_button(BTN_EAST, GPAD_BTN_EAST, buttons_mask);
+        self.sync_button(BTN_WEST, GPAD_BTN_WEST, buttons_mask);
+        self.sync_button(BTN_NORTH, GPAD_BTN_NORTH, buttons_mask);
+        self.sync_button(BTN_TL, GPAD_BTN_TL, buttons_mask);
+        self.sync_button(BTN_TR, GPAD_BTN_TR, buttons_mask);
+        self.sync_button(BTN_THUMBL, GPAD_BTN_THUMBL, buttons_mask);
+        self.sync_button(BTN_THUMBR, GPAD_BTN_THUMBR, buttons_mask);
+        self.sync_button(BTN_SELECT, GPAD_BTN_SELECT, buttons_mask);
+        self.sync_button(BTN_START, GPAD_BTN_START, buttons_mask);
+        self.sync_button(BTN_MODE, GPAD_BTN_MODE, buttons_mask);
+        self.buttons_mask = buttons_mask;
+
+        self.emit(EV_ABS, ABS_X, lx as i32);
+        self.emit(EV_ABS, ABS_Y, ly as i32);
+        self.emit(EV_ABS, ABS_RX, rx as i32);
+        self.emit(EV_ABS, ABS_RY, ry as i32);
+        self.emit(EV_ABS, ABS_Z, lt as i32);
+        self.emit(EV_ABS, ABS_RZ, rt as i32);
+        self.emit(EV_ABS, ABS_HAT0X, hat_x as i32);
+        self.emit(EV_ABS, ABS_HAT0Y, hat_y as i32);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
+    pub fn release_all(&mut self) {
+        self.set_state(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    fn sync_button(&mut self, linux_code: u16, bit: u16, new_mask: u16) {
+        let prev = (self.buttons_mask & bit) != 0;
+        let next = (new_mask & bit) != 0;
+        if prev != next {
+            self.emit(EV_KEY, linux_code, if next { 1 } else { 0 });
+        }
+    }
+
+    fn emit(&mut self, type_: u16, code: u16, value: i32) {
+        let ev = InputEvent {
+            time: current_timeval(),
+            type_,
+            code,
+            value,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ev as *const InputEvent as *const u8,
+                mem::size_of::<InputEvent>(),
+            )
+        };
+        let _ = self.file.write_all(bytes);
+    }
+}
+
+impl Drop for VirtualGamepad {
+    fn drop(&mut self) {
+        self.release_all();
+        unsafe {
+            libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
+        }
+        println!("[gamepad] virtual gamepad destroyed");
     }
 }
 
