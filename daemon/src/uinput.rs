@@ -26,7 +26,6 @@ const UI_SET_EVBIT: libc::c_ulong = 0x40045564;   // _IOW('U', 100, int)
 const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;  // _IOW('U', 101, int)
 const UI_SET_ABSBIT: libc::c_ulong = 0x40045567;  // _IOW('U', 103, int)
 const UI_SET_PROPBIT: libc::c_ulong = 0x4004556e;  // _IOW('U', 110, int)
-const INPUT_PROP_POINTER: libc::c_int = 0x00;
 const INPUT_PROP_DIRECT: libc::c_int = 0x01;
 
 const MAX_SLOTS: i32 = 10;
@@ -350,15 +349,21 @@ unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
 const EV_REL: u16 = 0x02;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
+const REL_Z: u16 = 0x02;
+const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+const BTN_FORWARD: u16 = 0x115;
+const BTN_BACK: u16 = 0x116;
+const BTN_TASK: u16 = 0x117;
 const UI_SET_RELBIT: libc::c_ulong = 0x40045566; // _IOW('U', 102, int)
 
 pub struct VirtualMouse {
     file: File,
-    buttons_mask: u8,
 }
 
 impl VirtualMouse {
@@ -374,15 +379,26 @@ impl VirtualMouse {
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_ABS as libc::c_int))?;
 
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_SIDE as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_EXTRA as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_FORWARD as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_BACK as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_TASK as libc::c_int))?;
 
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_X as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_Y as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_Z as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_HWHEEL as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_WHEEL as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_X as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_Y as libc::c_int))?;
+            set_abs(fd, ABS_X, 0, 65535)?;
+            set_abs(fd, ABS_Y, 0, 65535)?;
 
             let mut setup: UinputSetup = mem::zeroed();
             setup.id.bustype = 0x03; // BUS_USB
@@ -399,10 +415,7 @@ impl VirtualMouse {
         std::thread::sleep(std::time::Duration::from_millis(200));
         println!("[mouse] virtual mouse created");
 
-        Ok(Self {
-            file,
-            buttons_mask: 0,
-        })
+        Ok(Self { file })
     }
 
     pub fn move_rel(&mut self, dx: i32, dy: i32) {
@@ -412,19 +425,15 @@ impl VirtualMouse {
     }
 
     pub fn button(&mut self, btn: u8, state: i32) {
-        let bit = match btn {
-            0 => 0x01,
-            1 => 0x02,
-            2 => 0x04,
+        let code = match btn {
+            0 => BTN_LEFT,
+            1 => BTN_RIGHT,
+            2 => BTN_MIDDLE,
             _ => return,
         };
-        let mut new_mask = self.buttons_mask;
-        if state != 0 {
-            new_mask |= bit;
-        } else {
-            new_mask &= !bit;
-        }
-        self.set_buttons_mask(new_mask);
+        crate::vlog!("[mouse] emit button: btn={} code={} state={state}", btn, code);
+        self.emit(EV_KEY, code, state);
+        self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
     pub fn scroll(&mut self, dy: i32) {
@@ -433,34 +442,9 @@ impl VirtualMouse {
     }
 
     pub fn release_all_buttons(&mut self) {
-        self.set_buttons_mask(0);
-    }
-
-    pub fn set_buttons_mask(&mut self, mask: u8) {
-        let prev = self.buttons_mask;
-        if prev == mask {
-            return;
-        }
-
-        let changed = prev ^ mask;
-
-        if changed & 0x01 != 0 {
-            let state = if mask & 0x01 != 0 { 1 } else { 0 };
-            crate::vlog!("[mouse] sync button mask left={state}");
-            self.emit(EV_KEY, BTN_LEFT, state);
-        }
-        if changed & 0x02 != 0 {
-            let state = if mask & 0x02 != 0 { 1 } else { 0 };
-            crate::vlog!("[mouse] sync button mask right={state}");
-            self.emit(EV_KEY, BTN_RIGHT, state);
-        }
-        if changed & 0x04 != 0 {
-            let state = if mask & 0x04 != 0 { 1 } else { 0 };
-            crate::vlog!("[mouse] sync button mask middle={state}");
-            self.emit(EV_KEY, BTN_MIDDLE, state);
-        }
-
-        self.buttons_mask = mask;
+        self.emit(EV_KEY, BTN_LEFT, 0);
+        self.emit(EV_KEY, BTN_RIGHT, 0);
+        self.emit(EV_KEY, BTN_MIDDLE, 0);
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
@@ -916,7 +900,6 @@ pub fn handle_touch_packet(touch: &mut VirtualTouchscreen, data: &[u8]) {
 const MOUSE_MOVE: u8 = 0x01;
 const MOUSE_BUTTON: u8 = 0x02;
 const MOUSE_SCROLL: u8 = 0x03;
-const MOUSE_BUTTONS: u8 = 0x04;
 
 /// Parse a mouse event packet.
 /// Format: event_type(1) + payload
@@ -939,10 +922,6 @@ pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
             let dy = i16::from_be_bytes([data[1], data[2]]) as i32;
             crate::vlog!("[mouse] recv scroll: dy={dy}");
             mouse.scroll(dy);
-        }
-        MOUSE_BUTTONS if data.len() >= 2 => {
-            crate::vlog!("[mouse] recv button mask: mask=0x{:02x}", data[1]);
-            mouse.set_buttons_mask(data[1]);
         }
         _ => {}
     }

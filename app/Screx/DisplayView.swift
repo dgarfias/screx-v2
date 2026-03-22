@@ -397,6 +397,17 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
         touchSlots.removeValue(forKey: id)
     }
 
+    private func shouldForwardTouch(_ touch: UITouch) -> Bool {
+        switch touch.type {
+        case .direct, .pencil:
+            return true
+        case .indirectPointer:
+            return false
+        default:
+            return false
+        }
+    }
+
     // MARK: - Touch events
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -424,6 +435,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
         var count: UInt8 = 0
 
         for touch in touches {
+            guard shouldForwardTouch(touch) else { continue }
             let point = touch.location(in: self)
             guard let (px, py) = mapToDisplay(point) else { continue }
             let slot = slotFor(touch)
