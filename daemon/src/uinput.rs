@@ -425,10 +425,20 @@ impl VirtualMouse {
     }
 
     pub fn button(&mut self, btn: u8, state: i32) {
+        if btn == 2 {
+            if state != 0 {
+                crate::vlog!("[mouse] emit middle click pulse");
+                self.emit(EV_KEY, BTN_MIDDLE, 1);
+                self.emit(EV_SYN, SYN_REPORT, 0);
+                self.emit(EV_KEY, BTN_MIDDLE, 0);
+                self.emit(EV_SYN, SYN_REPORT, 0);
+            }
+            return;
+        }
+
         let code = match btn {
             0 => BTN_LEFT,
             1 => BTN_RIGHT,
-            2 => BTN_MIDDLE,
             _ => return,
         };
         crate::vlog!("[mouse] emit button: btn={} code={} state={state}", btn, code);
