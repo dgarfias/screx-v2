@@ -181,6 +181,7 @@ final class StreamViewModel: ObservableObject {
     @Published var physicalKeyboardConnected = false
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
+    private var physicalMouseButtonMask: UInt8 = 0
 
     private func log(_ message: String) {
         print("[app] \(message)")
@@ -635,6 +636,7 @@ final class StreamViewModel: ObservableObject {
 
     private func attachMouse(_ mouse: GCMouse) {
         physicalMouseConnected = true
+        physicalMouseButtonMask = 0
         sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
 
         guard let input = mouse.mouseInput else { return }
@@ -651,20 +653,20 @@ final class StreamViewModel: ObservableObject {
 
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
             guard let self else { return }
-            Task { @MainActor in self.sendMouse(Data([0x02, 0x00, pressed ? 1 : 0])) }
+            Task { @MainActor in self.updatePhysicalMouseButton(button: 0x01, pressed: pressed) }
         }
 
         if let right = input.rightButton {
             right.pressedChangedHandler = { [weak self] _, _, pressed in
                 guard let self else { return }
-                Task { @MainActor in self.sendMouse(Data([0x02, 0x01, pressed ? 1 : 0])) }
+                Task { @MainActor in self.updatePhysicalMouseButton(button: 0x02, pressed: pressed) }
             }
         }
 
         if let middle = input.middleButton {
             middle.pressedChangedHandler = { [weak self] _, _, pressed in
                 guard let self else { return }
-                Task { @MainActor in self.sendMouse(Data([0x02, 0x02, pressed ? 1 : 0])) }
+                Task { @MainActor in self.updatePhysicalMouseButton(button: 0x04, pressed: pressed) }
             }
         }
 
@@ -681,9 +683,30 @@ final class StreamViewModel: ObservableObject {
 
     private func detachMouse() {
         guard physicalMouseConnected else { return }
+        physicalMouseButtonMask = 0
+        sendMouse(Data([0x04, 0x00]))
         physicalMouseConnected = false
         sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
         print("[periph] mouse detached")
+    }
+
+    private func updatePhysicalMouseButton(button: UInt8, pressed: Bool) {
+        let mouseButtonCode: UInt8
+        switch button {
+        case 0x01: mouseButtonCode = 0x00
+        case 0x02: mouseButtonCode = 0x01
+        case 0x04: mouseButtonCode = 0x02
+        default: return
+        }
+
+        if pressed {
+            physicalMouseButtonMask |= button
+        } else {
+            physicalMouseButtonMask &= ~button
+        }
+
+        sendMouse(Data([0x02, mouseButtonCode, pressed ? 1 : 0]))
+        sendMouse(Data([0x04, physicalMouseButtonMask]))
     }
 
     private func attachKeyboard(_ kb: GCKeyboard) {

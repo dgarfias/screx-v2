@@ -358,6 +358,7 @@ const UI_SET_RELBIT: libc::c_ulong = 0x40045566; // _IOW('U', 102, int)
 
 pub struct VirtualMouse {
     file: File,
+    buttons_mask: u8,
 }
 
 impl VirtualMouse {
@@ -398,7 +399,10 @@ impl VirtualMouse {
         std::thread::sleep(std::time::Duration::from_millis(200));
         println!("[mouse] virtual mouse created");
 
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            buttons_mask: 0,
+        })
     }
 
     pub fn move_rel(&mut self, dx: i32, dy: i32) {
@@ -408,15 +412,19 @@ impl VirtualMouse {
     }
 
     pub fn button(&mut self, btn: u8, state: i32) {
-        let code = match btn {
-            0 => BTN_LEFT,
-            1 => BTN_RIGHT,
-            2 => BTN_MIDDLE,
+        let bit = match btn {
+            0 => 0x01,
+            1 => 0x02,
+            2 => 0x04,
             _ => return,
         };
-        crate::vlog!("[mouse] emit button: btn={} code={} state={state}", btn, code);
-        self.emit(EV_KEY, code, state);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        let mut new_mask = self.buttons_mask;
+        if state != 0 {
+            new_mask |= bit;
+        } else {
+            new_mask &= !bit;
+        }
+        self.set_buttons_mask(new_mask);
     }
 
     pub fn scroll(&mut self, dy: i32) {
@@ -425,9 +433,34 @@ impl VirtualMouse {
     }
 
     pub fn release_all_buttons(&mut self) {
-        self.emit(EV_KEY, BTN_LEFT, 0);
-        self.emit(EV_KEY, BTN_RIGHT, 0);
-        self.emit(EV_KEY, BTN_MIDDLE, 0);
+        self.set_buttons_mask(0);
+    }
+
+    pub fn set_buttons_mask(&mut self, mask: u8) {
+        let prev = self.buttons_mask;
+        if prev == mask {
+            return;
+        }
+
+        let changed = prev ^ mask;
+
+        if changed & 0x01 != 0 {
+            let state = if mask & 0x01 != 0 { 1 } else { 0 };
+            crate::vlog!("[mouse] sync button mask left={state}");
+            self.emit(EV_KEY, BTN_LEFT, state);
+        }
+        if changed & 0x02 != 0 {
+            let state = if mask & 0x02 != 0 { 1 } else { 0 };
+            crate::vlog!("[mouse] sync button mask right={state}");
+            self.emit(EV_KEY, BTN_RIGHT, state);
+        }
+        if changed & 0x04 != 0 {
+            let state = if mask & 0x04 != 0 { 1 } else { 0 };
+            crate::vlog!("[mouse] sync button mask middle={state}");
+            self.emit(EV_KEY, BTN_MIDDLE, state);
+        }
+
+        self.buttons_mask = mask;
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
@@ -883,6 +916,7 @@ pub fn handle_touch_packet(touch: &mut VirtualTouchscreen, data: &[u8]) {
 const MOUSE_MOVE: u8 = 0x01;
 const MOUSE_BUTTON: u8 = 0x02;
 const MOUSE_SCROLL: u8 = 0x03;
+const MOUSE_BUTTONS: u8 = 0x04;
 
 /// Parse a mouse event packet.
 /// Format: event_type(1) + payload
@@ -905,6 +939,10 @@ pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
             let dy = i16::from_be_bytes([data[1], data[2]]) as i32;
             crate::vlog!("[mouse] recv scroll: dy={dy}");
             mouse.scroll(dy);
+        }
+        MOUSE_BUTTONS if data.len() >= 2 => {
+            crate::vlog!("[mouse] recv button mask: mask=0x{:02x}", data[1]);
+            mouse.set_buttons_mask(data[1]);
         }
         _ => {}
     }

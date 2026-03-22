@@ -212,6 +212,26 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     }
 }
 
+pub fn drop_network_client(shared: &Arc<SharedState>) {
+    *shared.client_addr.lock().unwrap() = None;
+    *shared.session_key.lock().unwrap() = None;
+    *shared.expected_client_ip.lock().unwrap() = None;
+
+    if !shared.usb_active.load(Ordering::Relaxed)
+        && shared.has_active_client.swap(false, Ordering::SeqCst)
+    {
+        let shared_lc = Arc::clone(shared);
+        std::thread::Builder::new()
+            .name("lifecycle-disconnect".into())
+            .spawn(move || {
+                if let Some(ref cb) = *shared_lc.on_client_disconnected.lock().unwrap() {
+                    cb();
+                }
+            })
+            .ok();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client manager — runs on its own thread, handles SCREX/PLI/keepalive
 // ---------------------------------------------------------------------------
@@ -488,23 +508,8 @@ pub fn run_client_manager(
             && last_keepalive.elapsed() > KEEPALIVE_TIMEOUT
         {
             println!("[client] keepalive timeout, dropping client");
-            *shared.client_addr.lock().unwrap() = None;
-            *shared.session_key.lock().unwrap() = None;
-            *shared.expected_client_ip.lock().unwrap() = None;
             local_cipher = None;
-            if !shared.usb_active.load(Ordering::Relaxed)
-                && shared.has_active_client.swap(false, Ordering::SeqCst)
-            {
-                let shared_lc = Arc::clone(&shared);
-                std::thread::Builder::new()
-                    .name("lifecycle-disconnect".into())
-                    .spawn(move || {
-                        if let Some(ref cb) = *shared_lc.on_client_disconnected.lock().unwrap() {
-                            cb();
-                        }
-                    })
-                    .ok();
-            }
+            drop_network_client(&shared);
         }
     }
 

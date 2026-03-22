@@ -578,6 +578,8 @@ fn run_control_loop(
         crate::stream_server::handle_control_message_data(shared, plaintext);
     }
 
+    crate::stream_server::drop_network_client(shared);
+
     Ok(())
 }
 
