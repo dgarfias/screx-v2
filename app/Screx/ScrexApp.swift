@@ -4,12 +4,16 @@ import AVFoundation
 import CryptoKit
 import Network
 import GameController
+import UIKit
 
 @main
-struct ScrexApp: App {
-    @StateObject private var model = StreamViewModel()
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    let model = StreamViewModel()
 
-    init() {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(
@@ -24,13 +28,108 @@ struct ScrexApp: App {
         } catch {
             print("[app] audio session setup failed: \(error)")
         }
+
+        return true
     }
 
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .environmentObject(model)
-                .onAppear { model.startDiscovery() }
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: "Default Configuration", sessionRole: connectingSceneSession.role)
+        config.delegateClass = SceneDelegate.self
+        return config
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        guard let appDelegate = UIApplication.shared.delegate as? AppDelegate else { return }
+
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = ScrexRootViewController(model: appDelegate.model)
+        self.window = window
+        window.makeKeyAndVisible()
+    }
+}
+
+final class ScrexRootViewController: GCEventViewController {
+    private let model: StreamViewModel
+    private let hostingController: UIHostingController<AnyView>
+    private var cancellables = Set<AnyCancellable>()
+
+    init(model: StreamViewModel) {
+        self.model = model
+        self.hostingController = UIHostingController(
+            rootView: AnyView(
+                ContentView()
+                    .environmentObject(model)
+                    .onAppear { model.startDiscovery() }
+            )
+        )
+        super.init(nibName: nil, bundle: nil)
+        controllerUserInteractionEnabled = !model.physicalMouseConnected
+        observeModel()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        addChild(hostingController)
+        hostingController.view.translatesAutoresizingMaskIntoConstraints = false
+        hostingController.view.backgroundColor = .clear
+        view.addSubview(hostingController.view)
+        NSLayoutConstraint.activate([
+            hostingController.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hostingController.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            hostingController.view.topAnchor.constraint(equalTo: view.topAnchor),
+            hostingController.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        hostingController.didMove(toParent: self)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
+        updatePhysicalMouseCapture(model.physicalMouseConnected)
+    }
+
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+
+    override var prefersPointerLocked: Bool {
+        model.physicalMouseConnected
+    }
+
+    private func observeModel() {
+        model.$physicalMouseConnected
+            .removeDuplicates()
+            .sink { [weak self] active in
+                self?.updatePhysicalMouseCapture(active)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func updatePhysicalMouseCapture(_ active: Bool) {
+        controllerUserInteractionEnabled = !active
+        if active {
+            _ = becomeFirstResponder()
+        }
+        if #available(iOS 14.0, *) {
+            setNeedsUpdateOfPrefersPointerLocked()
         }
     }
 }
