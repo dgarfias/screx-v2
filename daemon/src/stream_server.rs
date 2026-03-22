@@ -20,6 +20,9 @@ const TOUCH_MAGIC: &[u8] = b"TOUCH";
 const KEY_MAGIC: &[u8] = b"KEY";
 const CAM_MAGIC: &[u8] = b"CAM";
 const MIC_MAGIC: &[u8] = b"MIC";
+const MOUSE_MAGIC: &[u8] = b"MOUSE";
+const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
+const PERIPH_MAGIC: &[u8] = b"PERIPH";
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -39,6 +42,7 @@ pub struct SharedState {
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
+    pub virtual_mouse: Mutex<Option<crate::uinput::VirtualMouse>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
     pub mic_writer: Mutex<Option<MicWriter>>,
     pub start_time: Instant,
@@ -64,6 +68,7 @@ impl SharedState {
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
+            virtual_mouse: Mutex::new(None),
             cam_writer: Mutex::new(None),
             mic_writer: Mutex::new(None),
             on_client_connected: Mutex::new(None),
@@ -102,6 +107,51 @@ fn build_header(
     h[12..14].copy_from_slice(&payload_len.to_be_bytes());
     h[14..18].copy_from_slice(&timestamp_ms.to_be_bytes());
     h
+}
+
+// ---------------------------------------------------------------------------
+// Peripheral attach/detach — creates/destroys virtual devices on demand
+// ---------------------------------------------------------------------------
+
+const PERIPH_MOUSE: u8 = 0x01;
+const PERIPH_KEYBOARD: u8 = 0x02;
+const PERIPH_ATTACHED: u8 = 0x01;
+const PERIPH_DETACHED: u8 = 0x00;
+
+pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
+    if data.len() < 2 {
+        return;
+    }
+    let device_type = data[0];
+    let state = data[1];
+
+    match (device_type, state) {
+        (PERIPH_MOUSE, PERIPH_ATTACHED) => {
+            let mut m = shared.virtual_mouse.lock().unwrap();
+            if m.is_none() {
+                match crate::uinput::VirtualMouse::new() {
+                    Ok(vm) => {
+                        *m = Some(vm);
+                        println!("[periph] physical mouse attached — virtual mouse created");
+                    }
+                    Err(e) => eprintln!("[periph] failed to create virtual mouse: {e}"),
+                }
+            }
+        }
+        (PERIPH_MOUSE, PERIPH_DETACHED) => {
+            let mut m = shared.virtual_mouse.lock().unwrap();
+            if m.take().is_some() {
+                println!("[periph] physical mouse detached — virtual mouse destroyed");
+            }
+        }
+        (PERIPH_KEYBOARD, PERIPH_ATTACHED) => {
+            println!("[periph] physical keyboard attached — using existing virtual keyboard");
+        }
+        (PERIPH_KEYBOARD, PERIPH_DETACHED) => {
+            println!("[periph] physical keyboard detached");
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +305,27 @@ pub fn run_client_manager(
                             eprintln!("[mic] write error: {e}");
                         }
                     }
+                }
+
+                if pt_len > MOUSE_MAGIC.len() && &plaintext[..MOUSE_MAGIC.len()] == MOUSE_MAGIC {
+                    let mouse_data = &plaintext[MOUSE_MAGIC.len()..];
+                    let mut m = shared.virtual_mouse.lock().unwrap();
+                    if let Some(ref mut vm) = *m {
+                        crate::uinput::handle_mouse_packet(vm, mouse_data);
+                    }
+                }
+
+                if pt_len > RAWKEY_MAGIC.len() && &plaintext[..RAWKEY_MAGIC.len()] == RAWKEY_MAGIC {
+                    let rk_data = &plaintext[RAWKEY_MAGIC.len()..];
+                    let mut kb = shared.virtual_keyboard.lock().unwrap();
+                    if let Some(ref mut keyboard) = *kb {
+                        crate::uinput::handle_rawkey_packet(keyboard, rk_data);
+                    }
+                }
+
+                if pt_len > PERIPH_MAGIC.len() && &plaintext[..PERIPH_MAGIC.len()] == PERIPH_MAGIC {
+                    let periph_data = &plaintext[PERIPH_MAGIC.len()..];
+                    handle_periph_packet_data(&shared, periph_data);
                 }
 
                 _input_seq_expected = seq_num.wrapping_add(1);

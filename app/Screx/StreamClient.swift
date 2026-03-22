@@ -381,6 +381,27 @@ final class StreamClient {
         guard let conn = connection else { return }
         encryptAndSend(packet, conn: conn, label: "mic")
     }
+
+    func sendMouse(_ mouseData: Data) {
+        guard let conn = connection else { return }
+        var packet = Data("MOUSE".utf8)
+        packet.append(mouseData)
+        encryptAndSend(packet, conn: conn, label: "mouse")
+    }
+
+    func sendRawKey(_ keyData: Data) {
+        guard let conn = connection else { return }
+        var packet = Data("RAWKEY".utf8)
+        packet.append(keyData)
+        encryptAndSend(packet, conn: conn, label: "rawkey")
+    }
+
+    func sendPeripheral(_ periphData: Data) {
+        guard let conn = connection else { return }
+        var packet = Data("PERIPH".utf8)
+        packet.append(periphData)
+        encryptAndSend(packet, conn: conn, label: "periph")
+    }
 }
 
 private final class FrameAssembly {

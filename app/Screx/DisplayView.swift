@@ -6,6 +6,7 @@ import UIKit
 
 struct KeyboardInputView: UIViewRepresentable {
     @Binding var isActive: Bool
+    var physicalKeyboardActive: Bool = false
     let onText: (String) -> Void
     let onDelete: () -> Void
     let onSpecial: (UInt8) -> Void
@@ -20,6 +21,7 @@ struct KeyboardInputView: UIViewRepresentable {
         view.onCombo = onCombo
         view.onModSpecial = onModSpecial
         view.onResign = { context.coordinator.deactivate() }
+        view.physicalKeyboardActive = physicalKeyboardActive
         view.isUserInteractionEnabled = false
         return view
     }
@@ -31,6 +33,7 @@ struct KeyboardInputView: UIViewRepresentable {
         uiView.onCombo = onCombo
         uiView.onModSpecial = onModSpecial
         uiView.onResign = { context.coordinator.deactivate() }
+        uiView.physicalKeyboardActive = physicalKeyboardActive
         uiView.allowFirstResponder = isActive
         uiView.isUserInteractionEnabled = isActive
         if isActive && !uiView.isFirstResponder {
@@ -59,6 +62,7 @@ final class KeyInputProxyView: UIView, UIKeyInput {
     var onModSpecial: ((UInt8, UInt8) -> Void)?
     var onResign: (() -> Void)?
     var allowFirstResponder = false
+    var physicalKeyboardActive = false
 
     private var activeModifiers: UInt8 = 0
     private var modifierButtons: [UInt8: UIButton] = [:]
@@ -71,6 +75,7 @@ final class KeyInputProxyView: UIView, UIKeyInput {
     override var inputAccessoryView: UIView? { accessoryBar }
 
     func insertText(_ text: String) {
+        guard !physicalKeyboardActive else { return }
         if activeModifiers != 0 {
             onCombo?(activeModifiers, text)
             clearModifiers()
@@ -80,6 +85,7 @@ final class KeyInputProxyView: UIView, UIKeyInput {
     }
 
     func deleteBackward() {
+        guard !physicalKeyboardActive else { return }
         if activeModifiers != 0 {
             onModSpecial?(activeModifiers, 0x01)
             clearModifiers()
@@ -229,12 +235,14 @@ struct VideoDisplayView: UIViewRepresentable {
     let videoWidth: Int
     let videoHeight: Int
     var onTouch: ((Data) -> Void)?
+    var hidePointer: Bool = false
 
     func makeUIView(context: Context) -> DisplayContainerView {
         let view = DisplayContainerView()
         view.videoWidth = videoWidth
         view.videoHeight = videoHeight
         view.onTouch = onTouch
+        view.hidePointer = hidePointer
         view.attach(layer: layer)
         return view
     }
@@ -243,17 +251,31 @@ struct VideoDisplayView: UIViewRepresentable {
         uiView.videoWidth = videoWidth
         uiView.videoHeight = videoHeight
         uiView.onTouch = onTouch
+        uiView.hidePointer = hidePointer
         uiView.attach(layer: layer)
     }
 }
 
-final class DisplayContainerView: UIView {
+final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     private weak var attachedLayer: AVSampleBufferDisplayLayer?
 
     var videoWidth: Int = 1920
     var videoHeight: Int = 1080
     var onTouch: ((Data) -> Void)?
+    var hidePointer: Bool = false {
+        didSet {
+            if hidePointer && pointerInteraction == nil {
+                let interaction = UIPointerInteraction(delegate: self)
+                addInteraction(interaction)
+                pointerInteraction = interaction
+            } else if !hidePointer, let interaction = pointerInteraction {
+                removeInteraction(interaction)
+                pointerInteraction = nil
+            }
+        }
+    }
 
+    private var pointerInteraction: UIPointerInteraction?
     private var touchSlots: [ObjectIdentifier: UInt8] = [:]
     private var nextSlot: UInt8 = 0
 
@@ -265,6 +287,14 @@ final class DisplayContainerView: UIView {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         isMultipleTouchEnabled = true
+    }
+
+    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest, defaultRegion: UIPointerRegion) -> UIPointerRegion? {
+        return defaultRegion
+    }
+
+    func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
+        return UIPointerStyle.hidden()
     }
 
     override func layoutSubviews() {

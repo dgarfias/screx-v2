@@ -19,6 +19,21 @@ use std::thread;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+fn parse_bitrate(s: &str) -> std::result::Result<u32, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".into());
+    }
+    let (num_part, multiplier) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1_000u64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1_000_000u64),
+        _ => (s, 1u64),
+    };
+    let num: f64 = num_part.parse().map_err(|e| format!("invalid number: {e}"))?;
+    let val = (num * multiplier as f64) as u64;
+    u32::try_from(val).map_err(|_| format!("bitrate {val} exceeds u32 max"))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "screx", about = "Low-latency Linux-to-iPad screen streaming daemon")]
 struct Cli {
@@ -41,8 +56,8 @@ struct Cli {
     #[arg(short, long, default_value_t = 30)]
     keyframe: u32,
 
-    /// Encoder bitrate in bps
-    #[arg(short = 'r', long, default_value_t = 8_000_000)]
+    /// Encoder bitrate (e.g. 8000000, 8M, 500K)
+    #[arg(short = 'r', long, default_value = "8M", value_parser = parse_bitrate)]
     bitrate: u32,
 
     /// UDP/TCP streaming port
@@ -262,6 +277,9 @@ async fn main() -> Result<()> {
                 audio::remove_virtual_mic(mic);
             }
             *shared_d.mic_writer.lock().unwrap() = None;
+
+            // Virtual mouse (physical peripheral)
+            *shared_d.virtual_mouse.lock().unwrap() = None;
 
             // Audio sink
             let mid = *audio_id_d.lock().unwrap();
@@ -510,6 +528,7 @@ async fn main() -> Result<()> {
     // Cleanup remaining resources
     *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
+    *shared.virtual_mouse.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
     if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
         audio::remove_virtual_mic(mic);

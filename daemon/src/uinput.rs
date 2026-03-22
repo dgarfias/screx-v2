@@ -335,6 +335,111 @@ unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual mouse (uinput) — receives mouse input from iPad's physical mouse
+// ---------------------------------------------------------------------------
+
+const EV_REL: u16 = 0x02;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_WHEEL: u16 = 0x08;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+const UI_SET_RELBIT: libc::c_ulong = 0x40045566; // _IOW('U', 102, int)
+
+pub struct VirtualMouse {
+    file: File,
+}
+
+impl VirtualMouse {
+    pub fn new() -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .context("failed to open /dev/uinput for mouse")?;
+
+        let fd = file.as_raw_fd();
+
+        unsafe {
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int))?;
+
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE as libc::c_int))?;
+
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_X as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_Y as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_WHEEL as libc::c_int))?;
+
+            let mut setup: UinputSetup = mem::zeroed();
+            setup.id.bustype = 0x03; // BUS_USB
+            setup.id.vendor = SCREX_VENDOR;
+            setup.id.product = SCREX_PRODUCT + 2;
+            setup.id.version = 1;
+            let name = b"Screx Virtual Mouse";
+            setup.name[..name.len()].copy_from_slice(name);
+
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_setup(), &setup))?;
+            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_create()))?;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        println!("[mouse] virtual mouse created");
+
+        Ok(Self { file })
+    }
+
+    pub fn move_rel(&mut self, dx: i32, dy: i32) {
+        self.emit(EV_REL, REL_X, dx);
+        self.emit(EV_REL, REL_Y, dy);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
+    pub fn button(&mut self, btn: u8, state: i32) {
+        let code = match btn {
+            0 => BTN_LEFT,
+            1 => BTN_RIGHT,
+            2 => BTN_MIDDLE,
+            _ => return,
+        };
+        self.emit(EV_KEY, code, state);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
+    pub fn scroll(&mut self, dy: i32) {
+        self.emit(EV_REL, REL_WHEEL, dy);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
+    fn emit(&mut self, type_: u16, code: u16, value: i32) {
+        let ev = InputEvent {
+            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            type_,
+            code,
+            value,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ev as *const InputEvent as *const u8,
+                mem::size_of::<InputEvent>(),
+            )
+        };
+        let _ = self.file.write_all(bytes);
+    }
+}
+
+impl Drop for VirtualMouse {
+    fn drop(&mut self) {
+        unsafe {
+            libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
+        }
+        println!("[mouse] virtual mouse destroyed");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Virtual keyboard (uinput) — receives keystrokes from iPad's native keyboard
 // ---------------------------------------------------------------------------
 
@@ -414,6 +519,10 @@ const ALL_KEYS: &[u16] = &[
     KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
     KEY_LEFTALT, KEY_LEFTMETA,
     KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_INSERT, KEY_HOME, KEY_END,
+    KEY_CAPSLOCK, KEY_RIGHTSHIFT, KEY_RIGHTCTRL, KEY_RIGHTALT, KEY_RIGHTMETA,
+    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
+    KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+    KEY_SCROLLLOCK, KEY_NUMLOCK, KEY_PAGEUP, KEY_PAGEDOWN, KEY_SYSRQ,
 ];
 
 fn char_to_key(c: char) -> Option<(u16, bool)> {
@@ -746,4 +855,169 @@ pub fn handle_touch_packet(touch: &mut VirtualTouchscreen, data: &[u8]) {
         touch.send_touch(slot, event_type, x, y);
     }
     touch.sync();
+}
+
+// ---------------------------------------------------------------------------
+// Mouse packet parsing
+// ---------------------------------------------------------------------------
+
+const MOUSE_MOVE: u8 = 0x01;
+const MOUSE_BUTTON: u8 = 0x02;
+const MOUSE_SCROLL: u8 = 0x03;
+
+/// Parse a mouse event packet.
+/// Format: event_type(1) + payload
+pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    match data[0] {
+        MOUSE_MOVE if data.len() >= 5 => {
+            let dx = i16::from_be_bytes([data[1], data[2]]) as i32;
+            let dy = i16::from_be_bytes([data[3], data[4]]) as i32;
+            mouse.move_rel(dx, dy);
+        }
+        MOUSE_BUTTON if data.len() >= 3 => {
+            mouse.button(data[1], data[2] as i32);
+        }
+        MOUSE_SCROLL if data.len() >= 3 => {
+            let dy = i16::from_be_bytes([data[1], data[2]]) as i32;
+            mouse.scroll(dy);
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw key packet parsing (physical keyboard HID usage → evdev)
+// ---------------------------------------------------------------------------
+
+/// Parse a raw key packet from a physical keyboard.
+/// Format: hid_usage(u16 BE) + state(1)
+pub fn handle_rawkey_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
+    if data.len() < 3 {
+        return;
+    }
+    let hid = u16::from_be_bytes([data[0], data[1]]);
+    let state = data[2] as i32;
+    if let Some(evdev) = hid_to_evdev(hid) {
+        kb.key_event(evdev, state);
+        kb.syn();
+    }
+}
+
+const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_RIGHTALT: u16 = 100;
+const KEY_RIGHTMETA: u16 = 126;
+const KEY_CAPSLOCK: u16 = 58;
+const KEY_F1: u16 = 59;
+const KEY_F2: u16 = 60;
+const KEY_F3: u16 = 61;
+const KEY_F4: u16 = 62;
+const KEY_F5: u16 = 63;
+const KEY_F6: u16 = 64;
+const KEY_F7: u16 = 65;
+const KEY_F8: u16 = 66;
+const KEY_F9: u16 = 67;
+const KEY_F10: u16 = 68;
+const KEY_F11: u16 = 87;
+const KEY_F12: u16 = 88;
+const KEY_SCROLLLOCK: u16 = 70;
+const KEY_NUMLOCK: u16 = 69;
+const KEY_PAGEUP: u16 = 104;
+const KEY_PAGEDOWN: u16 = 109;
+const KEY_SYSRQ: u16 = 99;
+
+/// Convert HID keyboard usage code (USB HID spec, usage page 0x07) to Linux evdev keycode.
+fn hid_to_evdev(hid: u16) -> Option<u16> {
+    match hid {
+        0x04 => Some(KEY_A),
+        0x05 => Some(KEY_B_KEY),
+        0x06 => Some(KEY_C),
+        0x07 => Some(KEY_D),
+        0x08 => Some(KEY_E),
+        0x09 => Some(KEY_F),
+        0x0A => Some(KEY_G),
+        0x0B => Some(KEY_H),
+        0x0C => Some(KEY_I),
+        0x0D => Some(KEY_J),
+        0x0E => Some(KEY_K),
+        0x0F => Some(KEY_L),
+        0x10 => Some(KEY_M),
+        0x11 => Some(KEY_N),
+        0x12 => Some(KEY_O),
+        0x13 => Some(KEY_P),
+        0x14 => Some(KEY_Q),
+        0x15 => Some(KEY_R),
+        0x16 => Some(KEY_S),
+        0x17 => Some(KEY_T_KEY),
+        0x18 => Some(KEY_U),
+        0x19 => Some(KEY_V),
+        0x1A => Some(KEY_W),
+        0x1B => Some(KEY_X),
+        0x1C => Some(KEY_Y),
+        0x1D => Some(KEY_Z),
+        0x1E => Some(KEY_1),
+        0x1F => Some(KEY_2),
+        0x20 => Some(KEY_3),
+        0x21 => Some(KEY_4),
+        0x22 => Some(KEY_5),
+        0x23 => Some(KEY_6),
+        0x24 => Some(KEY_7),
+        0x25 => Some(KEY_8),
+        0x26 => Some(KEY_9),
+        0x27 => Some(KEY_0),
+        0x28 => Some(KEY_ENTER),
+        0x29 => Some(KEY_ESC),
+        0x2A => Some(KEY_BACKSPACE),
+        0x2B => Some(KEY_TAB),
+        0x2C => Some(KEY_SPACE),
+        0x2D => Some(KEY_MINUS),
+        0x2E => Some(KEY_EQUAL),
+        0x2F => Some(KEY_LEFTBRACE),
+        0x30 => Some(KEY_RIGHTBRACE),
+        0x31 => Some(KEY_BACKSLASH),
+        0x33 => Some(KEY_SEMICOLON),
+        0x34 => Some(KEY_APOSTROPHE),
+        0x35 => Some(KEY_GRAVE),
+        0x36 => Some(KEY_COMMA),
+        0x37 => Some(KEY_DOT),
+        0x38 => Some(KEY_SLASH),
+        0x39 => Some(KEY_CAPSLOCK),
+        0x3A => Some(KEY_F1),
+        0x3B => Some(KEY_F2),
+        0x3C => Some(KEY_F3),
+        0x3D => Some(KEY_F4),
+        0x3E => Some(KEY_F5),
+        0x3F => Some(KEY_F6),
+        0x40 => Some(KEY_F7),
+        0x41 => Some(KEY_F8),
+        0x42 => Some(KEY_F9),
+        0x43 => Some(KEY_F10),
+        0x44 => Some(KEY_F11),
+        0x45 => Some(KEY_F12),
+        0x46 => Some(KEY_SYSRQ),
+        0x47 => Some(KEY_SCROLLLOCK),
+        0x49 => Some(KEY_INSERT),
+        0x4A => Some(KEY_HOME),
+        0x4B => Some(KEY_PAGEUP),
+        0x4C => Some(KEY_DELETE),
+        0x4D => Some(KEY_END),
+        0x4E => Some(KEY_PAGEDOWN),
+        0x4F => Some(KEY_RIGHT),
+        0x50 => Some(KEY_LEFT),
+        0x51 => Some(KEY_DOWN),
+        0x52 => Some(KEY_UP),
+        0x53 => Some(KEY_NUMLOCK),
+        0xE0 => Some(KEY_LEFTCTRL),
+        0xE1 => Some(KEY_LEFTSHIFT),
+        0xE2 => Some(KEY_LEFTALT),
+        0xE3 => Some(KEY_LEFTMETA),
+        0xE4 => Some(KEY_RIGHTCTRL),
+        0xE5 => Some(KEY_RIGHTSHIFT),
+        0xE6 => Some(KEY_RIGHTALT),
+        0xE7 => Some(KEY_RIGHTMETA),
+        _ => None,
+    }
 }

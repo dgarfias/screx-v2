@@ -296,6 +296,45 @@ final class USBListener {
         })
     }
 
+    func sendMouse(_ mouseData: Data) {
+        guard let conn = connection else { return }
+        let payload = Data("MOUSE".utf8) + mouseData
+        let payloadLen = UInt32(1 + payload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error { print("[usb] mouse send error: \(error)") }
+        })
+    }
+
+    func sendRawKey(_ keyData: Data) {
+        guard let conn = connection else { return }
+        let payload = Data("RAWKEY".utf8) + keyData
+        let payloadLen = UInt32(1 + payload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error { print("[usb] rawkey send error: \(error)") }
+        })
+    }
+
+    func sendPeripheral(_ periphData: Data) {
+        guard let conn = connection else { return }
+        let payload = Data("PERIPH".utf8) + periphData
+        let payloadLen = UInt32(1 + payload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error { print("[usb] periph send error: \(error)") }
+        })
+    }
+
     var isConnected: Bool {
         connection != nil
     }

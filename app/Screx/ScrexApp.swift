@@ -3,6 +3,7 @@ import Combine
 import AVFoundation
 import CryptoKit
 import Network
+import GameController
 
 @main
 struct ScrexApp: App {
@@ -68,6 +69,11 @@ final class StreamViewModel: ObservableObject {
     private var lastNetName: String?
     private var micSeq: UInt32 = 0
 
+    @Published var physicalMouseConnected = false
+    @Published var physicalKeyboardConnected = false
+    private var mouseObservers: [Any] = []
+    private var keyboardObservers: [Any] = []
+
     func startDiscovery() {
         guard !discoveryStarted else { return }
         discoveryStarted = true
@@ -92,6 +98,7 @@ final class StreamViewModel: ObservableObject {
                 self.transport = "USB"
                 self.stream?.suppressTimeout = true
                 self.audioPlayer.start()
+                self.startPeripheralMonitoring()
             }
         }
         usb.onDisconnected = { [weak self] in
@@ -259,6 +266,7 @@ final class StreamViewModel: ObservableObject {
                         self.isConnected = true
                         self.transport = "Network"
                         self.audioPlayer.start()
+                        self.startPeripheralMonitoring()
                     }
                 }
             }
@@ -288,6 +296,7 @@ final class StreamViewModel: ObservableObject {
             transport = ""
             status = "USB disconnected, looking for daemon..."
             audioPlayer.stop()
+            stopPeripheralMonitoring()
             discovery.resetKnownHost()
         }
     }
@@ -302,6 +311,7 @@ final class StreamViewModel: ObservableObject {
         transport = ""
         audioPlayer.stop()
         micCapture.stop()
+        stopPeripheralMonitoring()
 
         // Try to reconnect immediately using the last known endpoint
         if let endpoint = lastNetEndpoint, let name = lastNetName {
@@ -324,6 +334,7 @@ final class StreamViewModel: ObservableObject {
         status = "Disconnected"
         audioPlayer.stop()
         micCapture.stop()
+        stopPeripheralMonitoring()
         lastNetEndpoint = nil
         lastNetName = nil
     }
@@ -370,6 +381,159 @@ final class StreamViewModel: ObservableObject {
     /// Sends a modifier combo with special key: type 0x04 + mods(1) + inner_type 0x02 + code(1)
     func sendComboSpecial(mods: UInt8, code: UInt8) {
         sendKey(Data([0x04, mods, 0x02, code]))
+    }
+
+    // MARK: - Physical Mouse/Keyboard
+
+    func sendMouse(_ mouseData: Data) {
+        if usbConnected, let usb = usbListener {
+            usb.sendMouse(mouseData)
+        } else if let stream {
+            stream.sendMouse(mouseData)
+        }
+    }
+
+    func sendRawKey(_ keyData: Data) {
+        if usbConnected, let usb = usbListener {
+            usb.sendRawKey(keyData)
+        } else if let stream {
+            stream.sendRawKey(keyData)
+        }
+    }
+
+    func sendPeripheral(_ periphData: Data) {
+        if usbConnected, let usb = usbListener {
+            usb.sendPeripheral(periphData)
+        } else if let stream {
+            stream.sendPeripheral(periphData)
+        }
+    }
+
+    // MARK: - Peripheral Monitoring (GCMouse / GCKeyboard)
+
+    func startPeripheralMonitoring() {
+        stopPeripheralMonitoring()
+
+        if let mouse = GCMouse.current {
+            attachMouse(mouse)
+        }
+        if let kb = GCKeyboard.coalesced {
+            attachKeyboard(kb)
+        }
+
+        let mc = NotificationCenter.default.addObserver(
+            forName: .GCMouseDidConnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let mouse = note.object as? GCMouse else { return }
+            Task { @MainActor in self.attachMouse(mouse) }
+        }
+        let md = NotificationCenter.default.addObserver(
+            forName: .GCMouseDidDisconnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            Task { @MainActor in self.detachMouse() }
+        }
+        let kc = NotificationCenter.default.addObserver(
+            forName: .GCKeyboardDidConnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let kb = note.object as? GCKeyboard else { return }
+            Task { @MainActor in self.attachKeyboard(kb) }
+        }
+        let kd = NotificationCenter.default.addObserver(
+            forName: .GCKeyboardDidDisconnect, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            Task { @MainActor in self.detachKeyboard() }
+        }
+        mouseObservers = [mc, md]
+        keyboardObservers = [kc, kd]
+    }
+
+    func stopPeripheralMonitoring() {
+        for obs in mouseObservers { NotificationCenter.default.removeObserver(obs) }
+        for obs in keyboardObservers { NotificationCenter.default.removeObserver(obs) }
+        mouseObservers.removeAll()
+        keyboardObservers.removeAll()
+        detachMouse()
+        detachKeyboard()
+    }
+
+    private func attachMouse(_ mouse: GCMouse) {
+        physicalMouseConnected = true
+        sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
+
+        guard let input = mouse.mouseInput else { return }
+
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
+            guard let self else { return }
+            var data = Data([0x01]) // MOUSE_MOVE
+            let idx = Int16(clamping: Int(dx)).bigEndian
+            let idy = Int16(clamping: Int(dy)).bigEndian
+            withUnsafeBytes(of: idx) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: idy) { data.append(contentsOf: $0) }
+            Task { @MainActor in self.sendMouse(data) }
+        }
+
+        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
+            guard let self else { return }
+            Task { @MainActor in self.sendMouse(Data([0x02, 0x00, pressed ? 1 : 0])) }
+        }
+
+        if let right = input.rightButton {
+            right.pressedChangedHandler = { [weak self] _, _, pressed in
+                guard let self else { return }
+                Task { @MainActor in self.sendMouse(Data([0x02, 0x01, pressed ? 1 : 0])) }
+            }
+        }
+
+        if let middle = input.middleButton {
+            middle.pressedChangedHandler = { [weak self] _, _, pressed in
+                guard let self else { return }
+                Task { @MainActor in self.sendMouse(Data([0x02, 0x02, pressed ? 1 : 0])) }
+            }
+        }
+
+        input.scroll.yAxis.valueChangedHandler = { [weak self] _, value in
+            guard let self else { return }
+            var data = Data([0x03]) // MOUSE_SCROLL
+            let dy = Int16(clamping: Int(value)).bigEndian
+            withUnsafeBytes(of: dy) { data.append(contentsOf: $0) }
+            Task { @MainActor in self.sendMouse(data) }
+        }
+
+        print("[periph] mouse attached")
+    }
+
+    private func detachMouse() {
+        guard physicalMouseConnected else { return }
+        physicalMouseConnected = false
+        sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
+        print("[periph] mouse detached")
+    }
+
+    private func attachKeyboard(_ kb: GCKeyboard) {
+        physicalKeyboardConnected = true
+        sendPeripheral(Data([0x02, 0x01])) // PERIPH_KEYBOARD, ATTACHED
+
+        guard let input = kb.keyboardInput else { return }
+
+        input.keyChangedHandler = { [weak self] _, key, keyCode, pressed in
+            guard let self else { return }
+            var data = Data()
+            let hid = UInt16(keyCode.rawValue).bigEndian
+            withUnsafeBytes(of: hid) { data.append(contentsOf: $0) }
+            data.append(pressed ? 1 : 0)
+            Task { @MainActor in self.sendRawKey(data) }
+        }
+
+        print("[periph] keyboard attached")
+    }
+
+    private func detachKeyboard() {
+        guard physicalKeyboardConnected else { return }
+        physicalKeyboardConnected = false
+        sendPeripheral(Data([0x02, 0x00])) // PERIPH_KEYBOARD, DETACHED
+        print("[periph] keyboard detached")
     }
 
     // MARK: - Camera
@@ -462,7 +626,8 @@ struct ContentView: View {
                         layer: layer,
                         videoWidth: model.decoder.videoWidth,
                         videoHeight: model.decoder.videoHeight,
-                        onTouch: { data in model.sendTouch(data) }
+                        onTouch: { data in model.sendTouch(data) },
+                        hidePointer: model.physicalMouseConnected
                     )
                     .ignoresSafeArea()
                 }
@@ -510,6 +675,7 @@ struct ContentView: View {
 
                 KeyboardInputView(
                     isActive: $isKeyboardActive,
+                    physicalKeyboardActive: model.physicalKeyboardConnected,
                     onText: { model.sendTextInsert($0) },
                     onDelete: { model.sendSpecialKey(0x01) },
                     onSpecial: { model.sendSpecialKey($0) },

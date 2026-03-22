@@ -293,6 +293,21 @@ fn read_control_loop(
                         eprintln!("[mic] USB write error: {e}");
                     }
                 }
+            } else if ctrl.starts_with(b"MOUSE") && ctrl.len() > 5 {
+                let mouse_data = &ctrl[5..];
+                let mut m = shared.virtual_mouse.lock().unwrap();
+                if let Some(ref mut vm) = *m {
+                    crate::uinput::handle_mouse_packet(vm, mouse_data);
+                }
+            } else if ctrl.starts_with(b"RAWKEY") && ctrl.len() > 6 {
+                let rk_data = &ctrl[6..];
+                let mut kb = shared.virtual_keyboard.lock().unwrap();
+                if let Some(ref mut keyboard) = *kb {
+                    crate::uinput::handle_rawkey_packet(keyboard, rk_data);
+                }
+            } else if ctrl.starts_with(b"PERIPH") && ctrl.len() > 6 {
+                let periph_data = &ctrl[6..];
+                crate::stream_server::handle_periph_packet_data(shared, periph_data);
             }
         }
     }

@@ -188,7 +188,7 @@ sudo ./target/release/screx
 sudo ./target/release/screx -w 1920 -H 1080 -f 60 -k 60 -b vaapi -c h264
 
 # H.265 with NVENC at 10 Mbps
-sudo ./target/release/screx --codec h265 --backend nvenc --bitrate 10000000
+sudo ./target/release/screx --codec h265 --backend nvenc --bitrate 10M
 
 # Disable beacon broadcasting (e.g. remote/VPS use)
 sudo ./target/release/screx --no-beacon -w 1920 -H 1080
@@ -212,7 +212,7 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `--height` | `-H` | `1620` | Virtual display height |
 | `--framerate` | `-f` | `30` | Target framerate |
 | `--keyframe` | `-k` | `30` | Keyframe interval (in frames) |
-| `--bitrate` | `-r` | `8000000` | Encoder bitrate in bps |
+| `--bitrate` | `-r` | `8M` | Encoder bitrate (accepts `8M`, `500K`, or raw `8000000`) |
 | `--port` | `-p` | `9000` | UDP/TCP streaming port |
 | `--backend` | `-b` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `--codec` | `-c` | `h264` | Video codec: `h264`, `h265` |
