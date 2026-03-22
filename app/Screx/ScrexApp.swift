@@ -68,6 +68,7 @@ final class StreamViewModel: ObservableObject {
     private var lastNetEndpoint: NWEndpoint?
     private var lastNetName: String?
     private var micSeq: UInt32 = 0
+    private var isConnecting = false
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -95,6 +96,7 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.usbConnected = true
                 self.isConnected = true
+                self.isConnecting = false
                 self.transport = "USB"
                 self.stream?.suppressTimeout = true
                 self.audioPlayer.start()
@@ -130,7 +132,7 @@ final class StreamViewModel: ObservableObject {
                 self.lastNetEndpoint = endpoint
                 self.lastNetName = ep.name
 
-                if !self.isConnected {
+                if !self.isConnected && !self.isConnecting {
                     self.connectToEndpoint(endpoint, name: ep.name)
                 }
             }
@@ -165,6 +167,8 @@ final class StreamViewModel: ObservableObject {
         stream?.onDisconnect = nil
         stream?.disconnect()
         pairingService?.cancel()
+
+        isConnecting = true
 
         if !usbConnected {
             status = "Pairing with \(name)..."
@@ -208,10 +212,12 @@ final class StreamViewModel: ObservableObject {
             case .rejected(let reason):
                 self.status = "Pairing rejected: \(reason)"
                 self.pairingService = nil
+                self.isConnecting = false
 
             case .error(let msg):
                 self.status = "Pairing error: \(msg)"
                 self.pairingService = nil
+                self.isConnecting = false
                 // Retry after a delay
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                     guard let self, !self.isConnected else { return }
@@ -264,6 +270,7 @@ final class StreamViewModel: ObservableObject {
                     let nowConnected = msg.contains("Streaming")
                     if nowConnected && !self.isConnected {
                         self.isConnected = true
+                        self.isConnecting = false
                         self.transport = "Network"
                         self.audioPlayer.start()
                         self.startPeripheralMonitoring()
@@ -308,6 +315,7 @@ final class StreamViewModel: ObservableObject {
         stream?.disconnect()
         stream = nil
         isConnected = false
+        isConnecting = false
         transport = ""
         audioPlayer.stop()
         micCapture.stop()
@@ -330,6 +338,7 @@ final class StreamViewModel: ObservableObject {
         usbListener = nil
         usbConnected = false
         isConnected = false
+        isConnecting = false
         transport = ""
         status = "Disconnected"
         audioPlayer.stop()
