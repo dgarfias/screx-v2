@@ -199,9 +199,6 @@ final class StreamViewModel: ObservableObject {
     private var keyboardObservers: [Any] = []
     private var physicalMouseButtonMask: UInt8 = 0
     private var physicalMouseScrollAccumulator: Float = 0
-    private var physicalMiddleButtonHeld = false
-    private var physicalMiddleButtonPressTask: DispatchWorkItem?
-    private let physicalMiddleButtonHoldDelay: TimeInterval = 0.18
 
     private func log(_ message: String) {
         print("[app] \(message)")
@@ -658,9 +655,6 @@ final class StreamViewModel: ObservableObject {
         physicalMouseConnected = true
         physicalMouseButtonMask = 0
         physicalMouseScrollAccumulator = 0
-        physicalMiddleButtonHeld = false
-        physicalMiddleButtonPressTask?.cancel()
-        physicalMiddleButtonPressTask = nil
         sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
 
         guard let input = mouse.mouseInput else { return }
@@ -704,12 +698,6 @@ final class StreamViewModel: ObservableObject {
 
     private func detachMouse() {
         guard physicalMouseConnected else { return }
-        physicalMiddleButtonPressTask?.cancel()
-        physicalMiddleButtonPressTask = nil
-        if physicalMiddleButtonHeld {
-            sendMouse(Data([0x02, 0x02, 0]))
-            physicalMiddleButtonHeld = false
-        }
         physicalMouseButtonMask = 0
         physicalMouseScrollAccumulator = 0
         physicalMouseConnected = false
@@ -718,15 +706,11 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func updatePhysicalMouseButton(button: UInt8, pressed: Bool) {
-        if button == 0x04 {
-            updatePhysicalMiddleButton(pressed: pressed)
-            return
-        }
-
         let mouseButtonCode: UInt8
         switch button {
         case 0x01: mouseButtonCode = 0x00
         case 0x02: mouseButtonCode = 0x01
+        case 0x04: mouseButtonCode = 0x02
         default: return
         }
 
@@ -737,30 +721,6 @@ final class StreamViewModel: ObservableObject {
         }
 
         sendMouse(Data([0x02, mouseButtonCode, pressed ? 1 : 0]))
-    }
-
-    private func updatePhysicalMiddleButton(pressed: Bool) {
-        physicalMiddleButtonPressTask?.cancel()
-        physicalMiddleButtonPressTask = nil
-
-        if pressed {
-            let task = DispatchWorkItem { [weak self] in
-                guard let self, self.physicalMouseConnected else { return }
-                self.physicalMiddleButtonHeld = true
-                self.sendMouse(Data([0x02, 0x02, 1]))
-            }
-            physicalMiddleButtonPressTask = task
-            DispatchQueue.main.asyncAfter(deadline: .now() + physicalMiddleButtonHoldDelay, execute: task)
-            return
-        }
-
-        if physicalMiddleButtonHeld {
-            physicalMiddleButtonHeld = false
-            sendMouse(Data([0x02, 0x02, 0]))
-        } else {
-            sendMouse(Data([0x02, 0x02, 1]))
-            sendMouse(Data([0x02, 0x02, 0]))
-        }
     }
 
     private func handlePhysicalMouseScroll(value: Float) {
