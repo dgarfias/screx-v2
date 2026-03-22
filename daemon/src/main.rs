@@ -5,6 +5,7 @@ mod crypto;
 mod discovery;
 mod doctor;
 mod encode;
+mod logging;
 mod pairing;
 mod stream_server;
 mod uinput;
@@ -75,6 +76,10 @@ struct Cli {
     /// Disable beacon broadcasting (for VPS/remote use)
     #[arg(long, default_value_t = false)]
     no_beacon: bool,
+
+    /// Enable detailed diagnostic logs
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,6 +123,7 @@ impl AppConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    logging::set_verbose(cli.verbose);
 
     match &cli.command {
         Some(Commands::Doctor) => return doctor::run_doctor(),
@@ -129,6 +135,9 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_cli(&cli);
     println!("screx v2 config: {config:?}");
+    if cli.verbose {
+        println!("[main] verbose logging enabled");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(stream_server::SharedState::new());

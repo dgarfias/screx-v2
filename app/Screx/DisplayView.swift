@@ -230,29 +230,64 @@ final class KeyInputProxyView: UIView, UIKeyInput {
     }
 }
 
-struct VideoDisplayView: UIViewRepresentable {
+struct VideoDisplayView: UIViewControllerRepresentable {
     let layer: AVSampleBufferDisplayLayer
     let videoWidth: Int
     let videoHeight: Int
     var onTouch: ((Data) -> Void)?
     var hidePointer: Bool = false
+    var lockPointer: Bool = false
 
-    func makeUIView(context: Context) -> DisplayContainerView {
-        let view = DisplayContainerView()
-        view.videoWidth = videoWidth
-        view.videoHeight = videoHeight
-        view.onTouch = onTouch
-        view.hidePointer = hidePointer
-        view.attach(layer: layer)
-        return view
+    func makeUIViewController(context: Context) -> DisplayContainerController {
+        let controller = DisplayContainerController()
+        controller.displayView.videoWidth = videoWidth
+        controller.displayView.videoHeight = videoHeight
+        controller.displayView.onTouch = onTouch
+        controller.displayView.hidePointer = hidePointer
+        controller.lockPointer = lockPointer
+        controller.displayView.attach(layer: layer)
+        return controller
     }
 
-    func updateUIView(_ uiView: DisplayContainerView, context: Context) {
-        uiView.videoWidth = videoWidth
-        uiView.videoHeight = videoHeight
-        uiView.onTouch = onTouch
-        uiView.hidePointer = hidePointer
-        uiView.attach(layer: layer)
+    func updateUIViewController(_ uiViewController: DisplayContainerController, context: Context) {
+        uiViewController.displayView.videoWidth = videoWidth
+        uiViewController.displayView.videoHeight = videoHeight
+        uiViewController.displayView.onTouch = onTouch
+        uiViewController.displayView.hidePointer = hidePointer
+        uiViewController.lockPointer = lockPointer
+        uiViewController.displayView.attach(layer: layer)
+    }
+}
+
+final class DisplayContainerController: UIViewController {
+    let displayView = DisplayContainerView()
+
+    var lockPointer: Bool = false {
+        didSet {
+            guard oldValue != lockPointer else { return }
+            if #available(iOS 14.0, *) {
+                setNeedsUpdateOfPrefersPointerLocked()
+            }
+        }
+    }
+
+    override func loadView() {
+        view = displayView
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if #available(iOS 14.0, *) {
+            setNeedsUpdateOfPrefersPointerLocked()
+        }
+    }
+
+    override var prefersPointerLocked: Bool {
+        if #available(iOS 14.0, *) {
+            return lockPointer
+        } else {
+            return false
+        }
     }
 }
 

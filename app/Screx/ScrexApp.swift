@@ -504,7 +504,7 @@ final class StreamViewModel: ObservableObject {
             guard let self else { return }
             var data = Data([0x01]) // MOUSE_MOVE
             let idx = Int16(clamping: Int(dx)).bigEndian
-            let idy = Int16(clamping: Int(dy)).bigEndian
+            let idy = Int16(clamping: -Int(dy)).bigEndian
             withUnsafeBytes(of: idx) { data.append(contentsOf: $0) }
             withUnsafeBytes(of: idy) { data.append(contentsOf: $0) }
             Task { @MainActor in self.sendMouse(data) }
@@ -663,7 +663,8 @@ struct ContentView: View {
                         videoWidth: model.decoder.videoWidth,
                         videoHeight: model.decoder.videoHeight,
                         onTouch: { data in model.sendTouch(data) },
-                        hidePointer: model.physicalMouseConnected
+                        hidePointer: model.physicalMouseConnected,
+                        lockPointer: model.physicalMouseConnected
                     )
                     .ignoresSafeArea()
                 }

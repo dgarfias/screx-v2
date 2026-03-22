@@ -197,6 +197,10 @@ pub fn run_client_manager(
                 let previous_expected = *shared.expected_client_ip.lock().unwrap();
                 let previous_client = *shared.client_addr.lock().unwrap();
                 println!(
+                    "[client] session key established from TCP handshake ({})",
+                    session.client_addr.ip(),
+                );
+                crate::vlog!(
                     "[client] session #{session_serial} key established from TCP handshake: tcp_addr={} expected_udp_ip={} previous_expected_ip={previous_expected:?} previous_udp_client={previous_client:?}",
                     session.client_addr,
                     session.client_addr.ip(),
@@ -215,7 +219,7 @@ pub fn run_client_manager(
                 if should_log_debug(recv_count) {
                     let registered_client = *shared.client_addr.lock().unwrap();
                     let expected_ip = *shared.expected_client_ip.lock().unwrap();
-                    println!(
+                    crate::vlog!(
                         "[client] udp recv #{recv_count}: from={addr} len={len} registered_client={registered_client:?} expected_ip={expected_ip:?} has_cipher={}",
                         local_cipher.is_some()
                     );
@@ -226,7 +230,7 @@ pub fn run_client_manager(
                 if len < 4 + crate::crypto::TAG_LEN {
                     short_drop_count = short_drop_count.wrapping_add(1);
                     if should_log_debug(short_drop_count) {
-                        println!(
+                        crate::vlog!(
                             "[client] drop short udp packet #{short_drop_count}: from={addr} len={len} min_len={}",
                             4 + crate::crypto::TAG_LEN
                         );
@@ -248,7 +252,7 @@ pub fn run_client_manager(
                     if !registered_ok && !expected_ok {
                         ip_mismatch_drop_count = ip_mismatch_drop_count.wrapping_add(1);
                         if should_log_debug(ip_mismatch_drop_count) {
-                            println!(
+                            crate::vlog!(
                                 "[client] drop udp packet #{ip_mismatch_drop_count}: from={addr} registered_client={registered_client:?} expected_ip={expected_ip:?} reason=ip_mismatch"
                             );
                         }
@@ -256,7 +260,7 @@ pub fn run_client_manager(
                     }
                     if let Some(ref mut r) = *client {
                         if *r != addr {
-                            println!("[client] udp client address updated: {r} -> {addr}");
+                            crate::vlog!("[client] udp client address updated: {r} -> {addr}");
                             *r = addr;
                         }
                     }
@@ -272,7 +276,7 @@ pub fn run_client_manager(
                     None => {
                         no_cipher_drop_count = no_cipher_drop_count.wrapping_add(1);
                         if should_log_debug(no_cipher_drop_count) {
-                            println!(
+                            crate::vlog!(
                                 "[client] drop udp packet #{no_cipher_drop_count}: from={addr} seq={seq_num} reason=no_session_cipher"
                             );
                         }
@@ -286,7 +290,7 @@ pub fn run_client_manager(
                     None => {
                         decrypt_fail_count = decrypt_fail_count.wrapping_add(1);
                         if should_log_debug(decrypt_fail_count) {
-                            println!(
+                            crate::vlog!(
                                 "[client] drop udp packet #{decrypt_fail_count}: from={addr} seq={seq_num} len={len} reason=decrypt_failed"
                             );
                         }
@@ -296,7 +300,7 @@ pub fn run_client_manager(
 
                 last_keepalive = Instant::now();
                 if should_log_debug(recv_count) {
-                    println!(
+                    crate::vlog!(
                         "[client] udp packet authenticated: from={addr} seq={seq_num} plaintext_len={}",
                         plaintext.len()
                     );
@@ -350,11 +354,11 @@ pub fn run_client_manager(
                 let pt_len = plaintext.len();
 
                 if pt_len >= REGISTER_MAGIC.len() && &plaintext[..REGISTER_MAGIC.len()] == REGISTER_MAGIC {
-                    println!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
+                    crate::vlog!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
                 }
 
                 if pt_len >= PLI_MAGIC.len() && &plaintext[..PLI_MAGIC.len()] == PLI_MAGIC {
-                    println!("[client] PLI received: from={addr} seq={seq_num}");
+                    crate::vlog!("[client] PLI received: from={addr} seq={seq_num}");
                     shared.force_idr.store(true, Ordering::Relaxed);
                 }
 
@@ -440,7 +444,7 @@ pub fn run_client_manager(
                     match socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr) {
                         Ok(sent) => {
                             if should_log_debug(heartbeat_count) {
-                                println!(
+                                crate::vlog!(
                                     "[client] heartbeat sent #{heartbeat_count}: to={addr} bytes={sent} payload_len={hb_magic_len}"
                                 );
                             }

@@ -46,6 +46,10 @@ final class StreamClient {
         print("[stream \(debugId)] \(message)")
     }
 
+    private func shouldLogDebug(_ count: Int) -> Bool {
+        count <= 12 || count.isMultiple(of: 25) || (count > 0 && (count & (count - 1)) == 0)
+    }
+
     init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
         self.decoder = decoder
@@ -187,7 +191,6 @@ final class StreamClient {
     }
 
     private func receiveLoop(_ conn: NWConnection) {
-        log("receiveLoop waiting for UDP datagram")
         conn.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
@@ -200,15 +203,15 @@ final class StreamClient {
 
             if let data, !data.isEmpty {
                 self.receiveCount += 1
-                self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")
+                if self.shouldLogDebug(self.receiveCount) {
+                    self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")
+                }
                 self.resetDataTimeout()
                 if data.count >= Self.headerLen {
                     self.handlePacket(data)
                 } else {
                     self.log("ignoring short inbound UDP datagram: \(data.count) bytes")
                 }
-            } else {
-                self.log("receiveLoop callback with empty data isComplete=\(isComplete)")
             }
 
             self.receiveLoop(conn)
@@ -231,7 +234,7 @@ final class StreamClient {
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
-        if receiveCount <= 12 || receiveCount.isMultiple(of: 25) {
+        if shouldLogDebug(receiveCount) {
             log("handlePacket frameId=\(frameId) chunkIdx=\(chunkIdx) totalData=\(totalData) totalParity=\(totalParity) flags=0x\(String(flags, radix: 16)) codecId=\(codecId) payloadLen=\(payloadLen)")
         }
 
