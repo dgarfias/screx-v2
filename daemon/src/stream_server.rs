@@ -254,10 +254,32 @@ pub fn run_client_manager(
                         }
                         if !shared.has_active_client.swap(true, Ordering::SeqCst) {
                             drop(client);
-                            if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
-                                cb();
-                            }
+                            let shared_lc = Arc::clone(&shared);
+                            std::thread::Builder::new()
+                                .name("lifecycle-connect".into())
+                                .spawn(move || {
+                                    if let Some(ref cb) = *shared_lc.on_client_connected.lock().unwrap() {
+                                        cb();
+                                    }
+                                })
+                                .ok();
                         }
+
+                        // Send an immediate heartbeat so the iPad's data timeout
+                        // doesn't fire while peripherals are being created.
+                        if let Some(ref c) = local_cipher {
+                            let hb_frame_id = 0xFFFF_FFFFu32;
+                            let hb_flags: u8 = 0x80;
+                            let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
+                            let header = build_header(hb_frame_id, 0, 0, 0, hb_flags, 0, HEARTBEAT_MAGIC.len() as u16, 0);
+                            let hb_magic_len = HEARTBEAT_MAGIC.len();
+                            let mut hb_buf = [0u8; HEADER_LEN + 64];
+                            hb_buf[..HEADER_LEN].copy_from_slice(&header);
+                            hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
+                            let enc_len = c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
+                            let _ = socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr);
+                        }
+                        last_heartbeat = Instant::now();
                     }
                 }
 
@@ -367,9 +389,15 @@ pub fn run_client_manager(
             if !shared.usb_active.load(Ordering::Relaxed)
                 && shared.has_active_client.swap(false, Ordering::SeqCst)
             {
-                if let Some(ref cb) = *shared.on_client_disconnected.lock().unwrap() {
-                    cb();
-                }
+                let shared_lc = Arc::clone(&shared);
+                std::thread::Builder::new()
+                    .name("lifecycle-disconnect".into())
+                    .spawn(move || {
+                        if let Some(ref cb) = *shared_lc.on_client_disconnected.lock().unwrap() {
+                            cb();
+                        }
+                    })
+                    .ok();
             }
         }
     }
