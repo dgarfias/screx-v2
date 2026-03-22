@@ -12,6 +12,7 @@ enum PairingResult {
 final class PairingService {
     private let queue = DispatchQueue(label: "screx.pairing", qos: .userInitiated)
     private var connection: NWConnection?
+    private let debugId = String(UUID().uuidString.prefix(6))
 
     private static let magicPair   = Data("SCREX_PAIR".utf8)    // 10 bytes
     private static let magicHello  = Data("SCREX_HELLO".utf8)   // 11 bytes
@@ -30,9 +31,14 @@ final class PairingService {
 
     var onResult: ((PairingResult) -> Void)?
 
+    private func log(_ message: String) {
+        print("[pairing \(debugId)] \(message)")
+    }
+
     func pair(host: String, port: UInt16) {
         let deviceId = Self.getOrCreateDeviceId()
         let pairingKey = KeychainHelper.loadPairingKey(for: host)
+        log("starting pair(host=\(host), port=\(port)) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pairingKeyPresent=\(pairingKey != nil)")
 
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
@@ -43,11 +49,14 @@ final class PairingService {
 
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
+            self.log("tcp state -> \(state)")
             switch state {
             case .ready:
                 if pairingKey != nil {
+                    self.log("tcp ready, using reconnect HELLO flow")
                     self.sendHello(conn: conn, host: host, deviceId: deviceId, pairingKey: pairingKey!)
                 } else {
+                    self.log("tcp ready, using first-time PAIR flow")
                     self.sendPairRequest(conn: conn, host: host, deviceId: deviceId)
                 }
             case .failed(let error):
@@ -61,6 +70,7 @@ final class PairingService {
     }
 
     func cancel() {
+        log("cancel()")
         connection?.cancel()
         connection = nil
     }
@@ -70,6 +80,7 @@ final class PairingService {
     private func sendPairRequest(conn: NWConnection, host: String, deviceId: Data) {
         let keyPair = ScrexCrypto.generateKeyPair()
         let pubKey = keyPair.publicKey.rawRepresentation
+        log("sending PAIR request: deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pubKeyLen=\(pubKey.count)")
 
         var packet = Self.magicPair
         packet.append(deviceId)
@@ -81,6 +92,7 @@ final class PairingService {
                 self.emitResult(.error("Send pair request failed: \(error.localizedDescription)"))
                 return
             }
+            self.log("PAIR request sent (\(packet.count) bytes), waiting for daemon response")
             self.waitForPinChallenge(conn: conn, host: host, deviceId: deviceId, keyPair: keyPair)
         })
     }
@@ -105,6 +117,7 @@ final class PairingService {
                 self.emitResult(.error("Empty response from daemon"))
                 return
             }
+            self.log("received pair challenge/ok response: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
 
             // Check for busy (daemon already has an active session)
             if data.count >= Self.magicBusy.count && data.prefix(Self.magicBusy.count) == Self.magicBusy {
@@ -121,6 +134,7 @@ final class PairingService {
                     return
                 }
                 let serverPubKey = data.subdata(in: 10..<(10 + Self.pubkeyLen))
+                self.log("daemon requested PIN entry, serverPubKeyLen=\(serverPubKey.count)")
 
                 guard let ecdhSecret = ScrexCrypto.ecdh(privateKey: keyPair, publicKeyBytes: serverPubKey) else {
                     self.emitResult(.error("ECDH failed"))
@@ -157,6 +171,7 @@ final class PairingService {
                     info: Data("screx-session".utf8)
                 )
                 let sessionKey = SymmetricKey(data: sessionKeyData)
+                self.log("received reconnect OK, derived session key and validating server HMAC")
 
                 let expectedHmac = ScrexCrypto.hmacSHA256(key: sessionKeyData, data: Data("server-verify".utf8))
                 guard expectedHmac == serverHmac else {
@@ -164,6 +179,7 @@ final class PairingService {
                     return
                 }
 
+                self.log("reconnect HELLO flow complete, session established")
                 conn.cancel()
                 self.emitResult(.sessionEstablished(sessionKey: sessionKey))
             } else {
@@ -173,6 +189,7 @@ final class PairingService {
     }
 
     private func sendPinAnswer(conn: NWConnection, host: String, deviceId: Data, pin: String, ecdhSecret: Data) {
+        log("sending PIN answer for host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined())")
         let pinKey = ScrexCrypto.hkdfSHA256Bytes(
             ikm: ecdhSecret,
             salt: Data("screx-pin-exchange".utf8),
@@ -204,6 +221,7 @@ final class PairingService {
                 self.emitResult(.error("Send PIN answer failed: \(error.localizedDescription)"))
                 return
             }
+            self.log("PIN answer sent, waiting for final OK")
             self.waitForPinResult(conn: conn, host: host, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
         })
     }
@@ -220,6 +238,7 @@ final class PairingService {
                 self.emitResult(.error("Empty PIN result"))
                 return
             }
+            self.log("received PIN result: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
 
             let magic = data.prefix(10)
 
@@ -261,6 +280,7 @@ final class PairingService {
                 info: Data("screx-session".utf8)
             )
             let sessionKey = SymmetricKey(data: sessionKeyData)
+            self.log("PIN flow complete, derived session key and validating server HMAC")
 
             // Verify server HMAC
             let expectedHmac = ScrexCrypto.hmacSHA256(key: sessionKeyData, data: Data("server-verify".utf8))
@@ -269,6 +289,7 @@ final class PairingService {
                 return
             }
 
+            self.log("pairing flow complete, session established")
             conn.cancel()
             self.emitResult(.sessionEstablished(sessionKey: sessionKey))
         }
@@ -279,6 +300,7 @@ final class PairingService {
     private func sendHello(conn: NWConnection, host: String, deviceId: Data, pairingKey: Data) {
         var clientNonce = Data(count: Self.nonceLen)
         _ = clientNonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, Self.nonceLen, $0.baseAddress!) }
+        log("sending HELLO: host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pairingKeyLen=\(pairingKey.count)")
 
         var packet = Self.magicHello
         packet.append(deviceId)
@@ -290,6 +312,7 @@ final class PairingService {
                 self.emitResult(.error("Send hello failed: \(error.localizedDescription)"))
                 return
             }
+            self.log("HELLO sent (\(packet.count) bytes), waiting for hello response")
             self.waitForHelloResponse(conn: conn, host: host, pairingKey: pairingKey, clientNonce: clientNonce)
         })
     }
@@ -306,6 +329,7 @@ final class PairingService {
                 self.emitResult(.error("Empty hello response"))
                 return
             }
+            self.log("received hello response: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
 
             if data.count >= Self.magicBusy.count && data.prefix(Self.magicBusy.count) == Self.magicBusy {
                 self.emitResult(.rejected(reason: "Daemon is busy with another client"))
@@ -340,6 +364,7 @@ final class PairingService {
                 info: Data("screx-session".utf8)
             )
             let sessionKey = SymmetricKey(data: sessionKeyData)
+            self.log("HELLO response validated, session established")
 
             let expectedHmac = ScrexCrypto.hmacSHA256(key: sessionKeyData, data: Data("server-verify".utf8))
             guard expectedHmac == serverHmac else {
@@ -355,6 +380,16 @@ final class PairingService {
     // MARK: - Helpers
 
     private func emitResult(_ result: PairingResult) {
+        switch result {
+        case .sessionEstablished:
+            log("emitResult(.sessionEstablished)")
+        case .pinRequired:
+            log("emitResult(.pinRequired)")
+        case .rejected(let reason):
+            log("emitResult(.rejected: \(reason))")
+        case .error(let message):
+            log("emitResult(.error: \(message))")
+        }
         DispatchQueue.main.async { [weak self] in
             self?.onResult?(result)
         }

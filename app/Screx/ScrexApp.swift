@@ -75,9 +75,14 @@ final class StreamViewModel: ObservableObject {
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
 
+    private func log(_ message: String) {
+        print("[app] \(message)")
+    }
+
     func startDiscovery() {
         guard !discoveryStarted else { return }
         discoveryStarted = true
+        log("startDiscovery()")
 
         // Start USB listener
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
@@ -86,6 +91,7 @@ final class StreamViewModel: ObservableObject {
         usb.onStatus = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
+                self.log("usb status: \(msg)")
                 if self.usbConnected || !self.isConnected {
                     self.status = msg
                 }
@@ -94,6 +100,7 @@ final class StreamViewModel: ObservableObject {
         usb.onConnected = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                self.log("usb connected")
                 self.usbConnected = true
                 self.isConnected = true
                 self.isConnecting = false
@@ -106,6 +113,7 @@ final class StreamViewModel: ObservableObject {
         usb.onDisconnected = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                self.log("usb disconnected")
                 self.usbConnected = false
                 self.stream?.suppressTimeout = false
                 self.fallbackToNetwork()
@@ -117,6 +125,7 @@ final class StreamViewModel: ObservableObject {
         discovery.onStatusUpdate = { [weak self] msg in
             Task { @MainActor in
                 guard let self else { return }
+                self.log("discovery status: \(msg)")
                 if !self.usbConnected && !self.isConnected {
                     self.status = msg
                 }
@@ -131,15 +140,19 @@ final class StreamViewModel: ObservableObject {
                 )
                 self.lastNetEndpoint = endpoint
                 self.lastNetName = ep.name
+                self.log("discovery found daemon: name=\(ep.name) host=\(ep.host) port=\(ep.port) isConnected=\(self.isConnected) isConnecting=\(self.isConnecting)")
 
                 if !self.isConnected && !self.isConnecting {
                     self.connectToEndpoint(endpoint, name: ep.name)
+                } else {
+                    self.log("ignoring discovered endpoint because isConnected=\(self.isConnected) isConnecting=\(self.isConnecting)")
                 }
             }
         }
         discovery.onDaemonLost = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                self.log("discovery reported daemon lost")
                 self.lastNetEndpoint = nil
                 self.lastNetName = nil
                 // Don't tear down an active stream just because beacons stopped --
@@ -162,6 +175,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
+        log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting) usbConnected=\(usbConnected)")
         // Detach old stream's callbacks so stale async events can't interfere
         stream?.onStatus = nil
         stream?.onDisconnect = nil
@@ -194,33 +208,39 @@ final class StreamViewModel: ObservableObject {
         // Step 1: TCP handshake for pairing/session key exchange
         let ps = PairingService()
         self.pairingService = ps
+        log("starting PairingService for host=\(host) port=\(port)")
 
         ps.onResult = { [weak self] result in
             guard let self else { return }
             switch result {
             case .sessionEstablished(let key):
+                self.log("PairingService result: session established")
                 self.sessionKey = key
                 self.pairingService = nil
                 self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key)
 
             case .pinRequired(let completion):
+                self.log("PairingService result: PIN required")
                 self.pendingPinCompletion = completion
                 self.pinInput = ""
                 self.showPinEntry = true
                 self.pairingStatus = "Enter the PIN shown on the daemon"
 
             case .rejected(let reason):
+                self.log("PairingService result: rejected (\(reason))")
                 self.status = "Pairing rejected: \(reason)"
                 self.pairingService = nil
                 self.isConnecting = false
 
             case .error(let msg):
+                self.log("PairingService result: error (\(msg))")
                 self.status = "Pairing error: \(msg)"
                 self.pairingService = nil
                 self.isConnecting = false
                 // Retry after a delay
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                     guard let self, !self.isConnected else { return }
+                    self.log("retrying connectToEndpoint after pairing error")
                     self.connectToEndpoint(endpoint, name: name)
                 }
             }
@@ -236,6 +256,7 @@ final class StreamViewModel: ObservableObject {
             pairingStatus = "PIN must be exactly 6 digits"
             return
         }
+        log("submitPin()")
         showPinEntry = false
         status = "Verifying PIN..."
         completion(pin)
@@ -243,6 +264,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func cancelPin() {
+        log("cancelPin()")
         showPinEntry = false
         pendingPinCompletion = nil
         pairingService?.cancel()
@@ -251,6 +273,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey) {
+        log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
         if !usbConnected {
             status = "Connecting to \(name)..."
         }
@@ -265,6 +288,7 @@ final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self, let client else { return }
                 guard self.stream === client else { return }
+                self.log("StreamClient status: \(msg)")
                 if !self.usbConnected {
                     self.status = msg
                     let nowConnected = msg.contains("Streaming")
@@ -282,6 +306,7 @@ final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self, let client else { return }
                 guard self.stream === client else { return }
+                self.log("StreamClient onDisconnect")
                 self.stream = nil
                 if !self.usbConnected {
                     self.handleStreamLost()
@@ -293,6 +318,7 @@ final class StreamViewModel: ObservableObject {
 
     /// Called when USB disconnects — try to resume network connection immediately
     private func fallbackToNetwork() {
+        log("fallbackToNetwork() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
         if let endpoint = lastNetEndpoint, let name = lastNetName {
             status = "USB disconnected, switching to network..."
             transport = "Network"
@@ -310,6 +336,7 @@ final class StreamViewModel: ObservableObject {
 
     /// Called when we've lost all streams and need to start looking again
     private func handleStreamLost() {
+        log("handleStreamLost() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
         stream?.onStatus = nil
         stream?.onDisconnect = nil
         stream?.disconnect()

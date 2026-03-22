@@ -225,8 +225,10 @@ fn handle_handshake(
     stream.read_exact(&mut header)?;
 
     if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
+        println!("[pairing] handshake type=PAIR from {addr}");
         handle_pair_request(&mut stream, addr, &header, pairing, session_tx)
     } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
+        println!("[pairing] handshake type=HELLO from {addr}");
         handle_hello_request(&mut stream, addr, &header, pairing, session_tx)
     } else {
         anyhow::bail!("unknown handshake magic");
@@ -296,6 +298,7 @@ fn handle_pair_request(
     response.extend_from_slice(server_public.as_ref());
     stream.write_all(&response)?;
     stream.flush()?;
+    println!("[pairing] sent PIN challenge to {addr} for device {device_id_hex}");
 
     // Store pending pairing for PIN verification
     {
@@ -306,6 +309,7 @@ fn handle_pair_request(
             ecdh_secret: ecdh_secret.clone(),
         });
     }
+    println!("[pairing] waiting for PIN answer from {addr} for device {device_id_hex}");
 
     // Wait for PIN answer: SCREX_ANSWER(12) + encrypted_pin_data
     let mut answer_header = [0u8; 12];
@@ -327,6 +331,7 @@ fn handle_pair_request(
     nonce.copy_from_slice(&encrypted_pin[..12]);
     let mut ct = encrypted_pin[12..].to_vec();
     let plaintext = cipher.decrypt(&nonce, b"screx-pin-verify", &mut ct);
+    println!("[pairing] received PIN answer from {addr} for device {device_id_hex}");
 
     match plaintext {
         Some(pin_bytes) => {
@@ -374,12 +379,18 @@ fn handle_pair_request(
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
     stream.flush()?;
+    println!("[pairing] sent pairing OK to {addr} for device {device_id_hex}");
 
     // Publish session
-    *session_tx.lock().unwrap() = Some(SessionInfo {
+    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
         session_key,
         client_addr: addr,
     });
+    println!(
+        "[pairing] published paired session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
+        addr.ip(),
+        replaced.is_some()
+    );
 
     Ok(())
 }
@@ -428,11 +439,17 @@ fn handle_pair_already_paired(
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
     stream.flush()?;
+    println!("[pairing] sent reconnect OK to {addr} for device {device_id_hex}");
 
-    *session_tx.lock().unwrap() = Some(SessionInfo {
+    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
         session_key,
         client_addr: addr,
     });
+    println!(
+        "[pairing] published reconnect session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
+        addr.ip(),
+        replaced.is_some()
+    );
 
     println!("[pairing] reconnected paired device {device_id_hex}");
     Ok(())
@@ -485,11 +502,17 @@ fn handle_hello_request(
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
     stream.flush()?;
+    println!("[pairing] sent hello OK to {addr} for device {device_id_hex}");
 
-    *session_tx.lock().unwrap() = Some(SessionInfo {
+    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
         session_key,
         client_addr: addr,
     });
+    println!(
+        "[pairing] published hello session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
+        addr.ip(),
+        replaced.is_some()
+    );
 
     println!("[pairing] session established with paired device {device_id_hex}");
     Ok(())

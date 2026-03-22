@@ -30,6 +30,10 @@ const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
 const PACING_DELAY: Duration = Duration::from_micros(10);
 
+fn should_log_debug(counter: u64) -> bool {
+    counter <= 12 || counter.is_power_of_two() || counter % 25 == 0
+}
+
 pub type LifecycleCallback = Box<dyn Fn() + Send + Sync>;
 
 pub struct SharedState {
@@ -174,6 +178,13 @@ pub fn run_client_manager(
     let mut cam_reassembler = CamReassembler::new();
     let mut _input_seq_expected: u32 = 0;
     let mut local_cipher: Option<crate::crypto::SessionCipher> = None;
+    let mut session_serial: u64 = 0;
+    let mut recv_count: u64 = 0;
+    let mut short_drop_count: u64 = 0;
+    let mut ip_mismatch_drop_count: u64 = 0;
+    let mut no_cipher_drop_count: u64 = 0;
+    let mut decrypt_fail_count: u64 = 0;
+    let mut heartbeat_count: u64 = 0;
 
     println!("[client] waiting for paired handshake...");
 
@@ -182,7 +193,14 @@ pub fn run_client_manager(
         {
             let mut rx = session_rx.lock().unwrap();
             if let Some(session) = rx.take() {
-                println!("[client] session key established from TCP handshake ({})", session.client_addr.ip());
+                session_serial = session_serial.wrapping_add(1);
+                let previous_expected = *shared.expected_client_ip.lock().unwrap();
+                let previous_client = *shared.client_addr.lock().unwrap();
+                println!(
+                    "[client] session #{session_serial} key established from TCP handshake: tcp_addr={} expected_udp_ip={} previous_expected_ip={previous_expected:?} previous_udp_client={previous_client:?}",
+                    session.client_addr,
+                    session.client_addr.ip(),
+                );
 
                 *shared.session_key.lock().unwrap() = Some(session.session_key);
                 *shared.expected_client_ip.lock().unwrap() = Some(session.client_addr.ip());
@@ -193,26 +211,52 @@ pub fn run_client_manager(
 
         match socket.recv_from(&mut recv_buf) {
             Ok((len, addr)) => {
+                recv_count = recv_count.wrapping_add(1);
+                if should_log_debug(recv_count) {
+                    let registered_client = *shared.client_addr.lock().unwrap();
+                    let expected_ip = *shared.expected_client_ip.lock().unwrap();
+                    println!(
+                        "[client] udp recv #{recv_count}: from={addr} len={len} registered_client={registered_client:?} expected_ip={expected_ip:?} has_cipher={}",
+                        local_cipher.is_some()
+                    );
+                }
+
                 // All client→daemon UDP packets are encrypted:
                 // [seq_num(4 BE)] [ciphertext] [tag(16)]
                 if len < 4 + crate::crypto::TAG_LEN {
+                    short_drop_count = short_drop_count.wrapping_add(1);
+                    if should_log_debug(short_drop_count) {
+                        println!(
+                            "[client] drop short udp packet #{short_drop_count}: from={addr} len={len} min_len={}",
+                            4 + crate::crypto::TAG_LEN
+                        );
+                    }
                     continue; // too small to be valid
                 }
 
                 // Check IP and update port in one lock acquisition
                 {
                     let mut client = shared.client_addr.lock().unwrap();
+                    let registered_client = *client;
+                    let expected_ip = *shared.expected_client_ip.lock().unwrap();
                     let registered_ok = client.map_or(false, |r| r.ip() == addr.ip());
                     let expected_ok = if !registered_ok {
-                        shared.expected_client_ip.lock().unwrap().map_or(false, |ip| ip == addr.ip())
+                        expected_ip.map_or(false, |ip| ip == addr.ip())
                     } else {
                         false
                     };
                     if !registered_ok && !expected_ok {
+                        ip_mismatch_drop_count = ip_mismatch_drop_count.wrapping_add(1);
+                        if should_log_debug(ip_mismatch_drop_count) {
+                            println!(
+                                "[client] drop udp packet #{ip_mismatch_drop_count}: from={addr} registered_client={registered_client:?} expected_ip={expected_ip:?} reason=ip_mismatch"
+                            );
+                        }
                         continue;
                     }
                     if let Some(ref mut r) = *client {
                         if *r != addr {
+                            println!("[client] udp client address updated: {r} -> {addr}");
                             *r = addr;
                         }
                     }
@@ -225,18 +269,38 @@ pub fn run_client_manager(
 
                 let cipher = match local_cipher.as_ref() {
                     Some(c) => c,
-                    None => continue,
+                    None => {
+                        no_cipher_drop_count = no_cipher_drop_count.wrapping_add(1);
+                        if should_log_debug(no_cipher_drop_count) {
+                            println!(
+                                "[client] drop udp packet #{no_cipher_drop_count}: from={addr} seq={seq_num} reason=no_session_cipher"
+                            );
+                        }
+                        continue;
+                    }
                 };
 
                 let aad: [u8; 4] = [recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]];
                 let plaintext = match cipher.decrypt(&nonce, &aad, &mut recv_buf[4..len]) {
                     Some(pt) => pt,
                     None => {
+                        decrypt_fail_count = decrypt_fail_count.wrapping_add(1);
+                        if should_log_debug(decrypt_fail_count) {
+                            println!(
+                                "[client] drop udp packet #{decrypt_fail_count}: from={addr} seq={seq_num} len={len} reason=decrypt_failed"
+                            );
+                        }
                         continue;
                     }
                 };
 
                 last_keepalive = Instant::now();
+                if should_log_debug(recv_count) {
+                    println!(
+                        "[client] udp packet authenticated: from={addr} seq={seq_num} plaintext_len={}",
+                        plaintext.len()
+                    );
+                }
 
                 // First authenticated packet: register the full client address
                 {
@@ -286,10 +350,11 @@ pub fn run_client_manager(
                 let pt_len = plaintext.len();
 
                 if pt_len >= REGISTER_MAGIC.len() && &plaintext[..REGISTER_MAGIC.len()] == REGISTER_MAGIC {
-                    // Keepalive — already handled above by resetting last_keepalive
+                    println!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
                 }
 
                 if pt_len >= PLI_MAGIC.len() && &plaintext[..PLI_MAGIC.len()] == PLI_MAGIC {
+                    println!("[client] PLI received: from={addr} seq={seq_num}");
                     shared.force_idr.store(true, Ordering::Relaxed);
                 }
 
@@ -362,6 +427,7 @@ pub fn run_client_manager(
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             if let Some(addr) = *shared.client_addr.lock().unwrap() {
                 if let Some(ref c) = local_cipher {
+                    heartbeat_count = heartbeat_count.wrapping_add(1);
                     let hb_frame_id = 0xFFFF_FFFFu32;
                     let hb_flags: u8 = 0x80;
                     let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
@@ -371,7 +437,16 @@ pub fn run_client_manager(
                     hb_buf[..HEADER_LEN].copy_from_slice(&header);
                     hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
                     let enc_len = c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
-                    let _ = socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr);
+                    match socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr) {
+                        Ok(sent) => {
+                            if should_log_debug(heartbeat_count) {
+                                println!(
+                                    "[client] heartbeat sent #{heartbeat_count}: to={addr} bytes={sent} payload_len={hb_magic_len}"
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[client] heartbeat send failed to {addr}: {e}"),
+                    }
                 }
             }
             last_heartbeat = Instant::now();

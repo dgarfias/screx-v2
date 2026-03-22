@@ -7,6 +7,7 @@ final class StreamClient {
     private let endpoint: NWEndpoint
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
+    private let debugId = String(UUID().uuidString.prefix(6))
     let decoder: VideoDecoder
     let audioPlayer: AudioPlayer
     let avSync: AVSyncState
@@ -37,6 +38,13 @@ final class StreamClient {
     private static let pliMinInterval: TimeInterval = 1.0
     private static let pliMagic = Data("PLI".utf8)
     private var sendSeq: UInt32 = 0
+    private var registerSendCount = 0
+    private var receiveCount = 0
+    private var decryptFailCount = 0
+
+    private func log(_ message: String) {
+        print("[stream \(debugId)] \(message)")
+    }
 
     init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
@@ -46,6 +54,7 @@ final class StreamClient {
     }
 
     func connect() {
+        log("connect() endpoint=\(endpoint)")
         let params = NWParameters.udp
         params.requiredLocalEndpoint = nil
 
@@ -54,8 +63,10 @@ final class StreamClient {
 
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
+            self.log("udp state -> \(state)")
             switch state {
             case .ready:
+                self.log("udp ready, sending initial register and starting receive loop")
                 self.onStatus?("Connected, registering...")
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
@@ -75,6 +86,7 @@ final class StreamClient {
     }
 
     func disconnect() {
+        log("disconnect() registerSends=\(registerSendCount) receives=\(receiveCount) decryptFailures=\(decryptFailCount)")
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
         dataTimeoutTimer?.cancel()
@@ -84,6 +96,8 @@ final class StreamClient {
     }
 
     private func sendRegister(_ conn: NWConnection) {
+        registerSendCount += 1
+        log("sendRegister() #\(registerSendCount)")
         encryptAndSend(Self.registerMagic, conn: conn, label: "register")
     }
 
@@ -91,6 +105,7 @@ final class StreamClient {
     private func encryptAndSend(_ plaintext: Data, conn: NWConnection, label: String) {
         guard let key = sessionKey else {
             // Fallback: send unencrypted (shouldn't happen in normal flow)
+            log("\(label) send without session key, bytes=\(plaintext.count)")
             conn.send(content: plaintext, completion: .contentProcessed { error in
                 if let error { print("[stream] \(label) send error: \(error)") }
             })
@@ -113,13 +128,19 @@ final class StreamClient {
 
         var packet = seqData
         packet.append(encrypted)
+        log("\(label) send queued: seq=\(seq) plaintext=\(plaintext.count) packet=\(packet.count)")
 
         conn.send(content: packet, completion: .contentProcessed { error in
-            if let error { print("[stream] \(label) send error: \(error)") }
+            if let error {
+                print("[stream] \(label) send error: \(error)")
+            } else {
+                self.log("\(label) send completed")
+            }
         })
     }
 
     private func startKeepalive(_ conn: NWConnection) {
+        log("startKeepalive(interval=\(Self.keepaliveInterval)s)")
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + Self.keepaliveInterval, repeating: Self.keepaliveInterval)
         timer.setEventHandler { [weak self] in
@@ -130,6 +151,7 @@ final class StreamClient {
     }
 
     private func startDataTimeout() {
+        log("startDataTimeout(timeout=\(Self.dataTimeout)s)")
         dataTimeoutTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + Self.dataTimeout)
@@ -157,6 +179,7 @@ final class StreamClient {
             resetDataTimeout()
             return
         }
+        log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
         print("[stream] data timeout — daemon appears gone")
         disconnect()
         onStatus?("Daemon disconnected")
@@ -164,20 +187,28 @@ final class StreamClient {
     }
 
     private func receiveLoop(_ conn: NWConnection) {
+        log("receiveLoop waiting for UDP datagram")
         conn.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
 
             if let error {
+                self.log("receiveLoop error: \(error.localizedDescription)")
                 self.onStatus?("Receive error: \(error.localizedDescription)")
                 self.handleTimeout()
                 return
             }
 
             if let data, !data.isEmpty {
+                self.receiveCount += 1
+                self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")
                 self.resetDataTimeout()
                 if data.count >= Self.headerLen {
                     self.handlePacket(data)
+                } else {
+                    self.log("ignoring short inbound UDP datagram: \(data.count) bytes")
                 }
+            } else {
+                self.log("receiveLoop callback with empty data isComplete=\(isComplete)")
             }
 
             self.receiveLoop(conn)
@@ -200,7 +231,12 @@ final class StreamClient {
         let isAudio = (flags & Self.flagAudio) != 0
         let isIdr = (flags & 1) != 0
 
+        if receiveCount <= 12 || receiveCount.isMultiple(of: 25) {
+            log("handlePacket frameId=\(frameId) chunkIdx=\(chunkIdx) totalData=\(totalData) totalParity=\(totalParity) flags=0x\(String(flags, radix: 16)) codecId=\(codecId) payloadLen=\(payloadLen)")
+        }
+
         if frameId == 0xFFFF_FFFF && totalData == 0 {
+            log("received heartbeat packet")
             return
         }
 
@@ -219,10 +255,13 @@ final class StreamClient {
             let nonce = ScrexCrypto.nonceServer(frameId: frameId, chunkIdx: chunkIdx, flags: flags)
             let header = data[..<Self.headerLen]
             guard let decrypted = ScrexCrypto.decrypt(key: key, nonce: nonce, ciphertextAndTag: encryptedPayload, aad: header) else {
+                decryptFailCount += 1
+                log("decrypt failed #\(decryptFailCount) for frameId=\(frameId) chunkIdx=\(chunkIdx) flags=0x\(String(flags, radix: 16)) encryptedLen=\(encryptedPayload.count)")
                 return
             }
             payload = decrypted
         } else {
+            log("no session key set while decoding inbound packet")
             payload = Data(encryptedPayload)
         }
 
@@ -307,6 +346,7 @@ final class StreamClient {
 
         if !decoder.hasReportedFirstFrame {
             decoder.hasReportedFirstFrame = true
+            log("first video frame delivered to decoder")
             onStatus?("Streaming")
         }
     }
