@@ -3,7 +3,7 @@ import Network
 import CryptoKit
 
 enum PairingResult {
-    case sessionEstablished(sessionKey: SymmetricKey)
+    case sessionEstablished(sessionKey: SymmetricKey, connection: NWConnection)
     case pinRequired(completion: (String) -> Void)
     case rejected(reason: String)
     case error(String)
@@ -180,8 +180,9 @@ final class PairingService {
                 }
 
                 self.log("reconnect HELLO flow complete, session established")
-                conn.cancel()
-                self.emitResult(.sessionEstablished(sessionKey: sessionKey))
+                conn.stateUpdateHandler = nil
+                self.connection = nil
+                self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
             } else {
                 self.emitResult(.error("Unexpected response from daemon"))
             }
@@ -290,8 +291,9 @@ final class PairingService {
             }
 
             self.log("pairing flow complete, session established")
-            conn.cancel()
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey))
+            conn.stateUpdateHandler = nil
+            self.connection = nil
+            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
         }
     }
 
@@ -372,8 +374,9 @@ final class PairingService {
                 return
             }
 
-            conn.cancel()
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey))
+            conn.stateUpdateHandler = nil
+            self.connection = nil
+            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
         }
     }
 

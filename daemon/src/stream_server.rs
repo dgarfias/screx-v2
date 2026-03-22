@@ -34,6 +34,11 @@ fn should_log_debug(counter: u64) -> bool {
     counter <= 12 || counter.is_power_of_two() || counter % 25 == 0
 }
 
+fn seq_is_stale(seq_num: u32, expected_seq: u32) -> bool {
+    let diff = seq_num.wrapping_sub(expected_seq);
+    diff > 0x8000_0000
+}
+
 pub type LifecycleCallback = Box<dyn Fn() + Send + Sync>;
 
 pub struct SharedState {
@@ -144,7 +149,8 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
         }
         (PERIPH_MOUSE, PERIPH_DETACHED) => {
             let mut m = shared.virtual_mouse.lock().unwrap();
-            if m.take().is_some() {
+            if let Some(mut vm) = m.take() {
+                vm.release_all_buttons();
                 println!("[periph] physical mouse detached — virtual mouse destroyed");
             }
         }
@@ -155,6 +161,54 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             println!("[periph] physical keyboard detached");
         }
         _ => {}
+    }
+}
+
+pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
+    if ctrl.starts_with(PLI_MAGIC) {
+        shared.force_idr.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    if ctrl.starts_with(TOUCH_MAGIC) && ctrl.len() > TOUCH_MAGIC.len() {
+        let touch_data = &ctrl[TOUCH_MAGIC.len()..];
+        let mut touch = shared.virtual_touch.lock().unwrap();
+        if let Some(ref mut ts) = *touch {
+            crate::uinput::handle_touch_packet(ts, touch_data);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(KEY_MAGIC) && ctrl.len() > KEY_MAGIC.len() {
+        let key_data = &ctrl[KEY_MAGIC.len()..];
+        let mut kb = shared.virtual_keyboard.lock().unwrap();
+        if let Some(ref mut keyboard) = *kb {
+            crate::uinput::handle_key_packet(keyboard, key_data);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(MOUSE_MAGIC) && ctrl.len() > MOUSE_MAGIC.len() {
+        let mouse_data = &ctrl[MOUSE_MAGIC.len()..];
+        let mut m = shared.virtual_mouse.lock().unwrap();
+        if let Some(ref mut vm) = *m {
+            crate::uinput::handle_mouse_packet(vm, mouse_data);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(RAWKEY_MAGIC) && ctrl.len() > RAWKEY_MAGIC.len() {
+        let rk_data = &ctrl[RAWKEY_MAGIC.len()..];
+        let mut kb = shared.virtual_keyboard.lock().unwrap();
+        if let Some(ref mut keyboard) = *kb {
+            crate::uinput::handle_rawkey_packet(keyboard, rk_data);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(PERIPH_MAGIC) && ctrl.len() > PERIPH_MAGIC.len() {
+        let periph_data = &ctrl[PERIPH_MAGIC.len()..];
+        handle_periph_packet_data(shared, periph_data);
     }
 }
 
@@ -176,7 +230,8 @@ pub fn run_client_manager(
     let mut last_heartbeat = Instant::now();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
-    let mut _input_seq_expected: u32 = 0;
+    let mut input_seq_expected: u32 = 0;
+    let mut input_seq_initialized = false;
     let mut local_cipher: Option<crate::crypto::SessionCipher> = None;
     let mut session_serial: u64 = 0;
     let mut recv_count: u64 = 0;
@@ -209,7 +264,8 @@ pub fn run_client_manager(
                 *shared.session_key.lock().unwrap() = Some(session.session_key);
                 *shared.expected_client_ip.lock().unwrap() = Some(session.client_addr.ip());
                 local_cipher = Some(crate::crypto::SessionCipher::new(&session.session_key));
-                _input_seq_expected = 0;
+                input_seq_expected = 0;
+                input_seq_initialized = false;
             }
         }
 
@@ -306,6 +362,20 @@ pub fn run_client_manager(
                     );
                 }
 
+                if input_seq_initialized && seq_is_stale(seq_num, input_seq_expected) {
+                    crate::vlog!(
+                        "[client] drop udp packet: from={addr} seq={seq_num} expected_seq={input_seq_expected} reason=stale_out_of_order"
+                    );
+                    continue;
+                }
+                if input_seq_initialized && seq_num != input_seq_expected {
+                    crate::vlog!(
+                        "[client] udp sequence gap: from={addr} seq={seq_num} expected_seq={input_seq_expected}"
+                    );
+                }
+                input_seq_expected = seq_num.wrapping_add(1);
+                input_seq_initialized = true;
+
                 // First authenticated packet: register the full client address
                 {
                     let mut client = shared.client_addr.lock().unwrap();
@@ -357,27 +427,6 @@ pub fn run_client_manager(
                     crate::vlog!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
                 }
 
-                if pt_len >= PLI_MAGIC.len() && &plaintext[..PLI_MAGIC.len()] == PLI_MAGIC {
-                    crate::vlog!("[client] PLI received: from={addr} seq={seq_num}");
-                    shared.force_idr.store(true, Ordering::Relaxed);
-                }
-
-                if pt_len > TOUCH_MAGIC.len() && &plaintext[..TOUCH_MAGIC.len()] == TOUCH_MAGIC {
-                    let touch_data = &plaintext[TOUCH_MAGIC.len()..];
-                    let mut touch = shared.virtual_touch.lock().unwrap();
-                    if let Some(ref mut ts) = *touch {
-                        crate::uinput::handle_touch_packet(ts, touch_data);
-                    }
-                }
-
-                if pt_len > KEY_MAGIC.len() && &plaintext[..KEY_MAGIC.len()] == KEY_MAGIC {
-                    let key_data = &plaintext[KEY_MAGIC.len()..];
-                    let mut kb = shared.virtual_keyboard.lock().unwrap();
-                    if let Some(ref mut keyboard) = *kb {
-                        crate::uinput::handle_key_packet(keyboard, key_data);
-                    }
-                }
-
                 if pt_len > CAM_MAGIC.len() && &plaintext[..CAM_MAGIC.len()] == CAM_MAGIC {
                     let cam_data = &plaintext[CAM_MAGIC.len()..];
                     if let Some(jpeg) = cam_reassembler.feed(cam_data) {
@@ -398,28 +447,6 @@ pub fn run_client_manager(
                     }
                 }
 
-                if pt_len > MOUSE_MAGIC.len() && &plaintext[..MOUSE_MAGIC.len()] == MOUSE_MAGIC {
-                    let mouse_data = &plaintext[MOUSE_MAGIC.len()..];
-                    let mut m = shared.virtual_mouse.lock().unwrap();
-                    if let Some(ref mut vm) = *m {
-                        crate::uinput::handle_mouse_packet(vm, mouse_data);
-                    }
-                }
-
-                if pt_len > RAWKEY_MAGIC.len() && &plaintext[..RAWKEY_MAGIC.len()] == RAWKEY_MAGIC {
-                    let rk_data = &plaintext[RAWKEY_MAGIC.len()..];
-                    let mut kb = shared.virtual_keyboard.lock().unwrap();
-                    if let Some(ref mut keyboard) = *kb {
-                        crate::uinput::handle_rawkey_packet(keyboard, rk_data);
-                    }
-                }
-
-                if pt_len > PERIPH_MAGIC.len() && &plaintext[..PERIPH_MAGIC.len()] == PERIPH_MAGIC {
-                    let periph_data = &plaintext[PERIPH_MAGIC.len()..];
-                    handle_periph_packet_data(&shared, periph_data);
-                }
-
-                _input_seq_expected = seq_num.wrapping_add(1);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}

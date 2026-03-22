@@ -159,6 +159,7 @@ final class StreamViewModel: ObservableObject {
 
     private let discovery = DiscoveryService()
     private var stream: StreamClient?
+    private var networkControl: NetworkControlClient?
     private var usbListener: USBListener?
     private var pairingService: PairingService?
     private var pendingPinCompletion: ((String) -> Void)?
@@ -286,6 +287,9 @@ final class StreamViewModel: ObservableObject {
         stream?.onStatus = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
+        networkControl?.onDisconnect = nil
+        networkControl?.disconnect()
+        networkControl = nil
         pairingService?.cancel()
 
         isConnecting = true
@@ -319,11 +323,27 @@ final class StreamViewModel: ObservableObject {
         ps.onResult = { [weak self] result in
             guard let self else { return }
             switch result {
-            case .sessionEstablished(let key):
+            case .sessionEstablished(let key, let connection):
                 self.log("PairingService result: session established")
                 self.sessionKey = key
                 self.pairingService = nil
-                self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key)
+
+                let control = NetworkControlClient(connection: connection, sessionKey: key)
+                control.onDisconnect = { [weak self, weak control] in
+                    Task { @MainActor in
+                        guard let self, let control else { return }
+                        guard self.networkControl === control else { return }
+                        self.log("NetworkControlClient onDisconnect")
+                        self.networkControl = nil
+                        if !self.usbConnected {
+                            self.handleStreamLost()
+                        }
+                    }
+                }
+                self.networkControl = control
+                control.start()
+
+                self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key, controlClient: control)
 
             case .pinRequired(let completion):
                 self.log("PairingService result: PIN required")
@@ -378,7 +398,7 @@ final class StreamViewModel: ObservableObject {
         status = "Pairing cancelled"
     }
 
-    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey) {
+    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey, controlClient: NetworkControlClient) {
         log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
         if !usbConnected {
             status = "Connecting to \(name)..."
@@ -388,6 +408,9 @@ final class StreamViewModel: ObservableObject {
 
         let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         client.sessionKey = sessionKey
+        client.sendPliRequest = { [weak controlClient] in
+            controlClient?.sendPli()
+        }
         self.stream = client
 
         client.onStatus = { [weak self, weak client] msg in
@@ -447,6 +470,9 @@ final class StreamViewModel: ObservableObject {
         stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
+        networkControl?.onDisconnect = nil
+        networkControl?.disconnect()
+        networkControl = nil
         isConnected = false
         isConnecting = false
         transport = ""
@@ -465,8 +491,15 @@ final class StreamViewModel: ObservableObject {
     }
 
     func disconnect() {
+        stream?.onStatus = nil
+        stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
+        networkControl?.onDisconnect = nil
+        networkControl?.disconnect()
+        networkControl = nil
+        pairingService?.cancel()
+        pairingService = nil
         usbListener?.stop()
         usbListener = nil
         usbConnected = false
@@ -488,16 +521,16 @@ final class StreamViewModel: ObservableObject {
     func sendTouch(_ data: Data) {
         if usbConnected, let usb = usbListener {
             usb.sendTouch(data)
-        } else if let stream {
-            stream.sendTouch(data)
+        } else if let control = networkControl {
+            control.sendTouch(data)
         }
     }
 
     func sendKey(_ keyData: Data) {
         if usbConnected, let usb = usbListener {
             usb.sendKey(keyData)
-        } else if let stream {
-            stream.sendKey(keyData)
+        } else if let control = networkControl {
+            control.sendKey(keyData)
         }
     }
 
@@ -530,24 +563,24 @@ final class StreamViewModel: ObservableObject {
     func sendMouse(_ mouseData: Data) {
         if usbConnected, let usb = usbListener {
             usb.sendMouse(mouseData)
-        } else if let stream {
-            stream.sendMouse(mouseData)
+        } else if let control = networkControl {
+            control.sendMouse(mouseData)
         }
     }
 
     func sendRawKey(_ keyData: Data) {
         if usbConnected, let usb = usbListener {
             usb.sendRawKey(keyData)
-        } else if let stream {
-            stream.sendRawKey(keyData)
+        } else if let control = networkControl {
+            control.sendRawKey(keyData)
         }
     }
 
     func sendPeripheral(_ periphData: Data) {
         if usbConnected, let usb = usbListener {
             usb.sendPeripheral(periphData)
-        } else if let stream {
-            stream.sendPeripheral(periphData)
+        } else if let control = networkControl {
+            control.sendPeripheral(periphData)
         }
     }
 

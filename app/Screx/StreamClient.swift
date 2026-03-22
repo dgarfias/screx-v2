@@ -15,6 +15,7 @@ final class StreamClient {
     var onStatus: ((String) -> Void)?
     var onDisconnect: (() -> Void)?
     var sessionKey: SymmetricKey?
+    var sendPliRequest: (() -> Void)?
 
     /// When true, suppresses the data timeout (e.g. USB is active and no network data is expected)
     var suppressTimeout = false
@@ -378,6 +379,10 @@ final class StreamClient {
         let now = CACurrentMediaTime()
         guard now - lastPliTime >= Self.pliMinInterval else { return }
         lastPliTime = now
+        if let sendPliRequest {
+            sendPliRequest()
+            return
+        }
         guard let conn = connection else { return }
         encryptAndSend(Self.pliMagic, conn: conn, label: "PLI")
     }

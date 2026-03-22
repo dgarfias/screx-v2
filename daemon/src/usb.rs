@@ -265,19 +265,11 @@ fn read_control_loop(
         if msg_buf[0] == MSG_CONTROL && msg_len >= 2 {
             let ctrl = &msg_buf[1..msg_len];
             if ctrl.starts_with(b"PLI") {
-                shared.force_idr.store(true, Ordering::Relaxed);
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"TOUCH") && ctrl.len() > 5 {
-                let touch_data = &ctrl[5..];
-                let mut touch = shared.virtual_touch.lock().unwrap();
-                if let Some(ref mut ts) = *touch {
-                    crate::uinput::handle_touch_packet(ts, touch_data);
-                }
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"KEY") && ctrl.len() > 3 {
-                let key_data = &ctrl[3..];
-                let mut kb = shared.virtual_keyboard.lock().unwrap();
-                if let Some(ref mut keyboard) = *kb {
-                    crate::uinput::handle_key_packet(keyboard, key_data);
-                }
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
                 let jpeg = &ctrl[3..];
                 let mut cam = shared.cam_writer.lock().unwrap();
@@ -294,20 +286,11 @@ fn read_control_loop(
                     }
                 }
             } else if ctrl.starts_with(b"MOUSE") && ctrl.len() > 5 {
-                let mouse_data = &ctrl[5..];
-                let mut m = shared.virtual_mouse.lock().unwrap();
-                if let Some(ref mut vm) = *m {
-                    crate::uinput::handle_mouse_packet(vm, mouse_data);
-                }
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"RAWKEY") && ctrl.len() > 6 {
-                let rk_data = &ctrl[6..];
-                let mut kb = shared.virtual_keyboard.lock().unwrap();
-                if let Some(ref mut keyboard) = *kb {
-                    crate::uinput::handle_rawkey_packet(keyboard, rk_data);
-                }
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"PERIPH") && ctrl.len() > 6 {
-                let periph_data = &ctrl[6..];
-                crate::stream_server::handle_periph_packet_data(shared, periph_data);
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             }
         }
     }

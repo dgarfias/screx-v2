@@ -26,6 +26,7 @@ const UI_SET_EVBIT: libc::c_ulong = 0x40045564;   // _IOW('U', 100, int)
 const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;  // _IOW('U', 101, int)
 const UI_SET_ABSBIT: libc::c_ulong = 0x40045567;  // _IOW('U', 103, int)
 const UI_SET_PROPBIT: libc::c_ulong = 0x4004556e;  // _IOW('U', 110, int)
+const INPUT_PROP_POINTER: libc::c_int = 0x00;
 const INPUT_PROP_DIRECT: libc::c_int = 0x01;
 
 const MAX_SLOTS: i32 = 10;
@@ -74,6 +75,17 @@ struct InputAbsinfo {
     fuzz: i32,
     flat: i32,
     resolution: i32,
+}
+
+fn current_timeval() -> libc::timeval {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::gettimeofday(&mut tv, std::ptr::null_mut());
+    }
+    tv
 }
 
 fn ioctl_ui_dev_setup() -> libc::c_ulong {
@@ -282,10 +294,7 @@ impl VirtualTouchscreen {
 
     fn emit(&mut self, type_: u16, code: u16, value: i32) {
         let ev = InputEvent {
-            time: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
+            time: current_timeval(),
             type_,
             code,
             value,
@@ -364,6 +373,7 @@ impl VirtualMouse {
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER))?;
 
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as libc::c_int))?;
@@ -404,6 +414,7 @@ impl VirtualMouse {
             2 => BTN_MIDDLE,
             _ => return,
         };
+        crate::vlog!("[mouse] emit button: btn={} code={} state={state}", btn, code);
         self.emit(EV_KEY, code, state);
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
@@ -413,9 +424,16 @@ impl VirtualMouse {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
+    pub fn release_all_buttons(&mut self) {
+        self.emit(EV_KEY, BTN_LEFT, 0);
+        self.emit(EV_KEY, BTN_RIGHT, 0);
+        self.emit(EV_KEY, BTN_MIDDLE, 0);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
     fn emit(&mut self, type_: u16, code: u16, value: i32) {
         let ev = InputEvent {
-            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            time: current_timeval(),
             type_,
             code,
             value,
@@ -432,6 +450,7 @@ impl VirtualMouse {
 
 impl Drop for VirtualMouse {
     fn drop(&mut self) {
+        self.release_all_buttons();
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
@@ -742,7 +761,7 @@ impl VirtualKeyboard {
 
     fn key_event(&mut self, code: u16, value: i32) {
         let ev = InputEvent {
-            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            time: current_timeval(),
             type_: EV_KEY,
             code,
             value,
@@ -758,7 +777,7 @@ impl VirtualKeyboard {
 
     fn syn(&mut self) {
         let ev = InputEvent {
-            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            time: current_timeval(),
             type_: EV_SYN,
             code: SYN_REPORT,
             value: 0,
@@ -875,13 +894,16 @@ pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
         MOUSE_MOVE if data.len() >= 5 => {
             let dx = i16::from_be_bytes([data[1], data[2]]) as i32;
             let dy = i16::from_be_bytes([data[3], data[4]]) as i32;
+            crate::vlog!("[mouse] recv move: dx={dx} dy={dy}");
             mouse.move_rel(dx, dy);
         }
         MOUSE_BUTTON if data.len() >= 3 => {
+            crate::vlog!("[mouse] recv button: btn={} state={}", data[1], data[2]);
             mouse.button(data[1], data[2] as i32);
         }
         MOUSE_SCROLL if data.len() >= 3 => {
             let dy = i16::from_be_bytes([data[1], data[2]]) as i32;
+            crate::vlog!("[mouse] recv scroll: dy={dy}");
             mouse.scroll(dy);
         }
         _ => {}

@@ -106,3 +106,12 @@ pub fn nonce_client(seq_num: u32) -> [u8; 12] {
     n[1..5].copy_from_slice(&seq_num.to_be_bytes());
     n
 }
+
+/// Build a 12-byte nonce for client→daemon TCP control packets from a sequence number.
+/// Layout: 0x7F | seq_num(4 BE) | 0x00(7)
+pub fn nonce_control_client(seq_num: u32) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[0] = 0x7F; // direction: client TCP control
+    n[1..5].copy_from_slice(&seq_num.to_be_bytes());
+    n
+}

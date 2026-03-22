@@ -157,6 +157,8 @@ fn config_dir() -> PathBuf {
 }
 
 const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
+const CONTROL_MAX_FRAME: usize = 65536;
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.
@@ -195,8 +197,14 @@ pub fn run_pairing_server(
                     .set_write_timeout(Some(Duration::from_secs(10)))
                     .ok();
 
-                match handle_handshake(stream, addr, &pairing, &session_tx) {
-                    Ok(()) => println!("[pairing] handshake with {addr} completed"),
+                match handle_handshake(&mut stream, addr, &pairing) {
+                    Ok(session) => {
+                        println!("[pairing] handshake with {addr} completed");
+                        *session_tx.lock().unwrap() = Some(session.clone());
+                        if let Err(e) = run_control_loop(stream, &shared, &stop, session.session_key) {
+                            eprintln!("[control] network control loop ended: {e:#}");
+                        }
+                    }
                     Err(e) => eprintln!("[pairing] handshake with {addr} failed: {e:#}"),
                 }
             }
@@ -215,21 +223,20 @@ pub fn run_pairing_server(
 }
 
 fn handle_handshake(
-    mut stream: TcpStream,
+    stream: &mut TcpStream,
     addr: std::net::SocketAddr,
     pairing: &Arc<Mutex<PairingState>>,
-    session_tx: &Arc<Mutex<Option<SessionInfo>>>,
-) -> Result<()> {
+ ) -> Result<SessionInfo> {
     // Read the first message to determine if this is PAIR or HELLO
     let mut header = [0u8; 12]; // max magic length
     stream.read_exact(&mut header)?;
 
     if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
         crate::vlog!("[pairing] handshake type=PAIR from {addr}");
-        handle_pair_request(&mut stream, addr, &header, pairing, session_tx)
+        handle_pair_request(stream, addr, &header, pairing)
     } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
         crate::vlog!("[pairing] handshake type=HELLO from {addr}");
-        handle_hello_request(&mut stream, addr, &header, pairing, session_tx)
+        handle_hello_request(stream, addr, &header, pairing)
     } else {
         anyhow::bail!("unknown handshake magic");
     }
@@ -240,8 +247,7 @@ fn handle_pair_request(
     addr: std::net::SocketAddr,
     header_buf: &[u8; 12],
     pairing: &Arc<Mutex<PairingState>>,
-    session_tx: &Arc<Mutex<Option<SessionInfo>>>,
-) -> Result<()> {
+) -> Result<SessionInfo> {
     // Already read 12 bytes; SCREX_PAIR is 10, so 2 bytes of device_id are in header_buf[10..12]
     // Read remaining: device_id(14 more) + client_pubkey(32) = 46 bytes
     let mut rest = [0u8; 46];
@@ -263,7 +269,7 @@ fn handle_pair_request(
         if ps.is_paired(&device_id_hex) {
             crate::vlog!("[pairing] device {device_id_hex} already paired, upgrading to session");
             drop(ps);
-            return handle_pair_already_paired(stream, addr, &device_id, &client_pubkey, pairing, session_tx);
+            return handle_pair_already_paired(stream, addr, &device_id, &client_pubkey, pairing);
         }
     }
 
@@ -381,18 +387,12 @@ fn handle_pair_request(
     stream.flush()?;
     crate::vlog!("[pairing] sent pairing OK to {addr} for device {device_id_hex}");
 
-    // Publish session
-    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
+    let session = SessionInfo {
         session_key,
         client_addr: addr,
-    });
-    crate::vlog!(
-        "[pairing] published paired session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
-        addr.ip(),
-        replaced.is_some()
-    );
+    };
 
-    Ok(())
+    Ok(session)
 }
 
 fn handle_pair_already_paired(
@@ -401,8 +401,7 @@ fn handle_pair_already_paired(
     device_id: &[u8; DEVICE_ID_LEN],
     client_pubkey: &[u8; PUBKEY_LEN],
     pairing: &Arc<Mutex<PairingState>>,
-    session_tx: &Arc<Mutex<Option<SessionInfo>>>,
-) -> Result<()> {
+) -> Result<SessionInfo> {
     let device_id_hex = hex_encode(device_id);
     let pairing_key = pairing
         .lock()
@@ -441,18 +440,13 @@ fn handle_pair_already_paired(
     stream.flush()?;
     crate::vlog!("[pairing] sent reconnect OK to {addr} for device {device_id_hex}");
 
-    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
+    let session = SessionInfo {
         session_key,
         client_addr: addr,
-    });
-    crate::vlog!(
-        "[pairing] published reconnect session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
-        addr.ip(),
-        replaced.is_some()
-    );
+    };
 
     println!("[pairing] reconnected paired device {device_id_hex}");
-    Ok(())
+    Ok(session)
 }
 
 fn handle_hello_request(
@@ -460,8 +454,7 @@ fn handle_hello_request(
     addr: std::net::SocketAddr,
     header_buf: &[u8; 12],
     pairing: &Arc<Mutex<PairingState>>,
-    session_tx: &Arc<Mutex<Option<SessionInfo>>>,
-) -> Result<()> {
+) -> Result<SessionInfo> {
     // SCREX_HELLO is 11 bytes, 1 byte of device_id in header_buf[11]
     // Read remaining: device_id(15) + client_nonce(32) = 47 bytes
     let mut rest = [0u8; 47];
@@ -504,17 +497,87 @@ fn handle_hello_request(
     stream.flush()?;
     crate::vlog!("[pairing] sent hello OK to {addr} for device {device_id_hex}");
 
-    let replaced = session_tx.lock().unwrap().replace(SessionInfo {
+    let session = SessionInfo {
         session_key,
         client_addr: addr,
-    });
-    crate::vlog!(
-        "[pairing] published hello session for device {device_id_hex}: udp_ip={} replaced_previous_session={}",
-        addr.ip(),
-        replaced.is_some()
-    );
+    };
 
     println!("[pairing] session established with paired device {device_id_hex}");
+    Ok(session)
+}
+
+fn run_control_loop(
+    mut stream: TcpStream,
+    shared: &Arc<crate::stream_server::SharedState>,
+    stop: &Arc<AtomicBool>,
+    session_key: [u8; 32],
+) -> Result<()> {
+    stream
+        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
+        .ok();
+    stream.set_nodelay(true).ok();
+
+    let cipher = crypto::SessionCipher::new(&session_key);
+    let mut len_buf = [0u8; 4];
+    let mut msg_buf = vec![0u8; 256];
+    let mut seq_expected = 0u32;
+    let mut seq_initialized = false;
+
+    println!("[control] network control channel active");
+
+    while !stop.load(Ordering::Relaxed) {
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => {
+                println!("[control] network control channel disconnected");
+                break;
+            }
+        }
+
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
+            crate::vlog!("[control] dropping invalid framed control message: len={msg_len}");
+            continue;
+        }
+
+        if msg_buf.len() < msg_len {
+            msg_buf.resize(msg_len, 0);
+        }
+
+        match stream.read_exact(&mut msg_buf[..msg_len]) {
+            Ok(()) => {}
+            Err(_) => {
+                println!("[control] network control channel disconnected (payload)");
+                break;
+            }
+        }
+
+        let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
+        if seq_initialized && seq_num != seq_expected {
+            crate::vlog!("[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}");
+        }
+        seq_expected = seq_num.wrapping_add(1);
+        seq_initialized = true;
+
+        let nonce = crypto::nonce_control_client(seq_num);
+        let aad = [msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]];
+        let plaintext = match cipher.decrypt(&nonce, &aad, &mut msg_buf[4..msg_len]) {
+            Some(pt) => pt,
+            None => {
+                crate::vlog!("[control] failed to decrypt tcp control frame seq={seq_num}");
+                continue;
+            }
+        };
+
+        crate::stream_server::handle_control_message_data(shared, plaintext);
+    }
+
     Ok(())
 }
 

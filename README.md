@@ -2,14 +2,14 @@
 
 Low-latency Linux-to-iPad screen streaming. Turns an iPad into a virtual second display for your Linux desktop.
 
-The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 or H.265/HEVC (VA-API, NVENC, or software), and streams video + audio to the iPad app over the network (UDP with FEC) or USB (TCP via iproxy). The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
+The daemon creates a virtual monitor via EVDI, captures and encodes its framebuffer with H.264 or H.265/HEVC (VA-API, NVENC, or software), and streams video + audio to the iPad app over the network or USB. On the network path, media stays on UDP with FEC while control and input use a persistent encrypted TCP channel. On USB, everything uses framed TCP via iproxy. The iPad decodes with VideoToolbox hardware acceleration and displays with AVSampleBufferDisplayLayer.
 
 ## Features
 
 - **Virtual second display** via EVDI kernel module — appears as a real monitor in GNOME
 - **H.264 and H.265/HEVC encoding** with multiple backends: VA-API (Intel/AMD), NVENC (NVIDIA), or software (libx264/libx265)
 - **Dual transport backends**:
-  - **Network**: UDP with Reed-Solomon FEC, chunked and paced for reliability
+  - **Network**: UDP with Reed-Solomon FEC for media plus persistent encrypted TCP for control/input
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
   - Automatic detection and failover (USB preferred when connected)
 - **Audio streaming**: Virtual PulseAudio/PipeWire sink ("Screx iPad") captured via `parec`, streamed alongside video
@@ -18,7 +18,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Touch input**: Multi-touch from iPad mapped to a Linux virtual touchscreen via uinput
 - **Keyboard input**: iPad native keyboard forwarded to Linux via uinput virtual keyboard, with `Ctrl+Shift+U` Unicode input for accented/special characters (ñ, á, ö, etc.)
 - **Modifier keys**: Accessory bar above the iPad keyboard with Esc, Tab, Ctrl, Alt, Super, Home, End, Ins, Del, and arrow keys — modifiers are sticky one-shot (tap to arm, next key sends the combo)
-- **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; all network UDP traffic encrypted with AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
+- **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; network UDP media and network TCP control both use AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
 - **Single-client mode**: Only one iPad can connect at a time; additional connection attempts receive a `SCREX_BUSY` rejection
 - **Auto-discovery**: UDP broadcast beacon (no mDNS dependency), iPad auto-connects within seconds. Beacon pauses during active sessions and resumes on disconnect
 - **Disconnect detection**: Data timeouts and beacon monitoring for automatic reconnection
@@ -29,7 +29,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ```
 ┌──────────────────── Linux Daemon ─────────────────────┐
 │                                                       │
-│  EVDI ──► H.264/H.265 encode ──► Transport Router   ──┬──► UDP (Network, AES-256-GCM)
+│  EVDI ──► H.264/H.265 encode ──► Transport Router   ──┬──► UDP media (Network, AES-256-GCM)
 │                                                       │
 │  parec (audio) ──────────────► Transport Router       ┴──► TCP (USB)
 │                                                       │
@@ -38,15 +38,17 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 │  Virtual mic (PipeWire source) ◄── Opus audio         │
 │  Virtual webcam (v4l2loopback) ◄── JPEG frames        │
 │                                                       │
-│  Pairing server (TCP :9000) ── PIN auth + key exchange│
+│  Pairing server + control channel (TCP :9000)         │
+│      └── PIN auth, key exchange, persistent input TCP │
 │  Beacon broadcaster (port 9999, pauses when connected)│
 └───────────────────────────────────────────────────────┘
-          │ Network (UDP :9000)     │ USB (iproxy :9001 → :9000)
-          │ encrypted (AES-GCM)     │
+          │ Network UDP media + TCP control │ USB (iproxy :9001 → :9000)
+          │ encrypted (AES-GCM)             │
           ▼                         ▼
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  PairingService (TCP) ── PIN entry + Keychain storage │
+│  NetworkControlClient (TCP) ── touch/keys/mouse/PLI   │
 │                                                       │
 │  StreamClient (UDP) ────┬──► VideoDecoder ──► Display │
 │                         │                             │
@@ -71,9 +73,9 @@ screx-v2/
 │       ├── main.rs                # Entry point, thread orchestration, shutdown
 │       ├── capture.rs             # EVDI virtual display capture
 │       ├── encode.rs              # H.264/H.265 encoder: VA-API, NVENC, or software (ffmpeg-next)
-│       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state
+│       ├── stream_server.rs       # UDP sender (FEC), audio sender, shared state, UDP media receiver
 │       ├── crypto.rs              # AES-256-GCM encrypt/decrypt, HKDF-SHA256, HMAC, nonce construction
-│       ├── pairing.rs             # TCP pairing handshake, paired device storage, unpair CLI
+│       ├── pairing.rs             # TCP pairing handshake, persistent network control channel, paired device storage
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
 │       ├── transport.rs           # Transport abstraction layer
 │       ├── discovery.rs           # UDP broadcast beacon (pauses during active sessions)
@@ -88,8 +90,9 @@ screx-v2/
 │       ├── ScrexApp.swift         # App entry, StreamViewModel, ContentView, floating toolbar
 │       ├── Crypto.swift           # CryptoKit wrappers: AES-GCM, X25519 ECDH, HKDF, HMAC
 │       ├── PairingService.swift   # TCP pairing client, PIN entry callback, Keychain storage
+│       ├── NetworkControlClient.swift # Persistent encrypted TCP control client for network input
 │       ├── Discovery.swift        # UDP beacon listener for auto-discovery
-│       ├── StreamClient.swift     # Network UDP client, FEC reassembly, keepalive, encrypted I/O
+│       ├── StreamClient.swift     # Network UDP media client, FEC reassembly, keepalive, encrypted I/O
 │       ├── USBListener.swift      # USB TCP listener, framed message parsing
 │       ├── Decoder.swift          # H.264/H.265 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
@@ -217,6 +220,7 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `--backend` | `-b` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `--codec` | `-c` | `h264` | Video codec: `h264`, `h265` |
 | `--no-beacon` | | `false` | Disable UDP discovery beacon (for VPS/remote use) |
+| `--verbose` | `-v` | `false` | Enable detailed diagnostic logging |
 
 ### Subcommands
 
@@ -270,7 +274,12 @@ On first connection, the iPad and daemon perform a PIN-based pairing handshake o
 
 **Busy rejection:** If a session is already active, the daemon sends `SCREX_BUSY` (12 bytes) and closes the TCP connection.
 
-Once the session key is established, all UDP traffic (both directions) is encrypted with **AES-256-GCM**. The 18-byte packet header is used as AAD (authenticated but not encrypted). Nonces are constructed from packet header fields (direction byte + frame_id + chunk_idx + flags) to guarantee uniqueness.
+Once the session key is established, network traffic is split:
+
+- **UDP media path**: video/audio from daemon to iPad plus mic/camera from iPad to daemon, encrypted with **AES-256-GCM**
+- **TCP control path**: touch, keyboard, physical mouse/keyboard, peripheral attach/detach, and PLI/control messages, encrypted with **AES-256-GCM**
+
+The UDP media header remains plaintext but authenticated as AAD. TCP control frames are length-prefixed and include a per-frame sequence number used as AAD and as part of nonce construction.
 
 ### Keyboard Packets
 
@@ -284,7 +293,7 @@ Keyboard events are sent as `"KEY" + type(1) + payload`:
 
 Modifier mask bits: `0x01` = Ctrl, `0x02` = Alt, `0x04` = Super.
 
-### Network Transport (UDP)
+### Network Media Transport (UDP)
 
 Each UDP packet has an 18-byte header:
 
@@ -301,7 +310,19 @@ Each UDP packet has an 18-byte header:
 
 Video frames are split into 1400-byte chunks with Reed-Solomon FEC parity shards. Audio is sent without FEC (small enough for single packets).
 
-When a session key is established (network connections), the payload after the header is AES-256-GCM encrypted with a 16-byte authentication tag appended. The header is sent in plaintext but authenticated as AAD. Client-to-daemon packets prepend a 4-byte sequence number (used as AAD and for nonce construction).
+When a session key is established, the payload after the header is AES-256-GCM encrypted with a 16-byte authentication tag appended. The header is sent in plaintext but authenticated as AAD. Client-to-daemon UDP media packets prepend a 4-byte sequence number (used as AAD and for nonce construction).
+
+### Network Control Transport (TCP)
+
+Network control/input uses the same paired TCP socket established during pairing.
+
+| Field | Size | Description |
+|---|---|---|
+| `length` | u32 BE | Frame length excluding this header |
+| `seq` | u32 BE | Per-frame sequence number |
+| `ciphertext+tag` | variable | AES-256-GCM encrypted control payload |
+
+Plaintext control payloads reuse the existing message prefixes: `PLI`, `TOUCH`, `KEY`, `MOUSE`, `RAWKEY`, and `PERIPH`.
 
 ### USB Transport (TCP)
 
@@ -331,10 +352,10 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
 2. **Beacon broadcasts** → iPad discovers daemon automatically
 3. **Pairing** (first time): TCP handshake with X25519 key exchange → daemon displays a 6-digit PIN → user enters PIN on iPad → pairing key stored on both sides. Subsequent connections skip this step
-4. **Session established**: Session key derived → all network UDP traffic encrypted with AES-256-GCM. Beacon pauses, additional connection attempts are rejected
-5. **iPad connects** (network UDP or USB TCP, whichever is available)
-6. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → encrypted transport sends to iPad
+4. **Session established**: Session key derived → persistent encrypted TCP control channel stays open for input/control; encrypted UDP is used for media. Beacon pauses, additional connection attempts are rejected
+5. **iPad connects** (network UDP media + TCP control, or USB TCP)
+6. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → encrypted UDP media sends to iPad
 7. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM encrypted and sent alongside video
-8. **Input loop**: iPad sends encrypted touch, keyboard, mic, and camera data back to daemon → decrypted and injected via uinput, PipeWire, and v4l2loopback
+8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, and control traffic over TCP; mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
 9. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
 10. **Disconnect detection**: data timeouts (network) and TCP close (USB) trigger automatic reconnection; beacon resumes for rediscovery
