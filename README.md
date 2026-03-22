@@ -18,6 +18,8 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Touch input**: Multi-touch from iPad mapped to a Linux virtual touchscreen via uinput
 - **Keyboard input**: iPad native keyboard forwarded to Linux via uinput virtual keyboard, with `Ctrl+Shift+U` Unicode input for accented/special characters (ñ, á, ö, etc.)
 - **Modifier keys**: Accessory bar above the iPad keyboard with Esc, Tab, Ctrl, Alt, Super, Home, End, Ins, Del, and arrow keys — modifiers are sticky one-shot (tap to arm, next key sends the combo)
+- **Physical peripheral forwarding**: External mouse and keyboard connected to the iPad are forwarded to Linux over both Network and USB
+- **Pointer capture for external mouse**: When a physical mouse is active, iPadOS pointer input is captured for the app, the system pointer is hidden, and indirect pointer touches are not forwarded as touchscreen input
 - **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; network UDP media and network TCP control both use AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
 - **Single-client mode**: Only one iPad can connect at a time; additional connection attempts receive a `SCREX_BUSY` rejection
 - **Auto-discovery**: UDP broadcast beacon (no mDNS dependency), iPad auto-connects within seconds. Beacon pauses during active sessions and resumes on disconnect
@@ -48,14 +50,16 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 ┌──────────────────── iPad App ─────────────────────────┐
 │                                                       │
 │  PairingService (TCP) ── PIN entry + Keychain storage │
-│  NetworkControlClient (TCP) ── touch/keys/mouse/PLI   │
+│  NetworkControlClient (TCP) ─ touch/keys/mouse/periph │
+│                           └─ PLI + control messages   │
 │                                                       │
 │  StreamClient (UDP) ────┬──► VideoDecoder ──► Display │
 │                         │                             │
 │  USBListener (TCP) ─────┘──► AudioPlayer ──► Speaker  │
 │                                                       │
-│  Touch ──────────────────────────────────► daemon     │
+│  Touch / Pencil ─────────────────────────► daemon     │
 │  Keyboard + modifier bar ────────────────► daemon     │
+│  External mouse / keyboard ──────────────► daemon     │
 │  Microphone (Opus) ──────────────────────► daemon     │
 │  Camera (JPEG) ──────────────────────────► daemon     │
 │                                                       │
@@ -81,7 +85,7 @@ screx-v2/
 │       ├── discovery.rs           # UDP broadcast beacon (pauses during active sessions)
 │       ├── audio.rs               # Virtual sink + parec capture, virtual mic (pipe-source / null-sink)
 │       ├── camera.rs              # v4l2loopback virtual webcam writer
-│       ├── uinput.rs              # Virtual touchscreen + keyboard, modifier combos, Unicode input
+│       ├── uinput.rs              # Virtual touchscreen, keyboard, and mouse injection
 │       ├── doctor.rs              # Host readiness checks
 │       ├── signaling.rs           # Signaling helpers
 │       └── webrtc_sender.rs       # WebRTC sender (experimental)
@@ -97,7 +101,7 @@ screx-v2/
 │       ├── Decoder.swift          # H.264/H.265 Annex-B → VideoToolbox → display layer
 │       ├── AudioPlayer.swift      # PCM playback via AVAudioEngine
 │       ├── AVSyncState.swift      # Audio/video synchronization state
-│       ├── DisplayView.swift      # Video display, touch forwarding, keyboard input + modifier bar
+│       ├── DisplayView.swift      # Video display, touch forwarding, indirect pointer filtering
 │       ├── FEC.swift              # Reed-Solomon decoder for network FEC recovery
 │       ├── MicCapture.swift       # iPad microphone capture → Opus encoding
 │       └── CameraCapture.swift    # iPad camera capture → JPEG frames
@@ -154,7 +158,7 @@ Three kernel modules are required:
 |---|---|---|---|
 | **evdi** | `evdi-git` (AUR) | `evdi-dkms` | Virtual display (appears as real monitor in GNOME) |
 | **v4l2loopback** | `v4l2loopback-dkms` | `v4l2loopback-dkms` | Virtual webcam for iPad camera forwarding |
-| **uinput** | built-in | built-in | Virtual touchscreen and keyboard |
+| **uinput** | built-in | built-in | Virtual touchscreen, keyboard, and mouse |
 
 All three are loaded automatically by the daemon when needed. If `uinput` isn't loaded on your system, run `sudo modprobe uinput`.
 
@@ -237,7 +241,7 @@ The floating toolbar pill can be dragged anywhere on screen. Drag to the left ed
 |---|---|
 | Mic | Toggle iPad microphone forwarding (green when active) |
 | Camera | Toggle iPad camera forwarding; long-press to flip front/rear |
-| Keyboard | Toggle iPad native keyboard with modifier accessory bar |
+| Keyboard | Toggle iPad native keyboard with modifier accessory bar; grays out when an external keyboard is connected |
 | Info (ⓘ) | Toggle connection status overlay; drag from anywhere on pill to reposition |
 
 ### Keyboard Accessory Bar
@@ -251,6 +255,15 @@ When the keyboard is active, an accessory bar appears above the iPad keyboard:
 - **Ctrl, Alt, Super** are sticky one-shot modifiers: tap to arm (turns blue), then the next key you type sends the combo (e.g., Ctrl + C). Tap again while armed to send the modifier key alone (e.g., Super to open GNOME Activities).
 - Accented characters from the iPad's native long-press keyboard (ñ, á, ö, etc.) are automatically handled via the `Ctrl+Shift+U` Unicode input method on Linux.
 
+### External Mouse and Keyboard
+
+- A physical mouse connected to the iPad is forwarded as a Linux virtual mouse.
+- A physical keyboard connected to the iPad is forwarded as raw key events to the Linux virtual keyboard.
+- Pointer input is captured by the app while the physical mouse is active, so indirect pointer touches are not also forwarded as touchscreen taps.
+- Mouse wheel scrolling is forwarded separately from button clicks.
+- Middle click is supported as a click action; middle-button hold semantics are not guaranteed.
+- When an external keyboard is connected, the on-screen keyboard button is disabled visually and tapping it shows `External keyboard detected`.
+
 ## Protocols
 
 ### Pairing Protocol (TCP)
@@ -259,18 +272,18 @@ On first connection, the iPad and daemon perform a PIN-based pairing handshake o
 
 **New device flow:**
 
-1. iPad sends `SCREX_PAIR` (10 bytes) + device UUID (36 bytes) + X25519 public key (32 bytes)
+1. iPad sends `SCREX_PAIR` (10 bytes) + device ID (16 bytes) + X25519 public key (32 bytes)
 2. Daemon generates its own X25519 keypair, computes ECDH shared secret, generates a 6-digit PIN, prints it to stdout
-3. Daemon sends `SCREX_PIN` (9 bytes) + server public key (32 bytes)
+3. Daemon sends `SCREX_PIN` (10 bytes) + server public key (32 bytes)
 4. User enters the PIN on the iPad
 5. iPad encrypts the PIN with the ECDH-derived key, sends `SCREX_ANSWER` (12 bytes) + encrypted PIN (34 bytes)
-6. Daemon verifies the PIN. If correct: derives a `pairing_key` (HKDF) stored in `~/.config/screx/paired_devices.json`, derives a `session_key`, sends `SCREX_OK` (9 bytes) + session salt (32 bytes) + HMAC (32 bytes). If wrong: sends `SCREX_REJECT` (12 bytes)
+6. Daemon verifies the PIN. If correct: derives a `pairing_key` (HKDF) stored in `~/.config/screx/paired_devices.json`, derives a `session_key`, sends `SCREX_OK` (10 bytes) + session salt (32 bytes) + HMAC (32 bytes). If wrong: sends `SCREX_REJECT` (12 bytes)
 
 **Paired device flow (reconnection):**
 
-1. iPad sends `SCREX_HELLO` (11 bytes) + device UUID (36 bytes) + client nonce (32 bytes)
+1. iPad sends `SCREX_HELLO` (11 bytes) + device ID (16 bytes) + client nonce (32 bytes)
 2. Daemon looks up the pairing key, derives a session key from pairing key + nonces
-3. Daemon sends `SCREX_OK` (9 bytes) + server nonce (32 bytes) + HMAC (32 bytes)
+3. Daemon sends `SCREX_OK` (10 bytes) + server nonce (32 bytes) + HMAC (32 bytes)
 
 **Busy rejection:** If a session is already active, the daemon sends `SCREX_BUSY` (12 bytes) and closes the TCP connection.
 
@@ -356,6 +369,6 @@ The iPad listens on port 9999 and extracts the daemon's IP from the packet sourc
 5. **iPad connects** (network UDP media + TCP control, or USB TCP)
 6. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → encrypted UDP media sends to iPad
 7. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM encrypted and sent alongside video
-8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, and control traffic over TCP; mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
+8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, and control traffic over TCP; indirect pointer touches are filtered out so physical mouse clicks do not also become touchscreen taps. Mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
 9. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
 10. **Disconnect detection**: data timeouts (network) and TCP close (USB) trigger automatic reconnection; beacon resumes for rediscovery
