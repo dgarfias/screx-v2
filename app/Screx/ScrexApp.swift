@@ -746,6 +746,10 @@ final class StreamViewModel: ObservableObject {
         sendMouse(data)
     }
 
+    func forwardPhysicalMouseScroll(deltaY: CGFloat) {
+        handlePhysicalMouseScroll(value: Float(deltaY))
+    }
+
     private func attachKeyboard(_ kb: GCKeyboard) {
         physicalKeyboardConnected = true
         sendPeripheral(Data([0x02, 0x01])) // PERIPH_KEYBOARD, ATTACHED
@@ -863,6 +867,7 @@ struct ContentView: View {
                         videoWidth: model.decoder.videoWidth,
                         videoHeight: model.decoder.videoHeight,
                         onTouch: { data in model.sendTouch(data) },
+                        onScroll: { deltaY in model.forwardPhysicalMouseScroll(deltaY: deltaY) },
                         hidePointer: model.physicalMouseConnected,
                         lockPointer: model.physicalMouseConnected
                     )

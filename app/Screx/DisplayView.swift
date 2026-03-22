@@ -235,6 +235,7 @@ struct VideoDisplayView: UIViewControllerRepresentable {
     let videoWidth: Int
     let videoHeight: Int
     var onTouch: ((Data) -> Void)?
+    var onScroll: ((CGFloat) -> Void)?
     var hidePointer: Bool = false
     var lockPointer: Bool = false
 
@@ -243,6 +244,7 @@ struct VideoDisplayView: UIViewControllerRepresentable {
         controller.displayView.videoWidth = videoWidth
         controller.displayView.videoHeight = videoHeight
         controller.displayView.onTouch = onTouch
+        controller.displayView.onScroll = onScroll
         controller.displayView.hidePointer = hidePointer
         controller.lockPointer = lockPointer
         controller.displayView.attach(layer: layer)
@@ -253,6 +255,7 @@ struct VideoDisplayView: UIViewControllerRepresentable {
         uiViewController.displayView.videoWidth = videoWidth
         uiViewController.displayView.videoHeight = videoHeight
         uiViewController.displayView.onTouch = onTouch
+        uiViewController.displayView.onScroll = onScroll
         uiViewController.displayView.hidePointer = hidePointer
         uiViewController.lockPointer = lockPointer
         uiViewController.displayView.attach(layer: layer)
@@ -297,6 +300,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     var videoWidth: Int = 1920
     var videoHeight: Int = 1080
     var onTouch: ((Data) -> Void)?
+    var onScroll: ((CGFloat) -> Void)?
     var hidePointer: Bool = false {
         didSet {
             if hidePointer && pointerInteraction == nil {
@@ -317,11 +321,31 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isMultipleTouchEnabled = true
+        configureScrollRecognizer()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         isMultipleTouchEnabled = true
+        configureScrollRecognizer()
+    }
+
+    private func configureScrollRecognizer() {
+        guard #available(iOS 13.4, *) else { return }
+        let recognizer = UIPanGestureRecognizer(target: self, action: #selector(handleDiscreteScroll(_:)))
+        recognizer.allowedScrollTypesMask = .discrete
+        recognizer.maximumNumberOfTouches = 0
+        recognizer.cancelsTouchesInView = false
+        addGestureRecognizer(recognizer)
+    }
+
+    @available(iOS 13.4, *)
+    @objc private func handleDiscreteScroll(_ recognizer: UIPanGestureRecognizer) {
+        guard let onScroll else { return }
+        let translation = recognizer.translation(in: self)
+        guard translation.y != 0 else { return }
+        onScroll(translation.y)
+        recognizer.setTranslation(.zero, in: self)
     }
 
     func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest, defaultRegion: UIPointerRegion) -> UIPointerRegion? {
