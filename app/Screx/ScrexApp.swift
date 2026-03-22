@@ -114,13 +114,13 @@ final class ScrexRootViewController: GCEventViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         captureView.becomeFirstResponder()
-        updatePhysicalMouseCapture(model.physicalMouseConnected)
+        updatePhysicalMouseCapture()
         setNeedsStatusBarAppearanceUpdate()
         setNeedsUpdateOfHomeIndicatorAutoHidden()
     }
 
     override var prefersPointerLocked: Bool {
-        model.physicalMouseConnected
+        model.physicalMouseConnected || model.physicalControllerConnectedCount > 0
     }
 
     override var prefersStatusBarHidden: Bool {
