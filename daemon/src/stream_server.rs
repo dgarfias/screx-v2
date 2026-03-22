@@ -693,6 +693,10 @@ impl AudioSender {
         self.cipher = Some(cipher);
     }
 
+    pub fn clear_cipher(&mut self) {
+        self.cipher = None;
+    }
+
     pub fn send_audio(&mut self, pcm: &[u8], client_addr: SocketAddr, timestamp_ms: u32) -> Result<()> {
         let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 

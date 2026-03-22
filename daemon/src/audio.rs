@@ -214,8 +214,11 @@ pub fn run_audio_capture(
         };
 
         // Set up encryption cipher if session key is available
-        if let Some(key) = *shared.session_key.lock().unwrap() {
+        let mut active_session_key = *shared.session_key.lock().unwrap();
+        if let Some(key) = active_session_key {
             sender.set_cipher(crate::crypto::SessionCipher::new(&key));
+        } else {
+            sender.clear_cipher();
         }
 
         println!(
@@ -252,6 +255,19 @@ pub fn run_audio_capture(
                             continue;
                         }
                     }
+
+                    let current_session_key = *shared.session_key.lock().unwrap();
+                    if current_session_key != active_session_key {
+                        active_session_key = current_session_key;
+                        if let Some(key) = active_session_key {
+                            sender.set_cipher(crate::crypto::SessionCipher::new(&key));
+                            crate::vlog!("[audio] refreshed UDP audio cipher for new session");
+                        } else {
+                            sender.clear_cipher();
+                            crate::vlog!("[audio] cleared UDP audio cipher (no active session key)");
+                        }
+                    }
+
                     let client_addr = *shared.client_addr.lock().unwrap();
                     if let Some(addr) = client_addr {
                         if let Err(e) = sender.send_audio(&buf, addr, ts) {
