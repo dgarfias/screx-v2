@@ -599,6 +599,18 @@ impl VirtualGamepad {
         hat_x: i8,
         hat_y: i8,
     ) {
+        crate::vlog!(
+            "[gamepad] apply state buttons=0x{:x} lx={} ly={} rx={} ry={} lt={} rt={} hat=({}, {})",
+            buttons_mask,
+            lx,
+            ly,
+            rx,
+            ry,
+            lt,
+            rt,
+            hat_x,
+            hat_y
+        );
         self.sync_button(BTN_SOUTH, GPAD_BTN_SOUTH, buttons_mask);
         self.sync_button(BTN_EAST, GPAD_BTN_EAST, buttons_mask);
         self.sync_button(BTN_WEST, GPAD_BTN_WEST, buttons_mask);

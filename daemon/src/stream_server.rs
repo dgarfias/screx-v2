@@ -266,6 +266,20 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             let hat_x = data[16] as i8;
             let hat_y = data[17] as i8;
 
+            crate::vlog!(
+                "[gamepad] recv state controller={} buttons=0x{:x} lx={} ly={} rx={} ry={} lt={} rt={} hat=({}, {})",
+                controller_id + 1,
+                buttons_mask,
+                lx,
+                ly,
+                rx,
+                ry,
+                lt,
+                rt,
+                hat_x,
+                hat_y
+            );
+
             let mut pads = shared.virtual_gamepads.lock().unwrap();
             if let Some(ref mut pad) = pads.get_mut(&controller_id) {
                 pad.set_state(buttons_mask, lx, ly, rx, ry, lt, rt, hat_x, hat_y);
