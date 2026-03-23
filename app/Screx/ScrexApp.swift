@@ -1257,16 +1257,12 @@ struct ContentView: View {
     private static let btnSpacing: CGFloat = 6
     private static let edgeThreshold: CGFloat = 40
     private static let connectionRowHeight: CGFloat = 52
-    private static let connectionHeaderHeight: CGFloat = 30
+    private static let connectionListChromeHeight: CGFloat = 28
 
-    private var connectionListHeight: CGFloat {
-        let sectionCount = (model.pinnedConnections.isEmpty ? 0 : 1) + (model.unpinnedRecentConnections.isEmpty ? 0 : 1)
-        let rowCount = model.pinnedConnections.count + model.unpinnedRecentConnections.count
+    private func connectionListHeight(for rowCount: Int) -> CGFloat {
         guard rowCount > 0 else { return 0 }
-        let estimated = CGFloat(rowCount) * Self.connectionRowHeight
-            + CGFloat(sectionCount) * Self.connectionHeaderHeight
-            + 12
-        return min(estimated, 260)
+        let estimated = CGFloat(rowCount) * Self.connectionRowHeight + Self.connectionListChromeHeight
+        return min(estimated, 220)
     }
 
     var body: some View {
@@ -1316,34 +1312,48 @@ struct ContentView: View {
                                     .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
 
-                            if connectionListHeight > 0 {
-                                List {
-                                    if !model.pinnedConnections.isEmpty {
-                                        Section("Pinned Connections") {
-                                            ForEach(model.pinnedConnections) { connection in
-                                                connectionRow(connection)
-                                            }
+                            if !model.pinnedConnections.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Pinned Connections")
+                                        .font(.caption.weight(.semibold))
+
+                                    List {
+                                        ForEach(model.pinnedConnections) { connection in
+                                            connectionRow(connection)
                                         }
+                                    }
+                                    .listStyle(.plain)
+                                    .scrollContentBackground(.hidden)
+                                    .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                    .frame(height: connectionListHeight(for: model.pinnedConnections.count))
+                                }
+                            }
+
+                            if !model.unpinnedRecentConnections.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("Recent Connections")
+                                            .font(.caption.weight(.semibold))
+                                        Spacer()
+                                        Button("Clear") { model.clearRecentConnections() }
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.red.opacity(0.18), in: Capsule())
+                                            .foregroundStyle(.red)
+                                            .buttonStyle(.plain)
                                     }
 
-                                    if !model.unpinnedRecentConnections.isEmpty {
-                                        Section {
-                                            ForEach(model.unpinnedRecentConnections) { connection in
-                                                connectionRow(connection)
-                                            }
-                                        } header: {
-                                            HStack {
-                                                Text("Recent Connections")
-                                                Spacer()
-                                                Button("Clear") { model.clearRecentConnections() }
-                                                    .font(.caption)
-                                            }
+                                    List {
+                                        ForEach(model.unpinnedRecentConnections) { connection in
+                                            connectionRow(connection)
                                         }
                                     }
+                                    .listStyle(.plain)
+                                    .scrollContentBackground(.hidden)
+                                    .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                    .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
                                 }
-                                .listStyle(.plain)
-                                .scrollContentBackground(.hidden)
-                                .frame(height: connectionListHeight)
                             }
                         } else {
                             Button("Disconnect") { model.disconnect() }
