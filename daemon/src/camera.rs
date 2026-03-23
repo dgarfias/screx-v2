@@ -7,8 +7,11 @@ use anyhow::{Context, Result};
 
 const VIDEO_DEVICE: &str = "/dev/video10";
 const CARD_LABEL: &str = "Screx iPad Camera";
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+pub const NETWORK_WIDTH: u32 = 1280;
+pub const NETWORK_HEIGHT: u32 = 720;
+pub const USB_WIDTH: u32 = 1920;
+pub const USB_HEIGHT: u32 = 1080;
+const MAX_CAM_CHUNKS: u16 = 4096;
 
 extern "C" {
     fn screx_v4l2_open_output(
@@ -29,7 +32,7 @@ impl CamWriter {
     }
 }
 
-pub fn load_v4l2loopback() -> Result<()> {
+pub fn load_v4l2loopback(exclusive_caps: bool) -> Result<()> {
     // Always reload cleanly to avoid stale device state
     if std::path::Path::new(VIDEO_DEVICE).exists() {
         println!("[camera] removing stale v4l2loopback...");
@@ -37,12 +40,19 @@ pub fn load_v4l2loopback() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    let exclusive_caps_arg = if exclusive_caps {
+        "exclusive_caps=1"
+    } else {
+        "exclusive_caps=0"
+    };
+    println!("[camera] loading v4l2loopback with {exclusive_caps_arg}");
+
     let status = Command::new("modprobe")
         .args([
             "v4l2loopback",
             "video_nr=10",
             &format!("card_label={CARD_LABEL}"),
-            "exclusive_caps=1",
+            exclusive_caps_arg,
             "max_buffers=2",
         ])
         .status()
@@ -67,12 +77,12 @@ pub fn load_v4l2loopback() -> Result<()> {
     Ok(())
 }
 
-pub fn create_cam_writer() -> Result<CamWriter> {
+pub fn create_cam_writer(width: u32, height: u32) -> Result<CamWriter> {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
     let fd = unsafe {
-        screx_v4l2_open_output(device.as_ptr(), WIDTH as libc::c_int, HEIGHT as libc::c_int)
+        screx_v4l2_open_output(device.as_ptr(), width as libc::c_int, height as libc::c_int)
     };
 
     match fd {
@@ -81,7 +91,7 @@ pub fn create_cam_writer() -> Result<CamWriter> {
         fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
         fd => {
             let file = unsafe { File::from_raw_fd(fd) };
-            println!("[camera] writer ready: {WIDTH}x{HEIGHT} MJPEG -> {VIDEO_DEVICE}");
+            println!("[camera] writer ready: {width}x{height} MJPEG -> {VIDEO_DEVICE}");
             Ok(CamWriter { file })
         }
     }
@@ -116,6 +126,10 @@ impl CamReassembler {
         let chunk_idx = u16::from_be_bytes([data[4], data[5]]) as usize;
         let total = u16::from_be_bytes([data[6], data[7]]);
         let payload = &data[8..];
+
+        if total == 0 || total > MAX_CAM_CHUNKS {
+            return None;
+        }
 
         if frame_id != self.current_frame_id || total != self.total_chunks {
             self.current_frame_id = frame_id;

@@ -38,7 +38,7 @@ final class PairingService {
 
     func pair(host: String, port: UInt16) {
         let deviceId = Self.getOrCreateDeviceId()
-        let pairingKey = KeychainHelper.loadPairingKey(for: host)
+        let pairingKey = KeychainHelper.loadPairingKey(forHost: host, port: port)
         log("starting pair(host=\(host), port=\(port)) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pairingKeyPresent=\(pairingKey != nil)")
 
         let endpoint = NWEndpoint.hostPort(
@@ -55,10 +55,10 @@ final class PairingService {
             case .ready:
                 if pairingKey != nil {
                     self.log("tcp ready, using reconnect HELLO flow")
-                    self.sendHello(conn: conn, host: host, deviceId: deviceId, pairingKey: pairingKey!)
+                    self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId, pairingKey: pairingKey!)
                 } else {
                     self.log("tcp ready, using first-time PAIR flow")
-                    self.sendPairRequest(conn: conn, host: host, deviceId: deviceId)
+                    self.sendPairRequest(conn: conn, host: host, port: port, deviceId: deviceId)
                 }
             case .waiting(let error):
                 self.connection?.cancel()
@@ -86,7 +86,7 @@ final class PairingService {
 
     // MARK: - New device pairing (SCREX_PAIR flow)
 
-    private func sendPairRequest(conn: NWConnection, host: String, deviceId: Data) {
+    private func sendPairRequest(conn: NWConnection, host: String, port: UInt16, deviceId: Data) {
         let keyPair = ScrexCrypto.generateKeyPair()
         let pubKey = keyPair.publicKey.rawRepresentation
         log("sending PAIR request: deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pubKeyLen=\(pubKey.count)")
@@ -102,13 +102,14 @@ final class PairingService {
                 return
             }
             self.log("PAIR request sent (\(packet.count) bytes), waiting for daemon response")
-            self.waitForPinChallenge(conn: conn, host: host, deviceId: deviceId, keyPair: keyPair)
+            self.waitForPinChallenge(conn: conn, host: host, port: port, deviceId: deviceId, keyPair: keyPair)
         })
     }
 
     private func waitForPinChallenge(
         conn: NWConnection,
         host: String,
+        port: UInt16,
         deviceId: Data,
         keyPair: Curve25519.KeyAgreement.PrivateKey
     ) {
@@ -151,7 +152,7 @@ final class PairingService {
                 }
 
                 self.emitResult(.pinRequired { [weak self] pin in
-                    self?.sendPinAnswer(conn: conn, host: host, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
+                    self?.sendPinAnswer(conn: conn, host: host, port: port, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
                 })
             } else if magic == Self.magicOK {
                 // Already paired — daemon recognized us
@@ -167,7 +168,7 @@ final class PairingService {
                     return
                 }
 
-                guard let pairingKey = KeychainHelper.loadPairingKey(for: host) else {
+                guard let pairingKey = KeychainHelper.loadPairingKey(forHost: host, port: port) else {
                     self.emitResult(.error("Pairing key missing"))
                     return
                 }
@@ -198,7 +199,7 @@ final class PairingService {
         }
     }
 
-    private func sendPinAnswer(conn: NWConnection, host: String, deviceId: Data, pin: String, ecdhSecret: Data) {
+    private func sendPinAnswer(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pin: String, ecdhSecret: Data) {
         log("sending PIN answer for host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined())")
         let pinKey = ScrexCrypto.hkdfSHA256Bytes(
             ikm: ecdhSecret,
@@ -232,11 +233,11 @@ final class PairingService {
                 return
             }
             self.log("PIN answer sent, waiting for final OK")
-            self.waitForPinResult(conn: conn, host: host, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
+            self.waitForPinResult(conn: conn, host: host, port: port, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
         })
     }
 
-    private func waitForPinResult(conn: NWConnection, host: String, deviceId: Data, pin: String, ecdhSecret: Data) {
+    private func waitForPinResult(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pin: String, ecdhSecret: Data) {
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
 
@@ -281,7 +282,7 @@ final class PairingService {
             )
 
             // Store pairing key
-            KeychainHelper.storePairingKey(pairingKey, for: host)
+            KeychainHelper.storePairingKey(pairingKey, forHost: host, port: port)
 
             // Derive session key
             let sessionKeyData = ScrexCrypto.hkdfSHA256Bytes(
@@ -308,7 +309,7 @@ final class PairingService {
 
     // MARK: - Reconnection (SCREX_HELLO flow)
 
-    private func sendHello(conn: NWConnection, host: String, deviceId: Data, pairingKey: Data) {
+    private func sendHello(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pairingKey: Data) {
         var clientNonce = Data(count: Self.nonceLen)
         _ = clientNonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, Self.nonceLen, $0.baseAddress!) }
         log("sending HELLO: host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pairingKeyLen=\(pairingKey.count)")
@@ -324,11 +325,11 @@ final class PairingService {
                 return
             }
             self.log("HELLO sent (\(packet.count) bytes), waiting for hello response")
-            self.waitForHelloResponse(conn: conn, host: host, pairingKey: pairingKey, clientNonce: clientNonce)
+            self.waitForHelloResponse(conn: conn, host: host, port: port, pairingKey: pairingKey, clientNonce: clientNonce)
         })
     }
 
-    private func waitForHelloResponse(conn: NWConnection, host: String, pairingKey: Data, clientNonce: Data) {
+    private func waitForHelloResponse(conn: NWConnection, host: String, port: UInt16, pairingKey: Data, clientNonce: Data) {
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
 
@@ -348,7 +349,7 @@ final class PairingService {
             }
 
             if data.count >= Self.magicReject.count && data.prefix(Self.magicReject.count) == Self.magicReject {
-                KeychainHelper.deletePairingKey(for: host)
+                KeychainHelper.deletePairingKey(forHost: host, port: port)
                 self.emitResult(.error("Not recognized by daemon — please pair again"))
                 return
             }
@@ -435,9 +436,12 @@ final class PairingService {
 
 enum KeychainHelper {
     private static let servicePrefix = "com.screx.pairing."
+    private static func serviceName(host: String, port: UInt16) -> String {
+        servicePrefix + formatEndpointInput(host: host, port: port)
+    }
 
-    static func storePairingKey(_ key: Data, for host: String) {
-        let service = servicePrefix + host
+    static func storePairingKey(_ key: Data, forHost host: String, port: UInt16) {
+        let service = serviceName(host: host, port: port)
         // Delete existing
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -457,26 +461,31 @@ enum KeychainHelper {
         }
     }
 
-    static func loadPairingKey(for host: String) -> Data? {
-        let service = servicePrefix + host
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else { return nil }
-        return result as? Data
+    static func loadPairingKey(forHost host: String, port: UInt16) -> Data? {
+        let services = [serviceName(host: host, port: port), servicePrefix + host]
+        for service in services {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            if status == errSecSuccess {
+                return result as? Data
+            }
+        }
+        return nil
     }
 
-    static func deletePairingKey(for host: String) {
-        let service = servicePrefix + host
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        SecItemDelete(query as CFDictionary)
+    static func deletePairingKey(forHost host: String, port: UInt16) {
+        for service in [serviceName(host: host, port: port), servicePrefix + host] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+            ]
+            SecItemDelete(query as CFDictionary)
+        }
     }
 }

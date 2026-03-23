@@ -336,10 +336,11 @@ final class USBListener {
         })
     }
 
-    /// Sends a camera JPEG frame over USB TCP. Single framed control message.
-    func sendCameraFrame(_ jpeg: Data) {
+    /// Sends a camera JPEG frame over USB TCP using the same chunk layout as the network path:
+    /// "CAM" + frame_id(u32 BE) + chunk_idx(u16 BE) + total_chunks(u16 BE) + jpeg_chunk
+    func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
         guard let conn = connection else { return }
-        let chunkSize = Self.maxControlPayload - 8
+        let chunkSize = Self.maxControlPayload - 12
         let totalChunks = max(1, (jpeg.count + chunkSize - 1) / chunkSize)
 
         for i in 0..<totalChunks {
@@ -348,6 +349,7 @@ final class USBListener {
             let chunk = jpeg.subdata(in: start..<end)
 
             var camPayload = Data("CAM".utf8)
+            withUnsafeBytes(of: frameId.bigEndian) { camPayload.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(i).bigEndian) { camPayload.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(totalChunks).bigEndian) { camPayload.append(contentsOf: $0) }
             camPayload.append(chunk)

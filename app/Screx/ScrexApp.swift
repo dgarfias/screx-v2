@@ -95,6 +95,9 @@ private func formatEndpointInput(host: String, port: UInt16) -> String {
 }
 
 private func formatByteRate(_ bytesPerSecond: Double) -> String {
+    if bytesPerSecond <= 0 {
+        return "0 bytes/s"
+    }
     let formatter = ByteCountFormatter()
     formatter.allowedUnits = [.useBytes, .useKB, .useMB]
     formatter.countStyle = .file
@@ -525,8 +528,8 @@ final class StreamViewModel: ObservableObject {
         isConnected = state.isConnected
         isConnecting = state.isConnecting
         if transport == .none && !state.isConnected {
-            receiveRateText = "0 B/s"
-            sendRateText = "0 B/s"
+            receiveRateText = "0 bytes/s"
+            sendRateText = "0 bytes/s"
         }
     }
 
@@ -541,9 +544,7 @@ final class StreamViewModel: ObservableObject {
         case .waitingForVideo:
             return "Connected, waiting for the first video frame."
         case .streaming:
-            return activeTransport == .usb
-                ? "USB session active."
-                : "Session active."
+            return ""
         case .busy:
             return "The daemon is already in use by another client."
         case .connectionRefused:
@@ -691,9 +692,11 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func syncCameraCompressionQuality() {
-        cameraCapture.compressionQuality = activeTransport == .usb
+        let isUSBTransport = activeTransport == .usb
+        cameraCapture.compressionQuality = isUSBTransport
             ? usbCameraCompressionQuality
             : networkCameraCompressionQuality
+        cameraCapture.captureProfile = isUSBTransport ? .usb : .network
     }
 
     private func startBatteryMonitoring() {
@@ -746,7 +749,7 @@ final class StreamViewModel: ObservableObject {
                 case .connected:
                     self.applyConnectionHealth(.waitingForVideo, detail: "USB connected. Waiting for video.", transport: .usb)
                 case .firstFrame:
-                    self.applyConnectionHealth(.streaming, detail: "USB session active.", transport: .usb)
+                    self.applyConnectionHealth(.streaming, transport: .usb)
                     if let endpoint = self.lastNetEndpoint {
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: self.lastNetName ?? "")
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
@@ -855,7 +858,11 @@ final class StreamViewModel: ObservableObject {
 
     func togglePinned(_ connection: RecentConnection) {
         if !connection.isPinned && pinnedConnections.count >= Self.maxPinnedConnections {
-            applyConnectionHealth(.idle, detail: "Pinned connections are limited to 10.")
+            if isConnected || isConnecting {
+                status = "Pinned connections are limited to 10."
+            } else {
+                applyConnectionHealth(.idle, detail: "Pinned connections are limited to 10.")
+            }
             return
         }
 
@@ -1049,7 +1056,7 @@ final class StreamViewModel: ObservableObject {
                         self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
                     case .firstFrame:
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
-                        self.applyConnectionHealth(.streaming, detail: "Session active.", transport: .network)
+                        self.applyConnectionHealth(.streaming, transport: .network)
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
                         let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
                         self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)
@@ -1588,7 +1595,7 @@ final class StreamViewModel: ObservableObject {
                 let fid = self.camFrameId
                 self.camFrameId = self.camFrameId &+ 1
                 if self.usbConnected, let usb = self.usbListener {
-                    usb.sendCameraFrame(jpeg)
+                    usb.sendCameraFrame(jpeg, frameId: fid)
                 } else if let stream = self.stream {
                     stream.sendCameraFrame(jpeg, frameId: fid)
                 }
@@ -1843,9 +1850,11 @@ struct ContentView: View {
                             infoRow(label: "Codec", value: model.codecLabel)
                         }
 
-                        Text(model.status)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        if !model.status.isEmpty {
+                            Text(model.status)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
 
                         Button("Disconnect") { model.disconnect() }
                             .buttonStyle(.bordered)

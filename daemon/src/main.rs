@@ -83,6 +83,10 @@ struct Cli {
     /// USB only — disable network pairing and UDP streaming
     #[arg(long, default_value_t = false, conflicts_with = "network_only")]
     usb_only: bool,
+
+    /// Disable v4l2loopback exclusive capture caps for better app compatibility
+    #[arg(long, default_value_t = false)]
+    no_camera_exclusive_caps: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,6 +110,7 @@ struct AppConfig {
     gop: u32,
     bitrate_bps: u32,
     stream_port: u16,
+    camera_exclusive_caps: bool,
 }
 
 impl AppConfig {
@@ -119,6 +124,7 @@ impl AppConfig {
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.bitrate,
             stream_port: cli.port,
+            camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
     }
 }
@@ -225,18 +231,26 @@ async fn main() -> Result<()> {
 
     {
         let shared_c = Arc::clone(&shared);
+        let camera_exclusive_caps = config.camera_exclusive_caps;
         *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
             println!("[lifecycle] client connected — creating peripherals");
 
             // Virtual camera
-            match camera::load_v4l2loopback() {
-                Ok(()) => match camera::create_cam_writer() {
-                    Ok(writer) => {
-                        *shared_c.cam_writer.lock().unwrap() = Some(writer);
-                        println!("[lifecycle] camera: virtual webcam ready");
+            match camera::load_v4l2loopback(camera_exclusive_caps) {
+                Ok(()) => {
+                    let (cam_width, cam_height) = if shared_c.usb_active.load(Ordering::SeqCst) {
+                        (camera::USB_WIDTH, camera::USB_HEIGHT)
+                    } else {
+                        (camera::NETWORK_WIDTH, camera::NETWORK_HEIGHT)
+                    };
+                    match camera::create_cam_writer(cam_width, cam_height) {
+                        Ok(writer) => {
+                            *shared_c.cam_writer.lock().unwrap() = Some(writer);
+                            println!("[lifecycle] camera: virtual webcam ready");
+                        }
+                        Err(e) => eprintln!("[lifecycle] camera: {e:#}"),
                     }
-                    Err(e) => eprintln!("[lifecycle] camera: {e:#}"),
-                },
+                }
                 Err(e) => eprintln!("[lifecycle] camera: v4l2loopback not available ({e:#})"),
             }
 
@@ -390,7 +404,7 @@ async fn main() -> Result<()> {
                 let sf = Arc::clone(&session_stop_flag);
 
                 // Watchdog thread: sets combined_stop when either flag fires
-                let watchdog = thread::Builder::new()
+                let watchdog = match thread::Builder::new()
                     .name("capture-wd".into())
                     .spawn(move || {
                         while !cs1.load(Ordering::Relaxed) {
@@ -401,7 +415,16 @@ async fn main() -> Result<()> {
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     })
-                    .ok();
+                {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        eprintln!("[capture] failed to spawn watchdog thread: {e}");
+                        capture_stop_flag.store(true, Ordering::SeqCst);
+                        capture_start.store(false, Ordering::Release);
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                };
 
                 if let Err(e) = capture::run_capture_loop(
                     capture_config.clone(),
@@ -466,9 +489,7 @@ async fn main() -> Result<()> {
                     eprintln!("[capture] session error: {e:#}");
                 }
 
-                if let Some(wd) = watchdog {
-                    let _ = wd.join();
-                }
+                let _ = watchdog.join();
 
                 println!("[capture] EVDI session ended, waiting for next client...");
 

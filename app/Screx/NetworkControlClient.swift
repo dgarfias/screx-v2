@@ -12,6 +12,7 @@ final class NetworkControlClient {
     private static let appForegroundMagic = Data("APPFG".utf8)
     private static let speakerMagic = Data("SPKR".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
+    private static let maxControlFrame = 65536
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
@@ -90,6 +91,13 @@ final class NetworkControlClient {
         onDisconnect?()
     }
 
+    private func protocolFailure(_ message: String) {
+        log(message)
+        recvBuffer.removeAll()
+        connection.cancel()
+        handleDisconnect()
+    }
+
     private func receiveLoop() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -126,8 +134,8 @@ final class NetworkControlClient {
                     | Int(bytes[3])
             }
 
-            guard bodyLen >= 4 + ScrexCrypto.tagLen else {
-                recvBuffer.removeAll()
+            guard bodyLen >= 4 + ScrexCrypto.tagLen, bodyLen <= Self.maxControlFrame else {
+                protocolFailure("invalid inbound tcp control frame length: \(bodyLen)")
                 return
             }
 
