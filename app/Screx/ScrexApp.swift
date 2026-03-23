@@ -534,6 +534,21 @@ final class StreamViewModel: ObservableObject {
         log("sceneWillResignActive")
     }
 
+    private func sendAppTransportBackgroundState(isBackgrounded: Bool) {
+        guard activeTransport != .none else { return }
+        if activeTransport == .usb {
+            usbListener?.sendAppBackgroundState(isBackgrounded: isBackgrounded)
+        } else {
+            networkControl?.sendAppBackgroundState(isBackgrounded: isBackgrounded)
+        }
+    }
+
+    private func assertForegroundTransportState() {
+        appIsBackgrounded = false
+        decoder.setSuspended(false)
+        sendAppTransportBackgroundState(isBackgrounded: false)
+    }
+
     func handleAppDidEnterBackground() {
         guard !appIsBackgrounded else { return }
         appIsBackgrounded = true
@@ -543,11 +558,7 @@ final class StreamViewModel: ObservableObject {
         guard connectionHealth == .streaming || connectionHealth == .waitingForVideo else { return }
 
         decoder.setSuspended(true)
-        if activeTransport == .usb {
-            usbListener?.sendAppBackgroundState(isBackgrounded: true)
-        } else {
-            networkControl?.sendAppBackgroundState(isBackgrounded: true)
-        }
+        sendAppTransportBackgroundState(isBackgrounded: true)
         if connectionHealth == .streaming {
             applyConnectionHealth(.backgroundAudioMode, transport: activeTransport)
         }
@@ -569,12 +580,7 @@ final class StreamViewModel: ObservableObject {
             return
         }
 
-        decoder.setSuspended(false)
-        if activeTransport == .usb {
-            usbListener?.sendAppBackgroundState(isBackgrounded: false)
-        } else {
-            networkControl?.sendAppBackgroundState(isBackgrounded: false)
-        }
+        assertForegroundTransportState()
 
         if connectionHealth == .backgroundAudioMode {
             applyConnectionHealth(.streaming, transport: activeTransport)
@@ -651,6 +657,7 @@ final class StreamViewModel: ObservableObject {
                 self.usbConnected = true
                 self.isUSBListening = false
                 self.stream?.suppressTimeout = true
+                self.assertForegroundTransportState()
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
             }
@@ -811,6 +818,7 @@ final class StreamViewModel: ObservableObject {
                 }
                 self.networkControl = control
                 control.start()
+                self.assertForegroundTransportState()
 
                 self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key, controlClient: control)
 
