@@ -1,9 +1,12 @@
 import AVFoundation
-import UIKit
+import CoreImage
+import ImageIO
+import UniformTypeIdentifiers
 
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
     private let outputQueue = DispatchQueue(label: "screx.camera", qos: .userInitiated)
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private var running = false
     private var frameCount: UInt32 = 0
     private(set) var usingFront = false
@@ -104,13 +107,27 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let onJPEG else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
+        autoreleasepool {
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
 
-        let uiImage = UIImage(cgImage: cgImage)
-        guard let jpegData = uiImage.jpegData(compressionQuality: 0.5) else { return }
+            let jpegData = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                jpegData as CFMutableData,
+                UTType.jpeg.identifier as CFString,
+                1,
+                nil
+            ) else {
+                return
+            }
 
-        onJPEG(jpegData)
+            let options = [
+                kCGImageDestinationLossyCompressionQuality: 0.5
+            ] as CFDictionary
+            CGImageDestinationAddImage(destination, cgImage, options)
+
+            guard CGImageDestinationFinalize(destination) else { return }
+            onJPEG(jpegData as Data)
+        }
     }
 }
