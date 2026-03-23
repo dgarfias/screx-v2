@@ -5,6 +5,9 @@ import UniformTypeIdentifiers
 import UIKit
 
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private static let outputWidth: CGFloat = 1280
+    private static let outputHeight: CGFloat = 720
+
     private let session = AVCaptureSession()
     private let outputQueue = DispatchQueue(label: "screx.camera", qos: .userInitiated)
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
@@ -114,7 +117,9 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         autoreleasepool {
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+            let targetRect = CGRect(x: 0, y: 0, width: Self.outputWidth, height: Self.outputHeight)
+            let framedImage = frameImage(ciImage, in: targetRect)
+            guard let cgImage = ciContext.createCGImage(framedImage, from: targetRect) else { return }
 
             let jpegData = NSMutableData()
             guard let destination = CGImageDestinationCreateWithData(
@@ -134,6 +139,24 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             guard CGImageDestinationFinalize(destination) else { return }
             onJPEG(jpegData as Data)
         }
+    }
+
+    private func frameImage(_ image: CIImage, in targetRect: CGRect) -> CIImage {
+        let sourceRect = image.extent.integral
+        guard sourceRect.width > 0, sourceRect.height > 0 else {
+            return CIImage(color: .black).cropped(to: targetRect)
+        }
+
+        let scale = min(targetRect.width / sourceRect.width, targetRect.height / sourceRect.height)
+        let scaledImage = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let scaledRect = scaledImage.extent
+        let translateX = targetRect.midX - scaledRect.midX
+        let translateY = targetRect.midY - scaledRect.midY
+        let positionedImage = scaledImage.transformed(
+            by: CGAffineTransform(translationX: translateX, y: translateY)
+        )
+        let background = CIImage(color: .black).cropped(to: targetRect)
+        return positionedImage.composited(over: background)
     }
 
     private func applyOrientation(to connection: AVCaptureConnection) {
