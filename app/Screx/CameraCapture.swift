@@ -16,7 +16,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var running = false
     private var frameCount: UInt32 = 0
     private(set) var usingFront = false
-    var compressionQuality: CGFloat = Self.defaultCompressionQuality
+    var compressionQuality: CGFloat = CameraCapture.defaultCompressionQuality
 
     var onJPEG: ((Data) -> Void)?
 
