@@ -466,8 +466,21 @@ final class StreamViewModel: ObservableObject {
                 self.log("usb disconnected")
                 self.usbConnected = false
                 self.isUSBListening = false
+                self.usbListener?.stop()
+                self.usbListener = nil
                 self.stream?.suppressTimeout = false
-                self.fallbackToNetwork()
+                self.stream?.onStatus = nil
+                self.stream?.onDisconnect = nil
+                self.stream?.disconnect()
+                self.stream = nil
+                self.closeNetworkControl(gracefully: false)
+                self.isConnected = false
+                self.isConnecting = false
+                self.transport = ""
+                self.audioPlayer.stop()
+                self.micCapture.stop()
+                self.stopPeripheralMonitoring()
+                self.status = "USB disconnected. \(self.disconnectedPrompt())"
             }
         }
         usb.start()
@@ -708,25 +721,6 @@ final class StreamViewModel: ObservableObject {
             }
         }
         client.connect()
-    }
-
-    private func fallbackToNetwork() {
-        log("fallbackToNetwork() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
-        stream?.onStatus = nil
-        stream?.onDisconnect = nil
-        stream?.disconnect()
-        stream = nil
-        closeNetworkControl(gracefully: false)
-        usbListener?.stop()
-        usbListener = nil
-        isConnected = false
-        isConnecting = false
-        isUSBListening = false
-        transport = ""
-        audioPlayer.stop()
-        micCapture.stop()
-        stopPeripheralMonitoring()
-        status = "USB disconnected. \(disconnectedPrompt())"
     }
 
     /// Called when we've lost all streams and should return to idle state.

@@ -11,7 +11,7 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Dual transport backends**:
   - **Network**: UDP with Reed-Solomon FEC for media plus persistent encrypted TCP for control/input
   - **USB**: TCP over iproxy/usbmuxd — zero packet loss, lower latency
-  - Automatic detection and failover (USB preferred when connected)
+  - Both transports are manual from the iPad app: network connects by host/IP, USB connects from a dedicated `Connect via USB` button
 - **Audio streaming**: Virtual PulseAudio/PipeWire sink ("Screx iPad") captured via `parec`, streamed alongside video
 - **Microphone forwarding**: iPad microphone → Opus-encoded → Linux virtual PipeWire source ("Screx Microphone")
 - **Camera forwarding**: iPad camera → JPEG frames → Linux v4l2loopback virtual webcam
@@ -23,9 +23,10 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 - **Pointer capture for external mouse**: When a physical mouse is active, iPadOS pointer input is captured for the app, the system pointer is hidden, and top status/system overlays are suppressed for a cleaner full-screen desktop view
 - **Touch/pointer separation**: Indirect pointer touches are filtered out so physical mouse clicks are not also forwarded as touchscreen taps
 - **Pairing and encryption**: PIN-based pairing via X25519 ECDH key exchange; network UDP media and network TCP control both use AES-256-GCM. Paired devices stored in `~/.config/screx/paired_devices.json`; reconnections are automatic (no re-pairing needed)
-- **Manual network connect + saved hosts**: Enter a daemon hostname/IP directly, pin up to 10 favorite connections so they never age out, and reconnect quickly from the iPad app's 5 most recent unpinned network connections
+- **Manual connection screen**: Enter a daemon hostname/IP directly, optionally include a port like `192.168.1.10:9000`, pin up to 10 favorite network connections so they never age out, reconnect from the app's 5 most recent unpinned network connections, or use a dedicated USB connect button when the iPad is plugged in
 - **Single-client mode**: Only one iPad can connect at a time; additional connection attempts receive a `SCREX_BUSY` rejection
-- **Disconnect detection**: Data timeouts and TCP close handling for automatic reconnection to the most recent endpoint
+- **Disconnect detection**: Network data timeouts and TCP close handling return the app to a clear disconnected state instead of silently retrying in the background
+- **Selectable daemon transport mode**: Run the daemon in combined mode (default), `--network-only`, or `--usb-only`
 - **Crash recovery**: Stale PulseAudio/PipeWire modules from previous runs are cleaned up on startup
 
 ## Architecture
@@ -65,7 +66,8 @@ The daemon creates a virtual monitor via EVDI, captures and encodes its framebuf
 │  Microphone (Opus) ──────────────────────► daemon     │
 │  Camera (JPEG) ──────────────────────────► daemon     │
 │                                                       │
-│  Manual host/IP entry + pinned/recent connections     │
+│  Manual host/IP[:port] entry + pinned/recent network  │
+│  connections + explicit USB connect button            │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -83,7 +85,6 @@ screx-v2/
 │       ├── crypto.rs              # AES-256-GCM encrypt/decrypt, HKDF-SHA256, HMAC, nonce construction
 │       ├── pairing.rs             # TCP pairing handshake, persistent network control channel, paired device storage
 │       ├── usb.rs                 # USB device detection, iproxy management, TCP framed sender
-│       ├── transport.rs           # Transport abstraction layer
 │       ├── audio.rs               # Virtual sink + parec capture, virtual mic (pipe-source / null-sink)
 │       ├── camera.rs              # v4l2loopback virtual webcam writer
 │       ├── uinput.rs              # Virtual touchscreen, keyboard, mouse, and gamepad injection
@@ -167,7 +168,7 @@ All three are loaded automatically by the daemon when needed. If `uinput` isn't 
 
 ### USB Transport (optional)
 
-For USB streaming, `idevice_id` and `iproxy` must be available. On Arch, they come from `libimobiledevice` and `libusbmuxd`. On Debian/Ubuntu, they come from `libimobiledevice-utils` and `libusbmuxd-tools`. The daemon auto-detects USB devices and manages iproxy automatically.
+For USB streaming, `idevice_id` and `iproxy` must be available. On Arch, they come from `libimobiledevice` and `libusbmuxd`. On Debian/Ubuntu, they come from `libimobiledevice-utils` and `libusbmuxd-tools`. When USB transport is enabled on the daemon, it watches for attached iOS devices and manages `iproxy` automatically. The iPad app does not auto-connect over USB; the user starts USB listening from the connection screen with `Connect via USB`.
 
 ### PipeWire / PulseAudio
 
@@ -200,6 +201,12 @@ sudo ./target/release/screx -w 1920 -H 1080 -f 60 -k 60 -b vaapi -c h264
 # H.265 with NVENC at 10 Mbps
 sudo ./target/release/screx --codec h265 --backend nvenc --bitrate 10M
 
+# Network only (disable USB transport)
+sudo ./target/release/screx --network-only
+
+# USB only (disable TCP pairing server and UDP network transport)
+sudo ./target/release/screx --usb-only
+
 # Run host readiness checks
 sudo ./target/release/screx doctor
 
@@ -224,6 +231,8 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `--backend` | `-b` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `--codec` | `-c` | `h264` | Video codec: `h264`, `h265` |
 | `--verbose` | `-v` | `false` | Enable detailed diagnostic logging |
+| `--network-only` |  | `false` | Disable USB transport and run only the network pairing/control/media path |
+| `--usb-only` |  | `false` | Disable network pairing/UDP transport and run only the USB transport path |
 
 ### Subcommands
 
@@ -233,6 +242,17 @@ The daemon requires `sudo` because EVDI needs root access to create virtual disp
 | `unpair [device_id]` | Remove a paired device, or `--all` to clear all paired devices |
 
 ## iPad App Controls
+
+### Connection Screen
+
+When disconnected, the iPad app shows a dedicated connection screen rather than the small in-session info overlay.
+
+- **Network connect**: Enter a daemon host/IP or `host:port`, then tap `Connect`
+- **Saved network targets**: Pin up to 10 favorite endpoints and keep up to 5 recent unpinned endpoints
+- **USB connect**: Tap `Connect via USB` to start the app's USB listener. The button is only enabled when the iPad appears to be plugged in via USB/power
+- **No background auto-retry**: after a failed or dropped connection, the app returns to the connection screen and waits for explicit user action
+
+### In-Session Overlay
 
 The floating toolbar pill can be dragged anywhere on screen. Drag to the left edge to switch to vertical layout, drag to the top or bottom edge to switch back to horizontal. Position and orientation are persisted across launches.
 
@@ -365,12 +385,15 @@ Video messages include `is_idr` (u8) and `codec_id` (u8: `0x00`=H.264, `0x01`=H.
 ## How It Works
 
 1. **Daemon starts** → cleans up stale audio modules → creates EVDI virtual display → GNOME sees a new monitor
-2. **User connects** from the iPad app by entering a daemon hostname/IP, selecting one of up to 10 pinned connections, or choosing one of the 5 most recent unpinned network connections
-3. **Pairing** (first time): TCP handshake with X25519 key exchange → daemon displays a 6-digit PIN → user enters PIN on iPad → pairing key stored on both sides. Subsequent connections skip this step
-4. **Session established**: Session key derived → persistent encrypted TCP control channel stays open for input/control; encrypted UDP is used for media. Additional connection attempts are rejected while the session is active
-5. **iPad connects** (network UDP media + TCP control, or USB TCP)
-6. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → encrypted UDP media sends to iPad
-7. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM encrypted and sent alongside video
-8. **Input loop**: iPad sends encrypted touch, keyboard, physical mouse/keyboard, gamepad state, and control traffic over TCP; indirect pointer touches are filtered out so physical mouse clicks do not also become touchscreen taps. Mic and camera data return over encrypted UDP media → injected via uinput, PipeWire, and v4l2loopback
-9. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
-10. **Disconnect detection**: data timeouts (network) and TCP close (USB) trigger automatic reconnection to the most recent endpoint
+2. **User chooses a transport** from the iPad connection screen:
+   - **Network**: enter a daemon host/IP (optionally `host:port`), or reuse a pinned/recent saved network target
+   - **USB**: tap `Connect via USB` to start the app's USB listener, then let the daemon's USB transport connect through `iproxy`
+3. **Pairing** (network, first time only): TCP handshake with X25519 key exchange → daemon displays a 6-digit PIN → user enters PIN on iPad → pairing key stored on both sides. Subsequent network connections skip the PIN step
+4. **Session established**:
+   - **Network**: session key derived → persistent encrypted TCP control channel stays open for input/control; encrypted UDP is used for media
+   - **USB**: the daemon opens a framed TCP stream over the USB tunnel for media and control
+5. **Capture loop**: EVDI damage events trigger framebuffer reads → H.264/H.265 encode (VA-API / NVENC / software) → transport router sends frames over encrypted UDP (network) or framed TCP (USB)
+6. **Audio loop**: `parec` captures from virtual PulseAudio sink → raw PCM is sent alongside video on the active transport
+7. **Input loop**: iPad sends touch, keyboard, physical mouse/keyboard, gamepad state, and control traffic to the daemon. Indirect pointer touches are filtered out so physical mouse clicks do not also become touchscreen taps. Mic and camera data return to Linux and are injected via uinput, PipeWire, and v4l2loopback
+8. **iPad decodes**: VideoToolbox hardware H.264/H.265 decode → AVSampleBufferDisplayLayer renders, AVAudioEngine plays audio
+9. **Disconnect detection**: data timeouts (network) and TCP close/error handling (USB) return the app to the manual connection screen; reconnects are user-initiated rather than automatic

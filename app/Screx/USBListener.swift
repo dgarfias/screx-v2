@@ -33,7 +33,11 @@ final class USBListener {
 
     func start() {
         do {
-            let params = NWParameters.tcp
+            let tcpOptions = NWProtocolTCP.Options()
+            tcpOptions.noDelay = true
+            tcpOptions.enableKeepalive = false
+            tcpOptions.connectionDropTime = 60
+            let params = NWParameters(tls: nil, tcp: tcpOptions)
             params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.any), port: 9000)
 
             let l = try NWListener(using: params)
@@ -88,14 +92,18 @@ final class USBListener {
                 self?.onStatus?("USB: connected")
                 self?.onConnected?()
                 self?.readLoop(conn)
+            case .waiting(let error):
+                print("[usb] connection waiting: \(error)")
+            case .preparing:
+                print("[usb] connection preparing")
             case .failed(let error):
                 print("[usb] connection failed: \(error)")
                 self?.handleDisconnect()
             case .cancelled:
                 print("[usb] connection cancelled")
                 self?.handleDisconnect()
-            default:
-                break
+            @unknown default:
+                print("[usb] connection unknown state: \(state)")
             }
         }
 
@@ -110,8 +118,11 @@ final class USBListener {
     }
 
     private func readLoop(_ conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, context, isComplete, error in
+            guard let self else {
+                print("[usb] readLoop: self deallocated, stopping")
+                return
+            }
 
             if let data, !data.isEmpty {
                 self.recvBuffer.append(data)
@@ -119,13 +130,13 @@ final class USBListener {
             }
 
             if isComplete {
-                print("[usb] TCP stream ended")
+                print("[usb] TCP stream ended (isComplete=true, error=\(String(describing: error)), dataLen=\(data?.count ?? 0))")
                 self.handleDisconnect()
                 return
             }
 
             if let error {
-                print("[usb] TCP read error: \(error)")
+                print("[usb] TCP read error: \(error.localizedDescription) (debugDescription=\(error))")
                 self.handleDisconnect()
                 return
             }

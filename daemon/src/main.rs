@@ -75,6 +75,14 @@ struct Cli {
     /// Enable detailed diagnostic logs
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+
+    /// Network only — disable USB transport
+    #[arg(long, default_value_t = false, conflicts_with = "usb_only")]
+    network_only: bool,
+
+    /// USB only — disable network pairing and UDP streaming
+    #[arg(long, default_value_t = false, conflicts_with = "network_only")]
+    usb_only: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,7 +137,15 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::from_cli(&cli);
+    let transport_mode = if cli.network_only {
+        "network-only"
+    } else if cli.usb_only {
+        "usb-only"
+    } else {
+        "network + usb"
+    };
     println!("screx v2 config: {config:?}");
+    println!("[main] transport mode: {transport_mode}");
     if cli.verbose {
         println!("[main] verbose logging enabled");
     }
@@ -154,12 +170,12 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // Pairing state + TCP handshake server
+    // Pairing state + TCP handshake server (not needed in USB-only mode)
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
     let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    {
+    if !cli.usb_only {
         let ps = Arc::clone(&pairing_state);
         let sr = Arc::clone(&session_rx);
         let pairing_shared = Arc::clone(&shared);
@@ -173,6 +189,8 @@ async fn main() -> Result<()> {
                 }
             })
             .context("failed to spawn pairing thread")?;
+    } else {
+        println!("[main] USB-only mode — network pairing disabled");
     }
 
     // Virtual touchscreen + keyboard (always running — needed for input even
@@ -280,23 +298,25 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Client manager thread
+    // Client manager thread (not needed in USB-only mode)
     // -----------------------------------------------------------------------
 
-    let client_socket = socket.try_clone().context("clone socket for client mgr")?;
-    let client_shared = Arc::clone(&shared);
-    let client_stop = Arc::clone(&stop);
-    let client_session_rx = Arc::clone(&session_rx);
-    let _client_thread = thread::Builder::new()
-        .name("client-mgr".into())
-        .spawn(move || {
-            if let Err(e) =
-                stream_server::run_client_manager(client_socket, client_shared, client_stop, client_session_rx)
-            {
-                eprintln!("[client] manager error: {e:#}");
-            }
-        })
-        .context("failed to spawn client manager thread")?;
+    if !cli.usb_only {
+        let client_socket = socket.try_clone().context("clone socket for client mgr")?;
+        let client_shared = Arc::clone(&shared);
+        let client_stop = Arc::clone(&stop);
+        let client_session_rx = Arc::clone(&session_rx);
+        let _client_thread = thread::Builder::new()
+            .name("client-mgr".into())
+            .spawn(move || {
+                if let Err(e) =
+                    stream_server::run_client_manager(client_socket, client_shared, client_stop, client_session_rx)
+                {
+                    eprintln!("[client] manager error: {e:#}");
+                }
+            })
+            .context("failed to spawn client manager thread")?;
+    }
 
     // -----------------------------------------------------------------------
     // Capture + encode + send thread
@@ -470,17 +490,21 @@ async fn main() -> Result<()> {
         .context("failed to spawn capture thread")?;
 
     // -----------------------------------------------------------------------
-    // USB transport thread
+    // USB transport thread (not needed in network-only mode)
     // -----------------------------------------------------------------------
 
-    let usb_shared = Arc::clone(&shared);
-    let usb_stop = Arc::clone(&stop);
-    let _usb_thread = thread::Builder::new()
-        .name("usb".into())
-        .spawn(move || {
-            usb::run_usb_transport(usb_shared, usb_stop);
-        })
-        .context("failed to spawn USB transport thread")?;
+    if !cli.network_only {
+        let usb_shared = Arc::clone(&shared);
+        let usb_stop = Arc::clone(&stop);
+        let _usb_thread = thread::Builder::new()
+            .name("usb".into())
+            .spawn(move || {
+                usb::run_usb_transport(usb_shared, usb_stop);
+            })
+            .context("failed to spawn USB transport thread")?;
+    } else {
+        println!("[main] network-only mode — USB transport disabled");
+    }
 
     // -----------------------------------------------------------------------
     // Audio capture thread (runs continuously, but only captures when sink exists)
