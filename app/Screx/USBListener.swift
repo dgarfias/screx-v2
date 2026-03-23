@@ -28,6 +28,7 @@ final class USBListener {
     private static let readyMagic = Data("READY".utf8)
     private static let appBackgroundMagic = Data("APPBG".utf8)
     private static let appForegroundMagic = Data("APPFG".utf8)
+    private static let speakerMagic = Data("SPKR".utf8)
 
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
@@ -272,6 +273,24 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] app state send error: \(error)")
+            }
+        })
+    }
+
+    func sendSpeakerState(isEnabled: Bool) {
+        guard let conn = connection else { return }
+
+        var frame = Data()
+        var payload = Self.speakerMagic
+        payload.append(isEnabled ? 1 : 0)
+        let payloadLen = UInt32(1 + payload.count)
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] speaker state send error: \(error)")
             }
         })
     }

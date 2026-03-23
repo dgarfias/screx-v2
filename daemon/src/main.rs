@@ -222,12 +222,8 @@ async fn main() -> Result<()> {
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
     // -----------------------------------------------------------------------
 
-    // State shared with the lifecycle callbacks
-    let audio_module_id = Arc::new(std::sync::Mutex::new(0u32));
-
     {
         let shared_c = Arc::clone(&shared);
-        let audio_id_c = Arc::clone(&audio_module_id);
         *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
             println!("[lifecycle] client connected — creating peripherals");
 
@@ -253,19 +249,12 @@ async fn main() -> Result<()> {
             }
 
             // Virtual audio sink + capture
-            match audio::create_virtual_sink() {
-                Ok(id) => {
-                    *audio_id_c.lock().unwrap() = id;
-                    println!("[lifecycle] audio: virtual sink ready (module {id})");
-                }
-                Err(e) => eprintln!("[lifecycle] audio: {e:#}"),
-            }
+            crate::stream_server::ensure_virtual_sink(&shared_c);
         }));
     }
 
     {
         let shared_d = Arc::clone(&shared);
-        let audio_id_d = Arc::clone(&audio_module_id);
         *shared.on_client_disconnected.lock().unwrap() = Some(Box::new(move || {
             println!("[lifecycle] client disconnected — removing peripherals");
 
@@ -285,11 +274,7 @@ async fn main() -> Result<()> {
             shared_d.virtual_gamepads.lock().unwrap().clear();
 
             // Audio sink
-            let mid = *audio_id_d.lock().unwrap();
-            if mid > 0 {
-                audio::remove_virtual_sink(mid);
-                *audio_id_d.lock().unwrap() = 0;
-            }
+            crate::stream_server::disable_virtual_sink(&shared_d);
 
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
@@ -544,10 +529,7 @@ async fn main() -> Result<()> {
         audio::remove_virtual_mic(mic);
     }
     *shared.mic_writer.lock().unwrap() = None;
-    let mid = *audio_module_id.lock().unwrap();
-    if mid > 0 {
-        audio::remove_virtual_sink(mid);
-    }
+    crate::stream_server::disable_virtual_sink(&shared);
 
     let _ = capture_thread.join();
 

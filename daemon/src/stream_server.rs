@@ -27,6 +27,7 @@ const PERIPH_MAGIC: &[u8] = b"PERIPH";
 const GPAD_MAGIC: &[u8] = b"GPAD";
 const APPBG_MAGIC: &[u8] = b"APPBG";
 const APPFG_MAGIC: &[u8] = b"APPFG";
+const SPEAKER_MAGIC: &[u8] = b"SPKR";
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -65,6 +66,8 @@ pub struct SharedState {
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
     pub client_backgrounded: AtomicBool,
+    pub audio_output_enabled: AtomicBool,
+    pub audio_module_id: Mutex<u32>,
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
     pub network_session_id: AtomicU64,
@@ -93,6 +96,8 @@ impl SharedState {
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
             client_backgrounded: AtomicBool::new(false),
+            audio_output_enabled: AtomicBool::new(true),
+            audio_module_id: Mutex::new(0),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
@@ -220,6 +225,19 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
         return;
     }
 
+    if ctrl.starts_with(SPEAKER_MAGIC) && ctrl.len() == SPEAKER_MAGIC.len() + 1 {
+        let enabled = ctrl[SPEAKER_MAGIC.len()] != 0;
+        shared.audio_output_enabled.store(enabled, Ordering::SeqCst);
+        if enabled {
+            println!("[audio] iPad speakers attached");
+            ensure_virtual_sink(shared);
+        } else {
+            println!("[audio] iPad speakers detached");
+            disable_virtual_sink(shared);
+        }
+        return;
+    }
+
     if ctrl.starts_with(TOUCH_MAGIC) && ctrl.len() > TOUCH_MAGIC.len() {
         let touch_data = &ctrl[TOUCH_MAGIC.len()..];
         let mut touch = shared.virtual_touch.lock().unwrap();
@@ -265,6 +283,35 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     if ctrl.starts_with(GPAD_MAGIC) && ctrl.len() > GPAD_MAGIC.len() {
         let gamepad_data = &ctrl[GPAD_MAGIC.len()..];
         handle_gamepad_packet_data(shared, gamepad_data);
+    }
+}
+
+pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
+    if !shared.has_active_client.load(Ordering::Relaxed)
+        || !shared.audio_output_enabled.load(Ordering::SeqCst)
+    {
+        return;
+    }
+
+    let current_id = *shared.audio_module_id.lock().unwrap();
+    if current_id > 0 {
+        return;
+    }
+
+    match crate::audio::create_virtual_sink() {
+        Ok(id) => {
+            *shared.audio_module_id.lock().unwrap() = id;
+            println!("[lifecycle] audio: virtual sink ready (module {id})");
+        }
+        Err(e) => eprintln!("[lifecycle] audio: {e:#}"),
+    }
+}
+
+pub fn disable_virtual_sink(shared: &Arc<SharedState>) {
+    let mut module_id = shared.audio_module_id.lock().unwrap();
+    if *module_id > 0 {
+        crate::audio::remove_virtual_sink(*module_id);
+        *module_id = 0;
     }
 }
 

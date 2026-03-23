@@ -10,6 +10,7 @@ final class NetworkControlClient {
     private static let disconnectMagic = Data("DISCONNECT".utf8)
     private static let appBackgroundMagic = Data("APPBG".utf8)
     private static let appForegroundMagic = Data("APPFG".utf8)
+    private static let speakerMagic = Data("SPKR".utf8)
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
@@ -160,6 +161,12 @@ final class NetworkControlClient {
             isBackgrounded ? Self.appBackgroundMagic : Self.appForegroundMagic,
             label: isBackgrounded ? "app-bg" : "app-fg"
         )
+    }
+
+    func sendSpeakerState(isEnabled: Bool) {
+        var payload = Self.speakerMagic
+        payload.append(isEnabled ? 1 : 0)
+        sendFrame(payload, label: isEnabled ? "speaker-on" : "speaker-off")
     }
 
     func sendTouch(_ contactData: Data) {

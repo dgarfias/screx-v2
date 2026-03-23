@@ -5,6 +5,7 @@ final class AudioPlayer {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private let avSync: AVSyncState
+    private(set) var isOutputEnabled = true
 
     private let lock = NSLock()
     private static let maxBufferSize = 48000 * 2 * 2 // ~500ms at 48kHz stereo i16
@@ -114,6 +115,8 @@ final class AudioPlayer {
     }
 
     func start() {
+        guard isOutputEnabled else { return }
+        guard !engine.isRunning else { return }
         do {
             try engine.start()
             print("[audio] playback engine started")
@@ -123,6 +126,7 @@ final class AudioPlayer {
     }
 
     func stop() {
+        guard engine.isRunning || ringCount > 0 else { return }
         engine.stop()
         lock.lock()
         ringClear()
@@ -130,7 +134,18 @@ final class AudioPlayer {
         print("[audio] playback engine stopped")
     }
 
+    func setOutputEnabled(_ enabled: Bool) {
+        guard enabled != isOutputEnabled else { return }
+        isOutputEnabled = enabled
+        if enabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+
     func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
+        guard isOutputEnabled else { return }
         if avSync.consumeGapResume() {
             lock.lock()
             ringClear()

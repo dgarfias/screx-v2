@@ -183,7 +183,9 @@ pub fn run_audio_capture(
 
     while !stop.load(Ordering::Relaxed) {
         // Wait for a client to be active (sink will exist)
-        if !shared.has_active_client.load(Ordering::Relaxed) {
+        if !shared.has_active_client.load(Ordering::Relaxed)
+            || !shared.audio_output_enabled.load(Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
         }

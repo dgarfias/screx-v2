@@ -322,6 +322,7 @@ final class StreamViewModel: ObservableObject {
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
     @Published var physicalControllerConnectedCount = 0
+    @Published private(set) var isControllerPassthroughEnabled = true
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
     private var controllerObservers: [Any] = []
@@ -543,10 +544,23 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
+    private func sendSpeakerTransportState(isEnabled: Bool) {
+        guard activeTransport != .none else { return }
+        if activeTransport == .usb {
+            usbListener?.sendSpeakerState(isEnabled: isEnabled)
+        } else {
+            networkControl?.sendSpeakerState(isEnabled: isEnabled)
+        }
+    }
+
     private func assertForegroundTransportState() {
         appIsBackgrounded = false
         decoder.setSuspended(false)
         sendAppTransportBackgroundState(isBackgrounded: false)
+    }
+
+    private func syncSpeakerPassthroughState() {
+        sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
     }
 
     func handleAppDidEnterBackground() {
@@ -658,6 +672,7 @@ final class StreamViewModel: ObservableObject {
                 self.isUSBListening = false
                 self.stream?.suppressTimeout = true
                 self.assertForegroundTransportState()
+                self.syncSpeakerPassthroughState()
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
             }
@@ -819,6 +834,7 @@ final class StreamViewModel: ObservableObject {
                 self.networkControl = control
                 control.start()
                 self.assertForegroundTransportState()
+                self.syncSpeakerPassthroughState()
 
                 self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key, controlClient: control)
 
@@ -1072,9 +1088,7 @@ final class StreamViewModel: ObservableObject {
         if let kb = GCKeyboard.coalesced {
             attachKeyboard(kb)
         }
-        for controller in GCController.controllers() {
-            attachController(controller)
-        }
+        refreshControllerPassthrough()
 
         let mc = NotificationCenter.default.addObserver(
             forName: .GCMouseDidConnect, object: nil, queue: .main
@@ -1252,6 +1266,10 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func attachController(_ controller: GCController) {
+        guard isControllerPassthroughEnabled else {
+            print("[gamepad] controller passthrough disabled, ignoring attach")
+            return
+        }
         let id = ObjectIdentifier(controller)
         guard controllerSlots[id] == nil else { return }
         guard controller.extendedGamepad != nil || controller.microGamepad != nil else {
@@ -1307,6 +1325,16 @@ final class StreamViewModel: ObservableObject {
         }
         controllerSlots.removeAll()
         physicalControllerConnectedCount = 0
+    }
+
+    private func refreshControllerPassthrough() {
+        if isControllerPassthroughEnabled {
+            for controller in GCController.controllers() {
+                attachController(controller)
+            }
+        } else {
+            detachAllControllers()
+        }
     }
 
     private func nextAvailableControllerSlot() -> UInt8? {
@@ -1478,6 +1506,22 @@ final class StreamViewModel: ObservableObject {
     }
 
     var isMicActive: Bool { micCapture.isRunning }
+
+    // MARK: - Speakers / Controllers
+
+    func toggleSpeaker() {
+        let isEnabled = !audioPlayer.isOutputEnabled
+        audioPlayer.setOutputEnabled(isEnabled)
+        sendSpeakerTransportState(isEnabled: isEnabled)
+        objectWillChange.send()
+    }
+
+    var isSpeakerActive: Bool { audioPlayer.isOutputEnabled }
+
+    func toggleControllerPassthrough() {
+        isControllerPassthroughEnabled.toggle()
+        refreshControllerPassthrough()
+    }
 }
 
 enum ToolbarOrientation: String {
@@ -1490,6 +1534,7 @@ struct ContentView: View {
 
     @State private var barPosition: CGPoint = Self.loadBarPosition()
     @State private var barOrientation: ToolbarOrientation = Self.loadBarOrientation()
+    @State private var isToolbarExpanded: Bool = Self.loadToolbarExpanded()
     @State private var dragOffset: CGSize = .zero
     @State private var isDragging = false
     @State private var isKeyboardActive = false
@@ -1807,20 +1852,34 @@ struct ContentView: View {
 
         layout {
             if model.isConnected {
-                toolbarButton(
-                    icon: model.isMicActive ? "mic.fill" : "mic",
-                    active: model.isMicActive,
-                    color: model.isMicActive ? .green : .white
-                ) { model.toggleMic() }
+                if isToolbarExpanded {
+                    toolbarButton(
+                        icon: model.isMicActive ? "mic.fill" : "mic",
+                        active: model.isMicActive,
+                        color: model.isMicActive ? .green : .white
+                    ) { model.toggleMic() }
 
-                toolbarButton(
-                    icon: model.isCameraActive
-                        ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
-                        : "video",
-                    active: model.isCameraActive,
-                    color: model.isCameraActive ? .green : .white
-                ) { model.toggleCamera() }
-                    .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
+                    toolbarButton(
+                        icon: model.isSpeakerActive ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                        active: model.isSpeakerActive,
+                        color: model.isSpeakerActive ? .green : .white
+                    ) { model.toggleSpeaker() }
+
+                    toolbarButton(
+                        icon: model.isCameraActive
+                            ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
+                            : "video",
+                        active: model.isCameraActive,
+                        color: model.isCameraActive ? .green : .white
+                    ) { model.toggleCamera() }
+                        .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
+
+                    toolbarButton(
+                        icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
+                        active: model.isControllerPassthroughEnabled,
+                        color: model.isControllerPassthroughEnabled ? .green : .white
+                    ) { model.toggleControllerPassthrough() }
+                }
 
                 toolbarButton(
                     icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
@@ -1835,14 +1894,30 @@ struct ContentView: View {
                 }
             }
 
-            Image(systemName: showOverlay ? "info.circle.fill" : "info.circle")
-                .font(.footnote)
-                .foregroundStyle(.white)
-                .frame(width: Self.btnSize, height: Self.btnSize)
-                .contentShape(Circle())
-                .onTapGesture {
-                    withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+            toolbarButton(
+                icon: showOverlay ? "info.circle.fill" : "info.circle",
+                color: .white
+            ) {
+                withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+            }
+
+            if model.isConnected {
+                toolbarButton(
+                    icon: isToolbarExpanded
+                        ? "arrow.down.right.and.arrow.up.left"
+                        : "arrow.up.left.and.arrow.down.right",
+                    color: .white
+                ) {
+                    let nextExpanded = !isToolbarExpanded
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isToolbarExpanded = nextExpanded
+                    }
+                    Self.saveToolbarExpanded(nextExpanded)
+                    DispatchQueue.main.async {
+                        clampBarPosition(in: geo.size)
+                    }
                 }
+            }
         }
         .padding(4)
         .background(.ultraThinMaterial, in: Capsule())
@@ -1861,6 +1936,14 @@ struct ContentView: View {
                         DispatchQueue.main.async {
                             pillSize = pillGeo.size
                             clampBarPosition(in: geo.size)
+                        }
+                    }
+                    .onChange(of: isToolbarExpanded) { _ in
+                        DispatchQueue.main.async {
+                            pillSize = pillGeo.size
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                clampBarPosition(in: geo.size)
+                            }
                         }
                     }
             }
@@ -2012,6 +2095,7 @@ struct ContentView: View {
     private static let posXKey = "screx_bar_x"
     private static let posYKey = "screx_bar_y"
     private static let orientKey = "screx_bar_orient"
+    private static let expandedKey = "screx_bar_expanded"
 
     private static func loadBarPosition() -> CGPoint {
         let defaults = UserDefaults.standard
@@ -2032,5 +2116,15 @@ struct ContentView: View {
 
     private static func saveBarOrientation(_ orient: ToolbarOrientation) {
         UserDefaults.standard.set(orient.rawValue, forKey: orientKey)
+    }
+
+    private static func loadToolbarExpanded() -> Bool {
+        UserDefaults.standard.object(forKey: expandedKey) != nil
+            ? UserDefaults.standard.bool(forKey: expandedKey)
+            : false
+    }
+
+    private static func saveToolbarExpanded(_ expanded: Bool) {
+        UserDefaults.standard.set(expanded, forKey: expandedKey)
     }
 }
