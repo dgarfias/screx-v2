@@ -474,6 +474,18 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
+    func deleteConnection(_ connection: RecentConnection) {
+        recentConnections.removeAll { $0.id == connection.id }
+        persistRecentConnections()
+        if lastNetEndpoint.map({ endpointHostAndPort($0, fallbackHost: lastNetName ?? "").host == connection.host && endpointHostAndPort($0, fallbackHost: lastNetName ?? "").port == connection.port }) == true {
+            lastNetEndpoint = nil
+            lastNetName = nil
+        }
+        if !isConnected && !isConnecting && !usbConnected {
+            status = disconnectedPrompt()
+        }
+    }
+
     func togglePinned(_ connection: RecentConnection) {
         if !connection.isPinned && pinnedConnections.count >= Self.maxPinnedConnections {
             status = "Pinned connections are limited to 10."
@@ -1300,44 +1312,13 @@ struct ContentView: View {
 
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(model.pinnedConnections) { connection in
-                                        HStack(spacing: 8) {
-                                            Button {
-                                                model.connectRecent(connection)
-                                            } label: {
-                                                HStack(spacing: 10) {
-                                                    Image(systemName: "star.fill")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.yellow)
-
-                                                    VStack(alignment: .leading, spacing: 2) {
-                                                        Text(connection.displayName)
-                                                            .font(.caption.weight(.medium))
-                                                            .foregroundStyle(.primary)
-                                                        Text(connection.endpointLabel)
-                                                            .font(.caption2)
-                                                            .foregroundStyle(.secondary)
-                                                    }
-
-                                                    Spacer()
-                                                }
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 8)
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(model.isConnecting)
-
-                                            Button {
-                                                model.togglePinned(connection)
-                                            } label: {
-                                                Image(systemName: "star.slash")
-                                                    .font(.caption)
-                                                    .frame(width: 32, height: 32)
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .foregroundStyle(.secondary)
-                                        }
+                                        SwipeableConnectionRow(
+                                            connection: connection,
+                                            isConnecting: model.isConnecting,
+                                            onConnect: { model.connectRecent(connection) },
+                                            onTogglePinned: { model.togglePinned(connection) },
+                                            onDelete: { model.deleteConnection(connection) }
+                                        )
                                     }
                                 }
                             }
@@ -1353,44 +1334,13 @@ struct ContentView: View {
 
                                 VStack(alignment: .leading, spacing: 6) {
                                     ForEach(model.unpinnedRecentConnections) { connection in
-                                        HStack(spacing: 8) {
-                                            Button {
-                                                model.connectRecent(connection)
-                                            } label: {
-                                                HStack(spacing: 10) {
-                                                    Image(systemName: "clock.arrow.circlepath")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-
-                                                    VStack(alignment: .leading, spacing: 2) {
-                                                        Text(connection.displayName)
-                                                            .font(.caption.weight(.medium))
-                                                            .foregroundStyle(.primary)
-                                                        Text(connection.endpointLabel)
-                                                            .font(.caption2)
-                                                            .foregroundStyle(.secondary)
-                                                    }
-
-                                                    Spacer()
-                                                }
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 8)
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-                                            }
-                                            .buttonStyle(.plain)
-                                            .disabled(model.isConnecting)
-
-                                            Button {
-                                                model.togglePinned(connection)
-                                            } label: {
-                                                Image(systemName: "star")
-                                                    .font(.caption)
-                                                    .frame(width: 32, height: 32)
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .foregroundStyle(.secondary)
-                                        }
+                                        SwipeableConnectionRow(
+                                            connection: connection,
+                                            isConnecting: model.isConnecting,
+                                            onConnect: { model.connectRecent(connection) },
+                                            onTogglePinned: { model.togglePinned(connection) },
+                                            onDelete: { model.deleteConnection(connection) }
+                                        )
                                     }
                                 }
                             }
@@ -1707,5 +1657,140 @@ struct ContentView: View {
 
     private static func saveBarOrientation(_ orient: ToolbarOrientation) {
         UserDefaults.standard.set(orient.rawValue, forKey: orientKey)
+    }
+}
+
+private struct SwipeableConnectionRow: View {
+    let connection: RecentConnection
+    let isConnecting: Bool
+    let onConnect: () -> Void
+    let onTogglePinned: () -> Void
+    let onDelete: () -> Void
+
+    @State private var offsetX: CGFloat = 0
+    @State private var dragStartOffset: CGFloat?
+
+    private let actionWidth: CGFloat = 84
+    private let revealThreshold: CGFloat = 36
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.06))
+
+            HStack(spacing: 0) {
+                swipeActionButton(
+                    title: connection.isPinned ? "Unpin" : "Pin",
+                    systemImage: connection.isPinned ? "pin.slash.fill" : "pin.fill",
+                    color: .yellow,
+                    action: {
+                        closeRow()
+                        onTogglePinned()
+                    }
+                )
+                .frame(width: actionWidth)
+                .opacity(offsetX > 0 ? 1 : 0)
+
+                Spacer(minLength: 0)
+
+                swipeActionButton(
+                    title: "Delete",
+                    systemImage: "trash.fill",
+                    color: .red,
+                    action: {
+                        closeRow()
+                        onDelete()
+                    }
+                )
+                .frame(width: actionWidth)
+                .opacity(offsetX < 0 ? 1 : 0)
+            }
+
+            Button {
+                if abs(offsetX) > 1 {
+                    closeRow()
+                } else {
+                    onConnect()
+                }
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(connection.displayName)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.primary)
+                        Text(connection.endpointLabel)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+            .disabled(isConnecting)
+            .offset(x: offsetX)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .opacity(isConnecting ? 0.7 : 1)
+        .gesture(
+            DragGesture(minimumDistance: 10)
+                .onChanged { value in
+                    guard !isConnecting else { return }
+                    let startOffset = dragStartOffset ?? offsetX
+                    if dragStartOffset == nil {
+                        dragStartOffset = offsetX
+                    }
+                    offsetX = min(max(startOffset + value.translation.width, -actionWidth), actionWidth)
+                }
+                .onEnded { value in
+                    guard !isConnecting else { return }
+                    let startOffset = dragStartOffset ?? offsetX
+                    let proposed = startOffset + value.translation.width
+                    dragStartOffset = nil
+
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        if proposed > revealThreshold {
+                            offsetX = actionWidth
+                        } else if proposed < -revealThreshold {
+                            offsetX = -actionWidth
+                        } else {
+                            offsetX = 0
+                        }
+                    }
+                }
+        )
+        .onChange(of: isConnecting) { connecting in
+            if connecting {
+                closeRow()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func swipeActionButton(title: String, systemImage: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.caption.weight(.semibold))
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .foregroundStyle(.white)
+            .background(color.opacity(0.9))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func closeRow() {
+        withAnimation(.easeOut(duration: 0.18)) {
+            offsetX = 0
+        }
+        dragStartOffset = nil
     }
 }
