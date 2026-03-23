@@ -87,9 +87,9 @@ final class MouseCaptureRootView: UIView {
     }
 }
 
-private let defaultDaemonPort: UInt16 = 9000
+let defaultDaemonPort: UInt16 = 9000
 
-private func formatEndpointInput(host: String, port: UInt16) -> String {
+func formatEndpointInput(host: String, port: UInt16) -> String {
     let formattedHost = host.contains(":") ? "[\(host)]" : host
     return port == defaultDaemonPort ? formattedHost : "\(formattedHost):\(port)"
 }
