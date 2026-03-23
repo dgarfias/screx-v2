@@ -103,6 +103,9 @@ private func formatByteRate(_ bytesPerSecond: Double) -> String {
     return "\(formatter.string(fromByteCount: Int64(bytesPerSecond.rounded())))/s"
 }
 
+private let networkCameraCompressionQuality: CGFloat = 0.4
+private let usbCameraCompressionQuality: CGFloat = 0.7
+
 struct RecentConnection: Codable, Identifiable, Equatable {
     let host: String
     let port: UInt16
@@ -517,6 +520,7 @@ final class StreamViewModel: ObservableObject {
         connectionHealth = state
         activeTransport = transport
         self.transport = transport.rawValue
+        syncCameraCompressionQuality()
         status = detail ?? defaultDetail(for: state)
         isConnected = state.isConnected
         isConnecting = state.isConnecting
@@ -538,8 +542,8 @@ final class StreamViewModel: ObservableObject {
             return "Connected, waiting for the first video frame."
         case .streaming:
             return activeTransport == .usb
-                ? "USB video and audio are active."
-                : "Video and audio are streaming."
+                ? "USB session active."
+                : "Session active."
         case .busy:
             return "The daemon is already in use by another client."
         case .connectionRefused:
@@ -649,6 +653,7 @@ final class StreamViewModel: ObservableObject {
         log("startServices()")
         startBatteryMonitoring()
         startTrafficMonitoring()
+        syncCameraCompressionQuality()
         if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
@@ -683,6 +688,12 @@ final class StreamViewModel: ObservableObject {
     private func updateSessionHostname(_ hostname: String) {
         guard !hostname.isEmpty else { return }
         sessionDisplayName = hostname
+    }
+
+    private func syncCameraCompressionQuality() {
+        cameraCapture.compressionQuality = activeTransport == .usb
+            ? usbCameraCompressionQuality
+            : networkCameraCompressionQuality
     }
 
     private func startBatteryMonitoring() {
@@ -735,7 +746,7 @@ final class StreamViewModel: ObservableObject {
                 case .connected:
                     self.applyConnectionHealth(.waitingForVideo, detail: "USB connected. Waiting for video.", transport: .usb)
                 case .firstFrame:
-                    self.applyConnectionHealth(.streaming, detail: "USB video and audio are active.", transport: .usb)
+                    self.applyConnectionHealth(.streaming, detail: "USB session active.", transport: .usb)
                     if let endpoint = self.lastNetEndpoint {
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: self.lastNetName ?? "")
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
@@ -1038,7 +1049,7 @@ final class StreamViewModel: ObservableObject {
                         self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
                     case .firstFrame:
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
-                        self.applyConnectionHealth(.streaming, detail: "Video and audio are streaming.", transport: .network)
+                        self.applyConnectionHealth(.streaming, detail: "Session active.", transport: .network)
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
                         let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
                         self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)

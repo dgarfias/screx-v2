@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
     let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
         Arc::new(std::sync::Mutex::new(None));
+    let mut pairing_thread = None;
 
     if !cli.usb_only {
         let ps = Arc::clone(&pairing_state);
@@ -181,14 +182,14 @@ async fn main() -> Result<()> {
         let pairing_shared = Arc::clone(&shared);
         let pairing_stop = Arc::clone(&stop);
         let port = config.stream_port;
-        thread::Builder::new()
+        pairing_thread = Some(thread::Builder::new()
             .name("pairing".into())
             .spawn(move || {
                 if let Err(e) = pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop) {
                     eprintln!("[pairing] server error: {e:#}");
                 }
             })
-            .context("failed to spawn pairing thread")?;
+            .context("failed to spawn pairing thread")?);
     } else {
         println!("[main] USB-only mode — network pairing disabled");
     }
@@ -286,12 +287,13 @@ async fn main() -> Result<()> {
     // Client manager thread (not needed in USB-only mode)
     // -----------------------------------------------------------------------
 
+    let mut client_thread = None;
     if !cli.usb_only {
         let client_socket = socket.try_clone().context("clone socket for client mgr")?;
         let client_shared = Arc::clone(&shared);
         let client_stop = Arc::clone(&stop);
         let client_session_rx = Arc::clone(&session_rx);
-        let _client_thread = thread::Builder::new()
+        client_thread = Some(thread::Builder::new()
             .name("client-mgr".into())
             .spawn(move || {
                 if let Err(e) =
@@ -300,7 +302,7 @@ async fn main() -> Result<()> {
                     eprintln!("[client] manager error: {e:#}");
                 }
             })
-            .context("failed to spawn client manager thread")?;
+            .context("failed to spawn client manager thread")?);
     }
 
     // -----------------------------------------------------------------------
@@ -482,15 +484,16 @@ async fn main() -> Result<()> {
     // USB transport thread (not needed in network-only mode)
     // -----------------------------------------------------------------------
 
+    let mut usb_thread = None;
     if !cli.network_only {
         let usb_shared = Arc::clone(&shared);
         let usb_stop = Arc::clone(&stop);
-        let _usb_thread = thread::Builder::new()
+        usb_thread = Some(thread::Builder::new()
             .name("usb".into())
             .spawn(move || {
                 usb::run_usb_transport(usb_shared, usb_stop);
             })
-            .context("failed to spawn USB transport thread")?;
+            .context("failed to spawn USB transport thread")?);
     } else {
         println!("[main] network-only mode — USB transport disabled");
     }
@@ -502,7 +505,7 @@ async fn main() -> Result<()> {
     let audio_socket = socket.try_clone().context("clone socket for audio")?;
     let audio_shared = Arc::clone(&shared);
     let audio_stop = Arc::clone(&stop);
-    let _audio_thread = thread::Builder::new()
+    let audio_thread = thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
             if let Err(e) = audio::run_audio_capture(audio_socket, audio_shared, audio_stop) {
@@ -532,7 +535,19 @@ async fn main() -> Result<()> {
     crate::stream_server::disable_virtual_sink(&shared);
 
     let _ = capture_thread.join();
+    if let Err(err) = audio_thread.join() {
+        eprintln!("[audio] thread join failed: {err:?}");
+    }
+    if let Some(thread) = usb_thread {
+        let _ = thread.join();
+    }
+    if let Some(thread) = client_thread {
+        let _ = thread.join();
+    }
+    if let Some(thread) = pairing_thread {
+        let _ = thread.join();
+    }
 
     println!("screx cleanup complete, exiting");
-    std::process::exit(0);
+    Ok(())
 }

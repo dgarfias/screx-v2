@@ -10,6 +10,7 @@ enum USBListenerEvent {
 }
 
 final class USBListener {
+    private static let maxControlPayload = 60 * 1024
     private var listener: NWListener?
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.usb", qos: .userInteractive)
@@ -338,22 +339,33 @@ final class USBListener {
     /// Sends a camera JPEG frame over USB TCP. Single framed control message.
     func sendCameraFrame(_ jpeg: Data) {
         guard let conn = connection else { return }
+        let chunkSize = Self.maxControlPayload - 8
+        let totalChunks = max(1, (jpeg.count + chunkSize - 1) / chunkSize)
 
-        let camPayload = Data("CAM".utf8) + jpeg
-        let payloadLen = UInt32(1 + camPayload.count)
+        for i in 0..<totalChunks {
+            let start = i * chunkSize
+            let end = min(start + chunkSize, jpeg.count)
+            let chunk = jpeg.subdata(in: start..<end)
 
-        var frame = Data()
-        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
-        frame.append(Self.msgControl)
-        frame.append(camPayload)
+            var camPayload = Data("CAM".utf8)
+            withUnsafeBytes(of: UInt16(i).bigEndian) { camPayload.append(contentsOf: $0) }
+            withUnsafeBytes(of: UInt16(totalChunks).bigEndian) { camPayload.append(contentsOf: $0) }
+            camPayload.append(chunk)
 
-        conn.send(content: frame, completion: .contentProcessed { error in
-            if let error {
-                print("[usb] cam send error: \(error)")
-            } else {
-                self.onTraffic?(0, frame.count)
-            }
-        })
+            let payloadLen = UInt32(1 + camPayload.count)
+            var frame = Data()
+            withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+            frame.append(Self.msgControl)
+            frame.append(camPayload)
+
+            conn.send(content: frame, completion: .contentProcessed { error in
+                if let error {
+                    print("[usb] cam send error: \(error)")
+                } else {
+                    self.onTraffic?(0, frame.count)
+                }
+            })
+        }
     }
 
     /// Sends a keyboard event over USB TCP. Framed control: "KEY" + type(1) + payload.

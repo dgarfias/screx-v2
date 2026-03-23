@@ -140,8 +140,8 @@ final class MicCapture {
 
         var encodedData = Data(count: 4000)
         do {
-            let _ = try encoder.encode(buffer, to: &encodedData)
-            onOpusPacket?(encodedData)
+            let encodedLen = try encoder.encode(buffer, to: &encodedData)
+            onOpusPacket?(encodedData.prefix(encodedLen))
         } catch {
             print("[mic] opus encode error: \(error)")
         }

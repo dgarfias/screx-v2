@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 
 const VIDEO_DEVICE: &str = "/dev/video10";
 const CARD_LABEL: &str = "Screx iPad Camera";
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
 
 extern "C" {
     fn screx_v4l2_open_output(

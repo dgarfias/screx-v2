@@ -120,11 +120,7 @@ final class StreamClient {
     /// Encrypt plaintext with session key, prepend 4-byte seq_num, send over UDP.
     private func encryptAndSend(_ plaintext: Data, conn: NWConnection, label: String) {
         guard let key = sessionKey else {
-            // Fallback: send unencrypted (shouldn't happen in normal flow)
-            log("\(label) send without session key, bytes=\(plaintext.count)")
-            conn.send(content: plaintext, completion: .contentProcessed { error in
-                if let error { print("[stream] \(label) send error: \(error)") }
-            })
+            log("\(label) send aborted: missing session key")
             return
         }
 

@@ -245,7 +245,8 @@ fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len == 0 || msg_len > 65536 {
-            continue;
+            crate::vlog!("[usb] invalid READY frame length: {msg_len}");
+            return false;
         }
         if msg_buf.len() < msg_len {
             msg_buf.resize(msg_len, 0);
@@ -343,6 +344,7 @@ fn read_control_loop(
 
     let mut len_buf = [0u8; 4];
     let mut msg_buf = vec![0u8; 256];
+    let mut cam_reassembler = crate::camera::CamReassembler::new();
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read_exact(&mut len_buf) {
@@ -361,7 +363,8 @@ fn read_control_loop(
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len == 0 || msg_len > 65536 {
-            continue;
+            eprintln!("[usb] invalid USB control frame length: {msg_len}, closing transport");
+            break;
         }
         if msg_buf.len() < msg_len {
             msg_buf.resize(msg_len, 0);
@@ -380,10 +383,11 @@ fn read_control_loop(
             if ctrl == READY_MAGIC {
                 crate::vlog!("[usb] ignoring duplicate READY on active transport");
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
-                let jpeg = &ctrl[3..];
-                let mut cam = shared.cam_writer.lock().unwrap();
-                if let Some(ref mut cw) = *cam {
-                    cw.write_frame(jpeg);
+                if let Some(jpeg) = cam_reassembler.feed(&ctrl[3..]) {
+                    let mut cam = shared.cam_writer.lock().unwrap();
+                    if let Some(ref mut cw) = *cam {
+                        cw.write_frame(&jpeg);
+                    }
                 }
             } else if ctrl.starts_with(b"MIC") && ctrl.len() > 7 {
                 // "MIC"(3) + seq(4) + opus_data

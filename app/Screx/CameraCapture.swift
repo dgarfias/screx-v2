@@ -5,8 +5,10 @@ import UniformTypeIdentifiers
 import UIKit
 
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private static let outputWidth: CGFloat = 1280
-    private static let outputHeight: CGFloat = 720
+    private static let outputWidth: CGFloat = 1920
+    private static let outputHeight: CGFloat = 1080
+    private static let targetFps: Int32 = 30
+    private static let defaultCompressionQuality: CGFloat = 0.4
 
     private let session = AVCaptureSession()
     private let outputQueue = DispatchQueue(label: "screx.camera", qos: .userInitiated)
@@ -14,6 +16,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var running = false
     private var frameCount: UInt32 = 0
     private(set) var usingFront = false
+    var compressionQuality: CGFloat = Self.defaultCompressionQuality
 
     var onJPEG: ((Data) -> Void)?
 
@@ -23,7 +26,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func startSession(front: Bool) {
-        session.sessionPreset = .hd1280x720
+        session.sessionPreset = .hd1920x1080
 
         let position: AVCaptureDevice.Position = front ? .front : .back
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
@@ -55,8 +58,8 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         do {
             try device.lockForConfiguration()
-            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
-            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 15)
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: Self.targetFps)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Self.targetFps)
             device.unlockForConfiguration()
         } catch {
             print("[camera] failed to set frame rate: \(error)")
@@ -65,7 +68,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.startRunning()
         running = true
         usingFront = front
-        print("[camera] capture started (720p, ~15fps, \(front ? "front" : "back"))")
+        print("[camera] capture started (1080p, ~\(Self.targetFps)fps, \(front ? "front" : "back"))")
     }
 
     func stop() {
@@ -99,8 +102,8 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         do {
             try device.lockForConfiguration()
-            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
-            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 15)
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: Self.targetFps)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: Self.targetFps)
             device.unlockForConfiguration()
         } catch {}
 
@@ -132,7 +135,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
 
             let options = [
-                kCGImageDestinationLossyCompressionQuality: 0.5
+                kCGImageDestinationLossyCompressionQuality: compressionQuality
             ] as CFDictionary
             CGImageDestinationAddImage(destination, cgImage, options)
 

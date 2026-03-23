@@ -592,8 +592,8 @@ fn run_control_loop(
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
-            crate::vlog!("[control] dropping invalid framed control message: len={msg_len}");
-            continue;
+            eprintln!("[control] invalid framed control message length: {msg_len}, closing channel");
+            break;
         }
 
         if msg_buf.len() < msg_len {
