@@ -1282,8 +1282,96 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 }
 
-                if showOverlay {
-                    VStack(alignment: .leading, spacing: 10) {
+                // MARK: Connection screen (always visible when disconnected)
+                if !model.isConnected {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Screx")
+                                .font(.title2.weight(.bold))
+                            Text(model.status)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack {
+                            TextField("Daemon host or IP[:port]", text: $model.manualHost)
+                                .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .keyboardType(.URL)
+                                .disabled(model.isConnecting)
+
+                            Button(model.isConnecting ? "Connecting..." : "Connect") { model.connectManual() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+
+                        if !model.pinnedConnections.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Pinned")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .textCase(.uppercase)
+
+                                List {
+                                    ForEach(model.pinnedConnections) { connection in
+                                        connectionRow(connection)
+                                    }
+                                }
+                                .listStyle(.plain)
+                                .scrollDisabled(true)
+                                .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                .frame(height: connectionListHeight(for: model.pinnedConnections.count))
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+
+                        if !model.unpinnedRecentConnections.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .center) {
+                                    Text("Recent")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                        .textCase(.uppercase)
+                                    Spacer()
+                                    Button {
+                                        model.clearRecentConnections()
+                                    } label: {
+                                        Text("Clear All")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 4)
+                                            .background(Color.red, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+
+                                List {
+                                    ForEach(model.unpinnedRecentConnections) { connection in
+                                        connectionRow(connection)
+                                    }
+                                }
+                                .listStyle(.plain)
+                                .scrollDisabled(true)
+                                .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
+                    .padding(24)
+                    .frame(maxWidth: 400)
+                    .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16))
+                    .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(.systemGroupedBackground).ignoresSafeArea())
+                    .transition(.opacity)
+                }
+
+                // MARK: Info overlay (toggleable when connected)
+                if model.isConnected && showOverlay {
+                    VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Screx").font(.headline)
                             if !model.transport.isEmpty {
@@ -1297,78 +1385,9 @@ struct ContentView: View {
                         }
                         Text(model.status).font(.caption).foregroundStyle(.secondary)
 
-                        if !model.isConnected {
-                            HStack {
-                                TextField("Daemon host or IP[:port]", text: $model.manualHost)
-                                    .textFieldStyle(.roundedBorder)
-                                    .autocorrectionDisabled()
-                                    .textInputAutocapitalization(.never)
-                                    .keyboardType(.URL)
-                                    .disabled(model.isConnecting)
-
-                                Button(model.isConnecting ? "Connecting..." : "Connect") { model.connectManual() }
-                                    .buttonStyle(.borderedProminent)
-                                    .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            }
-
-                            if !model.pinnedConnections.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("Pinned")
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(.secondary)
-                                        .textCase(.uppercase)
-
-                                    List {
-                                        ForEach(model.pinnedConnections) { connection in
-                                            connectionRow(connection)
-                                        }
-                                    }
-                                    .listStyle(.plain)
-                                    .scrollDisabled(true)
-                                    .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                    .frame(height: connectionListHeight(for: model.pinnedConnections.count))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                }
-                            }
-
-                            if !model.unpinnedRecentConnections.isEmpty {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack(alignment: .center) {
-                                        Text("Recent")
-                                            .font(.caption.weight(.medium))
-                                            .foregroundStyle(.secondary)
-                                            .textCase(.uppercase)
-                                        Spacer()
-                                        Button {
-                                            model.clearRecentConnections()
-                                        } label: {
-                                            Text("Clear All")
-                                                .font(.caption2.weight(.semibold))
-                                                .foregroundStyle(.white)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 4)
-                                                .background(Color.red, in: Capsule())
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-
-                                    List {
-                                        ForEach(model.unpinnedRecentConnections) { connection in
-                                            connectionRow(connection)
-                                        }
-                                    }
-                                    .listStyle(.plain)
-                                    .scrollDisabled(true)
-                                    .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                    .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                }
-                            }
-                        } else {
-                            Button("Disconnect") { model.disconnect() }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                        }
+                        Button("Disconnect") { model.disconnect() }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
                     }
                     .padding(12)
                     .frame(maxWidth: 380, alignment: .leading)
@@ -1387,7 +1406,7 @@ struct ContentView: View {
                         .background(.ultraThinMaterial, in: Capsule())
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .padding(.top, showOverlay ? 92 : 16)
+                        .padding(.top, showOverlay && model.isConnected ? 92 : 16)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
@@ -1402,7 +1421,9 @@ struct ContentView: View {
                 )
                 .frame(width: 0, height: 0)
 
-                floatingBar(in: geo)
+                if model.isConnected {
+                    floatingBar(in: geo)
+                }
             }
             .onAppear {
                 viewSize = geo.size
