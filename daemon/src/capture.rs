@@ -518,9 +518,15 @@ mod evdi {
 
                 if refresh_retries > 0 {
                     refresh_retries -= 1;
-                    if refresh_retries == 0 && has_first_frame {
-                        // Retries exhausted — send the last captured buffer as fallback
-                        println!("[capture] force refresh: no new damage, sending last captured buffer");
+                    if refresh_retries == 0 {
+                        if has_first_frame {
+                            // Retries exhausted — send the last captured buffer as fallback.
+                            println!("[capture] force refresh: no new damage, sending last captured buffer");
+                        } else {
+                            // No compositor frame arrived yet; send the zero-initialized buffer
+                            // once so the client can leave "waiting for video" state.
+                            println!("[capture] force refresh: no compositor damage yet, sending black bootstrap frame");
+                        }
                         let frame = CaptureFrame {
                             width: config.width,
                             height: config.height,

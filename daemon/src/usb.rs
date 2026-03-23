@@ -267,6 +267,9 @@ fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
     shared.client_backgrounded.store(false, Ordering::SeqCst);
     shared.force_idr.store(true, Ordering::Relaxed);
     shared.capture_start.store(true, Ordering::Release);
+    if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
+        fr.store(true, Ordering::Relaxed);
+    }
     if !shared.has_active_client.swap(true, Ordering::SeqCst) {
         if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
             cb();
