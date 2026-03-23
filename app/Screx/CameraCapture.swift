@@ -5,8 +5,8 @@ import UniformTypeIdentifiers
 import UIKit
 
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private static let outputWidth: CGFloat = 1920
-    private static let outputHeight: CGFloat = 1080
+    private static let outputWidth: CGFloat = 1280
+    private static let outputHeight: CGFloat = 720
     private static let targetFps: Int32 = 30
     private static let defaultCompressionQuality: CGFloat = 0.4
 
@@ -26,7 +26,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func startSession(front: Bool) {
-        session.sessionPreset = .hd1920x1080
+        session.sessionPreset = .hd1280x720
 
         let position: AVCaptureDevice.Position = front ? .front : .back
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
@@ -68,7 +68,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.startRunning()
         running = true
         usingFront = front
-        print("[camera] capture started (1080p, ~\(Self.targetFps)fps, \(front ? "front" : "back"))")
+        print("[camera] capture started (720p, ~\(Self.targetFps)fps, \(front ? "front" : "back"))")
     }
 
     func stop() {
