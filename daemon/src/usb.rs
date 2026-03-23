@@ -110,14 +110,22 @@ impl TcpFramedSender {
 /// Detects device, starts iproxy, connects TCP, reads control messages.
 pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
     println!("[usb] transport thread started (polling for device every {DETECT_INTERVAL:?})");
+    let mut device_present = false;
 
     while !stop.load(Ordering::Relaxed) {
         if !detect_device() {
+            if device_present {
+                println!("[usb] iOS device disconnected from USB");
+                device_present = false;
+            }
             std::thread::sleep(DETECT_INTERVAL);
             continue;
         }
 
-        println!("[usb] iOS device detected via USB");
+        if !device_present {
+            println!("[usb] iOS device detected via USB");
+            device_present = true;
+        }
 
         let mut iproxy_child = match start_iproxy() {
             Ok(child) => child,
@@ -129,6 +137,7 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
         };
 
         let addr = format!("127.0.0.1:{IPROXY_LOCAL_PORT}");
+        println!("[usb] waiting for Screx app USB listener");
         while !stop.load(Ordering::Relaxed) && detect_device() {
             let stream = match connect_to_iproxy(&addr, &stop) {
                 Some(stream) => stream,
@@ -179,19 +188,11 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
 }
 
 fn connect_to_iproxy(addr: &str, stop: &Arc<AtomicBool>) -> Option<TcpStream> {
-    let mut attempt: u64 = 0;
-
     while !stop.load(Ordering::Relaxed) && detect_device() {
         match TcpStream::connect(addr) {
-            Ok(stream) => {
-                println!("[usb] TCP connected to {addr} (attempt {attempt})");
-                return Some(stream);
-            }
+            Ok(stream) => return Some(stream),
             Err(e) => {
-                if attempt == 0 || attempt.is_multiple_of(5) {
-                    eprintln!("[usb] waiting for USB app listener at {addr}: {e}");
-                }
-                attempt = attempt.wrapping_add(1);
+                crate::vlog!("[usb] waiting for USB app listener at {addr}: {e}");
                 std::thread::sleep(CONNECT_RETRY);
             }
         }
@@ -224,7 +225,7 @@ fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
                 continue;
             }
             Err(e) => {
-                println!("[usb] TCP disconnected before READY: {e}");
+                crate::vlog!("[usb] TCP disconnected before READY: {e}");
                 return false;
             }
         }
@@ -240,7 +241,7 @@ fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
         match stream.read_exact(&mut msg_buf[..msg_len]) {
             Ok(()) => {}
             Err(e) => {
-                println!("[usb] TCP disconnected before READY payload: {e}");
+                crate::vlog!("[usb] TCP disconnected before READY payload: {e}");
                 return false;
             }
         }
@@ -263,6 +264,7 @@ fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
         *usb = Some(sender);
     }
     shared.usb_active.store(true, Ordering::SeqCst);
+    shared.client_backgrounded.store(false, Ordering::SeqCst);
     shared.force_idr.store(true, Ordering::Relaxed);
     shared.capture_start.store(true, Ordering::Release);
     if !shared.has_active_client.swap(true, Ordering::SeqCst) {
@@ -274,6 +276,7 @@ fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
 
 fn deactivate_usb_transport(shared: &Arc<SharedState>) {
     shared.usb_active.store(false, Ordering::SeqCst);
+    shared.client_backgrounded.store(false, Ordering::SeqCst);
     {
         let mut usb = shared.usb_sender.lock().unwrap();
         *usb = None;
@@ -335,12 +338,6 @@ fn read_control_loop(
             let ctrl = &msg_buf[1..msg_len];
             if ctrl == READY_MAGIC {
                 crate::vlog!("[usb] ignoring duplicate READY on active transport");
-            } else if ctrl.starts_with(b"PLI") {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
-            } else if ctrl.starts_with(b"TOUCH") && ctrl.len() > 5 {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
-            } else if ctrl.starts_with(b"KEY") && ctrl.len() > 3 {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
                 let jpeg = &ctrl[3..];
                 let mut cam = shared.cam_writer.lock().unwrap();
@@ -356,11 +353,7 @@ fn read_control_loop(
                         eprintln!("[mic] USB write error: {e}");
                     }
                 }
-            } else if ctrl.starts_with(b"MOUSE") && ctrl.len() > 5 {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
-            } else if ctrl.starts_with(b"RAWKEY") && ctrl.len() > 6 {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
-            } else if ctrl.starts_with(b"PERIPH") && ctrl.len() > 6 {
+            } else {
                 crate::stream_server::handle_control_message_data(shared, ctrl);
             }
         }

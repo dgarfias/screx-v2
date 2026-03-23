@@ -3,6 +3,15 @@ import Network
 import CryptoKit
 import QuartzCore
 
+enum StreamClientEvent {
+    case readyToRegister
+    case waiting(String)
+    case connectionFailed(String)
+    case receiveError(String)
+    case timedOut
+    case firstFrame
+}
+
 final class StreamClient {
     private let endpoint: NWEndpoint
     private var connection: NWConnection?
@@ -12,7 +21,7 @@ final class StreamClient {
     let audioPlayer: AudioPlayer
     let avSync: AVSyncState
 
-    var onStatus: ((String) -> Void)?
+    var onEvent: ((StreamClientEvent) -> Void)?
     var onDisconnect: (() -> Void)?
     var sessionKey: SymmetricKey?
     var sendPliRequest: (() -> Void)?
@@ -72,16 +81,17 @@ final class StreamClient {
             switch state {
             case .ready:
                 self.log("udp ready, sending initial register and starting receive loop")
-                self.onStatus?("Connected, registering...")
+                self.onEvent?(.readyToRegister)
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
                 self.startDataTimeout()
                 self.receiveLoop(conn)
             case .failed(let error):
-                self.onStatus?("Connection failed: \(error.localizedDescription)")
-                self.handleTimeout()
+                self.disconnect()
+                self.onEvent?(.connectionFailed(error.localizedDescription))
+                self.onDisconnect?()
             case .waiting(let error):
-                self.onStatus?("Waiting: \(error.localizedDescription)")
+                self.onEvent?(.waiting(error.localizedDescription))
             default:
                 break
             }
@@ -187,7 +197,7 @@ final class StreamClient {
         log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
         print("[stream] data timeout — daemon appears gone")
         disconnect()
-        onStatus?("Daemon disconnected")
+        onEvent?(.timedOut)
         onDisconnect?()
     }
 
@@ -197,8 +207,9 @@ final class StreamClient {
 
             if let error {
                 self.log("receiveLoop error: \(error.localizedDescription)")
-                self.onStatus?("Receive error: \(error.localizedDescription)")
-                self.handleTimeout()
+                self.disconnect()
+                self.onEvent?(.receiveError(error.localizedDescription))
+                self.onDisconnect?()
                 return
             }
 
@@ -351,7 +362,7 @@ final class StreamClient {
         if !decoder.hasReportedFirstFrame {
             decoder.hasReportedFirstFrame = true
             log("first video frame delivered to decoder")
-            onStatus?("Streaming")
+            onEvent?(.firstFrame)
         }
     }
 

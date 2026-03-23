@@ -2,6 +2,13 @@ import Foundation
 import Network
 import QuartzCore
 
+enum USBListenerEvent {
+    case listenerReady
+    case listenerFailed(String)
+    case connected
+    case firstFrame
+}
+
 final class USBListener {
     private var listener: NWListener?
     private var connection: NWConnection?
@@ -11,7 +18,7 @@ final class USBListener {
     private let audioPlayer: AudioPlayer
     private let avSync: AVSyncState
 
-    var onStatus: ((String) -> Void)?
+    var onEvent: ((USBListenerEvent) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
 
@@ -19,6 +26,8 @@ final class USBListener {
     private static let msgAudio: UInt8 = 0x02
     private static let msgControl: UInt8 = 0x03
     private static let readyMagic = Data("READY".utf8)
+    private static let appBackgroundMagic = Data("APPBG".utf8)
+    private static let appForegroundMagic = Data("APPFG".utf8)
 
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
@@ -47,11 +56,11 @@ final class USBListener {
             l.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    self?.onStatus?("USB: listening on port 9000")
+                    self?.onEvent?(.listenerReady)
                     print("[usb] listener ready on port 9000")
                 case .failed(let error):
                     print("[usb] listener failed: \(error)")
-                    self?.onStatus?("USB listener failed: \(error.localizedDescription)")
+                    self?.onEvent?(.listenerFailed(error.localizedDescription))
                 default:
                     break
                 }
@@ -65,7 +74,7 @@ final class USBListener {
             print("[usb] TCP listener starting on port 9000")
         } catch {
             print("[usb] failed to create listener: \(error)")
-            onStatus?("USB listener error: \(error.localizedDescription)")
+            onEvent?(.listenerFailed(error.localizedDescription))
         }
     }
 
@@ -91,7 +100,7 @@ final class USBListener {
             case .ready:
                 print("[usb] TCP connection established from daemon")
                 self?.sendReady(on: conn)
-                self?.onStatus?("USB: connected")
+                self?.onEvent?(.connected)
                 self?.onConnected?()
                 self?.readLoop(conn)
             case .waiting(let error):
@@ -208,7 +217,7 @@ final class USBListener {
                 if !hasReportedFirstFrame {
                     hasReportedFirstFrame = true
                     decoder.hasReportedFirstFrame = true
-                    onStatus?("USB: streaming")
+                    onEvent?(.firstFrame)
                 }
 
             case Self.msgAudio:
@@ -246,6 +255,23 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] PLI send error: \(error)")
+            }
+        })
+    }
+
+    func sendAppBackgroundState(isBackgrounded: Bool) {
+        guard let conn = connection else { return }
+
+        var frame = Data()
+        let payload = isBackgrounded ? Self.appBackgroundMagic : Self.appForegroundMagic
+        let payloadLen = UInt32(1 + payload.count)
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(payload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] app state send error: \(error)")
             }
         })
     }

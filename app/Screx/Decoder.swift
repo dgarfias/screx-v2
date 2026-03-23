@@ -13,6 +13,7 @@ final class VideoDecoder {
     var hasReportedFirstFrame = false
     private(set) var videoWidth: Int = 1920
     private(set) var videoHeight: Int = 1080
+    private(set) var isSuspended = false
 
     private(set) var codec: VideoCodecType = .h264
 
@@ -33,6 +34,19 @@ final class VideoDecoder {
         displayLayer.videoGravity = .resizeAspect
     }
 
+    func setSuspended(_ suspended: Bool) {
+        guard suspended != isSuspended else { return }
+        isSuspended = suspended
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            if suspended {
+                self.displayLayer.flushAndRemoveImage()
+            } else {
+                self.displayLayer.flush()
+            }
+        }
+    }
+
     func setCodec(_ codec: VideoCodecType) {
         guard codec != self.codec else { return }
         self.codec = codec
@@ -46,6 +60,7 @@ final class VideoDecoder {
     }
 
     func decodeAccessUnit(_ data: Data) {
+        guard !isSuspended else { return }
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
             parseNALUnits(base, count: raw.count)

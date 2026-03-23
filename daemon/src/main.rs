@@ -422,6 +422,10 @@ async fn main() -> Result<()> {
                     Arc::clone(&session_refresh),
                     Arc::new(AtomicBool::new(true)), // already started
                     |frame| {
+                        if session_shared.client_backgrounded.load(Ordering::Relaxed) {
+                            return;
+                        }
+
                         let force_idr =
                             session_shared.force_idr.swap(false, Ordering::Relaxed);
                         let ts = session_shared.start_time.elapsed().as_millis() as u32;

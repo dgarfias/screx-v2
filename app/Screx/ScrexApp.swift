@@ -113,6 +113,53 @@ struct RecentConnection: Codable, Identifiable, Equatable {
     }
 }
 
+enum ConnectionTransport: String {
+    case none = ""
+    case network = "Network"
+    case usb = "USB"
+}
+
+enum ConnectionHealthState: String {
+    case idle = "Idle"
+    case connecting = "Connecting"
+    case pairing = "Pairing"
+    case waitingForVideo = "Waiting for video"
+    case streaming = "Streaming"
+    case busy = "Busy"
+    case connectionRefused = "Connection refused"
+    case timedOut = "Timed out"
+    case sessionStale = "Session stale, try again"
+    case backgroundAudioMode = "Background audio mode"
+    case connectionError = "Connection error"
+
+    var isConnected: Bool {
+        switch self {
+        case .streaming, .backgroundAudioMode:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var isConnecting: Bool {
+        switch self {
+        case .connecting, .pairing, .waitingForVideo:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var isTerminalFailure: Bool {
+        switch self {
+        case .busy, .connectionRefused, .timedOut, .sessionStale, .connectionError:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 final class ScrexRootViewController: GCEventViewController {
     private let model: StreamViewModel
     private let hostingController: UIHostingController<AnyView>
@@ -214,6 +261,7 @@ final class ScrexRootViewController: GCEventViewController {
 @MainActor
 final class StreamViewModel: ObservableObject {
     @Published var status: String = "Enter a daemon host or IP to connect."
+    @Published private(set) var connectionHealth: ConnectionHealthState = .idle
     @Published var isConnected = false
     @Published var manualHost: String = ""
     @Published var transport: String = ""
@@ -248,6 +296,7 @@ final class StreamViewModel: ObservableObject {
     private var lastNetName: String?
     private var micSeq: UInt32 = 0
     @Published private(set) var isConnecting = false
+    private var activeTransport: ConnectionTransport = .none
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -340,21 +389,21 @@ final class StreamViewModel: ObservableObject {
 
         if input.hasPrefix("[") {
             guard let closeBracket = input.firstIndex(of: "]") else {
-                status = "Invalid address. Use host, host:port, or [ipv6]:port."
+                applyConnectionHealth(.idle, detail: "Invalid address. Use host, host:port, or [ipv6]:port.")
                 return nil
             }
 
             let host = String(input[input.index(after: input.startIndex)..<closeBracket])
             let suffix = String(input[input.index(after: closeBracket)...])
             guard !host.isEmpty else {
-                status = "Host cannot be empty."
+                applyConnectionHealth(.idle, detail: "Host cannot be empty.")
                 return nil
             }
             if suffix.isEmpty {
                 return (host, defaultDaemonPort)
             }
             guard suffix.hasPrefix(":"), let port = UInt16(suffix.dropFirst()), port > 0 else {
-                status = "Invalid port. Use a value from 1 to 65535."
+                applyConnectionHealth(.idle, detail: "Invalid port. Use a value from 1 to 65535.")
                 return nil
             }
             return (host, port)
@@ -368,11 +417,11 @@ final class StreamViewModel: ObservableObject {
             let host = String(input[..<colon])
             let portPart = String(input[input.index(after: colon)...])
             guard !host.isEmpty else {
-                status = "Host cannot be empty."
+                    applyConnectionHealth(.idle, detail: "Host cannot be empty.")
                 return nil
             }
             guard let port = UInt16(portPart), port > 0 else {
-                status = "Invalid port. Use a value from 1 to 65535."
+                    applyConnectionHealth(.idle, detail: "Invalid port. Use a value from 1 to 65535.")
                 return nil
             }
             return (host, port)
@@ -396,13 +445,108 @@ final class StreamViewModel: ObservableObject {
             : "Choose a pinned or recent daemon, or enter a host or IP[:port] to connect."
     }
 
+    var connectionHealthTitle: String {
+        connectionHealth.rawValue
+    }
+
+    private func applyConnectionHealth(
+        _ state: ConnectionHealthState,
+        detail: String? = nil,
+        transport: ConnectionTransport = .none
+    ) {
+        connectionHealth = state
+        activeTransport = transport
+        self.transport = transport.rawValue
+        status = detail ?? defaultDetail(for: state)
+        isConnected = state.isConnected
+        isConnecting = state.isConnecting
+    }
+
+    private func defaultDetail(for state: ConnectionHealthState) -> String {
+        switch state {
+        case .idle:
+            return disconnectedPrompt()
+        case .connecting:
+            return "Opening a connection to the daemon."
+        case .pairing:
+            return "Negotiating a secure session."
+        case .waitingForVideo:
+            return "Connected, waiting for the first video frame."
+        case .streaming:
+            return activeTransport == .usb
+                ? "USB video and audio are active."
+                : "Video and audio are streaming."
+        case .busy:
+            return "The daemon is already in use by another client."
+        case .connectionRefused:
+            return "The daemon refused the connection."
+        case .timedOut:
+            return "The daemon stopped responding in time."
+        case .sessionStale:
+            return "The saved session looks stale. Try again or pair again."
+        case .backgroundAudioMode:
+            return "Screx is backgrounded and audio mode stays active."
+        case .connectionError:
+            return "The connection failed unexpectedly."
+        }
+    }
+
+    private func applyConnectionFailure(_ message: String, transport: ConnectionTransport = .none) {
+        let normalized = message.lowercased()
+        if normalized.contains("busy") {
+            applyConnectionHealth(.busy, detail: "The daemon is already in use by another client.", transport: transport)
+        } else if normalized.contains("refused") {
+            applyConnectionHealth(.connectionRefused, detail: "The daemon refused the connection.", transport: transport)
+        } else if normalized.contains("timed out") || normalized.contains("timeout") {
+            applyConnectionHealth(.timedOut, detail: "The daemon stopped responding in time.", transport: transport)
+        } else if normalized.contains("not recognized by daemon")
+            || normalized.contains("pair again")
+            || normalized.contains("stale")
+        {
+            applyConnectionHealth(.sessionStale, detail: "The saved session looks stale. Try again.", transport: transport)
+        } else {
+            applyConnectionHealth(.connectionError, detail: message, transport: transport)
+        }
+    }
+
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            if activeTransport != .none && (connectionHealth == .streaming || connectionHealth == .waitingForVideo) {
+                decoder.setSuspended(true)
+                if activeTransport == .usb {
+                    usbListener?.sendAppBackgroundState(isBackgrounded: true)
+                } else {
+                    networkControl?.sendAppBackgroundState(isBackgrounded: true)
+                }
+                if connectionHealth == .streaming {
+                    applyConnectionHealth(.backgroundAudioMode, transport: activeTransport)
+                }
+            }
+        case .active:
+            if activeTransport != .none {
+                decoder.setSuspended(false)
+                if activeTransport == .usb {
+                    usbListener?.sendAppBackgroundState(isBackgrounded: false)
+                } else {
+                    networkControl?.sendAppBackgroundState(isBackgrounded: false)
+                }
+            }
+            if connectionHealth == .backgroundAudioMode {
+                applyConnectionHealth(.streaming, transport: activeTransport)
+            }
+        default:
+            break
+        }
+    }
+
     func startServices() {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
         startBatteryMonitoring()
         if !isConnected && !isConnecting {
-            status = disconnectedPrompt()
+            applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
 
@@ -431,18 +575,31 @@ final class StreamViewModel: ObservableObject {
         guard !isConnecting && !isConnected else { return }
 
         isUSBListening = true
-        isConnecting = true
-        status = "Listening for USB connection…"
+        applyConnectionHealth(.connecting, detail: "Listening for USB connection.", transport: .usb)
 
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.usbListener = usb
 
-        usb.onStatus = { [weak self] msg in
+        usb.onEvent = { [weak self] event in
             Task { @MainActor in
                 guard let self else { return }
-                self.log("usb status: \(msg)")
-                if self.usbConnected {
-                    self.status = msg
+                self.log("usb event: \(String(describing: event))")
+                switch event {
+                case .listenerReady:
+                    if self.isUSBListening && !self.usbConnected {
+                        self.applyConnectionHealth(.connecting, detail: "USB listener is ready. Waiting for the daemon.", transport: .usb)
+                    }
+                case .listenerFailed(let message):
+                    self.isUSBListening = false
+                    self.applyConnectionFailure("USB listener failed: \(message)", transport: .none)
+                case .connected:
+                    self.applyConnectionHealth(.waitingForVideo, detail: "USB connected. Waiting for video.", transport: .usb)
+                case .firstFrame:
+                    self.applyConnectionHealth(.streaming, detail: "USB video and audio are active.", transport: .usb)
+                    if let endpoint = self.lastNetEndpoint {
+                        let target = self.endpointHostAndPort(endpoint, fallbackHost: self.lastNetName ?? "")
+                        self.manualHost = formatEndpointInput(host: target.host, port: target.port)
+                    }
                 }
             }
         }
@@ -451,10 +608,7 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.log("usb connected")
                 self.usbConnected = true
-                self.isConnected = true
-                self.isConnecting = false
                 self.isUSBListening = false
-                self.transport = "USB"
                 self.stream?.suppressTimeout = true
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
@@ -469,18 +623,16 @@ final class StreamViewModel: ObservableObject {
                 self.usbListener?.stop()
                 self.usbListener = nil
                 self.stream?.suppressTimeout = false
-                self.stream?.onStatus = nil
+                self.stream?.onEvent = nil
                 self.stream?.onDisconnect = nil
                 self.stream?.disconnect()
                 self.stream = nil
                 self.closeNetworkControl(gracefully: false)
-                self.isConnected = false
-                self.isConnecting = false
-                self.transport = ""
+                self.decoder.setSuspended(false)
                 self.audioPlayer.stop()
                 self.micCapture.stop()
                 self.stopPeripheralMonitoring()
-                self.status = "USB disconnected. \(self.disconnectedPrompt())"
+                self.applyConnectionHealth(.connectionError, detail: "USB disconnected. \(self.disconnectedPrompt())", transport: .none)
             }
         }
         usb.start()
@@ -490,9 +642,8 @@ final class StreamViewModel: ObservableObject {
         usbListener?.stop()
         usbListener = nil
         isUSBListening = false
-        isConnecting = false
         usbConnected = false
-        status = disconnectedPrompt()
+        applyConnectionHealth(.idle, detail: disconnectedPrompt())
     }
 
     func connectManual() {
@@ -523,7 +674,7 @@ final class StreamViewModel: ObservableObject {
         recentConnections = pinnedConnections
         persistRecentConnections()
         if !isConnected && !isConnecting && !usbConnected {
-            status = disconnectedPrompt()
+            applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
 
@@ -535,13 +686,13 @@ final class StreamViewModel: ObservableObject {
             lastNetName = nil
         }
         if !isConnected && !isConnecting && !usbConnected {
-            status = disconnectedPrompt()
+            applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
 
     func togglePinned(_ connection: RecentConnection) {
         if !connection.isPinned && pinnedConnections.count >= Self.maxPinnedConnections {
-            status = "Pinned connections are limited to 10."
+            applyConnectionHealth(.idle, detail: "Pinned connections are limited to 10.")
             return
         }
 
@@ -560,24 +711,20 @@ final class StreamViewModel: ObservableObject {
         persistRecentConnections()
 
         if !isConnected && !isConnecting && !usbConnected {
-            status = disconnectedPrompt()
+            applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
         log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting) usbConnected=\(usbConnected)")
         // Detach old stream's callbacks so stale async events can't interfere
-        stream?.onStatus = nil
+        stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
         closeNetworkControl(gracefully: true)
         pairingService?.cancel()
 
-        isConnecting = true
-
-        if !usbConnected {
-            status = "Pairing with \(name)..."
-        }
+        applyConnectionHealth(.connecting, detail: "Connecting to \(name).", transport: .network)
 
         // Extract host string from endpoint
         let host: String
@@ -631,19 +778,18 @@ final class StreamViewModel: ObservableObject {
                 self.pendingPinCompletion = completion
                 self.pinInput = ""
                 self.showPinEntry = true
+                self.applyConnectionHealth(.pairing, detail: "Enter the PIN shown on the daemon.", transport: .network)
                 self.pairingStatus = "Enter the PIN shown on the daemon"
 
             case .rejected(let reason):
                 self.log("PairingService result: rejected (\(reason))")
-                self.status = "Pairing rejected: \(reason)"
                 self.pairingService = nil
-                self.isConnecting = false
+                self.applyConnectionFailure("Pairing rejected: \(reason)", transport: .none)
 
             case .error(let msg):
                 self.log("PairingService result: error (\(msg))")
-                self.status = "Pairing error: \(msg)"
                 self.pairingService = nil
-                self.isConnecting = false
+                self.applyConnectionFailure("Pairing error: \(msg)", transport: .none)
             }
         }
 
@@ -659,7 +805,7 @@ final class StreamViewModel: ObservableObject {
         }
         log("submitPin()")
         showPinEntry = false
-        status = "Verifying PIN..."
+        applyConnectionHealth(.pairing, detail: "Verifying the pairing PIN.", transport: .network)
         completion(pin)
         pendingPinCompletion = nil
     }
@@ -670,13 +816,13 @@ final class StreamViewModel: ObservableObject {
         pendingPinCompletion = nil
         pairingService?.cancel()
         pairingService = nil
-        status = "Pairing cancelled"
+        applyConnectionHealth(.idle, detail: "Pairing cancelled. \(disconnectedPrompt())", transport: .none)
     }
 
     private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey, controlClient: NetworkControlClient) {
         log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
         if !usbConnected {
-            status = "Connecting to \(name)..."
+            applyConnectionHealth(.waitingForVideo, detail: "Waiting for video from \(name).", transport: .network)
         }
 
         decoder.hasReportedFirstFrame = false
@@ -688,19 +834,31 @@ final class StreamViewModel: ObservableObject {
         }
         self.stream = client
 
-        client.onStatus = { [weak self, weak client] msg in
+        client.onEvent = { [weak self, weak client] event in
             Task { @MainActor in
                 guard let self, let client else { return }
                 guard self.stream === client else { return }
-                self.log("StreamClient status: \(msg)")
+                self.log("StreamClient event: \(String(describing: event))")
                 if !self.usbConnected {
-                    self.status = msg
-                    let nowConnected = msg.contains("Streaming")
-                    if nowConnected && !self.isConnected {
+                    switch event {
+                    case .readyToRegister:
+                        self.applyConnectionHealth(.waitingForVideo, detail: "Connected. Registering for network video.", transport: .network)
+                    case .waiting(let message):
+                        let normalized = message.lowercased()
+                        if normalized.contains("refused") || normalized.contains("timed out") || normalized.contains("timeout") {
+                            self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
+                        } else {
+                            self.applyConnectionHealth(.waitingForVideo, detail: "Waiting for video. \(message)", transport: .network)
+                        }
+                    case .connectionFailed(let message):
+                        self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
+                    case .receiveError(let message):
+                        self.applyConnectionFailure("Receive error: \(message)", transport: .none)
+                    case .timedOut:
+                        self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
+                    case .firstFrame:
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
-                        self.isConnected = true
-                        self.isConnecting = false
-                        self.transport = "Network"
+                        self.applyConnectionHealth(.streaming, detail: "Video and audio are streaming.", transport: .network)
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
                         self.rememberRecentConnection(name: name, host: target.host, port: target.port)
                         self.audioPlayer.start()
@@ -726,22 +884,26 @@ final class StreamViewModel: ObservableObject {
     /// Called when we've lost all streams and should return to idle state.
     private func handleStreamLost() {
         log("handleStreamLost() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
-        stream?.onStatus = nil
+        let preservedHealth = connectionHealth
+        let preservedStatus = status
+        stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
         closeNetworkControl(gracefully: true)
-        isConnected = false
-        isConnecting = false
-        transport = ""
+        decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
         stopPeripheralMonitoring()
-        status = "Daemon disconnected. \(disconnectedPrompt())"
+        if preservedHealth.isTerminalFailure {
+            applyConnectionHealth(preservedHealth, detail: preservedStatus, transport: .none)
+        } else {
+            applyConnectionHealth(.timedOut, detail: "The session ended. \(disconnectedPrompt())", transport: .none)
+        }
     }
 
     func disconnect() {
-        stream?.onStatus = nil
+        stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
@@ -752,15 +914,13 @@ final class StreamViewModel: ObservableObject {
         usbListener = nil
         usbConnected = false
         isUSBListening = false
-        isConnected = false
-        isConnecting = false
-        transport = ""
-        status = "Disconnected. \(disconnectedPrompt())"
+        decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
         stopPeripheralMonitoring()
         lastNetEndpoint = nil
         lastNetName = nil
+        applyConnectionHealth(.idle, detail: disconnectedPrompt(), transport: .none)
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
@@ -1276,6 +1436,7 @@ enum ToolbarOrientation: String {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
 
@@ -1325,6 +1486,8 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Screx")
                                 .font(.title2.weight(.bold))
+                            Text(model.connectionHealthTitle)
+                                .font(.headline)
                             Text(model.status)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
@@ -1338,7 +1501,15 @@ struct ContentView: View {
                                 .keyboardType(.URL)
                                 .disabled(model.isConnecting)
 
-                            Button(model.isConnecting && !model.isUSBListening ? "Connecting…" : "Connect") { model.connectManual() }
+                            Button(
+                                model.connectionHealth == .pairing
+                                    ? "Pairing…"
+                                    : model.connectionHealth == .waitingForVideo && model.transport == ConnectionTransport.network.rawValue
+                                        ? "Waiting…"
+                                        : model.isConnecting && !model.isUSBListening
+                                            ? "Connecting…"
+                                            : "Connect"
+                            ) { model.connectManual() }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
@@ -1361,7 +1532,13 @@ struct ContentView: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: "cable.connector")
-                                Text(model.isUSBListening ? "Cancel USB" : "Connect via USB")
+                                Text(
+                                    model.isUSBListening
+                                        ? "Cancel USB"
+                                        : model.connectionHealth == .waitingForVideo && model.transport == ConnectionTransport.usb.rawValue
+                                            ? "Waiting for Video…"
+                                            : "Connect via USB"
+                                )
                             }
                             .frame(maxWidth: .infinity)
                         }
@@ -1446,6 +1623,8 @@ struct ContentView: View {
                                     .foregroundStyle(.white)
                             }
                         }
+                        Text(model.connectionHealthTitle)
+                            .font(.caption.weight(.semibold))
                         Text(model.status).font(.caption).foregroundStyle(.secondary)
 
                         Button("Disconnect") { model.disconnect() }
@@ -1498,6 +1677,9 @@ struct ContentView: View {
             }
             .onChange(of: pillSize) { _ in
                 clampBarPosition(in: geo.size)
+            }
+            .onChange(of: scenePhase) { newPhase in
+                model.handleScenePhase(newPhase)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in

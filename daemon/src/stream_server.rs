@@ -25,6 +25,8 @@ const MOUSE_MAGIC: &[u8] = b"MOUSE";
 const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
 const PERIPH_MAGIC: &[u8] = b"PERIPH";
 const GPAD_MAGIC: &[u8] = b"GPAD";
+const APPBG_MAGIC: &[u8] = b"APPBG";
+const APPFG_MAGIC: &[u8] = b"APPFG";
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -62,6 +64,7 @@ pub struct SharedState {
     pub on_client_connected: Mutex<Option<LifecycleCallback>>,
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
+    pub client_backgrounded: AtomicBool,
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
     pub network_session_id: AtomicU64,
@@ -89,6 +92,7 @@ impl SharedState {
             on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
+            client_backgrounded: AtomicBool::new(false),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
@@ -194,6 +198,25 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     if ctrl.starts_with(PLI_MAGIC) {
         shared.force_idr.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    if ctrl == APPBG_MAGIC {
+        if !shared.client_backgrounded.swap(true, Ordering::SeqCst) {
+            println!("[client] app entered background mode");
+        }
+        return;
+    }
+
+    if ctrl == APPFG_MAGIC {
+        let was_backgrounded = shared.client_backgrounded.swap(false, Ordering::SeqCst);
+        shared.force_idr.store(true, Ordering::Relaxed);
+        if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
+            fr.store(true, Ordering::Relaxed);
+        }
+        if was_backgrounded {
+            println!("[client] app returned to foreground mode");
+        }
         return;
     }
 
@@ -322,6 +345,7 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
     *shared.expected_client_ip.lock().unwrap() = None;
     shared.network_session_pending.store(false, Ordering::SeqCst);
     shared.network_session_busy.store(false, Ordering::SeqCst);
+    shared.client_backgrounded.store(false, Ordering::SeqCst);
 
     if !shared.usb_active.load(Ordering::Relaxed)
         && shared.has_active_client.swap(false, Ordering::SeqCst)
@@ -527,6 +551,7 @@ pub fn run_client_manager(
                         *shared.expected_client_ip.lock().unwrap() = None;
                         shared.mark_network_session_active(current_session_id);
                         pending_started_at = None;
+                        shared.client_backgrounded.store(false, Ordering::SeqCst);
                         shared.force_idr.store(true, Ordering::Relaxed);
                         shared.capture_start.store(true, Ordering::Release);
                         if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {

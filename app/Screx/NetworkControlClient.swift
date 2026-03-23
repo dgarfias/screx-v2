@@ -8,6 +8,8 @@ final class NetworkControlClient {
     private let queue = DispatchQueue(label: "screx.netcontrol", qos: .userInteractive)
     private let debugId = String(UUID().uuidString.prefix(6))
     private static let disconnectMagic = Data("DISCONNECT".utf8)
+    private static let appBackgroundMagic = Data("APPBG".utf8)
+    private static let appForegroundMagic = Data("APPFG".utf8)
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
@@ -151,6 +153,13 @@ final class NetworkControlClient {
 
     func sendPli() {
         sendFrame(Data("PLI".utf8), label: "PLI")
+    }
+
+    func sendAppBackgroundState(isBackgrounded: Bool) {
+        sendFrame(
+            isBackgrounded ? Self.appBackgroundMagic : Self.appForegroundMagic,
+            label: isBackgrounded ? "app-bg" : "app-fg"
+        )
     }
 
     func sendTouch(_ contactData: Data) {
