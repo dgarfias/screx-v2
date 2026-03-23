@@ -213,7 +213,7 @@ final class StreamViewModel: ObservableObject {
     @Published var showPinEntry = false
     @Published var pinInput: String = ""
     @Published var pairingStatus: String = ""
-    @Published var recentConnections: [RecentConnection] = Self.loadRecentConnections()
+    @Published var recentConnections: [RecentConnection] = StreamViewModel.loadRecentConnections()
 
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
