@@ -19,6 +19,7 @@ const MSG_VIDEO: u8 = 0x01;
 const MSG_AUDIO: u8 = 0x02;
 const MSG_CONTROL: u8 = 0x03;
 const READY_MAGIC: &[u8] = b"READY";
+const HOSTNAME_MAGIC: &[u8] = b"HOST";
 
 fn detect_device() -> bool {
     Command::new("idevice_id")
@@ -103,6 +104,18 @@ impl TcpFramedSender {
         self.stream
             .write_all(&self.write_buf)
             .context("USB TCP write (audio)")
+    }
+
+    pub fn send_control(&mut self, payload: &[u8]) -> Result<()> {
+        let payload_len = 1 + payload.len();
+        self.write_buf.clear();
+        self.write_buf
+            .extend_from_slice(&(payload_len as u32).to_be_bytes());
+        self.write_buf.push(MSG_CONTROL);
+        self.write_buf.extend_from_slice(payload);
+        self.stream
+            .write_all(&self.write_buf)
+            .context("USB TCP write (control)")
     }
 }
 
@@ -258,7 +271,16 @@ fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
     false
 }
 
-fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
+fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender) {
+    if let Some(hostname) = local_hostname() {
+        let mut payload = Vec::with_capacity(HOSTNAME_MAGIC.len() + hostname.len());
+        payload.extend_from_slice(HOSTNAME_MAGIC);
+        payload.extend_from_slice(hostname.as_bytes());
+        if let Err(e) = sender.send_control(&payload) {
+            eprintln!("[usb] failed to send hostname: {e:#}");
+        }
+    }
+
     {
         let mut usb = shared.usb_sender.lock().unwrap();
         *usb = Some(sender);
@@ -274,6 +296,22 @@ fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
         if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
             cb();
         }
+    }
+}
+
+fn local_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let hostname = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname)
     }
 }
 

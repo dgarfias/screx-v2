@@ -23,6 +23,7 @@ final class StreamClient {
 
     var onEvent: ((StreamClientEvent) -> Void)?
     var onDisconnect: (() -> Void)?
+    var onTraffic: ((Int, Int) -> Void)?
     var sessionKey: SymmetricKey?
     var sendPliRequest: (() -> Void)?
 
@@ -149,6 +150,7 @@ final class StreamClient {
             if let error {
                 print("[stream] \(label) send error: \(error)")
             } else {
+                self.onTraffic?(0, packet.count)
                 self.log("\(label) send completed")
             }
         })
@@ -214,6 +216,7 @@ final class StreamClient {
             }
 
             if let data, !data.isEmpty {
+                self.onTraffic?(data.count, 0)
                 self.receiveCount += 1
                 if self.shouldLogDebug(self.receiveCount) {
                     self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")

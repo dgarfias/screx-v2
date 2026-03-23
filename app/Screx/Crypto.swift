@@ -120,4 +120,15 @@ struct ScrexCrypto {
         n[4] = UInt8(truncatingIfNeeded: seqNum)
         return n
     }
+
+    /// Server→client TCP control nonce from sequence number.
+    static func nonceControlServer(seqNum: UInt32) -> Data {
+        var n = Data(count: 12)
+        n[0] = 0x80
+        n[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
+        n[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
+        n[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
+        n[4] = UInt8(truncatingIfNeeded: seqNum)
+        return n
+    }
 }

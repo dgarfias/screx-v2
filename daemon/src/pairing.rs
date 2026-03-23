@@ -161,6 +161,7 @@ const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
 const CONTROL_MAX_FRAME: usize = 65536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
 const CONTROL_DISCONNECT_MAGIC: &[u8] = b"DISCONNECT";
+const CONTROL_HOSTNAME_MAGIC: &[u8] = b"HOST";
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.
@@ -556,8 +557,18 @@ fn run_control_loop(
     let mut msg_buf = vec![0u8; 256];
     let mut seq_expected = 0u32;
     let mut seq_initialized = false;
+    let mut send_seq = 0u32;
 
     println!("[control] network control channel active");
+
+    if let Some(hostname) = local_hostname() {
+        let mut payload = Vec::with_capacity(CONTROL_HOSTNAME_MAGIC.len() + hostname.len());
+        payload.extend_from_slice(CONTROL_HOSTNAME_MAGIC);
+        payload.extend_from_slice(hostname.as_bytes());
+        if let Err(e) = send_control_frame(&mut stream, &cipher, &mut send_seq, &payload) {
+            eprintln!("[control] failed to send hostname: {e:#}");
+        }
+    }
 
     while !stop.load(Ordering::Relaxed) {
         if !shared.is_current_network_session(session_id) {
@@ -625,6 +636,45 @@ fn run_control_loop(
     crate::stream_server::drop_network_client(shared, session_id);
 
     Ok(())
+}
+
+fn send_control_frame(
+    stream: &mut TcpStream,
+    cipher: &crypto::SessionCipher,
+    send_seq: &mut u32,
+    payload: &[u8],
+) -> Result<()> {
+    let seq = *send_seq;
+    *send_seq = send_seq.wrapping_add(1);
+
+    let aad = seq.to_be_bytes();
+    let nonce = crypto::nonce_control_server(seq);
+    let mut encrypted = vec![0u8; payload.len() + crypto::TAG_LEN];
+    encrypted[..payload.len()].copy_from_slice(payload);
+    let encrypted_len = cipher.encrypt_slice(&nonce, &aad, &mut encrypted, payload.len());
+
+    let body_len = (aad.len() + encrypted_len) as u32;
+    stream.write_all(&body_len.to_be_bytes())?;
+    stream.write_all(&aad)?;
+    stream.write_all(&encrypted[..encrypted_len])?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn local_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let hostname = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname)
+    }
 }
 
 fn generate_pin(rng: &SystemRandom) -> String {

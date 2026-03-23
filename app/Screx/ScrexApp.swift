@@ -94,6 +94,15 @@ private func formatEndpointInput(host: String, port: UInt16) -> String {
     return port == defaultDaemonPort ? formattedHost : "\(formattedHost):\(port)"
 }
 
+private func formatByteRate(_ bytesPerSecond: Double) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useBytes, .useKB, .useMB]
+    formatter.countStyle = .file
+    formatter.includesUnit = true
+    formatter.isAdaptive = true
+    return "\(formatter.string(fromByteCount: Int64(bytesPerSecond.rounded())))/s"
+}
+
 struct RecentConnection: Codable, Identifiable, Equatable {
     let host: String
     let port: UInt16
@@ -289,6 +298,9 @@ final class StreamViewModel: ObservableObject {
     @Published var pinInput: String = ""
     @Published var pairingStatus: String = ""
     @Published var recentConnections: [RecentConnection] = StreamViewModel.loadRecentConnections()
+    @Published private(set) var sessionDisplayName: String = ""
+    @Published private(set) var receiveRateText: String = "0 B/s"
+    @Published private(set) var sendRateText: String = "0 B/s"
 
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
@@ -318,6 +330,11 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
     private var appIsBackgrounded = false
+    private var trafficTimer: DispatchSourceTimer?
+    private var totalRxBytes: UInt64 = 0
+    private var totalTxBytes: UInt64 = 0
+    private var previousRxBytes: UInt64 = 0
+    private var previousTxBytes: UInt64 = 0
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -471,6 +488,27 @@ final class StreamViewModel: ObservableObject {
         connectionHealth.rawValue
     }
 
+    var sessionTransportTitle: String {
+        let transportLabel = transport.isEmpty ? "connection" : transport.lowercased()
+        switch connectionHealth {
+        case .backgroundAudioMode:
+            return "Background audio via \(transportLabel)"
+        case .streaming:
+            return "Streaming via \(transportLabel)"
+        default:
+            return "\(connectionHealthTitle) via \(transportLabel)"
+        }
+    }
+
+    var codecLabel: String {
+        switch decoder.codec {
+        case .h264:
+            return "H264"
+        case .h265:
+            return "H265"
+        }
+    }
+
     private func applyConnectionHealth(
         _ state: ConnectionHealthState,
         detail: String? = nil,
@@ -482,6 +520,10 @@ final class StreamViewModel: ObservableObject {
         status = detail ?? defaultDetail(for: state)
         isConnected = state.isConnected
         isConnecting = state.isConnecting
+        if transport == .none && !state.isConnected {
+            receiveRateText = "0 B/s"
+            sendRateText = "0 B/s"
+        }
     }
 
     private func defaultDetail(for state: ConnectionHealthState) -> String {
@@ -606,9 +648,41 @@ final class StreamViewModel: ObservableObject {
         servicesStarted = true
         log("startServices()")
         startBatteryMonitoring()
+        startTrafficMonitoring()
         if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
+    }
+
+    private func startTrafficMonitoring() {
+        trafficTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let rxDelta = self.totalRxBytes &- self.previousRxBytes
+            let txDelta = self.totalTxBytes &- self.previousTxBytes
+            self.previousRxBytes = self.totalRxBytes
+            self.previousTxBytes = self.totalTxBytes
+            self.receiveRateText = formatByteRate(Double(rxDelta))
+            self.sendRateText = formatByteRate(Double(txDelta))
+        }
+        timer.resume()
+        trafficTimer = timer
+    }
+
+    private func recordTraffic(rxBytes: Int = 0, txBytes: Int = 0) {
+        if rxBytes > 0 {
+            totalRxBytes = totalRxBytes &+ UInt64(rxBytes)
+        }
+        if txBytes > 0 {
+            totalTxBytes = totalTxBytes &+ UInt64(txBytes)
+        }
+    }
+
+    private func updateSessionHostname(_ hostname: String) {
+        guard !hostname.isEmpty else { return }
+        sessionDisplayName = hostname
     }
 
     private func startBatteryMonitoring() {
@@ -640,6 +714,11 @@ final class StreamViewModel: ObservableObject {
 
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.usbListener = usb
+        self.sessionDisplayName = "USB device"
+        self.totalRxBytes = 0
+        self.totalTxBytes = 0
+        self.previousRxBytes = 0
+        self.previousTxBytes = 0
 
         usb.onEvent = { [weak self] event in
             Task { @MainActor in
@@ -662,6 +741,16 @@ final class StreamViewModel: ObservableObject {
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
                     }
                 }
+            }
+        }
+        usb.onTraffic = { [weak self] rxBytes, txBytes in
+            Task { @MainActor in
+                self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
+            }
+        }
+        usb.onHostname = { [weak self] hostname in
+            Task { @MainActor in
+                self?.updateSessionHostname(hostname)
             }
         }
         usb.onConnected = { [weak self] in
@@ -788,6 +877,11 @@ final class StreamViewModel: ObservableObject {
         pairingService?.cancel()
 
         applyConnectionHealth(.connecting, detail: "Connecting to \(name).", transport: .network)
+        sessionDisplayName = name
+        totalRxBytes = 0
+        totalTxBytes = 0
+        previousRxBytes = 0
+        previousTxBytes = 0
 
         // Extract host string from endpoint
         let host: String
@@ -832,6 +926,20 @@ final class StreamViewModel: ObservableObject {
                     }
                 }
                 self.networkControl = control
+                control.onTraffic = { [weak self, weak control] rxBytes, txBytes in
+                    Task { @MainActor in
+                        guard let self, let control else { return }
+                        guard self.networkControl === control else { return }
+                        self.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
+                    }
+                }
+                control.onHostname = { [weak self, weak control] hostname in
+                    Task { @MainActor in
+                        guard let self, let control else { return }
+                        guard self.networkControl === control else { return }
+                        self.updateSessionHostname(hostname)
+                    }
+                }
                 control.start()
                 self.assertForegroundTransportState()
                 self.syncSpeakerPassthroughState()
@@ -898,6 +1006,13 @@ final class StreamViewModel: ObservableObject {
             controlClient?.sendPli()
         }
         self.stream = client
+        client.onTraffic = { [weak self, weak client] rxBytes, txBytes in
+            Task { @MainActor in
+                guard let self, let client else { return }
+                guard self.stream === client else { return }
+                self.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
+            }
+        }
 
         client.onEvent = { [weak self, weak client] event in
             Task { @MainActor in
@@ -925,7 +1040,8 @@ final class StreamViewModel: ObservableObject {
                         let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
                         self.applyConnectionHealth(.streaming, detail: "Video and audio are streaming.", transport: .network)
                         self.manualHost = formatEndpointInput(host: target.host, port: target.port)
-                        self.rememberRecentConnection(name: name, host: target.host, port: target.port)
+                        let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
+                        self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)
                         self.audioPlayer.start()
                         self.startPeripheralMonitoring()
                     }
@@ -985,6 +1101,7 @@ final class StreamViewModel: ObservableObject {
         stopPeripheralMonitoring()
         lastNetEndpoint = nil
         lastNetName = nil
+        sessionDisplayName = ""
         applyConnectionHealth(.idle, detail: disconnectedPrompt(), transport: .none)
     }
 
@@ -1704,21 +1821,20 @@ struct ContentView: View {
 
                 // MARK: Info overlay (toggleable when connected)
                 if model.isConnected && showOverlay {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Screx").font(.headline)
-                            if !model.transport.isEmpty {
-                                Text(model.transport)
-                                    .font(.caption2)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(model.transport == "USB" ? Color.green : Color.blue, in: Capsule())
-                                    .foregroundStyle(.white)
-                            }
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(model.sessionTransportTitle)
+                            .font(.title3.weight(.bold))
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            infoRow(label: "Hostname", value: model.sessionDisplayName.isEmpty ? "Unknown" : model.sessionDisplayName)
+                            infoRow(label: "Receiving", value: model.receiveRateText)
+                            infoRow(label: "Sending", value: model.sendRateText)
+                            infoRow(label: "Codec", value: model.codecLabel)
                         }
-                        Text(model.connectionHealthTitle)
-                            .font(.caption.weight(.semibold))
-                        Text(model.status).font(.caption).foregroundStyle(.secondary)
+
+                        Text(model.status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
 
                         Button("Disconnect") { model.disconnect() }
                             .buttonStyle(.bordered)
@@ -1852,18 +1968,28 @@ struct ContentView: View {
 
         layout {
             if model.isConnected {
+                toolbarButton(
+                    icon: barOrientation == .vertical
+                        ? (isToolbarExpanded ? "chevron.down" : "chevron.up")
+                        : (isToolbarExpanded ? "chevron.right" : "chevron.left"),
+                    color: .white
+                ) {
+                    let nextExpanded = !isToolbarExpanded
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isToolbarExpanded = nextExpanded
+                    }
+                    Self.saveToolbarExpanded(nextExpanded)
+                    DispatchQueue.main.async {
+                        clampBarPosition(in: geo.size)
+                    }
+                }
+
                 if isToolbarExpanded {
                     toolbarButton(
-                        icon: model.isMicActive ? "mic.fill" : "mic",
-                        active: model.isMicActive,
-                        color: model.isMicActive ? .green : .white
-                    ) { model.toggleMic() }
-
-                    toolbarButton(
-                        icon: model.isSpeakerActive ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                        active: model.isSpeakerActive,
-                        color: model.isSpeakerActive ? .green : .white
-                    ) { model.toggleSpeaker() }
+                        icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
+                        active: model.isControllerPassthroughEnabled,
+                        color: model.isControllerPassthroughEnabled ? .green : .white
+                    ) { model.toggleControllerPassthrough() }
 
                     toolbarButton(
                         icon: model.isCameraActive
@@ -1875,10 +2001,16 @@ struct ContentView: View {
                         .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
 
                     toolbarButton(
-                        icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
-                        active: model.isControllerPassthroughEnabled,
-                        color: model.isControllerPassthroughEnabled ? .green : .white
-                    ) { model.toggleControllerPassthrough() }
+                        icon: model.isMicActive ? "mic.fill" : "mic",
+                        active: model.isMicActive,
+                        color: model.isMicActive ? .green : .white
+                    ) { model.toggleMic() }
+
+                    toolbarButton(
+                        icon: model.isSpeakerActive ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                        active: model.isSpeakerActive,
+                        color: model.isSpeakerActive ? .green : .white
+                    ) { model.toggleSpeaker() }
                 }
 
                 toolbarButton(
@@ -1892,30 +2024,13 @@ struct ContentView: View {
                         isKeyboardActive.toggle()
                     }
                 }
-            }
 
-            toolbarButton(
-                icon: showOverlay ? "info.circle.fill" : "info.circle",
-                color: .white
-            ) {
-                withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
-            }
-
-            if model.isConnected {
                 toolbarButton(
-                    icon: isToolbarExpanded
-                        ? "arrow.down.right.and.arrow.up.left"
-                        : "arrow.up.left.and.arrow.down.right",
-                    color: .white
+                    icon: showOverlay ? "info.circle.fill" : "info.circle",
+                    active: showOverlay,
+                    color: showOverlay ? .green : .white
                 ) {
-                    let nextExpanded = !isToolbarExpanded
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isToolbarExpanded = nextExpanded
-                    }
-                    Self.saveToolbarExpanded(nextExpanded)
-                    DispatchQueue.main.async {
-                        clampBarPosition(in: geo.size)
-                    }
+                    withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
                 }
             }
         }
@@ -1997,6 +2112,19 @@ struct ContentView: View {
             .frame(width: Self.btnSize, height: Self.btnSize)
             .contentShape(Circle())
             .onTapGesture(perform: action)
+    }
+
+    @ViewBuilder
+    private func infoRow(label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Text("\(label):")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 0)
+        }
     }
 
     private func showToolbarMessage(_ message: String) {

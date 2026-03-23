@@ -11,11 +11,15 @@ final class NetworkControlClient {
     private static let appBackgroundMagic = Data("APPBG".utf8)
     private static let appForegroundMagic = Data("APPFG".utf8)
     private static let speakerMagic = Data("SPKR".utf8)
+    private static let hostnameMagic = Data("HOST".utf8)
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
+    private var recvBuffer = Data()
 
     var onDisconnect: (() -> Void)?
+    var onTraffic: ((Int, Int) -> Void)?
+    var onHostname: ((String) -> Void)?
 
     init(connection: NWConnection, sessionKey: SymmetricKey) {
         self.connection = connection
@@ -103,10 +107,69 @@ final class NetworkControlClient {
             }
 
             if let data, !data.isEmpty {
-                self.log("unexpected inbound tcp control payload: \(data.count) bytes")
+                self.onTraffic?(data.count, 0)
+                self.recvBuffer.append(data)
+                self.processReceiveBuffer()
             }
 
             self.receiveLoop()
+        }
+    }
+
+    private func processReceiveBuffer() {
+        while recvBuffer.count >= 4 {
+            let bodyLen = recvBuffer.prefix(4).withUnsafeBytes { raw -> Int in
+                let bytes = raw.bindMemory(to: UInt8.self)
+                return Int(bytes[0]) << 24
+                    | Int(bytes[1]) << 16
+                    | Int(bytes[2]) << 8
+                    | Int(bytes[3])
+            }
+
+            guard bodyLen >= 4 + ScrexCrypto.tagLen else {
+                recvBuffer.removeAll()
+                return
+            }
+
+            let totalLen = 4 + bodyLen
+            guard recvBuffer.count >= totalLen else { return }
+
+            let frame = Data(recvBuffer.prefix(totalLen))
+            recvBuffer.removeFirst(totalLen)
+
+            let body = frame.dropFirst(4)
+            let seqNum = body.prefix(4).withUnsafeBytes { raw -> UInt32 in
+                let bytes = raw.bindMemory(to: UInt8.self)
+                return UInt32(bytes[0]) << 24
+                    | UInt32(bytes[1]) << 16
+                    | UInt32(bytes[2]) << 8
+                    | UInt32(bytes[3])
+            }
+
+            let aad = Data(body.prefix(4))
+            let ciphertext = Data(body.dropFirst(4))
+            guard let plaintext = ScrexCrypto.decrypt(
+                key: sessionKey,
+                nonce: ScrexCrypto.nonceControlServer(seqNum: seqNum),
+                ciphertextAndTag: ciphertext,
+                aad: aad
+            ) else {
+                log("failed to decrypt inbound tcp control frame")
+                continue
+            }
+
+            handleInboundPayload(plaintext)
+        }
+    }
+
+    private func handleInboundPayload(_ payload: Data) {
+        if payload.starts(with: Self.hostnameMagic) {
+            let hostData = payload.dropFirst(Self.hostnameMagic.count)
+            let hostname = String(decoding: hostData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !hostname.isEmpty else { return }
+            onHostname?(hostname)
+        } else {
+            log("unexpected inbound tcp control payload: \(payload.count) bytes")
         }
     }
 
@@ -147,6 +210,8 @@ final class NetworkControlClient {
                 if let error {
                     self.log("\(label) send error: \(error.localizedDescription)")
                     self.handleDisconnect()
+                } else {
+                    self.onTraffic?(0, frame.count)
                 }
             })
         }

@@ -21,6 +21,8 @@ final class USBListener {
     var onEvent: ((USBListenerEvent) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
+    var onTraffic: ((Int, Int) -> Void)?
+    var onHostname: ((String) -> Void)?
 
     private static let msgVideo: UInt8 = 0x01
     private static let msgAudio: UInt8 = 0x02
@@ -29,6 +31,7 @@ final class USBListener {
     private static let appBackgroundMagic = Data("APPBG".utf8)
     private static let appForegroundMagic = Data("APPFG".utf8)
     private static let speakerMagic = Data("SPKR".utf8)
+    private static let hostnameMagic = Data("HOST".utf8)
 
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
@@ -194,6 +197,7 @@ final class USBListener {
             // Copy out the message bytes into a fresh contiguous Data
             let msgData = Data(recvBuffer.prefix(totalNeeded).dropFirst(4))
             recvBuffer = Data(recvBuffer.dropFirst(totalNeeded))
+            onTraffic?(totalNeeded, 0)
 
             guard msgData.count >= 1 else { continue }
 
@@ -231,6 +235,15 @@ final class USBListener {
                 audioPlayer.enqueueAudio(pcm, timestampMs: tsMs)
 
             case Self.msgControl:
+                if msgData.dropFirst().starts(with: Self.hostnameMagic) {
+                    let hostname = String(
+                        decoding: msgData.dropFirst(1 + Self.hostnameMagic.count),
+                        as: UTF8.self
+                    ).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !hostname.isEmpty {
+                        onHostname?(hostname)
+                    }
+                }
                 break
 
             default:
@@ -256,6 +269,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] PLI send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -273,6 +288,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] app state send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -291,6 +308,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] speaker state send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -310,6 +329,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] touch send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -329,6 +350,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] cam send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -348,6 +371,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] key send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -366,6 +391,8 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] mic send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
             }
         })
     }
@@ -379,7 +406,11 @@ final class USBListener {
         frame.append(Self.msgControl)
         frame.append(payload)
         conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { print("[usb] mouse send error: \(error)") }
+            if let error {
+                print("[usb] mouse send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
         })
     }
 
@@ -392,7 +423,11 @@ final class USBListener {
         frame.append(Self.msgControl)
         frame.append(payload)
         conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { print("[usb] rawkey send error: \(error)") }
+            if let error {
+                print("[usb] rawkey send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
         })
     }
 
@@ -405,7 +440,11 @@ final class USBListener {
         frame.append(Self.msgControl)
         frame.append(payload)
         conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { print("[usb] periph send error: \(error)") }
+            if let error {
+                print("[usb] periph send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
         })
     }
 
@@ -418,7 +457,11 @@ final class USBListener {
         frame.append(Self.msgControl)
         frame.append(payload)
         conn.send(content: frame, completion: .contentProcessed { error in
-            if let error { print("[usb] gpad send error: \(error)") }
+            if let error {
+                print("[usb] gpad send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
         })
     }
 
