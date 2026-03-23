@@ -67,6 +67,45 @@ final class MouseCaptureRootView: UIView {
     }
 }
 
+struct RecentConnection: Codable, Identifiable, Equatable {
+    let host: String
+    let port: UInt16
+    let name: String
+    let lastConnectedAt: Date
+    let isPinned: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case host
+        case port
+        case name
+        case lastConnectedAt
+        case isPinned
+    }
+
+    init(host: String, port: UInt16, name: String, lastConnectedAt: Date, isPinned: Bool = false) {
+        self.host = host
+        self.port = port
+        self.name = name
+        self.lastConnectedAt = lastConnectedAt
+        self.isPinned = isPinned
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        host = try container.decode(String.self, forKey: .host)
+        port = try container.decode(UInt16.self, forKey: .port)
+        name = try container.decode(String.self, forKey: .name)
+        lastConnectedAt = try container.decode(Date.self, forKey: .lastConnectedAt)
+        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+    }
+
+    var id: String { "\(host):\(port)" }
+    var displayName: String { name.isEmpty ? host : name }
+    var endpointLabel: String {
+        port == 9000 ? host : "\(host):\(port)"
+    }
+}
+
 final class ScrexRootViewController: GCEventViewController {
     private let model: StreamViewModel
     private let hostingController: UIHostingController<AnyView>
@@ -79,7 +118,7 @@ final class ScrexRootViewController: GCEventViewController {
             rootView: AnyView(
                 ContentView()
                     .environmentObject(model)
-                    .onAppear { model.startDiscovery() }
+                    .onAppear { model.startServices() }
             )
         )
         super.init(nibName: nil, bundle: nil)
@@ -167,13 +206,14 @@ final class ScrexRootViewController: GCEventViewController {
 
 @MainActor
 final class StreamViewModel: ObservableObject {
-    @Published var status: String = "Looking for daemon..."
+    @Published var status: String = "Enter a daemon host or IP to connect."
     @Published var isConnected = false
-    @Published var manualIP: String = ""
+    @Published var manualHost: String = ""
     @Published var transport: String = ""
     @Published var showPinEntry = false
     @Published var pinInput: String = ""
     @Published var pairingStatus: String = ""
+    @Published var recentConnections: [RecentConnection] = Self.loadRecentConnections()
 
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
@@ -181,7 +221,6 @@ final class StreamViewModel: ObservableObject {
     let cameraCapture = CameraCapture()
     let micCapture = MicCapture()
 
-    private let discovery = DiscoveryService()
     private var stream: StreamClient?
     private var networkControl: NetworkControlClient?
     private var usbListener: USBListener?
@@ -192,7 +231,7 @@ final class StreamViewModel: ObservableObject {
     nonisolated init() {
         self.audioPlayer = AudioPlayer(avSync: avSync)
     }
-    private var discoveryStarted = false
+    private var servicesStarted = false
     private var usbConnected = false
     private var camFrameId: UInt32 = 0
 
@@ -211,14 +250,100 @@ final class StreamViewModel: ObservableObject {
     private var physicalMouseButtonMask: UInt8 = 0
     private var physicalMouseScrollAccumulator: Float = 0
 
+    private static let recentConnectionsKey = "screx_recent_connections"
+    private static let maxRecentConnections = 5
+    private static let maxPinnedConnections = 10
+
     private func log(_ message: String) {
         print("[app] \(message)")
     }
 
-    func startDiscovery() {
-        guard !discoveryStarted else { return }
-        discoveryStarted = true
-        log("startDiscovery()")
+    var pinnedConnections: [RecentConnection] {
+        recentConnections.filter(\.isPinned)
+    }
+
+    var unpinnedRecentConnections: [RecentConnection] {
+        recentConnections.filter { !$0.isPinned }
+    }
+
+    private static func normalizeConnections(_ connections: [RecentConnection]) -> [RecentConnection] {
+        let pinned = connections
+            .filter(\.isPinned)
+            .sorted { $0.lastConnectedAt > $1.lastConnectedAt }
+        let recents = connections
+            .filter { !$0.isPinned }
+            .sorted { $0.lastConnectedAt > $1.lastConnectedAt }
+
+        return Array(pinned.prefix(Self.maxPinnedConnections))
+            + Array(recents.prefix(Self.maxRecentConnections))
+    }
+
+    private static func loadRecentConnections() -> [RecentConnection] {
+        guard let data = UserDefaults.standard.data(forKey: recentConnectionsKey) else {
+            return []
+        }
+        do {
+            let decoded = try JSONDecoder().decode([RecentConnection].self, from: data)
+            return normalizeConnections(decoded)
+        } catch {
+            print("[app] failed to load recent connections: \(error)")
+            return []
+        }
+    }
+
+    private func persistRecentConnections() {
+        do {
+            let data = try JSONEncoder().encode(recentConnections)
+            UserDefaults.standard.set(data, forKey: Self.recentConnectionsKey)
+        } catch {
+            log("failed to persist recent connections: \(error)")
+        }
+    }
+
+    private func rememberRecentConnection(name: String, host: String, port: UInt16) {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? host : name
+        let existing = recentConnections.first { $0.host == host && $0.port == port }
+        var updated = recentConnections.filter { $0.host != host || $0.port != port }
+        updated.insert(
+            RecentConnection(
+                host: host,
+                port: port,
+                name: displayName,
+                lastConnectedAt: Date(),
+                isPinned: existing?.isPinned ?? false
+            ),
+            at: 0
+        )
+        recentConnections = Self.normalizeConnections(updated)
+        persistRecentConnections()
+    }
+
+    private func makeEndpoint(host: String, port: UInt16) -> NWEndpoint {
+        NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(integerLiteral: port)
+        )
+    }
+
+    private func endpointHostAndPort(_ endpoint: NWEndpoint, fallbackHost: String) -> (host: String, port: UInt16) {
+        switch endpoint {
+        case .hostPort(let host, let port):
+            return ("\(host)", port.rawValue)
+        default:
+            return (fallbackHost, 9000)
+        }
+    }
+
+    private func disconnectedPrompt() -> String {
+        recentConnections.isEmpty
+            ? "Enter a daemon host or IP to connect."
+            : "Choose a pinned or recent daemon, or enter a host or IP to connect."
+    }
+
+    func startServices() {
+        guard !servicesStarted else { return }
+        servicesStarted = true
+        log("startServices()")
 
         // Start USB listener
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
@@ -228,7 +353,9 @@ final class StreamViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.log("usb status: \(msg)")
-                if self.usbConnected || !self.isConnected {
+                if self.usbConnected {
+                    self.status = msg
+                } else if msg.localizedCaseInsensitiveContains("failed") || msg.localizedCaseInsensitiveContains("error") {
                     self.status = msg
                 }
             }
@@ -256,58 +383,59 @@ final class StreamViewModel: ObservableObject {
             }
         }
         usb.start()
-
-        // Start network discovery (beacon listener)
-        discovery.onStatusUpdate = { [weak self] msg in
-            Task { @MainActor in
-                guard let self else { return }
-                self.log("discovery status: \(msg)")
-                if !self.usbConnected && !self.isConnected {
-                    self.status = msg
-                }
-            }
+        if !isConnected && !isConnecting {
+            status = disconnectedPrompt()
         }
-        discovery.onEndpointFound = { [weak self] ep in
-            Task { @MainActor in
-                guard let self else { return }
-                let endpoint = NWEndpoint.hostPort(
-                    host: NWEndpoint.Host(ep.host),
-                    port: NWEndpoint.Port(integerLiteral: ep.port)
-                )
-                self.lastNetEndpoint = endpoint
-                self.lastNetName = ep.name
-                self.log("discovery found daemon: name=\(ep.name) host=\(ep.host) port=\(ep.port) isConnected=\(self.isConnected) isConnecting=\(self.isConnecting)")
-
-                if !self.isConnected && !self.isConnecting {
-                    self.connectToEndpoint(endpoint, name: ep.name)
-                } else {
-                    self.log("ignoring discovered endpoint because isConnected=\(self.isConnected) isConnecting=\(self.isConnecting)")
-                }
-            }
-        }
-        discovery.onDaemonLost = { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.log("discovery reported daemon lost")
-                self.lastNetEndpoint = nil
-                self.lastNetName = nil
-                // Don't tear down an active stream just because beacons stopped --
-                // the stream has its own data timeout for true disconnections.
-                // This allows manual IP connections (no beacons) to stay alive.
-            }
-        }
-        discovery.startListening()
     }
 
     func connectManual() {
-        let ip = manualIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !ip.isEmpty else { return }
-        let host = NWEndpoint.Host(ip)
-        let port = NWEndpoint.Port(integerLiteral: 9000)
-        let endpoint = NWEndpoint.hostPort(host: host, port: port)
+        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return }
+        let endpoint = makeEndpoint(host: host, port: 9000)
         lastNetEndpoint = endpoint
-        lastNetName = ip
-        connectToEndpoint(endpoint, name: ip)
+        lastNetName = host
+        connectToEndpoint(endpoint, name: host)
+    }
+
+    func connectRecent(_ recent: RecentConnection) {
+        manualHost = recent.host
+        let endpoint = makeEndpoint(host: recent.host, port: recent.port)
+        lastNetEndpoint = endpoint
+        lastNetName = recent.displayName
+        connectToEndpoint(endpoint, name: recent.displayName)
+    }
+
+    func clearRecentConnections() {
+        recentConnections = pinnedConnections
+        persistRecentConnections()
+        if !isConnected && !isConnecting && !usbConnected {
+            status = disconnectedPrompt()
+        }
+    }
+
+    func togglePinned(_ connection: RecentConnection) {
+        if !connection.isPinned && pinnedConnections.count >= Self.maxPinnedConnections {
+            status = "Pinned connections are limited to 10."
+            return
+        }
+
+        recentConnections = Self.normalizeConnections(
+            recentConnections.map { existing in
+                guard existing.id == connection.id else { return existing }
+                return RecentConnection(
+                    host: existing.host,
+                    port: existing.port,
+                    name: existing.name,
+                    lastConnectedAt: existing.lastConnectedAt,
+                    isPinned: !existing.isPinned
+                )
+            }
+        )
+        persistRecentConnections()
+
+        if !isConnected && !isConnecting && !usbConnected {
+            status = disconnectedPrompt()
+        }
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
@@ -451,9 +579,12 @@ final class StreamViewModel: ObservableObject {
                     self.status = msg
                     let nowConnected = msg.contains("Streaming")
                     if nowConnected && !self.isConnected {
+                        let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
                         self.isConnected = true
                         self.isConnecting = false
                         self.transport = "Network"
+                        self.manualHost = target.host
+                        self.rememberRecentConnection(name: name, host: target.host, port: target.port)
                         self.audioPlayer.start()
                         self.startPeripheralMonitoring()
                     }
@@ -485,10 +616,9 @@ final class StreamViewModel: ObservableObject {
         } else {
             isConnected = false
             transport = ""
-            status = "USB disconnected, looking for daemon..."
+            status = "USB disconnected. \(disconnectedPrompt())"
             audioPlayer.stop()
             stopPeripheralMonitoring()
-            discovery.resetKnownHost()
         }
     }
 
@@ -514,8 +644,7 @@ final class StreamViewModel: ObservableObject {
             status = "Reconnecting to \(name)..."
             connectToEndpoint(endpoint, name: name)
         } else {
-            status = "Daemon disconnected, looking..."
-            discovery.resetKnownHost()
+            status = "Daemon disconnected. \(disconnectedPrompt())"
         }
     }
 
@@ -535,7 +664,7 @@ final class StreamViewModel: ObservableObject {
         isConnected = false
         isConnecting = false
         transport = ""
-        status = "Disconnected"
+        status = "Disconnected. \(disconnectedPrompt())"
         audioPlayer.stop()
         micCapture.stop()
         stopPeripheralMonitoring()
@@ -1097,14 +1226,115 @@ struct ContentView: View {
 
                         if !model.isConnected {
                             HStack {
-                                TextField("Daemon IP", text: $model.manualIP)
+                                TextField("Daemon host or IP", text: $model.manualHost)
                                     .textFieldStyle(.roundedBorder)
                                     .autocorrectionDisabled()
                                     .textInputAutocapitalization(.never)
-                                    .keyboardType(.numbersAndPunctuation)
+                                    .keyboardType(.URL)
 
                                 Button("Connect") { model.connectManual() }
                                     .buttonStyle(.borderedProminent)
+                            }
+
+                            if !model.pinnedConnections.isEmpty {
+                                HStack {
+                                    Text("Pinned Connections")
+                                        .font(.caption.weight(.semibold))
+                                }
+
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(model.pinnedConnections) { connection in
+                                        HStack(spacing: 8) {
+                                            Button {
+                                                model.connectRecent(connection)
+                                            } label: {
+                                                HStack(spacing: 10) {
+                                                    Image(systemName: "star.fill")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.yellow)
+
+                                                    VStack(alignment: .leading, spacing: 2) {
+                                                        Text(connection.displayName)
+                                                            .font(.caption.weight(.medium))
+                                                            .foregroundStyle(.primary)
+                                                        Text(connection.endpointLabel)
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+                                                    }
+
+                                                    Spacer()
+                                                }
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 8)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                                            }
+                                            .buttonStyle(.plain)
+
+                                            Button {
+                                                model.togglePinned(connection)
+                                            } label: {
+                                                Image(systemName: "star.slash")
+                                                    .font(.caption)
+                                                    .frame(width: 32, height: 32)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !model.unpinnedRecentConnections.isEmpty {
+                                HStack {
+                                    Text("Recent Connections")
+                                        .font(.caption.weight(.semibold))
+                                    Spacer()
+                                    Button("Clear") { model.clearRecentConnections() }
+                                        .font(.caption)
+                                }
+
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(model.unpinnedRecentConnections) { connection in
+                                        HStack(spacing: 8) {
+                                            Button {
+                                                model.connectRecent(connection)
+                                            } label: {
+                                                HStack(spacing: 10) {
+                                                    Image(systemName: "clock.arrow.circlepath")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+
+                                                    VStack(alignment: .leading, spacing: 2) {
+                                                        Text(connection.displayName)
+                                                            .font(.caption.weight(.medium))
+                                                            .foregroundStyle(.primary)
+                                                        Text(connection.endpointLabel)
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+                                                    }
+
+                                                    Spacer()
+                                                }
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 8)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                                            }
+                                            .buttonStyle(.plain)
+
+                                            Button {
+                                                model.togglePinned(connection)
+                                            } label: {
+                                                Image(systemName: "star")
+                                                    .font(.caption)
+                                                    .frame(width: 32, height: 32)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             Button("Disconnect") { model.disconnect() }

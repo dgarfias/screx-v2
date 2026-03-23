@@ -2,7 +2,6 @@ mod audio;
 mod camera;
 mod capture;
 mod crypto;
-mod discovery;
 mod doctor;
 mod encode;
 mod logging;
@@ -72,10 +71,6 @@ struct Cli {
     /// Video codec: h264, h265
     #[arg(short, long, default_value = "h264")]
     codec: String,
-
-    /// Disable beacon broadcasting (for VPS/remote use)
-    #[arg(long, default_value_t = false)]
-    no_beacon: bool,
 
     /// Enable detailed diagnostic logs
     #[arg(short, long, default_value_t = false)]
@@ -159,25 +154,6 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // Beacon for iPad discovery
-    let _beacon_thread = if cli.no_beacon {
-        println!("[main] beacon: disabled (--no-beacon)");
-        None
-    } else {
-        let beacon_stop = Arc::clone(&stop);
-        let beacon_pause = Arc::clone(&shared.beacon_pause);
-        match discovery::start_beacon(config.stream_port, beacon_stop, beacon_pause) {
-            Ok(handle) => {
-                println!("[main] beacon: broadcasting on port 9999");
-                Some(handle)
-            }
-            Err(err) => {
-                eprintln!("[main] beacon failed (continuing): {err:#}");
-                None
-            }
-        }
-    };
-
     // Pairing state + TCP handshake server
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
     let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
@@ -236,9 +212,6 @@ async fn main() -> Result<()> {
         let audio_id_c = Arc::clone(&audio_module_id);
         *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
             println!("[lifecycle] client connected — creating peripherals");
-
-            // Pause beacon so no other iPads discover us during the session
-            shared_c.beacon_pause.store(true, Ordering::Relaxed);
 
             // Virtual camera
             match camera::load_v4l2loopback() {
@@ -303,9 +276,6 @@ async fn main() -> Result<()> {
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
             shared_d.capture_start.store(false, Ordering::Release);
-
-            // Resume beacon so new iPads can discover us
-            shared_d.beacon_pause.store(false, Ordering::Relaxed);
         }));
     }
 

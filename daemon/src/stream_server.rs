@@ -64,8 +64,6 @@ pub struct SharedState {
     pub session_key: Mutex<Option<[u8; 32]>>,
     /// IP expected from the TCP handshake; used to accept the first UDP packet
     pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
-    /// When true, beacon broadcasting is suppressed
-    pub beacon_pause: Arc<AtomicBool>,
 }
 
 impl SharedState {
@@ -89,7 +87,6 @@ impl SharedState {
             has_active_client: AtomicBool::new(false),
             session_key: Mutex::new(None),
             expected_client_ip: Mutex::new(None),
-            beacon_pause: Arc::new(AtomicBool::new(false)),
             start_time: Instant::now(),
         }
     }
