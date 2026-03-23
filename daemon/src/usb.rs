@@ -3,7 +3,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -13,10 +13,12 @@ const IPROXY_LOCAL_PORT: u16 = 9001;
 const DEVICE_PORT: u16 = 9000;
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_RETRY: Duration = Duration::from_secs(1);
+const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const MSG_VIDEO: u8 = 0x01;
 const MSG_AUDIO: u8 = 0x02;
 const MSG_CONTROL: u8 = 0x03;
+const READY_MAGIC: &[u8] = b"READY";
 
 fn detect_device() -> bool {
     Command::new("idevice_id")
@@ -127,96 +129,163 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
         };
 
         let addr = format!("127.0.0.1:{IPROXY_LOCAL_PORT}");
+        while !stop.load(Ordering::Relaxed) && detect_device() {
+            let stream = match connect_to_iproxy(&addr, &stop) {
+                Some(stream) => stream,
+                None => break,
+            };
 
-        // Retry TCP connect a few times (iproxy may need a moment)
-        let mut tcp_stream = None;
-        for attempt in 0..5 {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            match TcpStream::connect(&addr) {
-                Ok(s) => {
-                    println!("[usb] TCP connected to {addr} (attempt {attempt})");
-                    tcp_stream = Some(s);
-                    break;
-                }
-                Err(_) => {
+            let mut read_stream = match stream.try_clone() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[usb] failed to clone TCP stream: {e}");
                     std::thread::sleep(CONNECT_RETRY);
+                    continue;
                 }
-            }
-        }
+            };
 
-        let stream = match tcp_stream {
-            Some(s) => s,
-            None => {
-                eprintln!("[usb] failed to connect to iproxy at {addr}");
-                stop_iproxy(&mut iproxy_child);
-                std::thread::sleep(DETECT_INTERVAL);
+            let sender = match TcpFramedSender::new(stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[usb] failed to create TCP sender: {e}");
+                    std::thread::sleep(CONNECT_RETRY);
+                    continue;
+                }
+            };
+
+            if !wait_for_ready(&mut read_stream, &stop) {
+                std::thread::sleep(CONNECT_RETRY);
                 continue;
             }
-        };
 
-        let read_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[usb] failed to clone TCP stream: {e}");
-                stop_iproxy(&mut iproxy_child);
-                continue;
-            }
-        };
+            activate_usb_transport(&shared, sender);
+            println!("[usb] transport ACTIVE — video/audio will prefer USB");
 
-        let sender = match TcpFramedSender::new(stream) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[usb] failed to create TCP sender: {e}");
-                stop_iproxy(&mut iproxy_child);
-                continue;
-            }
-        };
+            read_control_loop(read_stream, &shared, &stop);
 
-        // Activate USB transport
-        {
-            let mut usb = shared.usb_sender.lock().unwrap();
-            *usb = Some(sender);
-        }
-        shared.usb_active.store(true, Ordering::SeqCst);
-        shared.force_idr.store(true, Ordering::Relaxed);
-        shared.capture_start.store(true, Ordering::Release);
-        if !shared.has_active_client.swap(true, Ordering::SeqCst) {
-            if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
-                cb();
-            }
-        }
-        println!("[usb] transport ACTIVE — video/audio will prefer USB");
+            deactivate_usb_transport(&shared);
+            println!("[usb] transport deactivated");
 
-        // Read control messages from iPad until disconnect
-        read_control_loop(read_stream, &shared, &stop);
-
-        // Deactivate USB transport
-        shared.usb_active.store(false, Ordering::SeqCst);
-        {
-            let mut usb = shared.usb_sender.lock().unwrap();
-            *usb = None;
-        }
-        println!("[usb] transport deactivated, falling back to network");
-
-        // If no network client either, fire disconnect lifecycle
-        if shared.client_addr.lock().unwrap().is_none()
-            && shared.has_active_client.swap(false, Ordering::SeqCst)
-        {
-            if let Some(ref cb) = *shared.on_client_disconnected.lock().unwrap() {
-                cb();
+            if !stop.load(Ordering::Relaxed) && detect_device() {
+                std::thread::sleep(CONNECT_RETRY);
             }
         }
 
+        deactivate_usb_transport(&shared);
         stop_iproxy(&mut iproxy_child);
-
-        if !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(DETECT_INTERVAL);
-        }
     }
 
     println!("[usb] transport thread stopped");
+}
+
+fn connect_to_iproxy(addr: &str, stop: &Arc<AtomicBool>) -> Option<TcpStream> {
+    let mut attempt: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) && detect_device() {
+        match TcpStream::connect(addr) {
+            Ok(stream) => {
+                println!("[usb] TCP connected to {addr} (attempt {attempt})");
+                return Some(stream);
+            }
+            Err(e) => {
+                if attempt == 0 || attempt.is_multiple_of(5) {
+                    eprintln!("[usb] waiting for USB app listener at {addr}: {e}");
+                }
+                attempt = attempt.wrapping_add(1);
+                std::thread::sleep(CONNECT_RETRY);
+            }
+        }
+    }
+
+    None
+}
+
+fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok();
+
+    let started = Instant::now();
+    let mut len_buf = [0u8; 4];
+    let mut msg_buf = vec![0u8; 256];
+
+    while !stop.load(Ordering::Relaxed) && detect_device() {
+        if started.elapsed() > READY_TIMEOUT {
+            println!("[usb] READY timeout, waiting for a fresh USB app connection");
+            return false;
+        }
+
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => {
+                println!("[usb] TCP disconnected before READY: {e}");
+                return false;
+            }
+        }
+
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len == 0 || msg_len > 65536 {
+            continue;
+        }
+        if msg_buf.len() < msg_len {
+            msg_buf.resize(msg_len, 0);
+        }
+
+        match stream.read_exact(&mut msg_buf[..msg_len]) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("[usb] TCP disconnected before READY payload: {e}");
+                return false;
+            }
+        }
+
+        if msg_buf[0] == MSG_CONTROL && msg_len >= 2 {
+            let ctrl = &msg_buf[1..msg_len];
+            if ctrl == READY_MAGIC {
+                println!("[usb] app READY received");
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn activate_usb_transport(shared: &Arc<SharedState>, sender: TcpFramedSender) {
+    {
+        let mut usb = shared.usb_sender.lock().unwrap();
+        *usb = Some(sender);
+    }
+    shared.usb_active.store(true, Ordering::SeqCst);
+    shared.force_idr.store(true, Ordering::Relaxed);
+    shared.capture_start.store(true, Ordering::Release);
+    if !shared.has_active_client.swap(true, Ordering::SeqCst) {
+        if let Some(ref cb) = *shared.on_client_connected.lock().unwrap() {
+            cb();
+        }
+    }
+}
+
+fn deactivate_usb_transport(shared: &Arc<SharedState>) {
+    shared.usb_active.store(false, Ordering::SeqCst);
+    {
+        let mut usb = shared.usb_sender.lock().unwrap();
+        *usb = None;
+    }
+
+    if shared.client_addr.lock().unwrap().is_none()
+        && shared.has_active_client.swap(false, Ordering::SeqCst)
+    {
+        if let Some(ref cb) = *shared.on_client_disconnected.lock().unwrap() {
+            cb();
+        }
+    }
 }
 
 fn read_control_loop(
@@ -264,7 +333,9 @@ fn read_control_loop(
 
         if msg_buf[0] == MSG_CONTROL && msg_len >= 2 {
             let ctrl = &msg_buf[1..msg_len];
-            if ctrl.starts_with(b"PLI") {
+            if ctrl == READY_MAGIC {
+                crate::vlog!("[usb] ignoring duplicate READY on active transport");
+            } else if ctrl.starts_with(b"PLI") {
                 crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"TOUCH") && ctrl.len() > 5 {
                 crate::stream_server::handle_control_message_data(shared, ctrl);

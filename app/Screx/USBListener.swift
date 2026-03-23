@@ -18,6 +18,7 @@ final class USBListener {
     private static let msgVideo: UInt8 = 0x01
     private static let msgAudio: UInt8 = 0x02
     private static let msgControl: UInt8 = 0x03
+    private static let readyMagic = Data("READY".utf8)
 
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
@@ -89,6 +90,7 @@ final class USBListener {
             switch state {
             case .ready:
                 print("[usb] TCP connection established from daemon")
+                self?.sendReady(on: conn)
                 self?.onStatus?("USB: connected")
                 self?.onConnected?()
                 self?.readLoop(conn)
@@ -108,6 +110,22 @@ final class USBListener {
         }
 
         conn.start(queue: queue)
+    }
+
+    private func sendReady(on conn: NWConnection) {
+        var frame = Data()
+        let payloadLen = UInt32(1 + Self.readyMagic.count)
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(Self.readyMagic)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] READY send error: \(error)")
+            } else {
+                print("[usb] READY sent")
+            }
+        })
     }
 
     private func handleDisconnect() {
