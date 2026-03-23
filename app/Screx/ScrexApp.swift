@@ -67,6 +67,13 @@ final class MouseCaptureRootView: UIView {
     }
 }
 
+private let defaultDaemonPort: UInt16 = 9000
+
+private func formatEndpointInput(host: String, port: UInt16) -> String {
+    let formattedHost = host.contains(":") ? "[\(host)]" : host
+    return port == defaultDaemonPort ? formattedHost : "\(formattedHost):\(port)"
+}
+
 struct RecentConnection: Codable, Identifiable, Equatable {
     let host: String
     let port: UInt16
@@ -102,7 +109,7 @@ struct RecentConnection: Codable, Identifiable, Equatable {
     var id: String { "\(host):\(port)" }
     var displayName: String { name.isEmpty ? host : name }
     var endpointLabel: String {
-        port == 9000 ? host : "\(host):\(port)"
+        formatEndpointInput(host: host, port: port)
     }
 }
 
@@ -325,19 +332,66 @@ final class StreamViewModel: ObservableObject {
         )
     }
 
+    private func parseManualEndpoint(_ rawInput: String) -> (host: String, port: UInt16)? {
+        let input = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return nil }
+
+        if input.hasPrefix("[") {
+            guard let closeBracket = input.firstIndex(of: "]") else {
+                status = "Invalid address. Use host, host:port, or [ipv6]:port."
+                return nil
+            }
+
+            let host = String(input[input.index(after: input.startIndex)..<closeBracket])
+            let suffix = String(input[input.index(after: closeBracket)...])
+            guard !host.isEmpty else {
+                status = "Host cannot be empty."
+                return nil
+            }
+            if suffix.isEmpty {
+                return (host, defaultDaemonPort)
+            }
+            guard suffix.hasPrefix(":"), let port = UInt16(suffix.dropFirst()), port > 0 else {
+                status = "Invalid port. Use a value from 1 to 65535."
+                return nil
+            }
+            return (host, port)
+        }
+
+        let colonCount = input.reduce(into: 0) { count, char in
+            if char == ":" { count += 1 }
+        }
+
+        if colonCount == 1, let colon = input.lastIndex(of: ":") {
+            let host = String(input[..<colon])
+            let portPart = String(input[input.index(after: colon)...])
+            guard !host.isEmpty else {
+                status = "Host cannot be empty."
+                return nil
+            }
+            guard let port = UInt16(portPart), port > 0 else {
+                status = "Invalid port. Use a value from 1 to 65535."
+                return nil
+            }
+            return (host, port)
+        }
+
+        return (input, defaultDaemonPort)
+    }
+
     private func endpointHostAndPort(_ endpoint: NWEndpoint, fallbackHost: String) -> (host: String, port: UInt16) {
         switch endpoint {
         case .hostPort(let host, let port):
             return ("\(host)", port.rawValue)
         default:
-            return (fallbackHost, 9000)
+            return (fallbackHost, defaultDaemonPort)
         }
     }
 
     private func disconnectedPrompt() -> String {
         recentConnections.isEmpty
-            ? "Enter a daemon host or IP to connect."
-            : "Choose a pinned or recent daemon, or enter a host or IP to connect."
+            ? "Enter a daemon host or IP[:port] to connect."
+            : "Choose a pinned or recent daemon, or enter a host or IP[:port] to connect."
     }
 
     func startServices() {
@@ -393,12 +447,11 @@ final class StreamViewModel: ObservableObject {
             log("connectManual() ignored while already connecting")
             return
         }
-        let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty else { return }
-        let endpoint = makeEndpoint(host: host, port: 9000)
+        guard let target = parseManualEndpoint(manualHost) else { return }
+        let endpoint = makeEndpoint(host: target.host, port: target.port)
         lastNetEndpoint = endpoint
-        lastNetName = host
-        connectToEndpoint(endpoint, name: host)
+        lastNetName = formatEndpointInput(host: target.host, port: target.port)
+        connectToEndpoint(endpoint, name: lastNetName ?? target.host)
     }
 
     func connectRecent(_ recent: RecentConnection) {
@@ -406,7 +459,7 @@ final class StreamViewModel: ObservableObject {
             log("connectRecent() ignored while already connecting")
             return
         }
-        manualHost = recent.host
+        manualHost = formatEndpointInput(host: recent.host, port: recent.port)
         let endpoint = makeEndpoint(host: recent.host, port: recent.port)
         lastNetEndpoint = endpoint
         lastNetName = recent.displayName
@@ -475,7 +528,7 @@ final class StreamViewModel: ObservableObject {
         case .hostPort(_, let p):
             port = p.rawValue
         default:
-            port = 9000
+            port = defaultDaemonPort
         }
 
         // Step 1: TCP handshake for pairing/session key exchange
@@ -583,7 +636,7 @@ final class StreamViewModel: ObservableObject {
                         self.isConnected = true
                         self.isConnecting = false
                         self.transport = "Network"
-                        self.manualHost = target.host
+                        self.manualHost = formatEndpointInput(host: target.host, port: target.port)
                         self.rememberRecentConnection(name: name, host: target.host, port: target.port)
                         self.audioPlayer.start()
                         self.startPeripheralMonitoring()
@@ -1227,7 +1280,7 @@ struct ContentView: View {
 
                         if !model.isConnected {
                             HStack {
-                                TextField("Daemon host or IP", text: $model.manualHost)
+                                TextField("Daemon host or IP[:port]", text: $model.manualHost)
                                     .textFieldStyle(.roundedBorder)
                                     .autocorrectionDisabled()
                                     .textInputAutocapitalization(.never)
