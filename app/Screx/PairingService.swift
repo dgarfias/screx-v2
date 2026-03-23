@@ -13,6 +13,7 @@ final class PairingService {
     private let queue = DispatchQueue(label: "screx.pairing", qos: .userInitiated)
     private var connection: NWConnection?
     private let debugId = String(UUID().uuidString.prefix(6))
+    private var didComplete = false
 
     private static let magicPair   = Data("SCREX_PAIR".utf8)    // 10 bytes
     private static let magicHello  = Data("SCREX_HELLO".utf8)   // 11 bytes
@@ -59,8 +60,15 @@ final class PairingService {
                     self.log("tcp ready, using first-time PAIR flow")
                     self.sendPairRequest(conn: conn, host: host, deviceId: deviceId)
                 }
-            case .failed(let error):
+            case .waiting(let error):
+                self.connection?.cancel()
+                self.connection = nil
                 self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
+            case .failed(let error):
+                self.connection = nil
+                self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
+            case .cancelled:
+                self.log("tcp state -> cancelled")
             default:
                 break
             }
@@ -71,6 +79,7 @@ final class PairingService {
 
     func cancel() {
         log("cancel()")
+        didComplete = true
         connection?.cancel()
         connection = nil
     }
@@ -383,6 +392,17 @@ final class PairingService {
     // MARK: - Helpers
 
     private func emitResult(_ result: PairingResult) {
+        switch result {
+        case .sessionEstablished, .rejected, .error:
+            guard !didComplete else {
+                log("emitResult ignored after completion")
+                return
+            }
+            didComplete = true
+        case .pinRequired:
+            break
+        }
+
         switch result {
         case .sessionEstablished:
             log("emitResult(.sessionEstablished)")
