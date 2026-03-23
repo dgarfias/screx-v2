@@ -1256,6 +1256,18 @@ struct ContentView: View {
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
     private static let edgeThreshold: CGFloat = 40
+    private static let connectionRowHeight: CGFloat = 52
+    private static let connectionHeaderHeight: CGFloat = 30
+
+    private var connectionListHeight: CGFloat {
+        let sectionCount = (model.pinnedConnections.isEmpty ? 0 : 1) + (model.unpinnedRecentConnections.isEmpty ? 0 : 1)
+        let rowCount = model.pinnedConnections.count + model.unpinnedRecentConnections.count
+        guard rowCount > 0 else { return 0 }
+        let estimated = CGFloat(rowCount) * Self.connectionRowHeight
+            + CGFloat(sectionCount) * Self.connectionHeaderHeight
+            + 12
+        return min(estimated, 260)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -1304,45 +1316,34 @@ struct ContentView: View {
                                     .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
 
-                            if !model.pinnedConnections.isEmpty {
-                                HStack {
-                                    Text("Pinned Connections")
-                                        .font(.caption.weight(.semibold))
-                                }
+                            if connectionListHeight > 0 {
+                                List {
+                                    if !model.pinnedConnections.isEmpty {
+                                        Section("Pinned Connections") {
+                                            ForEach(model.pinnedConnections) { connection in
+                                                connectionRow(connection)
+                                            }
+                                        }
+                                    }
 
-                                VStack(alignment: .leading, spacing: 6) {
-                                    ForEach(model.pinnedConnections) { connection in
-                                        SwipeableConnectionRow(
-                                            connection: connection,
-                                            isConnecting: model.isConnecting,
-                                            onConnect: { model.connectRecent(connection) },
-                                            onTogglePinned: { model.togglePinned(connection) },
-                                            onDelete: { model.deleteConnection(connection) }
-                                        )
+                                    if !model.unpinnedRecentConnections.isEmpty {
+                                        Section {
+                                            ForEach(model.unpinnedRecentConnections) { connection in
+                                                connectionRow(connection)
+                                            }
+                                        } header: {
+                                            HStack {
+                                                Text("Recent Connections")
+                                                Spacer()
+                                                Button("Clear") { model.clearRecentConnections() }
+                                                    .font(.caption)
+                                            }
+                                        }
                                     }
                                 }
-                            }
-
-                            if !model.unpinnedRecentConnections.isEmpty {
-                                HStack {
-                                    Text("Recent Connections")
-                                        .font(.caption.weight(.semibold))
-                                    Spacer()
-                                    Button("Clear") { model.clearRecentConnections() }
-                                        .font(.caption)
-                                }
-
-                                VStack(alignment: .leading, spacing: 6) {
-                                    ForEach(model.unpinnedRecentConnections) { connection in
-                                        SwipeableConnectionRow(
-                                            connection: connection,
-                                            isConnecting: model.isConnecting,
-                                            onConnect: { model.connectRecent(connection) },
-                                            onTogglePinned: { model.togglePinned(connection) },
-                                            onDelete: { model.deleteConnection(connection) }
-                                        )
-                                    }
-                                }
+                                .listStyle(.plain)
+                                .scrollContentBackground(.hidden)
+                                .frame(height: connectionListHeight)
                             }
                         } else {
                             Button("Disconnect") { model.disconnect() }
@@ -1597,6 +1598,46 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private func connectionRow(_ connection: RecentConnection) -> some View {
+        Button {
+            model.connectRecent(connection)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: connection.isPinned ? "star.fill" : "clock.arrow.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(connection.isPinned ? .yellow : .secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(connection.displayName)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(connection.endpointLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+        .disabled(model.isConnecting)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button(connection.isPinned ? "Unpin" : "Pin") {
+                model.togglePinned(connection)
+            }
+            .tint(.yellow)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button("Delete", role: .destructive) {
+                model.deleteConnection(connection)
+            }
+        }
+    }
+
     private func defaultBarPosition(in size: CGSize) -> CGPoint {
         let halfW = pillSize.width / 2 + 4
         let halfH = pillSize.height / 2 + 4
@@ -1657,140 +1698,5 @@ struct ContentView: View {
 
     private static func saveBarOrientation(_ orient: ToolbarOrientation) {
         UserDefaults.standard.set(orient.rawValue, forKey: orientKey)
-    }
-}
-
-private struct SwipeableConnectionRow: View {
-    let connection: RecentConnection
-    let isConnecting: Bool
-    let onConnect: () -> Void
-    let onTogglePinned: () -> Void
-    let onDelete: () -> Void
-
-    @State private var offsetX: CGFloat = 0
-    @State private var dragStartOffset: CGFloat?
-
-    private let actionWidth: CGFloat = 84
-    private let revealThreshold: CGFloat = 36
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.white.opacity(0.06))
-
-            HStack(spacing: 0) {
-                swipeActionButton(
-                    title: connection.isPinned ? "Unpin" : "Pin",
-                    systemImage: connection.isPinned ? "pin.slash.fill" : "pin.fill",
-                    color: .yellow,
-                    action: {
-                        closeRow()
-                        onTogglePinned()
-                    }
-                )
-                .frame(width: actionWidth)
-                .opacity(offsetX > 0 ? 1 : 0)
-
-                Spacer(minLength: 0)
-
-                swipeActionButton(
-                    title: "Delete",
-                    systemImage: "trash.fill",
-                    color: .red,
-                    action: {
-                        closeRow()
-                        onDelete()
-                    }
-                )
-                .frame(width: actionWidth)
-                .opacity(offsetX < 0 ? 1 : 0)
-            }
-
-            Button {
-                if abs(offsetX) > 1 {
-                    closeRow()
-                } else {
-                    onConnect()
-                }
-            } label: {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(connection.displayName)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.primary)
-                        Text(connection.endpointLabel)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
-            }
-            .buttonStyle(.plain)
-            .disabled(isConnecting)
-            .offset(x: offsetX)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .contentShape(RoundedRectangle(cornerRadius: 10))
-        .opacity(isConnecting ? 0.7 : 1)
-        .gesture(
-            DragGesture(minimumDistance: 10)
-                .onChanged { value in
-                    guard !isConnecting else { return }
-                    let startOffset = dragStartOffset ?? offsetX
-                    if dragStartOffset == nil {
-                        dragStartOffset = offsetX
-                    }
-                    offsetX = min(max(startOffset + value.translation.width, -actionWidth), actionWidth)
-                }
-                .onEnded { value in
-                    guard !isConnecting else { return }
-                    let startOffset = dragStartOffset ?? offsetX
-                    let proposed = startOffset + value.translation.width
-                    dragStartOffset = nil
-
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        if proposed > revealThreshold {
-                            offsetX = actionWidth
-                        } else if proposed < -revealThreshold {
-                            offsetX = -actionWidth
-                        } else {
-                            offsetX = 0
-                        }
-                    }
-                }
-        )
-        .onChange(of: isConnecting) { connecting in
-            if connecting {
-                closeRow()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func swipeActionButton(title: String, systemImage: String, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: systemImage)
-                    .font(.caption.weight(.semibold))
-                Text(title)
-                    .font(.caption2.weight(.semibold))
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .foregroundStyle(.white)
-            .background(color.opacity(0.9))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func closeRow() {
-        withAnimation(.easeOut(duration: 0.18)) {
-            offsetX = 0
-        }
-        dragStartOffset = nil
     }
 }
