@@ -37,6 +37,7 @@ struct PairedDevice {
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
+    pub session_id: u64,
     pub session_key: [u8; 32],
     pub client_addr: std::net::SocketAddr,
 }
@@ -190,6 +191,16 @@ pub fn run_pairing_server(
                     continue;
                 }
 
+                let reserved_session_id = match shared.reserve_network_session() {
+                    Some(id) => id,
+                    None => {
+                        println!("[pairing] rejecting {addr} — network session already pending");
+                        let _ = stream.write_all(MAGIC_BUSY);
+                        let _ = stream.flush();
+                        continue;
+                    }
+                };
+
                 println!("[pairing] incoming handshake from {addr}");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(30)))
@@ -199,14 +210,32 @@ pub fn run_pairing_server(
                     .ok();
 
                 match handle_handshake(&mut stream, addr, &pairing) {
-                    Ok(session) => {
+                    Ok(mut session) => {
+                        session.session_id = reserved_session_id;
                         println!("[pairing] handshake with {addr} completed");
                         *session_tx.lock().unwrap() = Some(session.clone());
-                        if let Err(e) = run_control_loop(stream, &shared, &stop, session.session_key) {
-                            eprintln!("[control] network control loop ended: {e:#}");
+                        let shared_control = Arc::clone(&shared);
+                        let stop_control = Arc::clone(&stop);
+                        let session_id = session.session_id;
+                        let session_key = session.session_key;
+                        if let Err(e) = std::thread::Builder::new()
+                            .name(format!("control-{session_id}"))
+                            .spawn(move || {
+                                if let Err(e) =
+                                    run_control_loop(stream, &shared_control, &stop_control, session_key, session_id)
+                                {
+                                    eprintln!("[control] network control loop ended: {e:#}");
+                                }
+                            })
+                        {
+                            eprintln!("[control] failed to spawn control loop: {e}");
+                            crate::stream_server::drop_network_client(&shared, reserved_session_id);
                         }
                     }
-                    Err(e) => eprintln!("[pairing] handshake with {addr} failed: {e:#}"),
+                    Err(e) => {
+                        crate::stream_server::drop_network_client(&shared, reserved_session_id);
+                        eprintln!("[pairing] handshake with {addr} failed: {e:#}");
+                    }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -389,6 +418,7 @@ fn handle_pair_request(
     crate::vlog!("[pairing] sent pairing OK to {addr} for device {device_id_hex}");
 
     let session = SessionInfo {
+        session_id: 0,
         session_key,
         client_addr: addr,
     };
@@ -442,6 +472,7 @@ fn handle_pair_already_paired(
     crate::vlog!("[pairing] sent reconnect OK to {addr} for device {device_id_hex}");
 
     let session = SessionInfo {
+        session_id: 0,
         session_key,
         client_addr: addr,
     };
@@ -499,6 +530,7 @@ fn handle_hello_request(
     crate::vlog!("[pairing] sent hello OK to {addr} for device {device_id_hex}");
 
     let session = SessionInfo {
+        session_id: 0,
         session_key,
         client_addr: addr,
     };
@@ -512,6 +544,7 @@ fn run_control_loop(
     shared: &Arc<crate::stream_server::SharedState>,
     stop: &Arc<AtomicBool>,
     session_key: [u8; 32],
+    session_id: u64,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
@@ -527,6 +560,11 @@ fn run_control_loop(
     println!("[control] network control channel active");
 
     while !stop.load(Ordering::Relaxed) {
+        if !shared.is_current_network_session(session_id) {
+            println!("[control] network control loop exiting for stale session {session_id}");
+            break;
+        }
+
         match stream.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(ref e)
@@ -584,7 +622,7 @@ fn run_control_loop(
         crate::stream_server::handle_control_message_data(shared, plaintext);
     }
 
-    crate::stream_server::drop_network_client(shared);
+    crate::stream_server::drop_network_client(shared, session_id);
 
     Ok(())
 }

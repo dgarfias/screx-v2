@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,8 @@ const MOUSE_MAGIC: &[u8] = b"MOUSE";
 const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
 const PERIPH_MAGIC: &[u8] = b"PERIPH";
 const GPAD_MAGIC: &[u8] = b"GPAD";
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FEC_SHARDS: usize = 127;
@@ -61,6 +62,9 @@ pub struct SharedState {
     pub on_client_connected: Mutex<Option<LifecycleCallback>>,
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
+    pub network_session_busy: AtomicBool,
+    pub network_session_pending: AtomicBool,
+    pub network_session_id: AtomicU64,
     pub session_key: Mutex<Option<[u8; 32]>>,
     /// IP expected from the TCP handshake; used to accept the first UDP packet
     pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
@@ -85,9 +89,31 @@ impl SharedState {
             on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
+            network_session_busy: AtomicBool::new(false),
+            network_session_pending: AtomicBool::new(false),
+            network_session_id: AtomicU64::new(0),
             session_key: Mutex::new(None),
             expected_client_ip: Mutex::new(None),
             start_time: Instant::now(),
+        }
+    }
+
+    pub fn reserve_network_session(&self) -> Option<u64> {
+        self.network_session_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        self.network_session_pending.store(true, Ordering::SeqCst);
+        Some(self.network_session_id.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
+    }
+
+    pub fn is_current_network_session(&self, session_id: u64) -> bool {
+        self.network_session_busy.load(Ordering::SeqCst)
+            && self.network_session_id.load(Ordering::SeqCst) == session_id
+    }
+
+    pub fn mark_network_session_active(&self, session_id: u64) {
+        if self.is_current_network_session(session_id) {
+            self.network_session_pending.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -286,10 +312,16 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
     }
 }
 
-pub fn drop_network_client(shared: &Arc<SharedState>) {
+pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
+    if !shared.is_current_network_session(session_id) {
+        return;
+    }
+
     *shared.client_addr.lock().unwrap() = None;
     *shared.session_key.lock().unwrap() = None;
     *shared.expected_client_ip.lock().unwrap() = None;
+    shared.network_session_pending.store(false, Ordering::SeqCst);
+    shared.network_session_busy.store(false, Ordering::SeqCst);
 
     if !shared.usb_active.load(Ordering::Relaxed)
         && shared.has_active_client.swap(false, Ordering::SeqCst)
@@ -334,6 +366,8 @@ pub fn run_client_manager(
     let mut no_cipher_drop_count: u64 = 0;
     let mut decrypt_fail_count: u64 = 0;
     let mut heartbeat_count: u64 = 0;
+    let mut current_session_id: u64 = 0;
+    let mut pending_started_at: Option<Instant> = None;
 
     println!("[client] waiting for paired handshake...");
 
@@ -342,6 +376,15 @@ pub fn run_client_manager(
         {
             let mut rx = session_rx.lock().unwrap();
             if let Some(session) = rx.take() {
+                if !shared.is_current_network_session(session.session_id) {
+                    crate::vlog!(
+                        "[client] ignoring stale session info: session_id={} current_id={} busy={}",
+                        session.session_id,
+                        shared.network_session_id.load(Ordering::SeqCst),
+                        shared.network_session_busy.load(Ordering::SeqCst)
+                    );
+                    continue;
+                }
                 session_serial = session_serial.wrapping_add(1);
                 let previous_expected = *shared.expected_client_ip.lock().unwrap();
                 let previous_client = *shared.client_addr.lock().unwrap();
@@ -360,6 +403,9 @@ pub fn run_client_manager(
                 local_cipher = Some(crate::crypto::SessionCipher::new(&session.session_key));
                 input_seq_expected = 0;
                 input_seq_initialized = false;
+                current_session_id = session.session_id;
+                pending_started_at = Some(Instant::now());
+                last_keepalive = Instant::now();
             }
         }
 
@@ -479,6 +525,8 @@ pub fn run_client_manager(
                     if is_new {
                         println!("[client] authenticated UDP client: {addr}");
                         *shared.expected_client_ip.lock().unwrap() = None;
+                        shared.mark_network_session_active(current_session_id);
+                        pending_started_at = None;
                         shared.force_idr.store(true, Ordering::Relaxed);
                         shared.capture_start.store(true, Ordering::Release);
                         if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
@@ -549,6 +597,20 @@ pub fn run_client_manager(
             }
         }
 
+        if current_session_id != 0
+            && shared.network_session_pending.load(Ordering::SeqCst)
+            && pending_started_at.map_or(false, |started| started.elapsed() > PENDING_SESSION_TIMEOUT)
+        {
+            println!(
+                "[client] pending session timed out after {:?}, dropping session",
+                PENDING_SESSION_TIMEOUT
+            );
+            local_cipher = None;
+            drop_network_client(&shared, current_session_id);
+            current_session_id = 0;
+            pending_started_at = None;
+        }
+
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             if let Some(addr) = *shared.client_addr.lock().unwrap() {
                 if let Some(ref c) = local_cipher {
@@ -583,7 +645,9 @@ pub fn run_client_manager(
         {
             println!("[client] keepalive timeout, dropping client");
             local_cipher = None;
-            drop_network_client(&shared);
+            drop_network_client(&shared, current_session_id);
+            current_session_id = 0;
+            pending_started_at = None;
         }
     }
 

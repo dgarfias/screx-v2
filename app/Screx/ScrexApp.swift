@@ -389,6 +389,10 @@ final class StreamViewModel: ObservableObject {
     }
 
     func connectManual() {
+        guard !isConnecting else {
+            log("connectManual() ignored while already connecting")
+            return
+        }
         let host = manualHost.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else { return }
         let endpoint = makeEndpoint(host: host, port: 9000)
@@ -398,6 +402,10 @@ final class StreamViewModel: ObservableObject {
     }
 
     func connectRecent(_ recent: RecentConnection) {
+        guard !isConnecting else {
+            log("connectRecent() ignored while already connecting")
+            return
+        }
         manualHost = recent.host
         let endpoint = makeEndpoint(host: recent.host, port: recent.port)
         lastNetEndpoint = endpoint
@@ -518,12 +526,6 @@ final class StreamViewModel: ObservableObject {
                 self.status = "Pairing error: \(msg)"
                 self.pairingService = nil
                 self.isConnecting = false
-                // Retry after a delay
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                    guard let self, !self.isConnected else { return }
-                    self.log("retrying connectToEndpoint after pairing error")
-                    self.connectToEndpoint(endpoint, name: name)
-                }
             }
         }
 
@@ -606,21 +608,21 @@ final class StreamViewModel: ObservableObject {
     /// Called when USB disconnects — try to resume network connection immediately
     private func fallbackToNetwork() {
         log("fallbackToNetwork() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
-        if let endpoint = lastNetEndpoint, let name = lastNetName {
-            status = "USB disconnected, switching to network..."
-            transport = "Network"
-            stream?.disconnect()
-            connectToEndpoint(endpoint, name: name)
-        } else {
-            isConnected = false
-            transport = ""
-            status = "USB disconnected. \(disconnectedPrompt())"
-            audioPlayer.stop()
-            stopPeripheralMonitoring()
-        }
+        stream?.onStatus = nil
+        stream?.onDisconnect = nil
+        stream?.disconnect()
+        stream = nil
+        closeNetworkControl(gracefully: false)
+        isConnected = false
+        isConnecting = false
+        transport = ""
+        audioPlayer.stop()
+        micCapture.stop()
+        stopPeripheralMonitoring()
+        status = "USB disconnected. \(disconnectedPrompt())"
     }
 
-    /// Called when we've lost all streams and need to start looking again
+    /// Called when we've lost all streams and should return to idle state.
     private func handleStreamLost() {
         log("handleStreamLost() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
         stream?.onStatus = nil
@@ -634,14 +636,7 @@ final class StreamViewModel: ObservableObject {
         audioPlayer.stop()
         micCapture.stop()
         stopPeripheralMonitoring()
-
-        // Try to reconnect immediately using the last known endpoint
-        if let endpoint = lastNetEndpoint, let name = lastNetName {
-            status = "Reconnecting to \(name)..."
-            connectToEndpoint(endpoint, name: name)
-        } else {
-            status = "Daemon disconnected. \(disconnectedPrompt())"
-        }
+        status = "Daemon disconnected. \(disconnectedPrompt())"
     }
 
     func disconnect() {
@@ -1237,9 +1232,11 @@ struct ContentView: View {
                                     .autocorrectionDisabled()
                                     .textInputAutocapitalization(.never)
                                     .keyboardType(.URL)
+                                    .disabled(model.isConnecting)
 
-                                Button("Connect") { model.connectManual() }
+                                Button(model.isConnecting ? "Connecting..." : "Connect") { model.connectManual() }
                                     .buttonStyle(.borderedProminent)
+                                    .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
 
                             if !model.pinnedConnections.isEmpty {
@@ -1276,6 +1273,7 @@ struct ContentView: View {
                                                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                                             }
                                             .buttonStyle(.plain)
+                                            .disabled(model.isConnecting)
 
                                             Button {
                                                 model.togglePinned(connection)
@@ -1328,6 +1326,7 @@ struct ContentView: View {
                                                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                                             }
                                             .buttonStyle(.plain)
+                                            .disabled(model.isConnecting)
 
                                             Button {
                                                 model.togglePinned(connection)
