@@ -238,7 +238,7 @@ final class StreamViewModel: ObservableObject {
     private var lastNetEndpoint: NWEndpoint?
     private var lastNetName: String?
     private var micSeq: UInt32 = 0
-    private var isConnecting = false
+    @Published private(set) var isConnecting = false
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
