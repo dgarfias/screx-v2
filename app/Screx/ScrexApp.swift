@@ -46,6 +46,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
+    private var model: StreamViewModel? {
+        (UIApplication.shared.delegate as? AppDelegate)?.model
+    }
+
     func scene(
         _ scene: UIScene,
         willConnectTo session: UISceneSession,
@@ -58,6 +62,22 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         window.rootViewController = ScrexRootViewController(model: appDelegate.model)
         self.window = window
         window.makeKeyAndVisible()
+    }
+
+    func sceneWillResignActive(_ scene: UIScene) {
+        model?.handleAppWillResignActive()
+    }
+
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        model?.handleAppDidEnterBackground()
+    }
+
+    func sceneWillEnterForeground(_ scene: UIScene) {
+        model?.handleAppWillEnterForeground()
+    }
+
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        model?.handleAppDidBecomeActive()
     }
 }
 
@@ -297,6 +317,7 @@ final class StreamViewModel: ObservableObject {
     private var micSeq: UInt32 = 0
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
+    private var appIsBackgrounded = false
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -509,34 +530,54 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    func handleScenePhase(_ phase: ScenePhase) {
-        switch phase {
-        case .background:
-            if activeTransport != .none && (connectionHealth == .streaming || connectionHealth == .waitingForVideo) {
-                decoder.setSuspended(true)
-                if activeTransport == .usb {
-                    usbListener?.sendAppBackgroundState(isBackgrounded: true)
-                } else {
-                    networkControl?.sendAppBackgroundState(isBackgrounded: true)
-                }
-                if connectionHealth == .streaming {
-                    applyConnectionHealth(.backgroundAudioMode, transport: activeTransport)
-                }
-            }
-        case .active:
-            if activeTransport != .none {
-                decoder.setSuspended(false)
-                if activeTransport == .usb {
-                    usbListener?.sendAppBackgroundState(isBackgrounded: false)
-                } else {
-                    networkControl?.sendAppBackgroundState(isBackgrounded: false)
-                }
-            }
-            if connectionHealth == .backgroundAudioMode {
-                applyConnectionHealth(.streaming, transport: activeTransport)
-            }
-        default:
-            break
+    func handleAppWillResignActive() {
+        log("sceneWillResignActive")
+    }
+
+    func handleAppDidEnterBackground() {
+        guard !appIsBackgrounded else { return }
+        appIsBackgrounded = true
+        log("sceneDidEnterBackground")
+
+        guard activeTransport != .none else { return }
+        guard connectionHealth == .streaming || connectionHealth == .waitingForVideo else { return }
+
+        decoder.setSuspended(true)
+        if activeTransport == .usb {
+            usbListener?.sendAppBackgroundState(isBackgrounded: true)
+        } else {
+            networkControl?.sendAppBackgroundState(isBackgrounded: true)
+        }
+        if connectionHealth == .streaming {
+            applyConnectionHealth(.backgroundAudioMode, transport: activeTransport)
+        }
+    }
+
+    func handleAppWillEnterForeground() {
+        if appIsBackgrounded {
+            log("sceneWillEnterForeground")
+        }
+    }
+
+    func handleAppDidBecomeActive() {
+        guard appIsBackgrounded else { return }
+        appIsBackgrounded = false
+        log("sceneDidBecomeActive")
+
+        guard activeTransport != .none else {
+            decoder.setSuspended(false)
+            return
+        }
+
+        decoder.setSuspended(false)
+        if activeTransport == .usb {
+            usbListener?.sendAppBackgroundState(isBackgrounded: false)
+        } else {
+            networkControl?.sendAppBackgroundState(isBackgrounded: false)
+        }
+
+        if connectionHealth == .backgroundAudioMode {
+            applyConnectionHealth(.streaming, transport: activeTransport)
         }
     }
 
@@ -1436,7 +1477,6 @@ enum ToolbarOrientation: String {
 }
 
 struct ContentView: View {
-    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var model: StreamViewModel
     @State private var showOverlay = true
 
@@ -1677,9 +1717,6 @@ struct ContentView: View {
             }
             .onChange(of: pillSize) { _ in
                 clampBarPosition(in: geo.size)
-            }
-            .onChange(of: scenePhase) { newPhase in
-                model.handleScenePhase(newPhase)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in
