@@ -1323,8 +1323,9 @@ struct ContentView: View {
                                         }
                                     }
                                     .listStyle(.plain)
-                                    .scrollContentBackground(.hidden)
                                     .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                     .frame(height: connectionListHeight(for: model.pinnedConnections.count))
                                 }
                             }
@@ -1350,8 +1351,9 @@ struct ContentView: View {
                                         }
                                     }
                                     .listStyle(.plain)
-                                    .scrollContentBackground(.hidden)
                                     .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
+                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                     .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
                                 }
                             }
