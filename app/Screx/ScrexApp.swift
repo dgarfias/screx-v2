@@ -1184,6 +1184,7 @@ struct ContentView: View {
     @State private var isKeyboardActive = false
     @State private var keyboardHeight: CGFloat = 0
     @State private var preKeyboardY: CGFloat? = nil
+    @State private var viewSize: CGSize = .zero
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
 
@@ -1377,23 +1378,26 @@ struct ContentView: View {
                 floatingBar(in: geo)
             }
             .onAppear {
-                if barPosition == .zero {
-                    let halfW = pillSize.width / 2 + 4
-                    let halfH = pillSize.height / 2 + 4
-                    barPosition = CGPoint(x: geo.size.width - halfW, y: geo.size.height - halfH)
-                }
+                viewSize = geo.size
+                clampBarPosition(in: geo.size, persist: barPosition != .zero)
+            }
+            .onChange(of: geo.size) { newSize in
+                viewSize = newSize
+                clampBarPosition(in: newSize)
+            }
+            .onChange(of: pillSize) { _ in
+                clampBarPosition(in: geo.size)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in
             guard let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
             let kbH = frame.height
             keyboardHeight = kbH
-            let halfH = pillSize.height / 2 + 4
-            let maxY = UIScreen.main.bounds.height - kbH - halfH
-            if barPosition.y > maxY {
+            let clamped = clampedBarPosition(barPosition, in: viewSize, keyboardHeight: kbH)
+            if clamped != barPosition {
                 preKeyboardY = barPosition.y
                 withAnimation(.easeOut(duration: 0.25)) {
-                    barPosition.y = maxY
+                    barPosition = clamped
                 }
             }
         }
@@ -1401,9 +1405,15 @@ struct ContentView: View {
             keyboardHeight = 0
             if let savedY = preKeyboardY {
                 withAnimation(.easeOut(duration: 0.25)) {
-                    barPosition.y = savedY
+                    barPosition = clampedBarPosition(
+                        CGPoint(x: barPosition.x, y: savedY),
+                        in: viewSize,
+                        keyboardHeight: 0
+                    )
                 }
                 preKeyboardY = nil
+            } else {
+                barPosition = clampedBarPosition(barPosition, in: viewSize, keyboardHeight: 0)
             }
         }
         .sheet(isPresented: $model.showPinEntry) {
@@ -1452,9 +1462,9 @@ struct ContentView: View {
             ? AnyLayout(VStackLayout(spacing: Self.btnSpacing))
             : AnyLayout(HStackLayout(spacing: Self.btnSpacing))
 
-        let pos = CGPoint(
-            x: barPosition.x + dragOffset.width,
-            y: barPosition.y + dragOffset.height
+        let pos = clampedBarPosition(
+            CGPoint(x: barPosition.x + dragOffset.width, y: barPosition.y + dragOffset.height),
+            in: geo.size
         )
 
         layout {
@@ -1503,8 +1513,17 @@ struct ContentView: View {
         .background(
             GeometryReader { pillGeo in
                 Color.clear.onAppear { pillSize = pillGeo.size }
+                    .onChange(of: pillGeo.size) { newSize in
+                        DispatchQueue.main.async {
+                            pillSize = newSize
+                            clampBarPosition(in: geo.size)
+                        }
+                    }
                     .onChange(of: model.isConnected) { _ in
-                        DispatchQueue.main.async { pillSize = pillGeo.size }
+                        DispatchQueue.main.async {
+                            pillSize = pillGeo.size
+                            clampBarPosition(in: geo.size)
+                        }
                     }
             }
         )
@@ -1531,17 +1550,8 @@ struct ContentView: View {
                         newOrientation = .horizontal
                     }
 
-                    let halfW = pillSize.width / 2 + 4
-                    let halfH = pillSize.height / 2 + 4
-
-                    newPos.x = max(halfW, min(newPos.x, geo.size.width - halfW))
-                    newPos.y = max(halfH, min(newPos.y, geo.size.height - halfH))
-
-                    if keyboardHeight > 0 {
-                        let maxY = geo.size.height - keyboardHeight - halfH
-                        newPos.y = min(newPos.y, maxY)
-                        preKeyboardY = nil
-                    }
+                    newPos = clampedBarPosition(newPos, in: geo.size)
+                    preKeyboardY = nil
 
                     barPosition = newPos
                     dragOffset = .zero
@@ -1577,6 +1587,41 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.2)) {
                 toolbarMessage = nil
             }
+        }
+    }
+
+    private func defaultBarPosition(in size: CGSize) -> CGPoint {
+        let halfW = pillSize.width / 2 + 4
+        let halfH = pillSize.height / 2 + 4
+        return CGPoint(x: size.width - halfW, y: size.height - halfH)
+    }
+
+    private func clampedBarPosition(_ position: CGPoint, in size: CGSize, keyboardHeight: CGFloat? = nil) -> CGPoint {
+        guard size.width > 0, size.height > 0 else { return position }
+
+        let halfW = pillSize.width / 2 + 4
+        let halfH = pillSize.height / 2 + 4
+        let activeKeyboardHeight = keyboardHeight ?? self.keyboardHeight
+
+        let minX = halfW
+        let maxX = max(halfW, size.width - halfW)
+        let minY = halfH
+        let maxVisibleY = size.height - activeKeyboardHeight - halfH
+        let maxY = max(halfH, maxVisibleY)
+
+        return CGPoint(
+            x: min(max(position.x, minX), maxX),
+            y: min(max(position.y, minY), maxY)
+        )
+    }
+
+    private func clampBarPosition(in size: CGSize, persist: Bool = true) {
+        let target = barPosition == .zero ? defaultBarPosition(in: size) : barPosition
+        let clamped = clampedBarPosition(target, in: size)
+        guard clamped != barPosition else { return }
+        barPosition = clamped
+        if persist {
+            Self.saveBarPosition(clamped)
         }
     }
 
