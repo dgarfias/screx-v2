@@ -1256,12 +1256,11 @@ struct ContentView: View {
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
     private static let edgeThreshold: CGFloat = 40
-    private static let connectionRowHeight: CGFloat = 52
-    private static let connectionListChromeHeight: CGFloat = 28
+    private static let connectionRowHeight: CGFloat = 44
 
     private func connectionListHeight(for rowCount: Int) -> CGFloat {
         guard rowCount > 0 else { return 0 }
-        let estimated = CGFloat(rowCount) * Self.connectionRowHeight + Self.connectionListChromeHeight
+        let estimated = CGFloat(rowCount) * Self.connectionRowHeight
         return min(estimated, 220)
     }
 
@@ -1313,9 +1312,11 @@ struct ContentView: View {
                             }
 
                             if !model.pinnedConnections.isEmpty {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("Pinned Connections")
-                                        .font(.caption.weight(.semibold))
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Pinned")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                        .textCase(.uppercase)
 
                                     List {
                                         ForEach(model.pinnedConnections) { connection in
@@ -1323,26 +1324,32 @@ struct ContentView: View {
                                         }
                                     }
                                     .listStyle(.plain)
+                                    .scrollDisabled(true)
                                     .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
-                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                     .frame(height: connectionListHeight(for: model.pinnedConnections.count))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
                                 }
                             }
 
                             if !model.unpinnedRecentConnections.isEmpty {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("Recent Connections")
-                                            .font(.caption.weight(.semibold))
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(alignment: .center) {
+                                        Text("Recent")
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(.secondary)
+                                            .textCase(.uppercase)
                                         Spacer()
-                                        Button("Clear") { model.clearRecentConnections() }
-                                            .font(.caption.weight(.semibold))
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 4)
-                                            .background(Color.red.opacity(0.18), in: Capsule())
-                                            .foregroundStyle(.red)
-                                            .buttonStyle(.plain)
+                                        Button {
+                                            model.clearRecentConnections()
+                                        } label: {
+                                            Text("Clear All")
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 4)
+                                                .background(Color.red, in: Capsule())
+                                        }
+                                        .buttonStyle(.plain)
                                     }
 
                                     List {
@@ -1351,10 +1358,10 @@ struct ContentView: View {
                                         }
                                     }
                                     .listStyle(.plain)
+                                    .scrollDisabled(true)
                                     .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
-                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                     .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
                                 }
                             }
                         } else {
@@ -1617,31 +1624,35 @@ struct ContentView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: connection.isPinned ? "star.fill" : "clock.arrow.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(connection.isPinned ? .yellow : .secondary)
+                    .font(.system(size: 14))
+                    .foregroundStyle(connection.isPinned ? .orange : Color(.systemGray3))
+                    .frame(width: 20)
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(connection.displayName)
-                        .font(.caption.weight(.medium))
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(.primary)
                     Text(connection.endpointLabel)
-                        .font(.caption2)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color(.systemGray3))
             }
-            .padding(.vertical, 4)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(model.isConnecting)
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button(connection.isPinned ? "Unpin" : "Pin") {
                 model.togglePinned(connection)
             }
-            .tint(.yellow)
+            .tint(.orange)
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button("Delete", role: .destructive) {
