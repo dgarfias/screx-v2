@@ -7,6 +7,7 @@ final class NetworkControlClient {
     private let sessionKey: SymmetricKey
     private let queue = DispatchQueue(label: "screx.netcontrol", qos: .userInteractive)
     private let debugId = String(UUID().uuidString.prefix(6))
+    private static let disconnectMagic = Data("DISCONNECT".utf8)
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
@@ -48,6 +49,34 @@ final class NetworkControlClient {
         }
     }
 
+    func disconnectGracefully() {
+        queue.async { [weak self] in
+            guard let self, !self.isClosed else { return }
+            guard let frame = self.makeFrame(Self.disconnectMagic, label: "disconnect") else {
+                self.log("graceful disconnect frame build failed, cancelling")
+                self.isClosed = true
+                self.connection.cancel()
+                return
+            }
+
+            self.isClosed = true
+            self.log("sending graceful disconnect")
+            self.connection.send(content: frame, completion: .contentProcessed { error in
+                if let error {
+                    self.log("disconnect send error: \(error.localizedDescription)")
+                } else {
+                    self.log("graceful disconnect sent")
+                }
+                self.connection.cancel()
+            })
+
+            self.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, self.isClosed else { return }
+                self.connection.cancel()
+            }
+        }
+    }
+
     private func handleDisconnect() {
         guard !isClosed else { return }
         isClosed = true
@@ -78,34 +107,38 @@ final class NetworkControlClient {
         }
     }
 
+    private func makeFrame(_ payload: Data, label: String) -> Data? {
+        let seq = sendSeq
+        sendSeq = sendSeq &+ 1
+
+        var seqData = Data(count: 4)
+        seqData.withUnsafeMutableBytes { buf in
+            buf.storeBytes(of: seq.bigEndian, as: UInt32.self)
+        }
+
+        let nonce = ScrexCrypto.nonceControlClient(seqNum: seq)
+        guard let encrypted = ScrexCrypto.encrypt(
+            key: sessionKey,
+            nonce: nonce,
+            plaintext: payload,
+            aad: seqData
+        ) else {
+            log("\(label) encrypt failed")
+            return nil
+        }
+
+        let bodyLen = UInt32(seqData.count + encrypted.count)
+        var frame = Data()
+        withUnsafeBytes(of: bodyLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(seqData)
+        frame.append(encrypted)
+        return frame
+    }
+
     private func sendFrame(_ payload: Data, label: String) {
         queue.async { [weak self] in
             guard let self, !self.isClosed else { return }
-
-            let seq = self.sendSeq
-            self.sendSeq = self.sendSeq &+ 1
-
-            var seqData = Data(count: 4)
-            seqData.withUnsafeMutableBytes { buf in
-                buf.storeBytes(of: seq.bigEndian, as: UInt32.self)
-            }
-
-            let nonce = ScrexCrypto.nonceControlClient(seqNum: seq)
-            guard let encrypted = ScrexCrypto.encrypt(
-                key: self.sessionKey,
-                nonce: nonce,
-                plaintext: payload,
-                aad: seqData
-            ) else {
-                self.log("\(label) encrypt failed")
-                return
-            }
-
-            let bodyLen = UInt32(seqData.count + encrypted.count)
-            var frame = Data()
-            withUnsafeBytes(of: bodyLen.bigEndian) { frame.append(contentsOf: $0) }
-            frame.append(seqData)
-            frame.append(encrypted)
+            guard let frame = self.makeFrame(payload, label: label) else { return }
 
             self.connection.send(content: frame, completion: .contentProcessed { error in
                 if let error {

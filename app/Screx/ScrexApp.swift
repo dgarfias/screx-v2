@@ -444,9 +444,7 @@ final class StreamViewModel: ObservableObject {
         stream?.onStatus = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
-        networkControl?.onDisconnect = nil
-        networkControl?.disconnect()
-        networkControl = nil
+        closeNetworkControl(gracefully: true)
         pairingService?.cancel()
 
         isConnecting = true
@@ -629,9 +627,7 @@ final class StreamViewModel: ObservableObject {
         stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
-        networkControl?.onDisconnect = nil
-        networkControl?.disconnect()
-        networkControl = nil
+        closeNetworkControl(gracefully: true)
         isConnected = false
         isConnecting = false
         transport = ""
@@ -653,9 +649,7 @@ final class StreamViewModel: ObservableObject {
         stream?.onDisconnect = nil
         stream?.disconnect()
         stream = nil
-        networkControl?.onDisconnect = nil
-        networkControl?.disconnect()
-        networkControl = nil
+        closeNetworkControl(gracefully: true)
         pairingService?.cancel()
         pairingService = nil
         usbListener?.stop()
@@ -674,6 +668,17 @@ final class StreamViewModel: ObservableObject {
 
     var displayLayer: AVSampleBufferDisplayLayer? {
         decoder.displayLayer
+    }
+
+    private func closeNetworkControl(gracefully: Bool) {
+        let control = networkControl
+        control?.onDisconnect = nil
+        networkControl = nil
+        if gracefully {
+            control?.disconnectGracefully()
+        } else {
+            control?.disconnect()
+        }
     }
 
     func sendTouch(_ data: Data) {

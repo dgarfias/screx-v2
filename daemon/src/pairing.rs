@@ -159,6 +159,7 @@ fn config_dir() -> PathBuf {
 const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
 const CONTROL_MAX_FRAME: usize = 65536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const CONTROL_DISCONNECT_MAGIC: &[u8] = b"DISCONNECT";
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.
@@ -574,6 +575,11 @@ fn run_control_loop(
                 continue;
             }
         };
+
+        if plaintext == CONTROL_DISCONNECT_MAGIC {
+            println!("[control] graceful disconnect requested by client");
+            break;
+        }
 
         crate::stream_server::handle_control_message_data(shared, plaintext);
     }
