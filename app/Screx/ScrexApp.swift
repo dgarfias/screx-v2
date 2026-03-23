@@ -240,6 +240,8 @@ final class StreamViewModel: ObservableObject {
     }
     private var servicesStarted = false
     private var usbConnected = false
+    @Published var isCharging = false
+    @Published var isUSBListening = false
     private var camFrameId: UInt32 = 0
 
     private var lastNetEndpoint: NWEndpoint?
@@ -398,8 +400,40 @@ final class StreamViewModel: ObservableObject {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
+        startBatteryMonitoring()
+        if !isConnected && !isConnecting {
+            status = disconnectedPrompt()
+        }
+    }
 
-        // Start USB listener
+    private func startBatteryMonitoring() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        updateChargingState()
+        NotificationCenter.default.addObserver(
+            forName: UIDevice.batteryStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateChargingState()
+        }
+    }
+
+    private func updateChargingState() {
+        let state = UIDevice.current.batteryState
+        isCharging = state == .charging || state == .full
+    }
+
+    func connectUSB() {
+        if isUSBListening {
+            cancelUSBListening()
+            return
+        }
+        guard !isConnecting && !isConnected else { return }
+
+        isUSBListening = true
+        isConnecting = true
+        status = "Listening for USB connection…"
+
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.usbListener = usb
 
@@ -408,8 +442,6 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.log("usb status: \(msg)")
                 if self.usbConnected {
-                    self.status = msg
-                } else if msg.localizedCaseInsensitiveContains("failed") || msg.localizedCaseInsensitiveContains("error") {
                     self.status = msg
                 }
             }
@@ -421,6 +453,7 @@ final class StreamViewModel: ObservableObject {
                 self.usbConnected = true
                 self.isConnected = true
                 self.isConnecting = false
+                self.isUSBListening = false
                 self.transport = "USB"
                 self.stream?.suppressTimeout = true
                 self.audioPlayer.start()
@@ -432,14 +465,21 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 self.log("usb disconnected")
                 self.usbConnected = false
+                self.isUSBListening = false
                 self.stream?.suppressTimeout = false
                 self.fallbackToNetwork()
             }
         }
         usb.start()
-        if !isConnected && !isConnecting {
-            status = disconnectedPrompt()
-        }
+    }
+
+    private func cancelUSBListening() {
+        usbListener?.stop()
+        usbListener = nil
+        isUSBListening = false
+        isConnecting = false
+        usbConnected = false
+        status = disconnectedPrompt()
     }
 
     func connectManual() {
@@ -670,7 +710,6 @@ final class StreamViewModel: ObservableObject {
         client.connect()
     }
 
-    /// Called when USB disconnects — try to resume network connection immediately
     private func fallbackToNetwork() {
         log("fallbackToNetwork() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
         stream?.onStatus = nil
@@ -678,8 +717,11 @@ final class StreamViewModel: ObservableObject {
         stream?.disconnect()
         stream = nil
         closeNetworkControl(gracefully: false)
+        usbListener?.stop()
+        usbListener = nil
         isConnected = false
         isConnecting = false
+        isUSBListening = false
         transport = ""
         audioPlayer.stop()
         micCapture.stop()
@@ -715,6 +757,7 @@ final class StreamViewModel: ObservableObject {
         usbListener?.stop()
         usbListener = nil
         usbConnected = false
+        isUSBListening = false
         isConnected = false
         isConnecting = false
         transport = ""
@@ -1301,10 +1344,36 @@ struct ContentView: View {
                                 .keyboardType(.URL)
                                 .disabled(model.isConnecting)
 
-                            Button(model.isConnecting ? "Connecting..." : "Connect") { model.connectManual() }
+                            Button(model.isConnecting && !model.isUSBListening ? "Connecting…" : "Connect") { model.connectManual() }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
+
+                        HStack(spacing: 6) {
+                            Rectangle()
+                                .frame(height: 1)
+                                .foregroundStyle(Color(.separator))
+                            Text("or")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Rectangle()
+                                .frame(height: 1)
+                                .foregroundStyle(Color(.separator))
+                        }
+                        .padding(.vertical, 2)
+
+                        Button {
+                            model.connectUSB()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "cable.connector")
+                                Text(model.isUSBListening ? "Cancel USB" : "Connect via USB")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(model.isUSBListening ? .red : .green)
+                        .disabled(!model.isUSBListening && (!model.isCharging || model.isConnecting))
 
                         if !model.pinnedConnections.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
