@@ -2,6 +2,7 @@ import AVFoundation
 import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
+import UIKit
 
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
@@ -44,6 +45,9 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         if session.canAddOutput(output) {
             session.addOutput(output)
+        }
+        if let connection = output.connection(with: .video) {
+            applyOrientation(to: connection)
         }
 
         do {
@@ -106,6 +110,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let onJPEG else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        applyOrientation(to: connection)
 
         autoreleasepool {
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
@@ -128,6 +133,37 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
             guard CGImageDestinationFinalize(destination) else { return }
             onJPEG(jpegData as Data)
+        }
+    }
+
+    private func applyOrientation(to connection: AVCaptureConnection) {
+        guard let orientation = currentVideoOrientation() else { return }
+
+        if connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
+        }
+    }
+
+    private func currentVideoOrientation() -> AVCaptureVideoOrientation? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })
+            ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+        else {
+            return nil
+        }
+
+        switch scene.interfaceOrientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            return .landscapeLeft
+        case .landscapeRight:
+            return .landscapeRight
+        default:
+            return nil
         }
     }
 }
