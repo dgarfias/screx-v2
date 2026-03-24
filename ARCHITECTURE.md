@@ -132,7 +132,7 @@ Why:
 ### USB session
 
 1. iPad enters `Connect via USB` listening mode.
-2. Daemon detects iOS device and starts `iproxy`.
+2. Daemon detects the connected iPadOS device and starts `iproxy`.
 3. Daemon connects to the app listener over forwarded TCP.
 4. iPad sends `READY`.
 5. Daemon activates USB transport.
@@ -235,8 +235,6 @@ Control payloads include messages such as:
 - `RAWKEY`
 - `PERIPH`
 - `GPAD`
-- `APPBG`
-- `APPFG`
 - `SPKR`
 - `HOST<hostname>`
 - `DISCONNECT`
@@ -265,8 +263,6 @@ ASCII prefix plus message body, for example:
 
 - `READY`
 - `PLI`
-- `APPBG`
-- `APPFG`
 - `SPKR<1-byte-flag>`
 - `HOST<hostname>`
 - `TOUCH...`
@@ -365,23 +361,6 @@ External keyboard HID-like packets use `"RAWKEY"`.
 - frames are JPEG-compressed
 - daemon writes them into a `v4l2loopback` webcam device
 
-## Background Session Mode
-
-When the iPad backgrounds:
-
-- app suspends decoder rendering
-- app sends `APPBG`
-- daemon marks client as backgrounded
-- daemon pauses video encode/send while keeping the session alive
-- audio/control can continue
-
-When the iPad returns to foreground:
-
-- app sends `APPFG`
-- daemon clears background mode
-- daemon forces a refresh / IDR
-- video resumes
-
 ## Connection Health Model
 
 The iPad app uses explicit session-health states such as:
@@ -395,7 +374,6 @@ The iPad app uses explicit session-health states such as:
 - Connection refused
 - Timed out
 - Session stale, try again
-- Background audio mode
 
 These states are driven by transport events instead of only raw status strings.
 

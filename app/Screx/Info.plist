@@ -32,9 +32,5 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>audio</string>
-	</array>
 </dict>
 </plist>

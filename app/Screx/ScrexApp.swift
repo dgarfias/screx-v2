@@ -64,20 +64,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         window.makeKeyAndVisible()
     }
 
-    func sceneWillResignActive(_ scene: UIScene) {
-        model?.handleAppWillResignActive()
-    }
-
     func sceneDidEnterBackground(_ scene: UIScene) {
         model?.handleAppDidEnterBackground()
-    }
-
-    func sceneWillEnterForeground(_ scene: UIScene) {
-        model?.handleAppWillEnterForeground()
-    }
-
-    func sceneDidBecomeActive(_ scene: UIScene) {
-        model?.handleAppDidBecomeActive()
     }
 }
 
@@ -164,12 +152,11 @@ enum ConnectionHealthState: String {
     case connectionRefused = "Connection refused"
     case timedOut = "Timed out"
     case sessionStale = "Session stale, try again"
-    case backgroundAudioMode = "Background audio mode"
     case connectionError = "Connection error"
 
     var isConnected: Bool {
         switch self {
-        case .streaming, .backgroundAudioMode:
+        case .streaming:
             return true
         default:
             return false
@@ -335,7 +322,6 @@ final class StreamViewModel: ObservableObject {
     private var micSeq: UInt32 = 0
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
-    private var appIsBackgrounded = false
     private var trafficTimer: DispatchSourceTimer?
     private var totalRxBytes: UInt64 = 0
     private var totalTxBytes: UInt64 = 0
@@ -497,8 +483,6 @@ final class StreamViewModel: ObservableObject {
     var sessionTransportTitle: String {
         let transportLabel = transport.isEmpty ? "connection" : transport.lowercased()
         switch connectionHealth {
-        case .backgroundAudioMode:
-            return "Background audio via \(transportLabel)"
         case .streaming:
             return "Streaming via \(transportLabel)"
         default:
@@ -553,8 +537,6 @@ final class StreamViewModel: ObservableObject {
             return "The daemon stopped responding in time."
         case .sessionStale:
             return "The saved session looks stale. Try again or pair again."
-        case .backgroundAudioMode:
-            return "Screx is backgrounded and audio mode stays active."
         case .connectionError:
             return "The connection failed unexpectedly."
         }
@@ -578,19 +560,6 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    func handleAppWillResignActive() {
-        log("sceneWillResignActive")
-    }
-
-    private func sendAppTransportBackgroundState(isBackgrounded: Bool) {
-        guard activeTransport != .none else { return }
-        if activeTransport == .usb {
-            usbListener?.sendAppBackgroundState(isBackgrounded: isBackgrounded)
-        } else {
-            networkControl?.sendAppBackgroundState(isBackgrounded: isBackgrounded)
-        }
-    }
-
     private func sendSpeakerTransportState(isEnabled: Bool) {
         guard activeTransport != .none else { return }
         if activeTransport == .usb {
@@ -600,52 +569,14 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    private func assertForegroundTransportState() {
-        appIsBackgrounded = false
-        decoder.setSuspended(false)
-        sendAppTransportBackgroundState(isBackgrounded: false)
-    }
-
     private func syncSpeakerPassthroughState() {
         sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
     }
 
     func handleAppDidEnterBackground() {
-        guard !appIsBackgrounded else { return }
-        appIsBackgrounded = true
         log("sceneDidEnterBackground")
-
-        guard activeTransport != .none else { return }
-        guard connectionHealth == .streaming || connectionHealth == .waitingForVideo else { return }
-
-        decoder.setSuspended(true)
-        sendAppTransportBackgroundState(isBackgrounded: true)
-        if connectionHealth == .streaming {
-            applyConnectionHealth(.backgroundAudioMode, transport: activeTransport)
-        }
-    }
-
-    func handleAppWillEnterForeground() {
-        if appIsBackgrounded {
-            log("sceneWillEnterForeground")
-        }
-    }
-
-    func handleAppDidBecomeActive() {
-        guard appIsBackgrounded else { return }
-        appIsBackgrounded = false
-        log("sceneDidBecomeActive")
-
-        guard activeTransport != .none else {
-            decoder.setSuspended(false)
-            return
-        }
-
-        assertForegroundTransportState()
-
-        if connectionHealth == .backgroundAudioMode {
-            applyConnectionHealth(.streaming, transport: activeTransport)
-        }
+        guard activeTransport != .none || isConnecting || isUSBListening || pairingService != nil else { return }
+        disconnect(detail: "Screx disconnected when the app entered the background. Reconnect to continue.")
     }
 
     func startServices() {
@@ -774,7 +705,7 @@ final class StreamViewModel: ObservableObject {
                 self.usbConnected = true
                 self.isUSBListening = false
                 self.stream?.suppressTimeout = true
-                self.assertForegroundTransportState()
+                self.decoder.setSuspended(false)
                 self.syncSpeakerPassthroughState()
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
@@ -797,6 +728,7 @@ final class StreamViewModel: ObservableObject {
                 self.decoder.setSuspended(false)
                 self.audioPlayer.stop()
                 self.micCapture.stop()
+                self.cameraCapture.stop()
                 self.stopPeripheralMonitoring()
                 self.applyConnectionHealth(.connectionError, detail: "USB disconnected. \(self.disconnectedPrompt())", transport: .none)
             }
@@ -959,7 +891,7 @@ final class StreamViewModel: ObservableObject {
                     }
                 }
                 control.start()
-                self.assertForegroundTransportState()
+                self.decoder.setSuspended(false)
                 self.syncSpeakerPassthroughState()
 
                 self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key, controlClient: control)
@@ -1093,6 +1025,7 @@ final class StreamViewModel: ObservableObject {
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
+        cameraCapture.stop()
         stopPeripheralMonitoring()
         if preservedHealth.isTerminalFailure {
             applyConnectionHealth(preservedHealth, detail: preservedStatus, transport: .none)
@@ -1101,7 +1034,7 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    func disconnect() {
+    func disconnect(detail: String? = nil) {
         stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
@@ -1116,11 +1049,12 @@ final class StreamViewModel: ObservableObject {
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
+        cameraCapture.stop()
         stopPeripheralMonitoring()
         lastNetEndpoint = nil
         lastNetName = nil
         sessionDisplayName = ""
-        applyConnectionHealth(.idle, detail: disconnectedPrompt(), transport: .none)
+        applyConnectionHealth(.idle, detail: detail ?? disconnectedPrompt(), transport: .none)
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {

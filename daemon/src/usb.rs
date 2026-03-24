@@ -287,7 +287,6 @@ fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender
         *usb = Some(sender);
     }
     shared.usb_active.store(true, Ordering::SeqCst);
-    shared.client_backgrounded.store(false, Ordering::SeqCst);
     shared.force_idr.store(true, Ordering::Relaxed);
     shared.capture_start.store(true, Ordering::Release);
     if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
@@ -318,7 +317,6 @@ fn local_hostname() -> Option<String> {
 
 fn deactivate_usb_transport(shared: &Arc<SharedState>) {
     shared.usb_active.store(false, Ordering::SeqCst);
-    shared.client_backgrounded.store(false, Ordering::SeqCst);
     {
         let mut usb = shared.usb_sender.lock().unwrap();
         *usb = None;
