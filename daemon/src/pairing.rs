@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use crate::crypto;
 
 // Wire protocol magic bytes
-const MAGIC_PAIR: &[u8] = b"SCREX_PAIR";      // 10 bytes
-const MAGIC_HELLO: &[u8] = b"SCREX_HELLO";    // 11 bytes
-const MAGIC_PIN: &[u8] = b"SCREX_PIN\0";      // 10 bytes (padded for alignment)
-const MAGIC_ANSWER: &[u8] = b"SCREX_ANSWER";  // 12 bytes
-const MAGIC_OK: &[u8] = b"SCREX_OK\0\0";      // 10 bytes
-const MAGIC_REJECT: &[u8] = b"SCREX_REJECT";  // 12 bytes
+const MAGIC_PAIR: &[u8] = b"SCREX_PAIR"; // 10 bytes
+const MAGIC_HELLO: &[u8] = b"SCREX_HELLO"; // 11 bytes
+const MAGIC_PIN: &[u8] = b"SCREX_PIN\0"; // 10 bytes (padded for alignment)
+const MAGIC_ANSWER: &[u8] = b"SCREX_ANSWER"; // 12 bytes
+const MAGIC_OK: &[u8] = b"SCREX_OK\0\0"; // 10 bytes
+const MAGIC_REJECT: &[u8] = b"SCREX_REJECT"; // 12 bytes
 
 const DEVICE_ID_LEN: usize = 16;
 const PUBKEY_LEN: usize = 32;
@@ -110,7 +110,12 @@ impl PairingState {
         })
     }
 
-    fn store_device(&mut self, device_id: &[u8; DEVICE_ID_LEN], pairing_key: &[u8; 32], name: &str) {
+    fn store_device(
+        &mut self,
+        device_id: &[u8; DEVICE_ID_LEN],
+        pairing_key: &[u8; 32],
+        name: &str,
+    ) {
         let id_hex = hex_encode(device_id);
         self.paired_devices.insert(
             id_hex,
@@ -203,12 +208,8 @@ pub fn run_pairing_server(
                 };
 
                 println!("[pairing] incoming handshake from {addr}");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(30)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(10)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
                 match handle_handshake(&mut stream, addr, &pairing) {
                     Ok(mut session) => {
@@ -222,9 +223,13 @@ pub fn run_pairing_server(
                         if let Err(e) = std::thread::Builder::new()
                             .name(format!("control-{session_id}"))
                             .spawn(move || {
-                                if let Err(e) =
-                                    run_control_loop(stream, &shared_control, &stop_control, session_key, session_id)
-                                {
+                                if let Err(e) = run_control_loop(
+                                    stream,
+                                    &shared_control,
+                                    &stop_control,
+                                    session_key,
+                                    session_id,
+                                ) {
                                     eprintln!("[control] network control loop ended: {e:#}");
                                 }
                             })
@@ -257,7 +262,7 @@ fn handle_handshake(
     stream: &mut TcpStream,
     addr: std::net::SocketAddr,
     pairing: &Arc<Mutex<PairingState>>,
- ) -> Result<SessionInfo> {
+) -> Result<SessionInfo> {
     // Read the first message to determine if this is PAIR or HELLO
     let mut header = [0u8; 12]; // max magic length
     stream.read_exact(&mut header)?;
@@ -314,10 +319,9 @@ fn handle_pair_request(
 
     // Compute ECDH shared secret
     let client_pub = UnparsedPublicKey::new(&X25519, &client_pubkey);
-    let ecdh_secret = agreement::agree_ephemeral(server_private, &client_pub, |shared| {
-        shared.to_vec()
-    })
-    .map_err(|_| anyhow::anyhow!("X25519 agreement failed"))?;
+    let ecdh_secret =
+        agreement::agree_ephemeral(server_private, &client_pub, |shared| shared.to_vec())
+            .map_err(|_| anyhow::anyhow!("X25519 agreement failed"))?;
 
     // Generate 6-digit PIN
     let pin = generate_pin(&rng);
@@ -450,10 +454,9 @@ fn handle_pair_already_paired(
         .map_err(|e| anyhow::anyhow!("X25519 pubkey: {e}"))?;
 
     let client_pub = UnparsedPublicKey::new(&X25519, client_pubkey);
-    let ecdh_secret = agreement::agree_ephemeral(server_private, &client_pub, |shared| {
-        shared.to_vec()
-    })
-    .map_err(|_| anyhow::anyhow!("X25519 agreement failed"))?;
+    let ecdh_secret =
+        agreement::agree_ephemeral(server_private, &client_pub, |shared| shared.to_vec())
+            .map_err(|_| anyhow::anyhow!("X25519 agreement failed"))?;
 
     // Derive session key from pairing_key + ECDH
     let mut ikm = Vec::new();
@@ -547,9 +550,7 @@ fn run_control_loop(
     session_key: [u8; 32],
     session_id: u64,
 ) -> Result<()> {
-    stream
-        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
-        .ok();
+    stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT)).ok();
     stream.set_nodelay(true).ok();
 
     let cipher = crypto::SessionCipher::new(&session_key);
@@ -592,7 +593,9 @@ fn run_control_loop(
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
-            eprintln!("[control] invalid framed control message length: {msg_len}, closing channel");
+            eprintln!(
+                "[control] invalid framed control message length: {msg_len}, closing channel"
+            );
             break;
         }
 
@@ -610,7 +613,9 @@ fn run_control_loop(
 
         let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
         if seq_initialized && seq_num != seq_expected {
-            crate::vlog!("[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}");
+            crate::vlog!(
+                "[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}"
+            );
         }
         seq_expected = seq_num.wrapping_add(1);
         seq_initialized = true;

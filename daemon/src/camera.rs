@@ -21,7 +21,6 @@ extern "C" {
     ) -> libc::c_int;
 }
 
-
 pub struct CamWriter {
     file: File,
 }
@@ -86,8 +85,14 @@ pub fn create_cam_writer(width: u32, height: u32) -> Result<CamWriter> {
     };
 
     match fd {
-        -1 => anyhow::bail!("failed to open {VIDEO_DEVICE}: {}", std::io::Error::last_os_error()),
-        -2 => anyhow::bail!("VIDIOC_S_FMT failed on {VIDEO_DEVICE}: {}", std::io::Error::last_os_error()),
+        -1 => anyhow::bail!(
+            "failed to open {VIDEO_DEVICE}: {}",
+            std::io::Error::last_os_error()
+        ),
+        -2 => anyhow::bail!(
+            "VIDIOC_S_FMT failed on {VIDEO_DEVICE}: {}",
+            std::io::Error::last_os_error()
+        ),
         fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
         fd => {
             let file = unsafe { File::from_raw_fd(fd) };

@@ -22,10 +22,10 @@ const ABS_MT_POSITION_Y: u16 = 0x36;
 
 // uinput ioctl constants
 const UINPUT_IOCTL_BASE: u8 = b'U';
-const UI_SET_EVBIT: libc::c_ulong = 0x40045564;   // _IOW('U', 100, int)
-const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;  // _IOW('U', 101, int)
-const UI_SET_ABSBIT: libc::c_ulong = 0x40045567;  // _IOW('U', 103, int)
-const UI_SET_PROPBIT: libc::c_ulong = 0x4004556e;  // _IOW('U', 110, int)
+const UI_SET_EVBIT: libc::c_ulong = 0x40045564; // _IOW('U', 100, int)
+const UI_SET_KEYBIT: libc::c_ulong = 0x40045565; // _IOW('U', 101, int)
+const UI_SET_ABSBIT: libc::c_ulong = 0x40045567; // _IOW('U', 103, int)
+const UI_SET_PROPBIT: libc::c_ulong = 0x4004556e; // _IOW('U', 110, int)
 const INPUT_PROP_DIRECT: libc::c_int = 0x01;
 
 const MAX_SLOTS: i32 = 10;
@@ -141,9 +141,21 @@ impl VirtualTouchscreen {
             ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_X as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_Y as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_MT_SLOT as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y as libc::c_int))?;
+            ioctl_check(libc::ioctl(
+                fd,
+                UI_SET_ABSBIT,
+                ABS_MT_TRACKING_ID as libc::c_int,
+            ))?;
+            ioctl_check(libc::ioctl(
+                fd,
+                UI_SET_ABSBIT,
+                ABS_MT_POSITION_X as libc::c_int,
+            ))?;
+            ioctl_check(libc::ioctl(
+                fd,
+                UI_SET_ABSBIT,
+                ABS_MT_POSITION_Y as libc::c_int,
+            ))?;
 
             let w = width as i32;
             let h = height as i32;
@@ -188,10 +200,7 @@ impl VirtualTouchscreen {
         // Wait for mutter to detect the new uinput device
         std::thread::sleep(std::time::Duration::from_millis(800));
 
-        let vendor_product = format!(
-            "{:04x}:{:04x}",
-            SCREX_VENDOR, SCREX_PRODUCT
-        );
+        let vendor_product = format!("{:04x}:{:04x}", SCREX_VENDOR, SCREX_PRODUCT);
         let schema_path = format!(
             "org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/{vendor_product}/"
         );
@@ -233,7 +242,9 @@ impl VirtualTouchscreen {
 
         match result {
             Ok(output) if output.status.success() => {
-                println!("[touch] mapped touchscreen {vendor_product} to EVDI output via gsettings");
+                println!(
+                    "[touch] mapped touchscreen {vendor_product} to EVDI output via gsettings"
+                );
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -290,7 +301,6 @@ impl VirtualTouchscreen {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
-
     fn emit(&mut self, type_: u16, code: u16, value: i32) {
         let ev = InputEvent {
             time: current_timeval(),
@@ -334,10 +344,7 @@ unsafe fn set_abs(fd: i32, code: u16, min: i32, max: i32) -> Result<()> {
 
 unsafe fn ioctl_check(ret: libc::c_int) -> Result<()> {
     if ret < 0 {
-        anyhow::bail!(
-            "ioctl failed: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::bail!("ioctl failed: {}", std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -462,7 +469,11 @@ impl VirtualMouse {
             1 => BTN_RIGHT,
             _ => return,
         };
-        crate::vlog!("[mouse] emit button: btn={} code={} state={state}", btn, code);
+        crate::vlog!(
+            "[mouse] emit button: btn={} code={} state={state}",
+            btn,
+            code
+        );
         self.emit(EV_KEY, code, state);
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
@@ -542,10 +553,8 @@ impl VirtualGamepad {
             ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_ABS as libc::c_int))?;
 
             for &btn in &[
-                BTN_SOUTH, BTN_EAST, BTN_C, BTN_NORTH, BTN_WEST, BTN_Z,
-                BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
-                BTN_SELECT, BTN_START, BTN_MODE,
-                BTN_THUMBL, BTN_THUMBR,
+                BTN_SOUTH, BTN_EAST, BTN_C, BTN_NORTH, BTN_WEST, BTN_Z, BTN_TL, BTN_TR, BTN_TL2,
+                BTN_TR2, BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR,
             ] {
                 ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, btn as libc::c_int))?;
             }
@@ -744,71 +753,190 @@ const KEY_HOME: u16 = 102;
 const KEY_END: u16 = 107;
 
 const ALL_KEYS: &[u16] = &[
-    KEY_ESC, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
-    KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB,
-    KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T_KEY, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
-    KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_ENTER, KEY_LEFTCTRL,
-    KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
-    KEY_SEMICOLON, KEY_APOSTROPHE, KEY_GRAVE, KEY_LEFTSHIFT, KEY_BACKSLASH,
-    KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B_KEY, KEY_N, KEY_M,
-    KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SPACE,
-    KEY_LEFTALT, KEY_LEFTMETA,
-    KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_DELETE, KEY_INSERT, KEY_HOME, KEY_END,
-    KEY_CAPSLOCK, KEY_RIGHTSHIFT, KEY_RIGHTCTRL, KEY_RIGHTALT, KEY_RIGHTMETA,
-    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
-    KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
-    KEY_SCROLLLOCK, KEY_NUMLOCK, KEY_PAGEUP, KEY_PAGEDOWN, KEY_SYSRQ,
+    KEY_ESC,
+    KEY_1,
+    KEY_2,
+    KEY_3,
+    KEY_4,
+    KEY_5,
+    KEY_6,
+    KEY_7,
+    KEY_8,
+    KEY_9,
+    KEY_0,
+    KEY_MINUS,
+    KEY_EQUAL,
+    KEY_BACKSPACE,
+    KEY_TAB,
+    KEY_Q,
+    KEY_W,
+    KEY_E,
+    KEY_R,
+    KEY_T_KEY,
+    KEY_Y,
+    KEY_U,
+    KEY_I,
+    KEY_O,
+    KEY_P,
+    KEY_LEFTBRACE,
+    KEY_RIGHTBRACE,
+    KEY_ENTER,
+    KEY_LEFTCTRL,
+    KEY_A,
+    KEY_S,
+    KEY_D,
+    KEY_F,
+    KEY_G,
+    KEY_H,
+    KEY_J,
+    KEY_K,
+    KEY_L,
+    KEY_SEMICOLON,
+    KEY_APOSTROPHE,
+    KEY_GRAVE,
+    KEY_LEFTSHIFT,
+    KEY_BACKSLASH,
+    KEY_Z,
+    KEY_X,
+    KEY_C,
+    KEY_V,
+    KEY_B_KEY,
+    KEY_N,
+    KEY_M,
+    KEY_COMMA,
+    KEY_DOT,
+    KEY_SLASH,
+    KEY_SPACE,
+    KEY_LEFTALT,
+    KEY_LEFTMETA,
+    KEY_UP,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_DOWN,
+    KEY_DELETE,
+    KEY_INSERT,
+    KEY_HOME,
+    KEY_END,
+    KEY_CAPSLOCK,
+    KEY_RIGHTSHIFT,
+    KEY_RIGHTCTRL,
+    KEY_RIGHTALT,
+    KEY_RIGHTMETA,
+    KEY_F1,
+    KEY_F2,
+    KEY_F3,
+    KEY_F4,
+    KEY_F5,
+    KEY_F6,
+    KEY_F7,
+    KEY_F8,
+    KEY_F9,
+    KEY_F10,
+    KEY_F11,
+    KEY_F12,
+    KEY_SCROLLLOCK,
+    KEY_NUMLOCK,
+    KEY_PAGEUP,
+    KEY_PAGEDOWN,
+    KEY_SYSRQ,
 ];
 
 fn char_to_key(c: char) -> Option<(u16, bool)> {
     match c {
-        'a' => Some((KEY_A, false)),       'b' => Some((KEY_B_KEY, false)),
-        'c' => Some((KEY_C, false)),       'd' => Some((KEY_D, false)),
-        'e' => Some((KEY_E, false)),       'f' => Some((KEY_F, false)),
-        'g' => Some((KEY_G, false)),       'h' => Some((KEY_H, false)),
-        'i' => Some((KEY_I, false)),       'j' => Some((KEY_J, false)),
-        'k' => Some((KEY_K, false)),       'l' => Some((KEY_L, false)),
-        'm' => Some((KEY_M, false)),       'n' => Some((KEY_N, false)),
-        'o' => Some((KEY_O, false)),       'p' => Some((KEY_P, false)),
-        'q' => Some((KEY_Q, false)),       'r' => Some((KEY_R, false)),
-        's' => Some((KEY_S, false)),       't' => Some((KEY_T_KEY, false)),
-        'u' => Some((KEY_U, false)),       'v' => Some((KEY_V, false)),
-        'w' => Some((KEY_W, false)),       'x' => Some((KEY_X, false)),
-        'y' => Some((KEY_Y, false)),       'z' => Some((KEY_Z, false)),
-        'A' => Some((KEY_A, true)),        'B' => Some((KEY_B_KEY, true)),
-        'C' => Some((KEY_C, true)),        'D' => Some((KEY_D, true)),
-        'E' => Some((KEY_E, true)),        'F' => Some((KEY_F, true)),
-        'G' => Some((KEY_G, true)),        'H' => Some((KEY_H, true)),
-        'I' => Some((KEY_I, true)),        'J' => Some((KEY_J, true)),
-        'K' => Some((KEY_K, true)),        'L' => Some((KEY_L, true)),
-        'M' => Some((KEY_M, true)),        'N' => Some((KEY_N, true)),
-        'O' => Some((KEY_O, true)),        'P' => Some((KEY_P, true)),
-        'Q' => Some((KEY_Q, true)),        'R' => Some((KEY_R, true)),
-        'S' => Some((KEY_S, true)),        'T' => Some((KEY_T_KEY, true)),
-        'U' => Some((KEY_U, true)),        'V' => Some((KEY_V, true)),
-        'W' => Some((KEY_W, true)),        'X' => Some((KEY_X, true)),
-        'Y' => Some((KEY_Y, true)),        'Z' => Some((KEY_Z, true)),
-        '1' => Some((KEY_1, false)),       '2' => Some((KEY_2, false)),
-        '3' => Some((KEY_3, false)),       '4' => Some((KEY_4, false)),
-        '5' => Some((KEY_5, false)),       '6' => Some((KEY_6, false)),
-        '7' => Some((KEY_7, false)),       '8' => Some((KEY_8, false)),
-        '9' => Some((KEY_9, false)),       '0' => Some((KEY_0, false)),
-        '!' => Some((KEY_1, true)),        '@' => Some((KEY_2, true)),
-        '#' => Some((KEY_3, true)),        '$' => Some((KEY_4, true)),
-        '%' => Some((KEY_5, true)),        '^' => Some((KEY_6, true)),
-        '&' => Some((KEY_7, true)),        '*' => Some((KEY_8, true)),
-        '(' => Some((KEY_9, true)),        ')' => Some((KEY_0, true)),
-        '-' => Some((KEY_MINUS, false)),   '_' => Some((KEY_MINUS, true)),
-        '=' => Some((KEY_EQUAL, false)),   '+' => Some((KEY_EQUAL, true)),
-        '[' => Some((KEY_LEFTBRACE, false)), '{' => Some((KEY_LEFTBRACE, true)),
-        ']' => Some((KEY_RIGHTBRACE, false)), '}' => Some((KEY_RIGHTBRACE, true)),
-        ';' => Some((KEY_SEMICOLON, false)), ':' => Some((KEY_SEMICOLON, true)),
-        '\'' => Some((KEY_APOSTROPHE, false)), '"' => Some((KEY_APOSTROPHE, true)),
-        '`' => Some((KEY_GRAVE, false)),   '~' => Some((KEY_GRAVE, true)),
-        '\\' => Some((KEY_BACKSLASH, false)), '|' => Some((KEY_BACKSLASH, true)),
-        ',' => Some((KEY_COMMA, false)),   '<' => Some((KEY_COMMA, true)),
-        '.' => Some((KEY_DOT, false)),     '>' => Some((KEY_DOT, true)),
-        '/' => Some((KEY_SLASH, false)),   '?' => Some((KEY_SLASH, true)),
+        'a' => Some((KEY_A, false)),
+        'b' => Some((KEY_B_KEY, false)),
+        'c' => Some((KEY_C, false)),
+        'd' => Some((KEY_D, false)),
+        'e' => Some((KEY_E, false)),
+        'f' => Some((KEY_F, false)),
+        'g' => Some((KEY_G, false)),
+        'h' => Some((KEY_H, false)),
+        'i' => Some((KEY_I, false)),
+        'j' => Some((KEY_J, false)),
+        'k' => Some((KEY_K, false)),
+        'l' => Some((KEY_L, false)),
+        'm' => Some((KEY_M, false)),
+        'n' => Some((KEY_N, false)),
+        'o' => Some((KEY_O, false)),
+        'p' => Some((KEY_P, false)),
+        'q' => Some((KEY_Q, false)),
+        'r' => Some((KEY_R, false)),
+        's' => Some((KEY_S, false)),
+        't' => Some((KEY_T_KEY, false)),
+        'u' => Some((KEY_U, false)),
+        'v' => Some((KEY_V, false)),
+        'w' => Some((KEY_W, false)),
+        'x' => Some((KEY_X, false)),
+        'y' => Some((KEY_Y, false)),
+        'z' => Some((KEY_Z, false)),
+        'A' => Some((KEY_A, true)),
+        'B' => Some((KEY_B_KEY, true)),
+        'C' => Some((KEY_C, true)),
+        'D' => Some((KEY_D, true)),
+        'E' => Some((KEY_E, true)),
+        'F' => Some((KEY_F, true)),
+        'G' => Some((KEY_G, true)),
+        'H' => Some((KEY_H, true)),
+        'I' => Some((KEY_I, true)),
+        'J' => Some((KEY_J, true)),
+        'K' => Some((KEY_K, true)),
+        'L' => Some((KEY_L, true)),
+        'M' => Some((KEY_M, true)),
+        'N' => Some((KEY_N, true)),
+        'O' => Some((KEY_O, true)),
+        'P' => Some((KEY_P, true)),
+        'Q' => Some((KEY_Q, true)),
+        'R' => Some((KEY_R, true)),
+        'S' => Some((KEY_S, true)),
+        'T' => Some((KEY_T_KEY, true)),
+        'U' => Some((KEY_U, true)),
+        'V' => Some((KEY_V, true)),
+        'W' => Some((KEY_W, true)),
+        'X' => Some((KEY_X, true)),
+        'Y' => Some((KEY_Y, true)),
+        'Z' => Some((KEY_Z, true)),
+        '1' => Some((KEY_1, false)),
+        '2' => Some((KEY_2, false)),
+        '3' => Some((KEY_3, false)),
+        '4' => Some((KEY_4, false)),
+        '5' => Some((KEY_5, false)),
+        '6' => Some((KEY_6, false)),
+        '7' => Some((KEY_7, false)),
+        '8' => Some((KEY_8, false)),
+        '9' => Some((KEY_9, false)),
+        '0' => Some((KEY_0, false)),
+        '!' => Some((KEY_1, true)),
+        '@' => Some((KEY_2, true)),
+        '#' => Some((KEY_3, true)),
+        '$' => Some((KEY_4, true)),
+        '%' => Some((KEY_5, true)),
+        '^' => Some((KEY_6, true)),
+        '&' => Some((KEY_7, true)),
+        '*' => Some((KEY_8, true)),
+        '(' => Some((KEY_9, true)),
+        ')' => Some((KEY_0, true)),
+        '-' => Some((KEY_MINUS, false)),
+        '_' => Some((KEY_MINUS, true)),
+        '=' => Some((KEY_EQUAL, false)),
+        '+' => Some((KEY_EQUAL, true)),
+        '[' => Some((KEY_LEFTBRACE, false)),
+        '{' => Some((KEY_LEFTBRACE, true)),
+        ']' => Some((KEY_RIGHTBRACE, false)),
+        '}' => Some((KEY_RIGHTBRACE, true)),
+        ';' => Some((KEY_SEMICOLON, false)),
+        ':' => Some((KEY_SEMICOLON, true)),
+        '\'' => Some((KEY_APOSTROPHE, false)),
+        '"' => Some((KEY_APOSTROPHE, true)),
+        '`' => Some((KEY_GRAVE, false)),
+        '~' => Some((KEY_GRAVE, true)),
+        '\\' => Some((KEY_BACKSLASH, false)),
+        '|' => Some((KEY_BACKSLASH, true)),
+        ',' => Some((KEY_COMMA, false)),
+        '<' => Some((KEY_COMMA, true)),
+        '.' => Some((KEY_DOT, false)),
+        '>' => Some((KEY_DOT, true)),
+        '/' => Some((KEY_SLASH, false)),
+        '?' => Some((KEY_SLASH, true)),
         ' ' => Some((KEY_SPACE, false)),
         '\t' => Some((KEY_TAB, false)),
         '\n' => Some((KEY_ENTER, false)),
@@ -913,10 +1041,22 @@ impl VirtualKeyboard {
 
         for b in hex.bytes() {
             let key = match b {
-                b'0' => KEY_0, b'1' => KEY_1, b'2' => KEY_2, b'3' => KEY_3,
-                b'4' => KEY_4, b'5' => KEY_5, b'6' => KEY_6, b'7' => KEY_7,
-                b'8' => KEY_8, b'9' => KEY_9, b'a' => KEY_A, b'b' => KEY_B_KEY,
-                b'c' => KEY_C, b'd' => KEY_D, b'e' => KEY_E, b'f' => KEY_F,
+                b'0' => KEY_0,
+                b'1' => KEY_1,
+                b'2' => KEY_2,
+                b'3' => KEY_3,
+                b'4' => KEY_4,
+                b'5' => KEY_5,
+                b'6' => KEY_6,
+                b'7' => KEY_7,
+                b'8' => KEY_8,
+                b'9' => KEY_9,
+                b'a' => KEY_A,
+                b'b' => KEY_B_KEY,
+                b'c' => KEY_C,
+                b'd' => KEY_D,
+                b'e' => KEY_E,
+                b'f' => KEY_F,
                 _ => continue,
             };
             self.key_event(key, 1);
@@ -945,11 +1085,15 @@ impl VirtualKeyboard {
         self.syn();
         for c in text.chars() {
             if let Some((keycode, shift)) = char_to_key(c) {
-                if shift { self.key_event(KEY_LEFTSHIFT, 1); }
+                if shift {
+                    self.key_event(KEY_LEFTSHIFT, 1);
+                }
                 self.key_event(keycode, 1);
                 self.syn();
                 self.key_event(keycode, 0);
-                if shift { self.key_event(KEY_LEFTSHIFT, 0); }
+                if shift {
+                    self.key_event(KEY_LEFTSHIFT, 0);
+                }
                 self.syn();
             }
         }
@@ -970,9 +1114,15 @@ impl VirtualKeyboard {
     }
 
     fn press_mod_keys(&mut self, mods: u8, value: i32) {
-        if mods & 0x01 != 0 { self.key_event(KEY_LEFTCTRL, value); }
-        if mods & 0x02 != 0 { self.key_event(KEY_LEFTALT, value); }
-        if mods & 0x04 != 0 { self.key_event(KEY_LEFTMETA, value); }
+        if mods & 0x01 != 0 {
+            self.key_event(KEY_LEFTCTRL, value);
+        }
+        if mods & 0x02 != 0 {
+            self.key_event(KEY_LEFTALT, value);
+        }
+        if mods & 0x04 != 0 {
+            self.key_event(KEY_LEFTMETA, value);
+        }
     }
 
     fn key_event(&mut self, code: u16, value: i32) {

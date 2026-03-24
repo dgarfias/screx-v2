@@ -108,7 +108,11 @@ impl SharedState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
         self.network_session_pending.store(true, Ordering::SeqCst);
-        Some(self.network_session_id.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
+        Some(
+            self.network_session_id
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1),
+        )
     }
 
     pub fn is_current_network_session(&self, session_id: u64) -> bool {
@@ -313,16 +317,25 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             match crate::uinput::VirtualGamepad::new(controller_id) {
                 Ok(pad) => {
                     pads.insert(controller_id, pad);
-                    println!("[gamepad] controller {} attached — virtual gamepad created", controller_id + 1);
+                    println!(
+                        "[gamepad] controller {} attached — virtual gamepad created",
+                        controller_id + 1
+                    );
                 }
-                Err(e) => eprintln!("[gamepad] failed to create virtual gamepad {}: {e}", controller_id + 1),
+                Err(e) => eprintln!(
+                    "[gamepad] failed to create virtual gamepad {}: {e}",
+                    controller_id + 1
+                ),
             }
         }
         GPAD_DETACHED => {
             let mut pads = shared.virtual_gamepads.lock().unwrap();
             if let Some(mut pad) = pads.remove(&controller_id) {
                 pad.release_all();
-                println!("[gamepad] controller {} detached — virtual gamepad destroyed", controller_id + 1);
+                println!(
+                    "[gamepad] controller {} detached — virtual gamepad destroyed",
+                    controller_id + 1
+                );
             }
         }
         GPAD_STATE if data.len() >= 18 => {
@@ -367,7 +380,9 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
     *shared.client_addr.lock().unwrap() = None;
     *shared.session_key.lock().unwrap() = None;
     *shared.expected_client_ip.lock().unwrap() = None;
-    shared.network_session_pending.store(false, Ordering::SeqCst);
+    shared
+        .network_session_pending
+        .store(false, Ordering::SeqCst);
     shared.network_session_busy.store(false, Ordering::SeqCst);
 
     if !shared.usb_active.load(Ordering::Relaxed)
@@ -509,9 +524,8 @@ pub fn run_client_manager(
                     }
                 }
 
-                let seq_num = u32::from_be_bytes([
-                    recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3],
-                ]);
+                let seq_num =
+                    u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
                 let nonce = crate::crypto::nonce_client(seq_num);
 
                 let cipher = match local_cipher.as_ref() {
@@ -585,7 +599,9 @@ pub fn run_client_manager(
                             std::thread::Builder::new()
                                 .name("lifecycle-connect".into())
                                 .spawn(move || {
-                                    if let Some(ref cb) = *shared_lc.on_client_connected.lock().unwrap() {
+                                    if let Some(ref cb) =
+                                        *shared_lc.on_client_connected.lock().unwrap()
+                                    {
                                         cb();
                                     }
                                 })
@@ -598,12 +614,27 @@ pub fn run_client_manager(
                             let hb_frame_id = 0xFFFF_FFFFu32;
                             let hb_flags: u8 = 0x80;
                             let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
-                            let header = build_header(hb_frame_id, 0, 0, 0, hb_flags, 0, HEARTBEAT_MAGIC.len() as u16, 0);
+                            let header = build_header(
+                                hb_frame_id,
+                                0,
+                                0,
+                                0,
+                                hb_flags,
+                                0,
+                                HEARTBEAT_MAGIC.len() as u16,
+                                0,
+                            );
                             let hb_magic_len = HEARTBEAT_MAGIC.len();
                             let mut hb_buf = [0u8; HEADER_LEN + 64];
                             hb_buf[..HEADER_LEN].copy_from_slice(&header);
-                            hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
-                            let enc_len = c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
+                            hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len]
+                                .copy_from_slice(HEARTBEAT_MAGIC);
+                            let enc_len = c.encrypt_slice(
+                                &nonce,
+                                &[],
+                                &mut hb_buf[HEADER_LEN..],
+                                hb_magic_len,
+                            );
                             let _ = socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr);
                         }
                         last_heartbeat = Instant::now();
@@ -612,7 +643,9 @@ pub fn run_client_manager(
 
                 let pt_len = plaintext.len();
 
-                if pt_len >= REGISTER_MAGIC.len() && &plaintext[..REGISTER_MAGIC.len()] == REGISTER_MAGIC {
+                if pt_len >= REGISTER_MAGIC.len()
+                    && &plaintext[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
+                {
                     crate::vlog!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
                 }
 
@@ -635,7 +668,6 @@ pub fn run_client_manager(
                         }
                     }
                 }
-
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -646,7 +678,8 @@ pub fn run_client_manager(
 
         if current_session_id != 0
             && shared.network_session_pending.load(Ordering::SeqCst)
-            && pending_started_at.map_or(false, |started| started.elapsed() > PENDING_SESSION_TIMEOUT)
+            && pending_started_at
+                .map_or(false, |started| started.elapsed() > PENDING_SESSION_TIMEOUT)
         {
             println!(
                 "[client] pending session timed out after {:?}, dropping session",
@@ -665,12 +698,22 @@ pub fn run_client_manager(
                     let hb_frame_id = 0xFFFF_FFFFu32;
                     let hb_flags: u8 = 0x80;
                     let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
-                    let header = build_header(hb_frame_id, 0, 0, 0, hb_flags, 0, HEARTBEAT_MAGIC.len() as u16, 0);
+                    let header = build_header(
+                        hb_frame_id,
+                        0,
+                        0,
+                        0,
+                        hb_flags,
+                        0,
+                        HEARTBEAT_MAGIC.len() as u16,
+                        0,
+                    );
                     let hb_magic_len = HEARTBEAT_MAGIC.len();
                     let mut hb_buf = [0u8; HEADER_LEN + 64]; // enough for magic + tag
                     hb_buf[..HEADER_LEN].copy_from_slice(&header);
                     hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
-                    let enc_len = c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
+                    let enc_len =
+                        c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
                     match socket.send_to(&hb_buf[..HEADER_LEN + enc_len], addr) {
                         Ok(sent) => {
                             if should_log_debug(heartbeat_count) {
@@ -735,7 +778,13 @@ impl UdpSender {
         self.cipher = Some(cipher);
     }
 
-    pub fn send_frame(&mut self, au: &EncodedAccessUnit, client_addr: SocketAddr, timestamp_ms: u32, codec_id: u8) -> Result<()> {
+    pub fn send_frame(
+        &mut self,
+        au: &EncodedAccessUnit,
+        client_addr: SocketAddr,
+        timestamp_ms: u32,
+        codec_id: u8,
+    ) -> Result<()> {
         let payload = &au.annex_b;
         let is_idr = au.is_idr;
 
@@ -882,7 +931,12 @@ impl AudioSender {
         self.cipher = None;
     }
 
-    pub fn send_audio(&mut self, pcm: &[u8], client_addr: SocketAddr, timestamp_ms: u32) -> Result<()> {
+    pub fn send_audio(
+        &mut self,
+        pcm: &[u8],
+        client_addr: SocketAddr,
+        timestamp_ms: u32,
+    ) -> Result<()> {
         let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
         for i in 0..data_count {

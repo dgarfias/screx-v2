@@ -29,13 +29,18 @@ fn parse_bitrate(s: &str) -> std::result::Result<u32, String> {
         Some(b'm' | b'M') => (&s[..s.len() - 1], 1_000_000u64),
         _ => (s, 1u64),
     };
-    let num: f64 = num_part.parse().map_err(|e| format!("invalid number: {e}"))?;
+    let num: f64 = num_part
+        .parse()
+        .map_err(|e| format!("invalid number: {e}"))?;
     let val = (num * multiplier as f64) as u64;
     u32::try_from(val).map_err(|_| format!("bitrate {val} exceeds u32 max"))
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "screx", about = "Low-latency Linux-to-iPad screen streaming daemon")]
+#[command(
+    name = "screx",
+    about = "Low-latency Linux-to-iPad screen streaming daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -188,14 +193,18 @@ async fn main() -> Result<()> {
         let pairing_shared = Arc::clone(&shared);
         let pairing_stop = Arc::clone(&stop);
         let port = config.stream_port;
-        pairing_thread = Some(thread::Builder::new()
-            .name("pairing".into())
-            .spawn(move || {
-                if let Err(e) = pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop) {
-                    eprintln!("[pairing] server error: {e:#}");
-                }
-            })
-            .context("failed to spawn pairing thread")?);
+        pairing_thread = Some(
+            thread::Builder::new()
+                .name("pairing".into())
+                .spawn(move || {
+                    if let Err(e) =
+                        pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
+                    {
+                        eprintln!("[pairing] server error: {e:#}");
+                    }
+                })
+                .context("failed to spawn pairing thread")?,
+        );
     } else {
         println!("[main] USB-only mode — network pairing disabled");
     }
@@ -307,16 +316,21 @@ async fn main() -> Result<()> {
         let client_shared = Arc::clone(&shared);
         let client_stop = Arc::clone(&stop);
         let client_session_rx = Arc::clone(&session_rx);
-        client_thread = Some(thread::Builder::new()
-            .name("client-mgr".into())
-            .spawn(move || {
-                if let Err(e) =
-                    stream_server::run_client_manager(client_socket, client_shared, client_stop, client_session_rx)
-                {
-                    eprintln!("[client] manager error: {e:#}");
-                }
-            })
-            .context("failed to spawn client manager thread")?);
+        client_thread = Some(
+            thread::Builder::new()
+                .name("client-mgr".into())
+                .spawn(move || {
+                    if let Err(e) = stream_server::run_client_manager(
+                        client_socket,
+                        client_shared,
+                        client_stop,
+                        client_session_rx,
+                    ) {
+                        eprintln!("[client] manager error: {e:#}");
+                    }
+                })
+                .context("failed to spawn client manager thread")?,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -404,27 +418,27 @@ async fn main() -> Result<()> {
                 let sf = Arc::clone(&session_stop_flag);
 
                 // Watchdog thread: sets combined_stop when either flag fires
-                let watchdog = match thread::Builder::new()
-                    .name("capture-wd".into())
-                    .spawn(move || {
-                        while !cs1.load(Ordering::Relaxed) {
-                            if ss.load(Ordering::Relaxed) || sf.load(Ordering::Relaxed) {
-                                cs1.store(true, Ordering::SeqCst);
-                                break;
+                let watchdog =
+                    match thread::Builder::new()
+                        .name("capture-wd".into())
+                        .spawn(move || {
+                            while !cs1.load(Ordering::Relaxed) {
+                                if ss.load(Ordering::Relaxed) || sf.load(Ordering::Relaxed) {
+                                    cs1.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }) {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            eprintln!("[capture] failed to spawn watchdog thread: {e}");
+                            capture_stop_flag.store(true, Ordering::SeqCst);
+                            capture_start.store(false, Ordering::Release);
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
                         }
-                    })
-                {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        eprintln!("[capture] failed to spawn watchdog thread: {e}");
-                        capture_stop_flag.store(true, Ordering::SeqCst);
-                        capture_start.store(false, Ordering::Release);
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        continue;
-                    }
-                };
+                    };
 
                 if let Err(e) = capture::run_capture_loop(
                     capture_config.clone(),
@@ -432,8 +446,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&session_refresh),
                     Arc::new(AtomicBool::new(true)), // already started
                     |frame| {
-                        let force_idr =
-                            session_shared.force_idr.swap(false, Ordering::Relaxed);
+                        let force_idr = session_shared.force_idr.swap(false, Ordering::Relaxed);
                         let ts = session_shared.start_time.elapsed().as_millis() as u32;
 
                         match encoder.encode_frame(&frame, force_idr) {
@@ -447,18 +460,12 @@ async fn main() -> Result<()> {
 
                                 for au in &aus {
                                     if use_usb {
-                                        let mut usb =
-                                            session_shared.usb_sender.lock().unwrap();
+                                        let mut usb = session_shared.usb_sender.lock().unwrap();
                                         if let Some(ref mut tcp) = *usb {
-                                            if let Err(e) = tcp.send_video(
-                                                &au.annex_b,
-                                                au.is_idr,
-                                                ts,
-                                                codec_id,
-                                            ) {
-                                                eprintln!(
-                                                    "[pipeline] USB send error: {e:#}"
-                                                );
+                                            if let Err(e) =
+                                                tcp.send_video(&au.annex_b, au.is_idr, ts, codec_id)
+                                            {
+                                                eprintln!("[pipeline] USB send error: {e:#}");
                                                 drop(usb);
                                                 session_shared
                                                     .usb_active
@@ -468,9 +475,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     if let Some(addr) = udp_addr {
-                                        if let Err(e) =
-                                            sender.send_frame(au, addr, ts, codec_id)
-                                        {
+                                        if let Err(e) = sender.send_frame(au, addr, ts, codec_id) {
                                             eprintln!("[pipeline] send error: {e:#}");
                                         }
                                     }
@@ -505,12 +510,14 @@ async fn main() -> Result<()> {
     if !cli.network_only {
         let usb_shared = Arc::clone(&shared);
         let usb_stop = Arc::clone(&stop);
-        usb_thread = Some(thread::Builder::new()
-            .name("usb".into())
-            .spawn(move || {
-                usb::run_usb_transport(usb_shared, usb_stop);
-            })
-            .context("failed to spawn USB transport thread")?);
+        usb_thread = Some(
+            thread::Builder::new()
+                .name("usb".into())
+                .spawn(move || {
+                    usb::run_usb_transport(usb_shared, usb_stop);
+                })
+                .context("failed to spawn USB transport thread")?,
+        );
     } else {
         println!("[main] network-only mode — USB transport disabled");
     }

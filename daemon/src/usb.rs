@@ -76,7 +76,13 @@ impl TcpFramedSender {
         })
     }
 
-    pub fn send_video(&mut self, annex_b: &[u8], is_idr: bool, timestamp_ms: u32, codec_id: u8) -> Result<()> {
+    pub fn send_video(
+        &mut self,
+        annex_b: &[u8],
+        is_idr: bool,
+        timestamp_ms: u32,
+        codec_id: u8,
+    ) -> Result<()> {
         let payload_len = 1 + 1 + 1 + 4 + annex_b.len(); // type + is_idr + codec_id + ts + data
         self.write_buf.clear();
         self.write_buf
@@ -331,11 +337,7 @@ fn deactivate_usb_transport(shared: &Arc<SharedState>) {
     }
 }
 
-fn read_control_loop(
-    mut stream: TcpStream,
-    shared: &Arc<SharedState>,
-    stop: &Arc<AtomicBool>,
-) {
+fn read_control_loop(mut stream: TcpStream, shared: &Arc<SharedState>, stop: &Arc<AtomicBool>) {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .ok();

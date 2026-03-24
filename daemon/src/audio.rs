@@ -52,7 +52,10 @@ fn pulse_env() -> Vec<(String, String)> {
                 let pulse_path = entry.path().join("pulse/native");
                 if pulse_path.exists() {
                     let runtime_dir = entry.path().to_string_lossy().to_string();
-                    println!("[audio] auto-detected PulseAudio socket at {}", pulse_path.display());
+                    println!(
+                        "[audio] auto-detected PulseAudio socket at {}",
+                        pulse_path.display()
+                    );
                     env.push(("XDG_RUNTIME_DIR".into(), runtime_dir.clone()));
                     env.push((
                         "PULSE_SERVER".into(),
@@ -266,7 +269,9 @@ pub fn run_audio_capture(
                             crate::vlog!("[audio] refreshed UDP audio cipher for new session");
                         } else {
                             sender.clear_cipher();
-                            crate::vlog!("[audio] cleared UDP audio cipher (no active session key)");
+                            crate::vlog!(
+                                "[audio] cleared UDP audio cipher (no active session key)"
+                            );
                         }
                     }
 
@@ -430,8 +435,8 @@ fn try_pipe_source() -> Result<MicWriter> {
     // and our frames are ~1920 bytes. Non-blocking prevents stalling
     // the control thread that also handles touch/key events.
 
-    let decoder = OpusDecoder::new(MIC_RATE, 1)
-        .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
+    let decoder =
+        OpusDecoder::new(MIC_RATE, 1).map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
 
     println!("[mic] virtual mic ready via pipe-source (FIFO)");
 
@@ -550,8 +555,8 @@ fn try_null_sink_mic() -> Result<MicWriter> {
     }
     println!("[mic] pacat started (pid {})", child.id());
 
-    let decoder = OpusDecoder::new(MIC_RATE, 1)
-        .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
+    let decoder =
+        OpusDecoder::new(MIC_RATE, 1).map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
 
     println!("[mic] virtual mic ready via null-sink + virtual-source");
 

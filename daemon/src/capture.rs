@@ -98,11 +98,7 @@ mod evdi {
         fn evdi_register_buffer(handle: EvdiHandle, buffer: EvdiBuffer);
         fn evdi_unregister_buffer(handle: EvdiHandle, buffer_id: c_int);
         fn evdi_request_update(handle: EvdiHandle, buffer_id: c_int) -> bool;
-        fn evdi_grab_pixels(
-            handle: EvdiHandle,
-            rects: *mut EvdiRect,
-            num_rects: *mut c_int,
-        );
+        fn evdi_grab_pixels(handle: EvdiHandle, rects: *mut EvdiRect, num_rects: *mut c_int);
         fn evdi_handle_events(handle: EvdiHandle, evtctx: *mut EvdiEventContext);
         fn evdi_get_event_ready(handle: EvdiHandle) -> c_int;
     }
@@ -180,9 +176,7 @@ mod evdi {
         edid[24] = 0x2E;
 
         // Chromaticity (sRGB standard values)
-        edid[25..35].copy_from_slice(&[
-            0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
-        ]);
+        edid[25..35].copy_from_slice(&[0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
 
         // No established timings
         edid[35..38].copy_from_slice(&[0x00, 0x00, 0x00]);
@@ -259,7 +253,7 @@ mod evdi {
         rd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFD, 0x00]);
         rd[5] = (refresh_hz.saturating_sub(1).max(1)) as u8; // min V rate
         rd[6] = (refresh_hz.saturating_add(1)) as u8; // max V rate
-        rd[7] = 1;  // min H rate kHz
+        rd[7] = 1; // min H rate kHz
         rd[8] = 255; // max H rate kHz
         rd[9] = ((pixel_clock_khz / 10000) + 1).min(255) as u8; // max pixel clock / 10 MHz
         rd[10] = 0x00; // default GTF
@@ -346,9 +340,7 @@ mod evdi {
             }
         }
 
-        anyhow::bail!(
-            "evdi_add_device succeeded but no EVDI card became available after 10s"
-        );
+        anyhow::bail!("evdi_add_device succeeded but no EVDI card became available after 10s");
     }
 
     // -- Public capture entry point ----------------------------------------
@@ -404,7 +396,10 @@ mod evdi {
         unsafe {
             evdi_register_buffer(handle, evdi_buf);
         }
-        println!("[capture] buffer registered: {}x{} stride={stride}", config.width, config.height);
+        println!(
+            "[capture] buffer registered: {}x{} stride={stride}",
+            config.width, config.height
+        );
 
         // Set up event callbacks
         let mut cb_state = CallbackState {
@@ -475,7 +470,11 @@ mod evdi {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let timeout = if refresh_retries > 0 { 30 } else { poll_timeout_ms };
+                let timeout = if refresh_retries > 0 {
+                    30
+                } else {
+                    poll_timeout_ms
+                };
                 let poll_ret = unsafe { libc::poll(&mut pollfd, 1, timeout) };
 
                 if poll_ret > 0 && (pollfd.revents & libc::POLLIN != 0) {
@@ -568,5 +567,11 @@ pub fn run_capture_loop(
     capture_start: Arc<AtomicBool>,
     mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    evdi::run_capture(&config, &stop, &force_refresh, &capture_start, &mut on_frame)
+    evdi::run_capture(
+        &config,
+        &stop,
+        &force_refresh,
+        &capture_start,
+        &mut on_frame,
+    )
 }
