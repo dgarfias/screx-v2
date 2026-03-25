@@ -9,6 +9,8 @@ final class NetworkControlClient {
     private let debugId = String(UUID().uuidString.prefix(6))
     private static let disconnectMagic = Data("DISCONNECT".utf8)
     private static let speakerMagic = Data("SPKR".utf8)
+    private static let micCfgMagic = Data("MICCFG".utf8)
+    private static let cameraCfgMagic = Data("CAMCFG".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
     private static let maxControlFrame = 65536
 
@@ -231,6 +233,23 @@ final class NetworkControlClient {
         var payload = Self.speakerMagic
         payload.append(isEnabled ? 1 : 0)
         sendFrame(payload, label: isEnabled ? "speaker-on" : "speaker-off")
+    }
+
+    /// Tells the daemon to create or destroy the virtual microphone device.
+    func sendMicState(isEnabled: Bool) {
+        var payload = Self.micCfgMagic
+        payload.append(isEnabled ? 1 : 0)
+        sendFrame(payload, label: isEnabled ? "mic-on" : "mic-off")
+    }
+
+    /// Sends the camera configuration (width, height, fps) to the daemon so it
+    /// can create or reconfigure the virtual webcam device to match.
+    func sendCameraConfig(width: UInt16, height: UInt16, fps: UInt16) {
+        var payload = Self.cameraCfgMagic
+        withUnsafeBytes(of: width.bigEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: height.bigEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: fps.bigEndian) { payload.append(contentsOf: $0) }
+        sendFrame(payload, label: "camcfg-\(width)x\(height)@\(fps)")
     }
 
     func sendTouch(_ contactData: Data) {

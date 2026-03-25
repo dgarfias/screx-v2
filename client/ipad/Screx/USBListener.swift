@@ -30,6 +30,8 @@ final class USBListener {
     private static let msgControl: UInt8 = 0x03
     private static let readyMagic = Data("READY".utf8)
     private static let speakerMagic = Data("SPKR".utf8)
+    private static let micCfgMagic = Data("MICCFG".utf8)
+    private static let cameraCfgMagic = Data("CAMCFG".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
 
     private var lastPliTime: TimeInterval = 0
@@ -288,6 +290,53 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] speaker state send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
+        })
+    }
+
+    /// Sends the camera configuration (width, height, fps) to the daemon so it
+    /// can create or reconfigure the virtual webcam device to match.
+    func sendCameraConfig(width: UInt16, height: UInt16, fps: UInt16) {
+        guard let conn = connection else { return }
+
+        var camPayload = Self.cameraCfgMagic
+        withUnsafeBytes(of: width.bigEndian) { camPayload.append(contentsOf: $0) }
+        withUnsafeBytes(of: height.bigEndian) { camPayload.append(contentsOf: $0) }
+        withUnsafeBytes(of: fps.bigEndian) { camPayload.append(contentsOf: $0) }
+
+        let payloadLen = UInt32(1 + camPayload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(camPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] camcfg send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
+        })
+    }
+
+    /// Tells the daemon to create or destroy the virtual microphone device.
+    func sendMicState(isEnabled: Bool) {
+        guard let conn = connection else { return }
+
+        var micPayload = Self.micCfgMagic
+        micPayload.append(isEnabled ? 1 : 0)
+
+        let payloadLen = UInt32(1 + micPayload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(micPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] miccfg send error: \(error)")
             } else {
                 self.onTraffic?(0, frame.count)
             }

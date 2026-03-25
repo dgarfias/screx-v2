@@ -8,7 +8,7 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::audio::MicWriter;
-use crate::camera::{CamReassembler, CamWriter};
+use crate::camera::{CamReassembler, CamWriter, CameraConfig};
 use crate::encode::EncodedAccessUnit;
 use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
 use crate::usb::TcpFramedSender;
@@ -26,6 +26,8 @@ const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
 const PERIPH_MAGIC: &[u8] = b"PERIPH";
 const GPAD_MAGIC: &[u8] = b"GPAD";
 const SPEAKER_MAGIC: &[u8] = b"SPKR";
+const MICCFG_MAGIC: &[u8] = b"MICCFG";
+const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -58,6 +60,8 @@ pub struct SharedState {
     pub virtual_mouse: Mutex<Option<crate::uinput::VirtualMouse>>,
     pub virtual_gamepads: Mutex<HashMap<u8, crate::uinput::VirtualGamepad>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
+    pub camera_config: Mutex<CameraConfig>,
+    pub camera_exclusive_caps: bool,
     pub mic_writer: Mutex<Option<MicWriter>>,
     pub start_time: Instant,
     pub on_client_connected: Mutex<Option<LifecycleCallback>>,
@@ -74,7 +78,7 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new() -> Self {
+    pub fn new(camera_exclusive_caps: bool) -> Self {
         Self {
             client_addr: Mutex::new(None),
             force_idr: AtomicBool::new(false),
@@ -88,11 +92,17 @@ impl SharedState {
             virtual_mouse: Mutex::new(None),
             virtual_gamepads: Mutex::new(HashMap::new()),
             cam_writer: Mutex::new(None),
+            camera_config: Mutex::new(CameraConfig {
+                width: 0,
+                height: 0,
+                fps: 0,
+            }),
+            camera_exclusive_caps,
             mic_writer: Mutex::new(None),
             on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
-            audio_output_enabled: AtomicBool::new(true),
+            audio_output_enabled: AtomicBool::new(false),
             audio_module_id: Mutex::new(0),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
@@ -124,6 +134,52 @@ impl SharedState {
         if self.is_current_network_session(session_id) {
             self.network_session_pending.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
+    let mut current = shared.camera_config.lock().unwrap();
+    let config_changed = *current != config;
+    *current = config;
+    drop(current);
+
+    println!(
+        "[camera] client enabled virtual webcam: {}x{} @ {}fps",
+        config.width, config.height, config.fps
+    );
+
+    // Tear down existing writer if config changed or there is none
+    let needs_create = {
+        let mut writer = shared.cam_writer.lock().unwrap();
+        if config_changed && writer.is_some() {
+            *writer = None;
+            true
+        } else {
+            writer.is_none()
+        }
+    };
+
+    if needs_create {
+        match crate::camera::ensure_v4l2loopback(shared.camera_exclusive_caps) {
+            Ok(()) => match crate::camera::create_cam_writer(config) {
+                Ok(writer) => {
+                    *shared.cam_writer.lock().unwrap() = Some(writer);
+                    println!(
+                        "[camera] virtual webcam ready ({}x{} @ {}fps)",
+                        config.width, config.height, config.fps
+                    );
+                }
+                Err(e) => eprintln!("[camera] {e:#}"),
+            },
+            Err(e) => eprintln!("[camera] v4l2loopback not available ({e:#})"),
+        }
+    }
+}
+
+pub fn disable_camera(shared: &Arc<SharedState>) {
+    let had_writer = shared.cam_writer.lock().unwrap().take().is_some();
+    if had_writer {
+        println!("[camera] client disabled virtual webcam — writer removed");
     }
 }
 
@@ -210,11 +266,34 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
         let enabled = ctrl[SPEAKER_MAGIC.len()] != 0;
         shared.audio_output_enabled.store(enabled, Ordering::SeqCst);
         if enabled {
-            println!("[audio] iPad speakers attached");
+            println!("[audio] client enabled speaker passthrough");
             ensure_virtual_sink(shared);
         } else {
-            println!("[audio] iPad speakers detached");
+            println!("[audio] client disabled speaker passthrough");
             disable_virtual_sink(shared);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(MICCFG_MAGIC) && ctrl.len() == MICCFG_MAGIC.len() + 1 {
+        let enabled = ctrl[MICCFG_MAGIC.len()] != 0;
+        if enabled {
+            enable_virtual_mic(shared);
+        } else {
+            disable_virtual_mic(shared);
+        }
+        return;
+    }
+
+    if ctrl.starts_with(CAMCFG_MAGIC) && ctrl.len() == CAMCFG_MAGIC.len() + 6 {
+        let off = CAMCFG_MAGIC.len();
+        let width = u16::from_be_bytes([ctrl[off], ctrl[off + 1]]) as u32;
+        let height = u16::from_be_bytes([ctrl[off + 2], ctrl[off + 3]]) as u32;
+        let fps = u16::from_be_bytes([ctrl[off + 4], ctrl[off + 5]]) as u32;
+        if width > 0 && height > 0 && fps > 0 {
+            enable_camera(shared, CameraConfig { width, height, fps });
+        } else {
+            disable_camera(shared);
         }
         return;
     }
@@ -294,6 +373,31 @@ pub fn disable_virtual_sink(shared: &Arc<SharedState>) {
         crate::audio::remove_virtual_sink(*module_id);
         *module_id = 0;
     }
+}
+
+pub fn enable_virtual_mic(shared: &Arc<SharedState>) {
+    {
+        let existing = shared.mic_writer.lock().unwrap();
+        if existing.is_some() {
+            return; // already active
+        }
+    }
+    match crate::audio::create_virtual_mic() {
+        Ok(writer) => {
+            *shared.mic_writer.lock().unwrap() = Some(writer);
+            println!("[mic] client enabled virtual microphone");
+        }
+        Err(e) => eprintln!("[mic] failed to create virtual microphone: {e:#}"),
+    }
+}
+
+pub fn disable_virtual_mic(shared: &Arc<SharedState>) {
+    let mut mic = shared.mic_writer.lock().unwrap();
+    if let Some(ref mut writer) = *mic {
+        crate::audio::remove_virtual_mic(writer);
+        println!("[mic] client disabled virtual microphone");
+    }
+    *mic = None;
 }
 
 const GPAD_DETACHED: u8 = 0x00;

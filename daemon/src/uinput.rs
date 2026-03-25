@@ -452,6 +452,12 @@ impl VirtualMouse {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
+    pub fn move_abs(&mut self, x: u16, y: u16) {
+        self.emit(EV_ABS, ABS_X, x as i32);
+        self.emit(EV_ABS, ABS_Y, y as i32);
+        self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+
     pub fn button(&mut self, btn: u8, state: i32) {
         if btn == 2 {
             if state != 0 {
@@ -1249,6 +1255,7 @@ pub fn handle_touch_packet(touch: &mut VirtualTouchscreen, data: &[u8]) {
 const MOUSE_MOVE: u8 = 0x01;
 const MOUSE_BUTTON: u8 = 0x02;
 const MOUSE_SCROLL: u8 = 0x03;
+const MOUSE_MOVE_ABS: u8 = 0x04;
 
 /// Parse a mouse event packet.
 /// Format: event_type(1) + payload
@@ -1262,6 +1269,12 @@ pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
             let dy = i16::from_be_bytes([data[3], data[4]]) as i32;
             crate::vlog!("[mouse] recv move: dx={dx} dy={dy}");
             mouse.move_rel(dx, dy);
+        }
+        MOUSE_MOVE_ABS if data.len() >= 5 => {
+            let x = u16::from_be_bytes([data[1], data[2]]);
+            let y = u16::from_be_bytes([data[3], data[4]]);
+            crate::vlog!("[mouse] recv abs move: x={x} y={y}");
+            mouse.move_abs(x, y);
         }
         MOUSE_BUTTON if data.len() >= 3 => {
             crate::vlog!("[mouse] recv button: btn={} state={}", data[1], data[2]);

@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let shared = Arc::new(stream_server::SharedState::new());
+    let shared = Arc::new(stream_server::SharedState::new(config.camera_exclusive_caps));
 
     // UDP socket for streaming
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
@@ -240,40 +240,12 @@ async fn main() -> Result<()> {
 
     {
         let shared_c = Arc::clone(&shared);
-        let camera_exclusive_caps = config.camera_exclusive_caps;
         *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
-            println!("[lifecycle] client connected — creating peripherals");
-
-            // Virtual camera
-            match camera::load_v4l2loopback(camera_exclusive_caps) {
-                Ok(()) => {
-                    let (cam_width, cam_height) = if shared_c.usb_active.load(Ordering::SeqCst) {
-                        (camera::USB_WIDTH, camera::USB_HEIGHT)
-                    } else {
-                        (camera::NETWORK_WIDTH, camera::NETWORK_HEIGHT)
-                    };
-                    match camera::create_cam_writer(cam_width, cam_height) {
-                        Ok(writer) => {
-                            *shared_c.cam_writer.lock().unwrap() = Some(writer);
-                            println!("[lifecycle] camera: virtual webcam ready");
-                        }
-                        Err(e) => eprintln!("[lifecycle] camera: {e:#}"),
-                    }
-                }
-                Err(e) => eprintln!("[lifecycle] camera: v4l2loopback not available ({e:#})"),
-            }
-
-            // Virtual microphone
-            match audio::create_virtual_mic() {
-                Ok(writer) => {
-                    *shared_c.mic_writer.lock().unwrap() = Some(writer);
-                    println!("[lifecycle] mic: virtual microphone ready");
-                }
-                Err(e) => eprintln!("[lifecycle] mic: {e:#}"),
-            }
-
-            // Virtual audio sink + capture
-            crate::stream_server::ensure_virtual_sink(&shared_c);
+            println!("[lifecycle] client connected");
+            // Peripherals (camera, mic, speaker) are now created on-demand
+            // when the client sends the corresponding enable signal (CAMCFG,
+            // MICCFG, SPKR). Nothing to create eagerly here.
+            let _ = &shared_c; // keep the Arc alive for future use
         }));
     }
 
@@ -299,6 +271,9 @@ async fn main() -> Result<()> {
 
             // Audio sink
             crate::stream_server::disable_virtual_sink(&shared_d);
+
+            // Reset audio output flag so next client starts with speakers off
+            shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
 
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
