@@ -328,7 +328,7 @@ fn handle_pair_request(
 
     println!();
     println!("╔══════════════════════════════════════╗");
-    println!("║  PAIRING PIN:  {pin}                 ║");
+    println!("║  PAIRING PIN:  {pin}                ║");
     println!("║  Enter this PIN on your iPad         ║");
     println!("╚══════════════════════════════════════╝");
     println!();

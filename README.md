@@ -64,7 +64,7 @@ cargo build --release
 
 ### iPad app
 
-Open `app/Screx.xcodeproj` in Xcode and build it to an iPad running iPadOS 16 or later.
+Open `client/ipad/Screx.xcodeproj` in Xcode and build it to an iPad running iPadOS 16 or later.
 
 ## Run
 
