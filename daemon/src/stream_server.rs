@@ -257,6 +257,34 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 }
 
 pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
+    // Temporary debug: log every incoming control message
+    if !ctrl.starts_with(b"TOUCH")
+        && !ctrl.starts_with(b"MOUSE")
+        && !ctrl.starts_with(b"KEY")
+        && !ctrl.starts_with(b"RAWKEY")
+    {
+        let preview = ctrl.len().min(32);
+        let hex: String = ctrl[..preview]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ascii: String = ctrl[..preview]
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        println!(
+            "[control-debug] recv {len} bytes: [{hex}] ascii=[{ascii}]",
+            len = ctrl.len()
+        );
+    }
+
     if ctrl.starts_with(PLI_MAGIC) {
         shared.force_idr.store(true, Ordering::Relaxed);
         return;
