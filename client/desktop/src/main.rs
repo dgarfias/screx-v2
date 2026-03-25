@@ -7,12 +7,11 @@ mod mic_capture;
 mod video_surface;
 mod webcam_capture;
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 
 use app_state::AppState;
 use qmetaobject::prelude::*;
-use qmetaobject::{qml_register_type, queued_callback, QObjectPinned, QPointer};
+use qmetaobject::{qml_register_singleton_instance, qml_register_type};
 use video_surface::VideoSurface;
 
 fn main() {
@@ -23,29 +22,19 @@ fn main() {
         0,
         CStr::from_bytes_with_nul(b"VideoSurface\0").unwrap(),
     );
+    qml_register_singleton_instance(
+        CStr::from_bytes_with_nul(b"Screx\0").unwrap(),
+        1,
+        0,
+        CStr::from_bytes_with_nul(b"AppState\0").unwrap(),
+        AppState::default(),
+    );
 
     // Initialize the global frame slot before spawning the backend.
-    let frame_slot = video_surface::init_global_frame_slot();
-
-    let state = RefCell::new(AppState::default());
-    let state_ptr = unsafe { QObjectPinned::new(&state) };
-    let qptr = QPointer::from(state_ptr.borrow());
-    let apply_event = queued_callback(move |event| {
-        qptr.as_pinned().map(|pinned| {
-            pinned.borrow_mut().apply_ui_event(event);
-        });
-    });
-
-    let backend = backend::spawn_backend(
-        move |event| {
-            apply_event(event);
-        },
-        frame_slot,
-    );
-    state.borrow_mut().install_backend(backend);
+    let _frame_slot = video_surface::init_global_frame_slot();
 
     let mut engine = QmlEngine::new();
-    engine.set_object_property("appState".into(), state_ptr);
     engine.load_data(include_str!("../qml/Main.qml").into());
+
     engine.exec();
 }

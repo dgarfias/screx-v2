@@ -28,6 +28,9 @@ const GPAD_MAGIC: &[u8] = b"GPAD";
 const SPEAKER_MAGIC: &[u8] = b"SPKR";
 const MICCFG_MAGIC: &[u8] = b"MICCFG";
 const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
+
+static MOUSE_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
+static RAWKEY_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -257,34 +260,6 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 }
 
 pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
-    // Temporary debug: log every incoming control message
-    if !ctrl.starts_with(b"TOUCH")
-        && !ctrl.starts_with(b"MOUSE")
-        && !ctrl.starts_with(b"KEY")
-        && !ctrl.starts_with(b"RAWKEY")
-    {
-        let preview = ctrl.len().min(32);
-        let hex: String = ctrl[..preview]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ascii: String = ctrl[..preview]
-            .iter()
-            .map(|&b| {
-                if b.is_ascii_graphic() || b == b' ' {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        println!(
-            "[control-debug] recv {len} bytes: [{hex}] ascii=[{ascii}]",
-            len = ctrl.len()
-        );
-    }
-
     if ctrl.starts_with(PLI_MAGIC) {
         shared.force_idr.store(true, Ordering::Relaxed);
         return;
@@ -351,6 +326,13 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(MOUSE_MAGIC) && ctrl.len() > MOUSE_MAGIC.len() {
         let mouse_data = &ctrl[MOUSE_MAGIC.len()..];
+        let count = MOUSE_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count % 100 == 0 {
+            println!(
+                "[control] parsed MOUSE packets={count} len={}",
+                mouse_data.len()
+            );
+        }
         let mut m = shared.virtual_mouse.lock().unwrap();
         if let Some(ref mut vm) = *m {
             crate::uinput::handle_mouse_packet(vm, mouse_data);
@@ -360,6 +342,13 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(RAWKEY_MAGIC) && ctrl.len() > RAWKEY_MAGIC.len() {
         let rk_data = &ctrl[RAWKEY_MAGIC.len()..];
+        let count = RAWKEY_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count % 50 == 0 {
+            println!(
+                "[control] parsed RAWKEY packets={count} len={}",
+                rk_data.len()
+            );
+        }
         let mut kb = shared.virtual_keyboard.lock().unwrap();
         if let Some(ref mut keyboard) = *kb {
             crate::uinput::handle_rawkey_packet(keyboard, rk_data);

@@ -977,6 +977,9 @@ fn spawn_udp_runtime(
         let mut last_packet = Instant::now();
         let mut decoder: Option<VideoDecoder> = None;
         let mut current_codec_id: Option<u8> = None;
+        let mut video_packet_count: u64 = 0;
+        let mut audio_packet_count: u64 = 0;
+        let mut decoded_frame_count: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
             match receiver.recv(&mut buffer) {
@@ -1009,6 +1012,17 @@ fn spawn_udp_runtime(
 
                     stats.note_packet(size);
                     if (flags & FLAG_AUDIO) != 0 {
+                        audio_packet_count = audio_packet_count.wrapping_add(1);
+                        if audio_packet_count == 1 || audio_packet_count % 200 == 0 {
+                            println!(
+                                "[desktop/audio] packets={} frame_id={} chunk={}/{} payload={}B",
+                                audio_packet_count,
+                                frame_id,
+                                chunk_idx + 1,
+                                total_data,
+                                payload_len
+                            );
+                        }
                         let assembly = audio_frames
                             .entry(frame_id)
                             .or_insert_with(|| AudioAssembly::new(total_data));
@@ -1022,6 +1036,19 @@ fn spawn_udp_runtime(
                             audio_frames.remove(&frame_id);
                         }
                     } else {
+                        video_packet_count = video_packet_count.wrapping_add(1);
+                        if video_packet_count == 1 || video_packet_count % 200 == 0 {
+                            println!(
+                                "[desktop/video] packets={} codec={} frame_id={} chunk={}/{} payload={}B flags=0x{:02x}",
+                                video_packet_count,
+                                codec_id,
+                                frame_id,
+                                chunk_idx + 1,
+                                total_data,
+                                payload_len,
+                                flags
+                            );
+                        }
                         let codec_label = if codec_id == 0x01 { "H.265" } else { "H.264" };
                         ui(UiEvent::SetCodecLabel(format!("{codec_label} · UDP live")));
                         let assembly = video_frames.entry(frame_id).or_insert_with(|| {
@@ -1036,6 +1063,14 @@ fn spawn_udp_runtime(
 
                         if assembly.is_complete() {
                             if let Some(annex_b) = assembly.reassemble() {
+                                println!(
+                                    "[desktop/video] reassembled frame_id={} bytes={} codec={} idr={} ts={}ms",
+                                    frame_id,
+                                    annex_b.len(),
+                                    codec_id,
+                                    (flags & FLAG_IDR) != 0,
+                                    timestamp_ms
+                                );
                                 // Ensure decoder matches the current codec
                                 let need_new_decoder =
                                     current_codec_id.map_or(true, |c| c != codec_id);
@@ -1065,6 +1100,19 @@ fn spawn_udp_runtime(
                                     match dec.decode(&annex_b) {
                                         Ok(decoded_frames) => {
                                             for df in decoded_frames {
+                                                decoded_frame_count =
+                                                    decoded_frame_count.wrapping_add(1);
+                                                if decoded_frame_count == 1
+                                                    || decoded_frame_count % 60 == 0
+                                                {
+                                                    println!(
+                                                        "[desktop/video] decoded_frames={} latest={}x{} rgba={}B",
+                                                        decoded_frame_count,
+                                                        df.width,
+                                                        df.height,
+                                                        df.rgba.len()
+                                                    );
+                                                }
                                                 // Push to shared frame slot for paint()
                                                 if let Ok(mut slot) = frame_slot.lock() {
                                                     ui(UiEvent::SetResolutionLabel(format!(

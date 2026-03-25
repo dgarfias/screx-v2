@@ -329,7 +329,7 @@ fn handle_pair_request(
     println!();
     println!("╔══════════════════════════════════════╗");
     println!("║  PAIRING PIN:  {pin}                ║");
-    println!("║  Enter this PIN on your iPad         ║");
+    println!("║  Enter this PIN on your device       ║");
     println!("╚══════════════════════════════════════╝");
     println!();
 
@@ -592,7 +592,6 @@ fn run_control_loop(
         }
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
-        println!("[control] raw frame arrived: {msg_len} bytes (seq will be at offset 0..4)");
         if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
             eprintln!(
                 "[control] invalid framed control message length: {msg_len}, closing channel"
@@ -614,7 +613,7 @@ fn run_control_loop(
 
         let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
         if seq_initialized && seq_num != seq_expected {
-            println!(
+            crate::vlog!(
                 "[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}"
             );
         }
@@ -626,9 +625,7 @@ fn run_control_loop(
         let plaintext = match cipher.decrypt(&nonce, &aad, &mut msg_buf[4..msg_len]) {
             Some(pt) => pt,
             None => {
-                println!(
-                    "[control] DECRYPT FAILED for tcp control frame seq={seq_num} len={msg_len}"
-                );
+                crate::vlog!("[control] failed to decrypt tcp control frame seq={seq_num}");
                 continue;
             }
         };

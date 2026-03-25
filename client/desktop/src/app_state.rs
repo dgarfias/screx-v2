@@ -1,4 +1,5 @@
 use qmetaobject::prelude::*;
+use qmetaobject::{queued_callback, QPointer};
 
 use crate::backend::{BackendHandle, UiEvent};
 
@@ -48,6 +49,9 @@ pub struct AppState {
     pub pin_prompt_text: qt_property!(QString; NOTIFY pin_prompt_text_changed),
     pub pin_prompt_text_changed: qt_signal!(),
 
+    pub pin_prompt_visible: qt_property!(bool; NOTIFY pin_prompt_visible_changed),
+    pub pin_prompt_visible_changed: qt_signal!(),
+
     pub fps: qt_property!(u32; NOTIFY fps_changed),
     pub fps_changed: qt_signal!(),
 
@@ -62,6 +66,7 @@ pub struct AppState {
 
     pub connect_to_host: qt_method!(
         fn connect_to_host(&mut self, host: QString) {
+            self.ensure_backend();
             let trimmed = host.to_string().trim().to_owned();
             if trimmed.is_empty() {
                 self.set_status("Enter a hostname or IP to start a Screx session.");
@@ -69,21 +74,31 @@ pub struct AppState {
                 return;
             }
 
+            self.set_pin_prompt_text("");
+            self.set_connecting(true);
+            self.set_connected(false);
+            self.set_status(&format!("Connecting to {trimmed}..."));
+
             if let Some(backend) = self.backend.clone() {
                 backend.connect(trimmed, self.speaker_enabled);
             } else {
                 self.set_status("Desktop backend is not ready yet.");
+                self.set_connecting(false);
             }
         }
     ),
 
     pub submit_pin: qt_method!(
         fn submit_pin(&mut self, pin: QString) {
+            self.ensure_backend();
             let trimmed = pin.to_string().trim().to_owned();
             if trimmed.is_empty() {
                 self.set_status("Enter the 6-digit PIN from the daemon terminal.");
                 return;
             }
+
+            self.set_connecting(true);
+            self.set_status("Finishing pairing handshake...");
 
             if let Some(backend) = self.backend.clone() {
                 backend.submit_pin(trimmed);
@@ -93,6 +108,7 @@ pub struct AppState {
 
     pub disconnect_session: qt_method!(
         fn disconnect_session(&mut self) {
+            self.ensure_backend();
             if let Some(backend) = self.backend.clone() {
                 backend.disconnect();
             }
@@ -101,6 +117,7 @@ pub struct AppState {
 
     pub toggle_speaker: qt_method!(
         fn toggle_speaker(&mut self) {
+            self.ensure_backend();
             self.speaker_enabled = !self.speaker_enabled;
             self.speaker_enabled_changed();
             if let Some(backend) = self.backend.clone() {
@@ -111,6 +128,7 @@ pub struct AppState {
 
     pub toggle_mic: qt_method!(
         fn toggle_mic(&mut self) {
+            self.ensure_backend();
             self.mic_enabled = !self.mic_enabled;
             self.mic_enabled_changed();
             if let Some(backend) = self.backend.clone() {
@@ -121,6 +139,7 @@ pub struct AppState {
 
     pub toggle_camera: qt_method!(
         fn toggle_camera(&mut self) {
+            self.ensure_backend();
             self.camera_enabled = !self.camera_enabled;
             self.camera_enabled_changed();
             if let Some(backend) = self.backend.clone() {
@@ -131,6 +150,7 @@ pub struct AppState {
 
     pub toggle_keyboard: qt_method!(
         fn toggle_keyboard(&mut self) {
+            self.ensure_backend();
             self.keyboard_enabled = !self.keyboard_enabled;
             self.keyboard_enabled_changed();
             if let Some(backend) = self.backend.clone() {
@@ -148,6 +168,7 @@ pub struct AppState {
 
     pub select_camera_mode: qt_method!(
         fn select_camera_mode(&mut self, mode: QString) {
+            self.ensure_backend();
             self.selected_camera_mode = mode;
             self.selected_camera_mode_changed();
             if let Some(backend) = self.backend.clone() {
@@ -158,6 +179,7 @@ pub struct AppState {
 
     pub send_key_event: qt_method!(
         fn send_key_event(&mut self, qt_key: i32, pressed: bool) {
+            self.ensure_backend();
             if !self.keyboard_enabled || !self.connected {
                 return;
             }
@@ -171,6 +193,7 @@ pub struct AppState {
 
     pub send_mouse_move: qt_method!(
         fn send_mouse_move(&mut self, norm_x: f32, norm_y: f32) {
+            self.ensure_backend();
             if !self.connected {
                 return;
             }
@@ -184,6 +207,7 @@ pub struct AppState {
 
     pub send_mouse_button: qt_method!(
         fn send_mouse_button(&mut self, button: i32, pressed: bool) {
+            self.ensure_backend();
             if !self.connected {
                 return;
             }
@@ -202,6 +226,7 @@ pub struct AppState {
 
     pub send_mouse_scroll: qt_method!(
         fn send_mouse_scroll(&mut self, dy: f32) {
+            self.ensure_backend();
             if !self.connected {
                 return;
             }
@@ -218,7 +243,22 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn install_backend(&mut self, backend: BackendHandle) {
+    fn ensure_backend(&mut self) {
+        if self.backend.is_some() {
+            return;
+        }
+        let qptr = QPointer::from(&*self);
+        let apply_event = queued_callback(move |event| {
+            qptr.as_pinned().map(|pinned| {
+                pinned.borrow_mut().apply_ui_event(event);
+            });
+        });
+        let backend = crate::backend::spawn_backend(
+            move |event| {
+                apply_event(event);
+            },
+            crate::video_surface::global_frame_slot_clone(),
+        );
         self.backend = Some(backend);
     }
 
@@ -289,6 +329,8 @@ impl AppState {
     fn set_pin_prompt_text(&mut self, value: &str) {
         self.pin_prompt_text = QString::from(value);
         self.pin_prompt_text_changed();
+        self.pin_prompt_visible = !value.is_empty();
+        self.pin_prompt_visible_changed();
     }
 }
 
@@ -324,6 +366,8 @@ impl Default for AppState {
             selected_camera_mode_changed: Default::default(),
             pin_prompt_text: QString::from(""),
             pin_prompt_text_changed: Default::default(),
+            pin_prompt_visible: false,
+            pin_prompt_visible_changed: Default::default(),
             fps: 0,
             fps_changed: Default::default(),
             latency_ms: 0,

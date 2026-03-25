@@ -11,8 +11,8 @@ ApplicationWindow {
     minimumWidth: 800
     minimumHeight: 600
     visible: true
-    title: appState.connected ? "Screx — " + appState.session_title : "Screx"
     color: "#000000"
+    title: AppState.connected ? "Screx - " + AppState.session_title : "Screx"
 
     function uiFont() {
         if (Qt.platform.os === "osx") return "SF Pro Display"
@@ -20,15 +20,13 @@ ApplicationWindow {
         return "Noto Sans"
     }
 
-    StackLayout {
+        StackLayout {
         anchors.fill: parent
-        currentIndex: appState.connected ? 1 : 0
+        currentIndex: AppState.connected ? 1 : 0
 
-        // ──────────────────────────────────────────────────
-        // DISCONNECTED — simple centered card like iPad
-        // ──────────────────────────────────────────────────
         Item {
-            anchors.fill: parent
+            Layout.fillWidth: true
+            Layout.fillHeight: true
 
             Rectangle {
                 anchors.fill: parent
@@ -36,26 +34,20 @@ ApplicationWindow {
             }
 
             Rectangle {
-                id: connectionCard
                 anchors.centerIn: parent
                 width: Math.min(parent.width - 48, 420)
+                implicitHeight: cardContent.implicitHeight + 48
                 radius: 16
                 color: "white"
                 border.color: "#e0e0e0"
                 border.width: 1
 
-                // Let the card height be driven by content
-                implicitHeight: cardContent.implicitHeight + 48
-
                 ColumnLayout {
                     id: cardContent
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
+                    anchors.fill: parent
                     anchors.margins: 24
                     spacing: 16
 
-                    // Title
                     ColumnLayout {
                         spacing: 4
                         Layout.fillWidth: true
@@ -69,7 +61,7 @@ ApplicationWindow {
                         }
 
                         Label {
-                            text: appState.connecting ? "Connecting" : "Idle"
+                            text: AppState.connecting ? "Connecting" : "Idle"
                             font.family: uiFont()
                             font.pixelSize: 17
                             font.weight: 600
@@ -77,7 +69,7 @@ ApplicationWindow {
                         }
 
                         Label {
-                            text: appState.status_text
+                            text: AppState.status_text
                             font.family: uiFont()
                             font.pixelSize: 14
                             color: "#8e8e93"
@@ -86,7 +78,6 @@ ApplicationWindow {
                         }
                     }
 
-                    // Host field + Connect button
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 10
@@ -98,28 +89,26 @@ ApplicationWindow {
                             font.family: uiFont()
                             font.pixelSize: 16
                             padding: 12
-                            enabled: !appState.connecting
+                            enabled: !AppState.connecting
                             background: Rectangle {
                                 radius: 10
                                 color: "#f2f2f7"
                                 border.color: hostField.activeFocus ? "#007aff" : "#d1d1d6"
                                 border.width: hostField.activeFocus ? 2 : 1
                             }
-                            onAccepted: appState.connect_to_host(text)
+                            onAccepted: AppState.connect_to_host(text)
                         }
 
                         Button {
-                            text: appState.connecting ? "Connecting…" : "Connect"
+                            text: AppState.connecting ? "Connecting..." : "Connect"
+                            enabled: !AppState.connecting && hostField.text.trim().length > 0
                             font.family: uiFont()
                             font.pixelSize: 16
                             font.weight: 600
-                            enabled: !appState.connecting && hostField.text.trim().length > 0
-                            onClicked: appState.connect_to_host(hostField.text)
+                            onClicked: AppState.connect_to_host(hostField.text)
                             background: Rectangle {
                                 radius: 10
-                                color: parent.enabled
-                                    ? (parent.down ? "#0056b3" : "#007aff")
-                                    : "#b0b0b8"
+                                color: parent.enabled ? (parent.down ? "#0056b3" : "#007aff") : "#b0b0b8"
                             }
                             contentItem: Text {
                                 text: parent.text
@@ -131,102 +120,13 @@ ApplicationWindow {
                             padding: 12
                         }
                     }
-
-                    // PIN entry — shown only when pairing is required
-                    Rectangle {
-                        visible: appState.pin_prompt_text.length > 0
-                        Layout.fillWidth: true
-                        implicitHeight: pinColumn.implicitHeight + 32
-                        radius: 12
-                        color: "#fff8f0"
-                        border.color: "#f0c78a"
-                        border.width: 1
-
-                        ColumnLayout {
-                            id: pinColumn
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            anchors.margins: 16
-                            spacing: 12
-
-                            Label {
-                                text: "Pairing Required"
-                                font.family: uiFont()
-                                font.pixelSize: 17
-                                font.weight: 700
-                                color: "#1c1c1e"
-                            }
-
-                            Label {
-                                text: appState.pin_prompt_text
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                                font.family: uiFont()
-                                font.pixelSize: 14
-                                color: "#636366"
-                            }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 10
-
-                                TextField {
-                                    id: pinField
-                                    Layout.fillWidth: true
-                                    placeholderText: "000000"
-                                    font.family: uiFont()
-                                    font.pixelSize: 24
-                                    font.weight: 700
-                                    horizontalAlignment: Text.AlignHCenter
-                                    inputMethodHints: Qt.ImhDigitsOnly
-                                    maximumLength: 6
-                                    padding: 10
-                                    onAccepted: {
-                                        if (text.length === 6) appState.submit_pin(text)
-                                    }
-                                    background: Rectangle {
-                                        radius: 10
-                                        color: "white"
-                                        border.color: pinField.activeFocus ? "#007aff" : "#d1d1d6"
-                                        border.width: pinField.activeFocus ? 2 : 1
-                                    }
-                                }
-
-                                Button {
-                                    text: "Pair"
-                                    font.family: uiFont()
-                                    font.pixelSize: 16
-                                    font.weight: 600
-                                    enabled: pinField.text.length === 6 && !appState.connecting
-                                    onClicked: appState.submit_pin(pinField.text)
-                                    background: Rectangle {
-                                        radius: 10
-                                        color: parent.enabled
-                                            ? (parent.down ? "#0056b3" : "#007aff")
-                                            : "#b0b0b8"
-                                    }
-                                    contentItem: Text {
-                                        text: parent.text
-                                        color: "white"
-                                        font: parent.font
-                                        horizontalAlignment: Text.AlignHCenter
-                                        verticalAlignment: Text.AlignVCenter
-                                    }
-                                    padding: 12
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
 
-        // ──────────────────────────────────────────────────
-        // CONNECTED — full streaming surface + overlays
-        // ──────────────────────────────────────────────────
         Item {
-            anchors.fill: parent
+            Layout.fillWidth: true
+            Layout.fillHeight: true
 
             Rectangle {
                 anchors.fill: parent
@@ -236,67 +136,61 @@ ApplicationWindow {
             VideoSurface {
                 id: streamView
                 anchors.fill: parent
-                focus: appState.connected && appState.keyboard_enabled
+                focus: AppState.connected && AppState.keyboard_enabled
 
                 Timer {
-                    running: appState.connected
+                    running: AppState.connected
                     repeat: true
                     interval: 16
                     onTriggered: streamView.update()
                 }
 
                 MouseArea {
-                    id: mouseArea
                     anchors.fill: parent
                     hoverEnabled: true
                     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
 
                     onPositionChanged: function(mouse) {
-                        if (!appState.connected) return
-                        var nx = mouse.x / width
-                        var ny = mouse.y / height
-                        appState.send_mouse_move(nx, ny)
+                        if (!AppState.connected) return
+                        AppState.send_mouse_move(mouse.x / width, mouse.y / height)
                     }
 
                     onPressed: function(mouse) {
-                        if (!appState.connected) return
-                        appState.send_mouse_button(mouse.button, true)
+                        if (!AppState.connected) return
+                        AppState.send_mouse_button(mouse.button, true)
                     }
 
                     onReleased: function(mouse) {
-                        if (!appState.connected) return
-                        appState.send_mouse_button(mouse.button, false)
+                        if (!AppState.connected) return
+                        AppState.send_mouse_button(mouse.button, false)
                     }
 
                     onWheel: function(wheel) {
-                        if (!appState.connected) return
-                        appState.send_mouse_scroll(wheel.angleDelta.y)
+                        if (!AppState.connected) return
+                        AppState.send_mouse_scroll(wheel.angleDelta.y)
                     }
                 }
             }
 
-            // Keyboard input capture
             Item {
-                id: keyGrabber
                 anchors.fill: parent
-                focus: appState.connected && appState.keyboard_enabled
+                focus: AppState.connected && AppState.keyboard_enabled
 
                 Keys.onPressed: function(event) {
-                    if (!appState.connected || !appState.keyboard_enabled) return
-                    appState.send_key_event(event.key, true)
+                    if (!AppState.connected || !AppState.keyboard_enabled) return
+                    AppState.send_key_event(event.key, true)
                     event.accepted = true
                 }
 
                 Keys.onReleased: function(event) {
-                    if (!appState.connected || !appState.keyboard_enabled) return
-                    appState.send_key_event(event.key, false)
+                    if (!AppState.connected || !AppState.keyboard_enabled) return
+                    AppState.send_key_event(event.key, false)
                     event.accepted = true
                 }
             }
 
-            // Info overlay — top left
             Rectangle {
-                visible: appState.info_visible
+                visible: AppState.info_visible
                 anchors.left: parent.left
                 anchors.top: parent.top
                 anchors.margins: 16
@@ -312,7 +206,7 @@ ApplicationWindow {
                     spacing: 6
 
                     Text {
-                        text: appState.session_title
+                        text: AppState.session_title
                         color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 16
@@ -320,7 +214,7 @@ ApplicationWindow {
                     }
 
                     Text {
-                        text: appState.transport_label + "  ·  " + appState.codec_label
+                        text: AppState.transport_label + "  ·  " + AppState.codec_label
                         color: "#aeaeb2"
                         font.family: uiFont()
                         font.pixelSize: 12
@@ -329,31 +223,29 @@ ApplicationWindow {
                     Rectangle { width: parent.width; height: 1; color: "#3a3a3c" }
 
                     Text {
-                        text: appState.resolution_label
+                        text: AppState.resolution_label
                         color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 13
                     }
 
                     Text {
-                        text: appState.fps + " fps  ·  " + appState.latency_ms + " ms  ·  " + appState.bitrate_mbps.toFixed(1) + " Mbps"
+                        text: AppState.fps + " fps  ·  " + AppState.latency_ms + " ms  ·  " + AppState.bitrate_mbps.toFixed(1) + " Mbps"
                         color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 13
                     }
 
                     Text {
-                        text: "Dropped: " + appState.dropped_frames
-                        color: appState.dropped_frames > 0 ? "#ff6961" : "#aeaeb2"
+                        text: "Dropped: " + AppState.dropped_frames
+                        color: AppState.dropped_frames > 0 ? "#ff6961" : "#aeaeb2"
                         font.family: uiFont()
                         font.pixelSize: 12
                     }
                 }
             }
 
-            // Top center pill toolbar
             Rectangle {
-                id: toolbar
                 anchors.top: parent.top
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.topMargin: 12
@@ -369,11 +261,11 @@ ApplicationWindow {
 
                     Repeater {
                         model: [
-                            { label: "Speaker", active: appState.speaker_enabled, action: function() { appState.toggle_speaker() } },
-                            { label: "Mic", active: appState.mic_enabled, action: function() { appState.toggle_mic() } },
-                            { label: "Camera", active: appState.camera_enabled, action: function() { appState.toggle_camera() } },
-                            { label: "Keyboard", active: appState.keyboard_enabled, action: function() { appState.toggle_keyboard() } },
-                            { label: "Info", active: appState.info_visible, action: function() { appState.toggle_info() } }
+                            { label: "Speaker", active: AppState.speaker_enabled, action: function() { AppState.toggle_speaker() } },
+                            { label: "Mic", active: AppState.mic_enabled, action: function() { AppState.toggle_mic() } },
+                            { label: "Camera", active: AppState.camera_enabled, action: function() { AppState.toggle_camera() } },
+                            { label: "Keyboard", active: AppState.keyboard_enabled, action: function() { AppState.toggle_keyboard() } },
+                            { label: "Info", active: AppState.info_visible, action: function() { AppState.toggle_info() } }
                         ]
 
                         delegate: Button {
@@ -400,20 +292,18 @@ ApplicationWindow {
                         }
                     }
 
-                    // Camera mode — only on connected screen
                     ComboBox {
-                        id: activeModeBox
                         model: [
                             "Auto · 1280 x 720 @ 30",
                             "720p · 1280 x 720 @ 60",
                             "1080p · 1920 x 1080 @ 30",
                             "1080p · 1920 x 1080 @ 60"
                         ]
-                        currentIndex: Math.max(0, model.indexOf(appState.selected_camera_mode))
+                        currentIndex: Math.max(0, model.indexOf(AppState.selected_camera_mode))
                         font.family: uiFont()
                         font.pixelSize: 12
                         Layout.preferredWidth: 210
-                        onActivated: appState.select_camera_mode(currentText)
+                        onActivated: AppState.select_camera_mode(currentText)
                     }
 
                     Button {
@@ -421,7 +311,7 @@ ApplicationWindow {
                         font.family: uiFont()
                         font.pixelSize: 13
                         font.weight: 700
-                        onClicked: appState.disconnect_session()
+                        onClicked: AppState.disconnect_session()
                         background: Rectangle {
                             radius: 16
                             color: parent.down ? "#c0392b" : "#e74c3c"
@@ -441,15 +331,115 @@ ApplicationWindow {
                 }
             }
 
-            // Bottom-left status
             Text {
                 anchors.left: parent.left
                 anchors.bottom: parent.bottom
                 anchors.margins: 16
-                text: appState.status_text
+                text: AppState.status_text
                 color: "#8e8e93"
                 font.family: uiFont()
                 font.pixelSize: 13
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        z: 1000
+        visible: AppState.pin_prompt_visible
+        color: "#66000000"
+
+        MouseArea {
+            anchors.fill: parent
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(root.width - 40, 380)
+            radius: 16
+            color: "white"
+            border.color: "#d1d1d6"
+            border.width: 1
+            implicitHeight: pinDialogContent.implicitHeight + 40
+
+            ColumnLayout {
+                id: pinDialogContent
+                anchors.fill: parent
+                anchors.margins: 20
+                spacing: 16
+
+                Label {
+                    text: "Pairing Required"
+                    font.family: uiFont()
+                    font.pixelSize: 20
+                    font.weight: 700
+                    color: "#1c1c1e"
+                }
+
+                Label {
+                    text: AppState.pin_prompt_text
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                    font.family: uiFont()
+                    font.pixelSize: 14
+                    color: "#636366"
+                }
+
+                TextField {
+                    id: pinDialogField
+                    Layout.fillWidth: true
+                    placeholderText: "000000"
+                    font.family: uiFont()
+                    font.pixelSize: 28
+                    font.weight: 700
+                    horizontalAlignment: Text.AlignHCenter
+                    inputMethodHints: Qt.ImhDigitsOnly
+                    maximumLength: 6
+                    onVisibleChanged: {
+                        if (visible) {
+                            text = ""
+                            forceActiveFocus()
+                        }
+                    }
+                    onAccepted: {
+                        if (text.length === 6)
+                            AppState.submit_pin(text)
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 12
+
+                    Button {
+                        text: "Cancel"
+                        Layout.fillWidth: true
+                        font.family: uiFont()
+                        font.pixelSize: 15
+                        onClicked: AppState.disconnect_session()
+                    }
+
+                    Button {
+                        text: AppState.connecting ? "Pairing..." : "Pair"
+                        Layout.fillWidth: true
+                        font.family: uiFont()
+                        font.pixelSize: 15
+                        font.weight: 600
+                        enabled: pinDialogField.text.length === 6 && !AppState.connecting
+                        onClicked: AppState.submit_pin(pinDialogField.text)
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.enabled ? (parent.down ? "#0056b3" : "#007aff") : "#b0b0b8"
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: "white"
+                            font: parent.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+                }
             }
         }
     }

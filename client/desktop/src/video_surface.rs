@@ -4,6 +4,7 @@
 // The backend pushes RGBA frame data into the global FRAME_SLOT, then
 // the paint() method reads the latest frame and draws it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cpp::cpp;
@@ -33,8 +34,12 @@ pub type FrameSlot = Arc<Mutex<Option<RawFrame>>>;
 /// Global frame slot shared between the backend decode thread and all
 /// VideoSurface instances. Initialized once at startup.
 static GLOBAL_FRAME_SLOT: OnceLock<FrameSlot> = OnceLock::new();
+static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_global_frame_slot() -> FrameSlot {
+    if let Some(existing) = GLOBAL_FRAME_SLOT.get() {
+        return existing.clone();
+    }
     let slot = Arc::new(Mutex::new(None));
     let _ = GLOBAL_FRAME_SLOT.set(slot.clone());
     slot
@@ -42,6 +47,10 @@ pub fn init_global_frame_slot() -> FrameSlot {
 
 fn global_frame_slot() -> Option<&'static FrameSlot> {
     GLOBAL_FRAME_SLOT.get()
+}
+
+pub fn global_frame_slot_clone() -> FrameSlot {
+    init_global_frame_slot()
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +125,14 @@ impl QQuickPaintedItem for VideoSurface {
             width: dw,
             height: dh,
         };
+
+        let paint_count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if paint_count == 1 || paint_count % 120 == 0 {
+            println!(
+                "[desktop/video] paints={} frame={}x{} item={:.0}x{:.0}",
+                paint_count, w, h, item_rect.width, item_rect.height
+            );
+        }
 
         painter.draw_image_fit_rect(dest, image);
     }
