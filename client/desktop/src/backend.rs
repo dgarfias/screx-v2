@@ -57,10 +57,9 @@ pub struct BackendHandle {
 }
 
 impl BackendHandle {
-    pub fn connect(&self, host: String, camera_mode: String, speaker_enabled: bool) {
+    pub fn connect(&self, host: String, speaker_enabled: bool) {
         let _ = self.tx.send(BackendCommand::Connect {
             host,
-            camera_mode,
             speaker_enabled,
         });
     }
@@ -79,12 +78,6 @@ impl BackendHandle {
 
     pub fn set_camera_mode(&self, mode: String) {
         let _ = self.tx.send(BackendCommand::SetCameraMode { mode });
-    }
-
-    pub fn note_unimplemented_toggle(&self, label: &'static str, enabled: bool) {
-        let _ = self
-            .tx
-            .send(BackendCommand::NoteUnimplementedToggle { label, enabled });
     }
 
     pub fn set_mic(&self, enabled: bool) {
@@ -121,53 +114,19 @@ impl BackendHandle {
 }
 
 enum BackendCommand {
-    Connect {
-        host: String,
-        camera_mode: String,
-        speaker_enabled: bool,
-    },
-    SubmitPin {
-        pin: String,
-    },
+    Connect { host: String, speaker_enabled: bool },
+    SubmitPin { pin: String },
     Disconnect,
-    SetSpeaker {
-        enabled: bool,
-    },
-    SetCameraMode {
-        mode: String,
-    },
-    NoteUnimplementedToggle {
-        label: &'static str,
-        enabled: bool,
-    },
-    SetMic {
-        enabled: bool,
-    },
-    SetCamera {
-        enabled: bool,
-    },
-    SetKeyboard {
-        enabled: bool,
-    },
-    SendKeyEvent {
-        hid_usage: u16,
-        pressed: bool,
-    },
-    SendMouseMove {
-        x: u16,
-        y: u16,
-    },
-    SendMouseButton {
-        button: u8,
-        pressed: bool,
-    },
-    SendMouseScroll {
-        dy: i16,
-    },
-    SessionClosed {
-        session_id: u64,
-        reason: String,
-    },
+    SetSpeaker { enabled: bool },
+    SetCameraMode { mode: String },
+    SetMic { enabled: bool },
+    SetCamera { enabled: bool },
+    SetKeyboard { enabled: bool },
+    SendKeyEvent { hid_usage: u16, pressed: bool },
+    SendMouseMove { x: u16, y: u16 },
+    SendMouseButton { button: u8, pressed: bool },
+    SendMouseScroll { dy: i16 },
+    SessionClosed { session_id: u64, reason: String },
 }
 
 #[derive(Clone)]
@@ -240,19 +199,12 @@ impl BackendWorker {
             match command {
                 BackendCommand::Connect {
                     host,
-                    camera_mode,
                     speaker_enabled,
-                } => self.handle_connect(host, camera_mode, speaker_enabled),
+                } => self.handle_connect(host, speaker_enabled),
                 BackendCommand::SubmitPin { pin } => self.handle_submit_pin(pin),
                 BackendCommand::Disconnect => self.handle_disconnect(false),
                 BackendCommand::SetSpeaker { enabled } => self.handle_set_speaker(enabled),
                 BackendCommand::SetCameraMode { mode } => self.handle_set_camera_mode(mode),
-                BackendCommand::NoteUnimplementedToggle { label, enabled } => {
-                    (self.ui)(UiEvent::SetStatus(format!(
-                        "{label} {} UI state only for now. Platform adapter wiring is next.",
-                        if enabled { "enabled" } else { "disabled" }
-                    )));
-                }
                 BackendCommand::SetMic { enabled } => self.handle_set_mic(enabled),
                 BackendCommand::SetCamera { enabled } => self.handle_set_camera(enabled),
                 BackendCommand::SetKeyboard { enabled } => {
@@ -310,7 +262,7 @@ impl BackendWorker {
         }
     }
 
-    fn handle_connect(&mut self, host_input: String, camera_mode: String, speaker_enabled: bool) {
+    fn handle_connect(&mut self, host_input: String, speaker_enabled: bool) {
         self.handle_disconnect(true);
         self.pending_pairing = None;
 
@@ -321,7 +273,7 @@ impl BackendWorker {
 
         match establish_session(&mut self.storage, &host_input) {
             Ok(ConnectResult::Established(bootstrap)) => {
-                self.activate_session(bootstrap, camera_mode, speaker_enabled);
+                self.activate_session(bootstrap, speaker_enabled);
             }
             Ok(ConnectResult::PinRequired(pending)) => {
                 self.pending_pairing = Some(pending);
@@ -330,7 +282,7 @@ impl BackendWorker {
                     "Enter the 6-digit PIN shown in the daemon terminal.".into(),
                 ));
                 (self.ui)(UiEvent::SetStatus(
-                    "Pairing requested. Waiting for the 6-digit PIN.".into(),
+                    "Pairing requested. Enter the PIN from the daemon.".into(),
                 ));
             }
             Err(error) => {
@@ -360,9 +312,8 @@ impl BackendWorker {
 
         match complete_pairing(&mut self.storage, pending, &pin) {
             Ok(bootstrap) => {
-                let camera_mode = bootstrap.initial_camera_mode.clone();
-                let speaker_enabled = bootstrap.initial_speaker_enabled;
-                self.activate_session(bootstrap, camera_mode, speaker_enabled);
+                // Speaker is enabled by default on fresh connections.
+                self.activate_session(bootstrap, true);
             }
             Err(error) => {
                 (self.ui)(UiEvent::SetConnecting(false));
@@ -374,15 +325,7 @@ impl BackendWorker {
         }
     }
 
-    fn activate_session(
-        &mut self,
-        mut bootstrap: SessionBootstrap,
-        camera_mode: String,
-        speaker_enabled: bool,
-    ) {
-        bootstrap.initial_camera_mode = camera_mode.clone();
-        bootstrap.initial_speaker_enabled = speaker_enabled;
-
+    fn activate_session(&mut self, bootstrap: SessionBootstrap, speaker_enabled: bool) {
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
@@ -435,11 +378,6 @@ impl BackendWorker {
             "Session established with {title}. Waiting for UDP media..."
         )));
 
-        if let Some(config) = parse_camera_mode(&camera_mode) {
-            // Store the camera mode but don't send CAMCFG yet — the daemon only
-            // creates the virtual webcam when the user explicitly enables the camera.
-            let _ = config;
-        }
         let _ = control.send_speaker_state(speaker_enabled);
 
         // Start audio playback before spawning UDP so the player is ready for PCM.
@@ -680,8 +618,6 @@ struct PendingPairing {
     endpoint_key: String,
     display_host: String,
     ecdh_secret: Vec<u8>,
-    initial_camera_mode: String,
-    initial_speaker_enabled: bool,
 }
 
 struct SessionBootstrap {
@@ -689,8 +625,6 @@ struct SessionBootstrap {
     server_addr: SocketAddr,
     display_host: String,
     session_key: [u8; 32],
-    initial_camera_mode: String,
-    initial_speaker_enabled: bool,
 }
 
 enum ConnectResult {
@@ -746,8 +680,6 @@ fn pair_flow(endpoint: EndpointInfo, device_id: [u8; 16]) -> Result<ConnectResul
                 endpoint_key: endpoint.endpoint_key,
                 display_host: endpoint.display_host,
                 ecdh_secret,
-                initial_camera_mode: String::new(),
-                initial_speaker_enabled: true,
             }))
         }
         HandshakeKind::Ok => {
@@ -810,8 +742,6 @@ fn complete_pairing(
                 server_addr: pending.server_addr,
                 display_host: pending.display_host,
                 session_key,
-                initial_camera_mode: pending.initial_camera_mode,
-                initial_speaker_enabled: pending.initial_speaker_enabled,
             })
         }
     }
@@ -864,8 +794,6 @@ fn hello_flow(
                 server_addr: endpoint.server_addr,
                 display_host: endpoint.display_host,
                 session_key,
-                initial_camera_mode: String::new(),
-                initial_speaker_enabled: true,
             }))
         }
     }

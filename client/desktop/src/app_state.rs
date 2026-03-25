@@ -70,11 +70,7 @@ pub struct AppState {
             }
 
             if let Some(backend) = self.backend.clone() {
-                backend.connect(
-                    trimmed,
-                    self.selected_camera_mode.to_string(),
-                    self.speaker_enabled,
-                );
+                backend.connect(trimmed, self.speaker_enabled);
             } else {
                 self.set_status("Desktop backend is not ready yet.");
             }
@@ -316,7 +312,7 @@ impl Default for AppState {
             info_visible_changed: Default::default(),
             session_title: QString::from("No active session"),
             session_title_changed: Default::default(),
-            status_text: QString::from("Rust desktop transport core is wiring up."),
+            status_text: QString::from("Enter a daemon host to connect."),
             status_text_changed: Default::default(),
             transport_label: QString::from("Network"),
             transport_label_changed: Default::default(),
