@@ -264,12 +264,17 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(SPEAKER_MAGIC) && ctrl.len() == SPEAKER_MAGIC.len() + 1 {
         let enabled = ctrl[SPEAKER_MAGIC.len()] != 0;
-        shared.audio_output_enabled.store(enabled, Ordering::SeqCst);
         if enabled {
             println!("[audio] client enabled speaker passthrough");
+            // Create the sink BEFORE setting the flag so the audio capture
+            // thread never sees "enabled" without a ready PulseAudio sink.
             ensure_virtual_sink(shared);
+            shared.audio_output_enabled.store(true, Ordering::SeqCst);
         } else {
             println!("[audio] client disabled speaker passthrough");
+            // Clear the flag BEFORE removing the sink so the capture thread
+            // stops trying to read from the monitor source.
+            shared.audio_output_enabled.store(false, Ordering::SeqCst);
             disable_virtual_sink(shared);
         }
         return;
@@ -347,15 +352,9 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 }
 
 pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
-    if !shared.has_active_client.load(Ordering::Relaxed)
-        || !shared.audio_output_enabled.load(Ordering::SeqCst)
-    {
-        return;
-    }
-
     let current_id = *shared.audio_module_id.lock().unwrap();
     if current_id > 0 {
-        return;
+        return; // already loaded
     }
 
     match crate::audio::create_virtual_sink() {

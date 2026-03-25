@@ -185,9 +185,12 @@ pub fn run_audio_capture(
     let start_time = shared.start_time;
 
     while !stop.load(Ordering::Relaxed) {
-        // Wait for a client to be active (sink will exist)
+        // Wait for a client to be active AND the virtual sink to actually exist.
+        // The sink is created by the SPKR control handler; we must not spawn
+        // parec until the PulseAudio module is loaded (audio_module_id > 0).
         if !shared.has_active_client.load(Ordering::Relaxed)
             || !shared.audio_output_enabled.load(Ordering::SeqCst)
+            || *shared.audio_module_id.lock().unwrap() == 0
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
@@ -242,7 +245,7 @@ pub fn run_audio_capture(
         };
 
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || !shared.audio_output_enabled.load(Ordering::SeqCst) {
                 break;
             }
             match stdout.read_exact(&mut buf) {
@@ -296,6 +299,9 @@ pub fn run_audio_capture(
         let _ = child.kill();
         let _ = child.wait();
         println!("[audio] capture session stopped, waiting for next client...");
+        // Brief backoff so we don't tight-loop if parec exits immediately
+        // (e.g. sink was removed between our check and parec connecting).
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     println!("[audio] capture thread exiting");
