@@ -47,6 +47,7 @@ const MAGIC_DISCONNECT: &[u8] = b"DISCONNECT";
 const MAGIC_SPEAKER: &[u8] = b"SPKR";
 const MAGIC_MICCFG: &[u8] = b"MICCFG";
 const MAGIC_CAMCFG: &[u8] = b"CAMCFG";
+const MAGIC_PERIPH: &[u8] = b"PERIPH";
 const FLAG_IDR: u8 = 0x01;
 const FLAG_AUDIO: u8 = 0x02;
 const TAG_LEN: usize = 16;
@@ -98,6 +99,15 @@ impl BackendHandle {
             .send(BackendCommand::SendKeyEvent { hid_usage, pressed });
     }
 
+    pub fn send_key_action(&self, qt_key: i32, text: String, modifiers: i32, pressed: bool) {
+        let _ = self.tx.send(BackendCommand::SendKeyAction {
+            qt_key,
+            text,
+            modifiers,
+            pressed,
+        });
+    }
+
     pub fn send_mouse_move(&self, x: u16, y: u16) {
         let _ = self.tx.send(BackendCommand::SendMouseMove { x, y });
     }
@@ -114,19 +124,54 @@ impl BackendHandle {
 }
 
 enum BackendCommand {
-    Connect { host: String, speaker_enabled: bool },
-    SubmitPin { pin: String },
+    Connect {
+        host: String,
+        speaker_enabled: bool,
+    },
+    SubmitPin {
+        pin: String,
+    },
     Disconnect,
-    SetSpeaker { enabled: bool },
-    SetCameraMode { mode: String },
-    SetMic { enabled: bool },
-    SetCamera { enabled: bool },
-    SetKeyboard { enabled: bool },
-    SendKeyEvent { hid_usage: u16, pressed: bool },
-    SendMouseMove { x: u16, y: u16 },
-    SendMouseButton { button: u8, pressed: bool },
-    SendMouseScroll { dy: i16 },
-    SessionClosed { session_id: u64, reason: String },
+    SetSpeaker {
+        enabled: bool,
+    },
+    SetCameraMode {
+        mode: String,
+    },
+    SetMic {
+        enabled: bool,
+    },
+    SetCamera {
+        enabled: bool,
+    },
+    SetKeyboard {
+        enabled: bool,
+    },
+    SendKeyEvent {
+        hid_usage: u16,
+        pressed: bool,
+    },
+    SendKeyAction {
+        qt_key: i32,
+        text: String,
+        modifiers: i32,
+        pressed: bool,
+    },
+    SendMouseMove {
+        x: u16,
+        y: u16,
+    },
+    SendMouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    SendMouseScroll {
+        dy: i16,
+    },
+    SessionClosed {
+        session_id: u64,
+        reason: String,
+    },
 }
 
 #[derive(Clone)]
@@ -217,6 +262,22 @@ impl BackendWorker {
                 BackendCommand::SendKeyEvent { hid_usage, pressed } => {
                     if let Some(ref active) = self.active {
                         let _ = crate::input::send_raw_key(&active.control, hid_usage, pressed);
+                    }
+                }
+                BackendCommand::SendKeyAction {
+                    qt_key,
+                    text,
+                    modifiers,
+                    pressed,
+                } => {
+                    if let Some(ref active) = self.active {
+                        let _ = crate::input::send_qt_key_action(
+                            &active.control,
+                            qt_key,
+                            &text,
+                            modifiers,
+                            pressed,
+                        );
                     }
                 }
                 BackendCommand::SendMouseMove { x, y } => {
@@ -379,6 +440,8 @@ impl BackendWorker {
         )));
 
         let _ = control.send_speaker_state(speaker_enabled);
+        let _ = control.send_peripheral_state(PERIPH_MOUSE, true);
+        let _ = control.send_peripheral_state(PERIPH_KEYBOARD, true);
 
         // Start audio playback before spawning UDP so the player is ready for PCM.
         let audio_player: Option<Arc<AudioPlayer>> = if speaker_enabled {
@@ -429,6 +492,8 @@ impl BackendWorker {
         self.pending_pairing = None;
         if let Some(active) = self.active.take() {
             // Tell the daemon to tear down virtual devices if active
+            let _ = active.control.send_peripheral_state(PERIPH_MOUSE, false);
+            let _ = active.control.send_peripheral_state(PERIPH_KEYBOARD, false);
             if active.webcam_capture.is_some() {
                 let _ = active.control.send_camera_disable();
             }
@@ -611,6 +676,11 @@ struct ActiveSession {
     mic_capture: Option<MicCapture>,
     webcam_capture: Option<WebcamCapture>,
 }
+
+const PERIPH_MOUSE: u8 = 0x01;
+const PERIPH_KEYBOARD: u8 = 0x02;
+const PERIPH_ATTACHED: u8 = 0x01;
+const PERIPH_DETACHED: u8 = 0x00;
 
 struct PendingPairing {
     tcp: TcpStream,
@@ -977,6 +1047,9 @@ fn spawn_udp_runtime(
         let mut last_packet = Instant::now();
         let mut decoder: Option<VideoDecoder> = None;
         let mut current_codec_id: Option<u8> = None;
+        let mut has_received_first_frame = false;
+        let mut last_completed_frame_id: u32 = 0;
+        let mut waiting_for_idr = false;
         let mut video_packet_count: u64 = 0;
         let mut audio_packet_count: u64 = 0;
         let mut decoded_frame_count: u64 = 0;
@@ -1063,6 +1136,22 @@ fn spawn_udp_runtime(
 
                         if assembly.is_complete() {
                             if let Some(annex_b) = assembly.reassemble() {
+                                if has_received_first_frame
+                                    && frame_id > last_completed_frame_id + 1
+                                {
+                                    let gap = frame_id - last_completed_frame_id - 1;
+                                    if gap > 0 && gap < 0x8000_0000 {
+                                        println!(
+                                            "[desktop/video] frame gap detected: last={} current={} gap={} -> PLI",
+                                            last_completed_frame_id,
+                                            frame_id,
+                                            gap
+                                        );
+                                        let _ = control.send_pli();
+                                        waiting_for_idr = true;
+                                    }
+                                }
+
                                 println!(
                                     "[desktop/video] reassembled frame_id={} bytes={} codec={} idr={} ts={}ms",
                                     frame_id,
@@ -1071,6 +1160,27 @@ fn spawn_udp_runtime(
                                     (flags & FLAG_IDR) != 0,
                                     timestamp_ms
                                 );
+
+                                let is_idr = (flags & FLAG_IDR) != 0;
+                                if waiting_for_idr && !is_idr {
+                                    println!(
+                                        "[desktop/video] dropping non-IDR frame {} while waiting for recovery",
+                                        frame_id
+                                    );
+                                    video_frames.remove(&frame_id);
+                                    continue;
+                                }
+
+                                if waiting_for_idr && is_idr {
+                                    println!(
+                                        "[desktop/video] recovery IDR received at frame {} - recreating decoder",
+                                        frame_id
+                                    );
+                                    decoder = None;
+                                    current_codec_id = None;
+                                    waiting_for_idr = false;
+                                }
+
                                 // Ensure decoder matches the current codec
                                 let need_new_decoder =
                                     current_codec_id.map_or(true, |c| c != codec_id);
@@ -1124,13 +1234,28 @@ fn spawn_udp_runtime(
                                                         height: df.height,
                                                         rgba: df.rgba,
                                                     });
+                                                    if decoded_frame_count == 1
+                                                        || decoded_frame_count % 60 == 0
+                                                    {
+                                                        println!(
+                                                            "[desktop/video] frame slot updated decoded_frames={} latest={}x{}",
+                                                            decoded_frame_count,
+                                                            df.width,
+                                                            df.height
+                                                        );
+                                                    }
                                                 }
+                                                crate::video_surface::request_video_surface_update(
+                                                );
                                             }
                                         }
                                         Err(e) => {
                                             eprintln!("[backend] decode error: {e:#}");
                                             stats.dropped_frames =
                                                 stats.dropped_frames.saturating_add(1);
+                                            decoder = None;
+                                            current_codec_id = None;
+                                            waiting_for_idr = true;
                                             let _ = control.send_pli();
                                         }
                                     }
@@ -1138,8 +1263,11 @@ fn spawn_udp_runtime(
 
                                 av_sync.update_video(timestamp_ms);
                                 stats.note_frame();
+                                last_completed_frame_id = frame_id;
+                                has_received_first_frame = true;
                             } else {
                                 stats.dropped_frames = stats.dropped_frames.saturating_add(1);
+                                waiting_for_idr = true;
                                 let _ = control.send_pli();
                             }
                             video_frames.remove(&frame_id);
@@ -1256,6 +1384,18 @@ impl ControlSender {
         let mut payload = Vec::with_capacity(MAGIC_MICCFG.len() + 1);
         payload.extend_from_slice(MAGIC_MICCFG);
         payload.push(u8::from(enabled));
+        self.send_payload(&payload)
+    }
+
+    fn send_peripheral_state(&self, periph: u8, attached: bool) -> Result<()> {
+        let mut payload = Vec::with_capacity(MAGIC_PERIPH.len() + 2);
+        payload.extend_from_slice(MAGIC_PERIPH);
+        payload.push(periph);
+        payload.push(if attached {
+            PERIPH_ATTACHED
+        } else {
+            PERIPH_DETACHED
+        });
         self.send_payload(&payload)
     }
 

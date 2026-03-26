@@ -14,6 +14,14 @@ ApplicationWindow {
     color: "#000000"
     title: AppState.connected ? "Screx - " + AppState.session_title : "Screx"
 
+    function captureStreamKey(event, pressed) {
+        event.accepted = false
+    }
+
+    function reserveStreamShortcut(event) {
+        event.accepted = false
+    }
+
     function uiFont() {
         if (Qt.platform.os === "osx") return "SF Pro Display"
         if (Qt.platform.os === "windows") return "Segoe UI Variable Display"
@@ -124,13 +132,19 @@ ApplicationWindow {
             }
         }
 
-        Item {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
+            Item {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
 
-            Rectangle {
-                anchors.fill: parent
-                color: "#000000"
+                Component.onCompleted: keyGrabber.forceActiveFocus()
+                onVisibleChanged: {
+                    if (visible && AppState.connected && AppState.keyboard_enabled)
+                        keyGrabber.forceActiveFocus()
+                }
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: "#000000"
             }
 
             VideoSurface {
@@ -138,25 +152,37 @@ ApplicationWindow {
                 anchors.fill: parent
                 focus: AppState.connected && AppState.keyboard_enabled
 
-                Timer {
-                    running: AppState.connected
-                    repeat: true
-                    interval: 16
-                    onTriggered: streamView.update()
+                function normalizedPoint(px, py) {
+                    const cw = content_width
+                    const ch = content_height
+                    if (cw <= 0 || ch <= 0) {
+                        return null
+                    }
+
+                    const nx = (px - content_x) / cw
+                    const ny = (py - content_y) / ch
+                    return {
+                        x: Math.max(0, Math.min(1, nx)),
+                        y: Math.max(0, Math.min(1, ny))
+                    }
                 }
 
                 MouseArea {
                     anchors.fill: parent
                     hoverEnabled: true
                     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+                    cursorShape: AppState.connected ? Qt.BlankCursor : Qt.ArrowCursor
 
                     onPositionChanged: function(mouse) {
                         if (!AppState.connected) return
-                        AppState.send_mouse_move(mouse.x / width, mouse.y / height)
+                        const point = streamView.normalizedPoint(mouse.x, mouse.y)
+                        if (!point) return
+                        AppState.send_mouse_move(point.x, point.y)
                     }
 
                     onPressed: function(mouse) {
                         if (!AppState.connected) return
+                        keyGrabber.forceActiveFocus()
                         AppState.send_mouse_button(mouse.button, true)
                     }
 
@@ -173,20 +199,10 @@ ApplicationWindow {
             }
 
             Item {
+                id: keyGrabber
                 anchors.fill: parent
                 focus: AppState.connected && AppState.keyboard_enabled
-
-                Keys.onPressed: function(event) {
-                    if (!AppState.connected || !AppState.keyboard_enabled) return
-                    AppState.send_key_event(event.key, true)
-                    event.accepted = true
-                }
-
-                Keys.onReleased: function(event) {
-                    if (!AppState.connected || !AppState.keyboard_enabled) return
-                    AppState.send_key_event(event.key, false)
-                    event.accepted = true
-                }
+                activeFocusOnTab: false
             }
 
             Rectangle {

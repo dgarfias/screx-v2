@@ -1,7 +1,44 @@
+use std::cell::RefCell;
+
 use qmetaobject::prelude::*;
 use qmetaobject::{queued_callback, QPointer};
 
 use crate::backend::{BackendHandle, UiEvent};
+
+const GLOBAL_KEY_SHORTCUT_OVERRIDE: i32 = 0;
+const GLOBAL_KEY_PRESS: i32 = 1;
+const GLOBAL_KEY_RELEASE: i32 = 2;
+
+type GlobalKeyDispatcher = Box<dyn Fn(i32, QString, i32, i32) -> bool>;
+
+thread_local! {
+    static GLOBAL_KEY_DISPATCHER: RefCell<Option<GlobalKeyDispatcher>> = RefCell::new(None);
+}
+
+pub fn dispatch_global_key_event(qt_key: i32, text: QString, modifiers: i32, phase: i32) -> bool {
+    GLOBAL_KEY_DISPATCHER.with(|dispatcher| {
+        dispatcher
+            .borrow()
+            .as_ref()
+            .map(|f| f(qt_key, text, modifiers, phase))
+            .unwrap_or(false)
+    })
+}
+
+fn should_log_key(qt_key: i32, text: &str) -> bool {
+    matches!(
+        qt_key,
+        0x01000003
+            | 0x01000004
+            | 0x01000005
+            | 0x01000001
+            | 0x01000000
+            | 0x01000012
+            | 0x01000013
+            | 0x01000014
+            | 0x01000015
+    ) || text.eq_ignore_ascii_case("s")
+}
 
 #[derive(QObject)]
 pub struct AppState {
@@ -178,15 +215,13 @@ pub struct AppState {
     ),
 
     pub send_key_event: qt_method!(
-        fn send_key_event(&mut self, qt_key: i32, pressed: bool) {
+        fn send_key_event(&mut self, qt_key: i32, text: QString, modifiers: i32, pressed: bool) {
             self.ensure_backend();
             if !self.keyboard_enabled || !self.connected {
                 return;
             }
-            if let Some(hid) = crate::input::qt_key_to_hid(qt_key) {
-                if let Some(backend) = self.backend.clone() {
-                    backend.send_key_event(hid, pressed);
-                }
+            if let Some(backend) = self.backend.clone() {
+                backend.send_key_action(qt_key, text.to_string(), modifiers, pressed);
             }
         }
     ),
@@ -211,11 +246,12 @@ pub struct AppState {
             if !self.connected {
                 return;
             }
-            // Qt button constants: 1=Left, 2=Right, 4=Middle
+            // Map Qt button constants to daemon mouse button codes:
+            // daemon expects 0=left, 1=right, 2=middle.
             let btn = match button {
-                1 => 1u8, // Left
-                2 => 2u8, // Right
-                4 => 3u8, // Middle
+                1 => 0u8, // Left
+                2 => 1u8, // Right
+                4 => 2u8, // Middle
                 _ => return,
             };
             if let Some(backend) = self.backend.clone() {
@@ -248,8 +284,9 @@ impl AppState {
             return;
         }
         let qptr = QPointer::from(&*self);
+        let event_qptr = qptr.clone();
         let apply_event = queued_callback(move |event| {
-            qptr.as_pinned().map(|pinned| {
+            event_qptr.as_pinned().map(|pinned| {
                 pinned.borrow_mut().apply_ui_event(event);
             });
         });
@@ -259,7 +296,62 @@ impl AppState {
             },
             crate::video_surface::global_frame_slot_clone(),
         );
+        GLOBAL_KEY_DISPATCHER.with(|dispatcher| {
+            let qptr = qptr.clone();
+            *dispatcher.borrow_mut() = Some(Box::new(move |qt_key, text, modifiers, phase| {
+                qptr.as_pinned()
+                    .map(|pinned| {
+                        pinned
+                            .borrow_mut()
+                            .handle_global_key_event(qt_key, text, modifiers, phase)
+                    })
+                    .unwrap_or(false)
+            }));
+        });
         self.backend = Some(backend);
+    }
+
+    fn handle_global_key_event(
+        &mut self,
+        qt_key: i32,
+        text: QString,
+        modifiers: i32,
+        phase: i32,
+    ) -> bool {
+        let text_string = text.to_string();
+        if should_log_key(qt_key, &text_string) {
+            println!(
+                "[desktop/key/app] phase={} key=0x{:x} text={:?} mods=0x{:x} connected={} keyboard_enabled={} pin_prompt_visible={}",
+                phase,
+                qt_key,
+                text_string,
+                modifiers,
+                self.connected,
+                self.keyboard_enabled,
+                self.pin_prompt_visible
+            );
+        }
+        if !self.connected || !self.keyboard_enabled || self.pin_prompt_visible {
+            return false;
+        }
+
+        match phase {
+            GLOBAL_KEY_SHORTCUT_OVERRIDE => true,
+            GLOBAL_KEY_PRESS | GLOBAL_KEY_RELEASE => {
+                if let Some(backend) = self.backend.clone() {
+                    backend.send_key_action(
+                        qt_key,
+                        text_string,
+                        modifiers,
+                        phase == GLOBAL_KEY_PRESS,
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     pub fn apply_ui_event(&mut self, event: UiEvent) {

@@ -1,4 +1,7 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/main.rs");
+    println!("cargo:rerun-if-changed=src/video_surface.rs");
+
     let qt_include_path = std::env::var("DEP_QT_INCLUDE_PATH").unwrap();
     let mut config = cpp_build::Config::new();
     for f in std::env::var("DEP_QT_COMPILE_FLAGS")

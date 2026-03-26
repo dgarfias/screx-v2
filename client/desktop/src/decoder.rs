@@ -470,6 +470,14 @@ impl HwDecoder {
                 rgba.extend_from_slice(std::slice::from_raw_parts(row_start, width * 4));
             }
 
+            // Qt draws RGBA images honoring the alpha channel. Some FFmpeg
+            // conversion paths leave alpha as 0, which makes the image fully
+            // transparent (appearing as a black screen over our black window).
+            // Force alpha to opaque.
+            for alpha in rgba[3..].iter_mut().step_by(4) {
+                *alpha = 0xFF;
+            }
+
             frames.push(DecodedFrame {
                 width: w as u32,
                 height: h as u32,
@@ -716,6 +724,11 @@ impl SwDecoder {
             for row in 0..height {
                 let row_start = src.add(row * stride);
                 rgba.extend_from_slice(std::slice::from_raw_parts(row_start, width * 4));
+            }
+
+            // Force alpha opaque for Qt image drawing.
+            for alpha in rgba[3..].iter_mut().step_by(4) {
+                *alpha = 0xFF;
             }
 
             frames.push(DecodedFrame {

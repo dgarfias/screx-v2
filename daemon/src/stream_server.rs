@@ -334,6 +334,18 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
             );
         }
         let mut m = shared.virtual_mouse.lock().unwrap();
+        if m.is_none() {
+            match crate::uinput::VirtualMouse::new() {
+                Ok(vm) => {
+                    println!("[mouse] direct control active - virtual mouse created");
+                    *m = Some(vm);
+                }
+                Err(e) => {
+                    eprintln!("[mouse] failed to create virtual mouse for direct control: {e}");
+                    return;
+                }
+            }
+        }
         if let Some(ref mut vm) = *m {
             crate::uinput::handle_mouse_packet(vm, mouse_data);
         }
