@@ -1124,6 +1124,19 @@ fn spawn_udp_runtime(
                         }
                         let codec_label = if codec_id == 0x01 { "H.265" } else { "H.264" };
                         ui(UiEvent::SetCodecLabel(format!("{codec_label} · UDP live")));
+
+                        if has_received_first_frame
+                            && frame_id < last_completed_frame_id
+                            && (last_completed_frame_id - frame_id) < 0x8000_0000
+                        {
+                            println!(
+                                "[desktop/video] dropping stale frame packet frame_id={} last_completed={}",
+                                frame_id,
+                                last_completed_frame_id
+                            );
+                            continue;
+                        }
+
                         let assembly = video_frames.entry(frame_id).or_insert_with(|| {
                             FrameAssembly::new(
                                 total_data,
@@ -1136,6 +1149,19 @@ fn spawn_udp_runtime(
 
                         if assembly.is_complete() {
                             if let Some(annex_b) = assembly.reassemble() {
+                                if has_received_first_frame
+                                    && frame_id < last_completed_frame_id
+                                    && (last_completed_frame_id - frame_id) < 0x8000_0000
+                                {
+                                    println!(
+                                        "[desktop/video] dropping stale complete frame_id={} last_completed={}",
+                                        frame_id,
+                                        last_completed_frame_id
+                                    );
+                                    video_frames.remove(&frame_id);
+                                    continue;
+                                }
+
                                 if has_received_first_frame
                                     && frame_id > last_completed_frame_id + 1
                                 {
