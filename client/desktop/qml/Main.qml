@@ -142,221 +142,192 @@ ApplicationWindow {
                         keyGrabber.forceActiveFocus()
                 }
 
-                Rectangle {
+                ColumnLayout {
                     anchors.fill: parent
-                    color: "#000000"
-            }
+                    spacing: 0
 
-            VideoSurface {
-                id: streamView
-                anchors.fill: parent
-                focus: AppState.connected && AppState.keyboard_enabled
+                    // ── Fixed top toolbar ──
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 40
+                        color: "#1c1c1e"
 
-                function normalizedPoint(px, py) {
-                    const cw = content_width
-                    const ch = content_height
-                    if (cw <= 0 || ch <= 0) {
-                        return null
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 12
+                            anchors.rightMargin: 12
+                            spacing: 6
+
+                            Text {
+                                text: AppState.session_title
+                                color: "#ffffff"
+                                font.family: uiFont()
+                                font.pixelSize: 13
+                                font.weight: 600
+                                Layout.rightMargin: 8
+                            }
+
+                            Rectangle { width: 1; Layout.fillHeight: true; Layout.topMargin: 8; Layout.bottomMargin: 8; color: "#3a3a3c" }
+
+                            Repeater {
+                                model: [
+                                    { label: "Speaker", active: AppState.speaker_enabled, action: function() { AppState.toggle_speaker() } },
+                                    { label: "Mic", active: AppState.mic_enabled, action: function() { AppState.toggle_mic() } },
+                                    { label: "Cam", active: AppState.camera_enabled, action: function() { AppState.toggle_camera() } },
+                                    { label: "KB", active: AppState.keyboard_enabled, action: function() { AppState.toggle_keyboard() } },
+                                    { label: "Info", active: AppState.info_visible, action: function() { AppState.toggle_info() } }
+                                ]
+
+                                delegate: Button {
+                                    text: modelData.label
+                                    font.family: uiFont()
+                                    font.pixelSize: 12
+                                    font.weight: 600
+                                    onClicked: modelData.action()
+                                    background: Rectangle {
+                                        radius: 4
+                                        color: modelData.active ? "#007aff" : "#2c2c2e"
+                                    }
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: modelData.active ? "white" : "#8e8e93"
+                                        font: parent.font
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    leftPadding: 10
+                                    rightPadding: 10
+                                    topPadding: 4
+                                    bottomPadding: 4
+                                }
+                            }
+
+                            Item { Layout.fillWidth: true }
+
+                            Text {
+                                visible: AppState.info_visible
+                                text: AppState.resolution_label + "  ·  " + AppState.fps + " fps  ·  " + AppState.bitrate_mbps.toFixed(1) + " Mbps"
+                                color: "#8e8e93"
+                                font.family: uiFont()
+                                font.pixelSize: 11
+                            }
+
+                            Rectangle { width: 1; Layout.fillHeight: true; Layout.topMargin: 8; Layout.bottomMargin: 8; color: "#3a3a3c" }
+
+                            Button {
+                                text: "Disconnect"
+                                font.family: uiFont()
+                                font.pixelSize: 12
+                                font.weight: 700
+                                onClicked: AppState.disconnect_session()
+                                background: Rectangle {
+                                    radius: 4
+                                    color: parent.down ? "#c0392b" : "#e74c3c"
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: "white"
+                                    font: parent.font
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                leftPadding: 10
+                                rightPadding: 10
+                                topPadding: 4
+                                bottomPadding: 4
+                            }
+                        }
                     }
 
-                    const nx = (px - content_x) / cw
-                    const ny = (py - content_y) / ch
-                    return {
-                        x: Math.max(0, Math.min(1, nx)),
-                        y: Math.max(0, Math.min(1, ny))
-                    }
-                }
+                    // ── Stream area ──
+                    Item {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
 
-                MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-                    cursorShape: AppState.connected ? Qt.BlankCursor : Qt.ArrowCursor
+                        Rectangle {
+                            anchors.fill: parent
+                            color: "#000000"
+                        }
 
-                    onPositionChanged: function(mouse) {
-                        if (!AppState.connected) return
-                        const point = streamView.normalizedPoint(mouse.x, mouse.y)
-                        if (!point) return
-                        AppState.send_mouse_move(point.x, point.y)
-                    }
+                        VideoSurface {
+                            id: streamView
+                            anchors.fill: parent
+                            focus: AppState.connected && AppState.keyboard_enabled
 
-                    onPressed: function(mouse) {
-                        if (!AppState.connected) return
-                        keyGrabber.forceActiveFocus()
-                        AppState.send_mouse_button(mouse.button, true)
-                    }
+                            function normalizedPoint(px, py) {
+                                const cw = content_width
+                                const ch = content_height
+                                if (cw <= 0 || ch <= 0) {
+                                    return null
+                                }
 
-                    onReleased: function(mouse) {
-                        if (!AppState.connected) return
-                        AppState.send_mouse_button(mouse.button, false)
-                    }
+                                const nx = (px - content_x) / cw
+                                const ny = (py - content_y) / ch
+                                return {
+                                    x: Math.max(0, Math.min(1, nx)),
+                                    y: Math.max(0, Math.min(1, ny))
+                                }
+                            }
 
-                    onWheel: function(wheel) {
-                        if (!AppState.connected) return
-                        AppState.send_mouse_scroll(wheel.angleDelta.y)
-                    }
-                }
-            }
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+                                cursorShape: AppState.connected ? Qt.BlankCursor : Qt.ArrowCursor
+                                property bool hasReceivedFirstMove: false
 
-            Item {
-                id: keyGrabber
-                anchors.fill: parent
-                focus: AppState.connected && AppState.keyboard_enabled
-                activeFocusOnTab: false
-            }
+                                onEntered: {
+                                    hasReceivedFirstMove = false
+                                }
 
-            Rectangle {
-                visible: AppState.info_visible
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.margins: 16
-                width: 260
-                radius: 14
-                color: "#cc1c1c1e"
-                implicitHeight: infoCol.implicitHeight + 24
+                                onPositionChanged: function(mouse) {
+                                    if (!AppState.connected) return
+                                    if (!hasReceivedFirstMove) {
+                                        hasReceivedFirstMove = true
+                                        return
+                                    }
+                                    const point = streamView.normalizedPoint(mouse.x, mouse.y)
+                                    if (!point) return
+                                    AppState.send_mouse_move(point.x, point.y)
+                                }
 
-                Column {
-                    id: infoCol
-                    anchors.fill: parent
-                    anchors.margins: 12
-                    spacing: 6
+                                onPressed: function(mouse) {
+                                    if (!AppState.connected) return
+                                    keyGrabber.forceActiveFocus()
+                                    AppState.send_mouse_button(mouse.button, true)
+                                }
 
-                    Text {
-                        text: AppState.session_title
-                        color: "#ffffff"
-                        font.family: uiFont()
-                        font.pixelSize: 16
-                        font.weight: 650
-                    }
+                                onReleased: function(mouse) {
+                                    if (!AppState.connected) return
+                                    AppState.send_mouse_button(mouse.button, false)
+                                }
 
-                    Text {
-                        text: AppState.transport_label + "  ·  " + AppState.codec_label
-                        color: "#aeaeb2"
-                        font.family: uiFont()
-                        font.pixelSize: 12
-                    }
+                                onWheel: function(wheel) {
+                                    if (!AppState.connected) return
+                                    AppState.send_mouse_scroll(wheel.angleDelta.y)
+                                }
+                            }
+                        }
 
-                    Rectangle { width: parent.width; height: 1; color: "#3a3a3c" }
+                        Item {
+                            id: keyGrabber
+                            anchors.fill: parent
+                            focus: AppState.connected && AppState.keyboard_enabled
+                            activeFocusOnTab: false
+                        }
 
-                    Text {
-                        text: AppState.resolution_label
-                        color: "#ffffff"
-                        font.family: uiFont()
-                        font.pixelSize: 13
-                    }
-
-                    Text {
-                        text: AppState.fps + " fps  ·  " + AppState.latency_ms + " ms  ·  " + AppState.bitrate_mbps.toFixed(1) + " Mbps"
-                        color: "#ffffff"
-                        font.family: uiFont()
-                        font.pixelSize: 13
-                    }
-
-                    Text {
-                        text: "Dropped: " + AppState.dropped_frames
-                        color: AppState.dropped_frames > 0 ? "#ff6961" : "#aeaeb2"
-                        font.family: uiFont()
-                        font.pixelSize: 12
-                    }
-                }
-            }
-
-            Rectangle {
-                anchors.top: parent.top
-                anchors.horizontalCenter: parent.horizontalCenter
-                anchors.topMargin: 12
-                implicitWidth: toolbarRow.implicitWidth + 20
-                implicitHeight: toolbarRow.implicitHeight + 12
-                radius: 22
-                color: "#cc1c1c1e"
-
-                RowLayout {
-                    id: toolbarRow
-                    anchors.centerIn: parent
-                    spacing: 6
-
-                    Repeater {
-                        model: [
-                            { label: "Speaker", active: AppState.speaker_enabled, action: function() { AppState.toggle_speaker() } },
-                            { label: "Mic", active: AppState.mic_enabled, action: function() { AppState.toggle_mic() } },
-                            { label: "Camera", active: AppState.camera_enabled, action: function() { AppState.toggle_camera() } },
-                            { label: "Keyboard", active: AppState.keyboard_enabled, action: function() { AppState.toggle_keyboard() } },
-                            { label: "Info", active: AppState.info_visible, action: function() { AppState.toggle_info() } }
-                        ]
-
-                        delegate: Button {
-                            text: modelData.label
+                        Text {
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 12
+                            text: AppState.status_text
+                            color: "#8e8e93"
                             font.family: uiFont()
-                            font.pixelSize: 13
-                            font.weight: 600
-                            onClicked: modelData.action()
-                            background: Rectangle {
-                                radius: 16
-                                color: modelData.active ? "#007aff" : "#2c2c2e"
-                            }
-                            contentItem: Text {
-                                text: parent.text
-                                color: modelData.active ? "white" : "#aeaeb2"
-                                font: parent.font
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                            leftPadding: 14
-                            rightPadding: 14
-                            topPadding: 7
-                            bottomPadding: 7
+                            font.pixelSize: 12
                         }
-                    }
-
-                    ComboBox {
-                        model: [
-                            "Auto · 1280 x 720 @ 30",
-                            "720p · 1280 x 720 @ 60",
-                            "1080p · 1920 x 1080 @ 30",
-                            "1080p · 1920 x 1080 @ 60"
-                        ]
-                        currentIndex: Math.max(0, model.indexOf(AppState.selected_camera_mode))
-                        font.family: uiFont()
-                        font.pixelSize: 12
-                        Layout.preferredWidth: 210
-                        onActivated: AppState.select_camera_mode(currentText)
-                    }
-
-                    Button {
-                        text: "Disconnect"
-                        font.family: uiFont()
-                        font.pixelSize: 13
-                        font.weight: 700
-                        onClicked: AppState.disconnect_session()
-                        background: Rectangle {
-                            radius: 16
-                            color: parent.down ? "#c0392b" : "#e74c3c"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "white"
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        leftPadding: 14
-                        rightPadding: 14
-                        topPadding: 7
-                        bottomPadding: 7
                     }
                 }
             }
-
-            Text {
-                anchors.left: parent.left
-                anchors.bottom: parent.bottom
-                anchors.margins: 16
-                text: AppState.status_text
-                color: "#8e8e93"
-                font.family: uiFont()
-                font.pixelSize: 13
-            }
-        }
     }
 
     Rectangle {

@@ -75,6 +75,18 @@ impl VideoDecoder {
             CodecId::H265 => "H.265",
         };
 
+        let force_software = std::env::var_os("SCREX_FORCE_SW_DECODE").is_some();
+        if force_software {
+            let sw = SwDecoder::new(codec)?;
+            println!("[decoder] forcing software {label} decode via SCREX_FORCE_SW_DECODE");
+            return Ok(Self {
+                inner: DecoderInner::Software(sw),
+                codec,
+                last_width: 0,
+                last_height: 0,
+            });
+        }
+
         // --- macOS: VideoToolbox ---
         #[cfg(target_os = "macos")]
         {
@@ -197,6 +209,7 @@ fn ffi_init() {
 struct HwDecoder {
     ctx: *mut ffi::AVCodecContext,
     hw_device_ctx: *mut ffi::AVBufferRef,
+    hw_pix_fmt: ffi::AVPixelFormat,
     parser: *mut ffi::AVCodecParserContext,
     pkt: *mut ffi::AVPacket,
     hw_frame: *mut ffi::AVFrame,
@@ -209,6 +222,39 @@ struct HwDecoder {
 }
 
 unsafe impl Send for HwDecoder {}
+
+unsafe extern "C" fn get_hw_format(
+    ctx: *mut ffi::AVCodecContext,
+    pix_fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    if ctx.is_null() || pix_fmts.is_null() {
+        return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+
+    let desired_ptr = (*ctx).opaque as *const ffi::AVPixelFormat;
+    if desired_ptr.is_null() {
+        return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    let desired = *desired_ptr;
+
+    let mut current = pix_fmts;
+    while *current != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+        if *current == desired {
+            return desired;
+        }
+        current = current.add(1);
+    }
+
+    eprintln!("[decoder] requested hw pixel format not offered by codec");
+    ffi::AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+unsafe fn apply_low_latency_decoder_flags(ctx: *mut ffi::AVCodecContext) {
+    (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+    (*ctx).flags2 |= (ffi::AV_CODEC_FLAG2_FAST | ffi::AV_CODEC_FLAG2_CHUNKS) as i32;
+    (*ctx).thread_count = 1;
+    (*ctx).thread_type = 0;
+}
 
 impl HwDecoder {
     /// VA-API (Linux).
@@ -277,9 +323,32 @@ impl HwDecoder {
                 bail!("failed to allocate decoder context");
             }
 
-            // Allow the decoder to use incomplete frames / frame threading
-            (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
-            (*ctx).thread_count = 1;
+            let mut hw_pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+            let mut config_index = 0;
+            loop {
+                let config = ffi::avcodec_get_hw_config(codec, config_index);
+                if config.is_null() {
+                    break;
+                }
+                if (*config).device_type == hw_type
+                    && ((*config).methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32)
+                        != 0
+                {
+                    hw_pix_fmt = (*config).pix_fmt;
+                    break;
+                }
+                config_index += 1;
+            }
+            if hw_pix_fmt == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                ffi::avcodec_free_context(&mut (ctx as *mut _));
+                bail!("decoder does not expose a compatible hw pixel format");
+            }
+
+            let hw_pix_fmt_box = Box::new(hw_pix_fmt);
+            (*ctx).opaque = Box::into_raw(hw_pix_fmt_box) as *mut _;
+            (*ctx).get_format = Some(get_hw_format);
+
+            apply_low_latency_decoder_flags(ctx);
 
             // Create hw device context
             let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -296,6 +365,11 @@ impl HwDecoder {
                 0,
             );
             if ret < 0 {
+                let opaque = (*ctx).opaque as *mut ffi::AVPixelFormat;
+                if !opaque.is_null() {
+                    drop(Box::from_raw(opaque));
+                    (*ctx).opaque = ptr::null_mut();
+                }
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 bail!("failed to create hw device context (error {ret})");
             }
@@ -307,6 +381,11 @@ impl HwDecoder {
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
+                let opaque = (*ctx).opaque as *mut ffi::AVPixelFormat;
+                if !opaque.is_null() {
+                    drop(Box::from_raw(opaque));
+                    (*ctx).opaque = ptr::null_mut();
+                }
                 ffi::av_buffer_unref(&mut hw_device_ctx);
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 bail!("failed to open hw decoder (error {ret})");
@@ -315,6 +394,11 @@ impl HwDecoder {
             // Parser for splitting Annex-B streams into packets
             let parser = ffi::av_parser_init((*codec).id as i32);
             if parser.is_null() {
+                let opaque = (*ctx).opaque as *mut ffi::AVPixelFormat;
+                if !opaque.is_null() {
+                    drop(Box::from_raw(opaque));
+                    (*ctx).opaque = ptr::null_mut();
+                }
                 ffi::av_buffer_unref(&mut hw_device_ctx);
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 bail!("failed to create parser");
@@ -332,6 +416,7 @@ impl HwDecoder {
             Ok(Self {
                 ctx,
                 hw_device_ctx,
+                hw_pix_fmt,
                 parser,
                 pkt,
                 hw_frame,
@@ -348,31 +433,12 @@ impl HwDecoder {
     fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
-            let mut data = annex_b.as_ptr();
-            let mut data_size = annex_b.len() as i32;
-
-            while data_size > 0 {
-                let consumed = ffi::av_parser_parse2(
-                    self.parser,
-                    self.ctx,
-                    &mut (*self.pkt).data,
-                    &mut (*self.pkt).size,
-                    data,
-                    data_size,
-                    ffi::AV_NOPTS_VALUE,
-                    ffi::AV_NOPTS_VALUE,
-                    0,
-                );
-                if consumed < 0 {
-                    bail!("parser error");
-                }
-                data = data.add(consumed as usize);
-                data_size -= consumed;
-
-                if (*self.pkt).size > 0 {
-                    self.send_and_receive(&mut frames)?;
-                }
-            }
+            // Feed the complete access unit directly — no parser needed.
+            (*self.pkt).data = annex_b.as_ptr() as *mut u8;
+            (*self.pkt).size = annex_b.len() as i32;
+            self.send_and_receive(&mut frames)?;
+            (*self.pkt).data = ptr::null_mut();
+            (*self.pkt).size = 0;
         }
         Ok(frames)
     }
@@ -380,22 +446,6 @@ impl HwDecoder {
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
-            // Flush parser
-            ffi::av_parser_parse2(
-                self.parser,
-                self.ctx,
-                &mut (*self.pkt).data,
-                &mut (*self.pkt).size,
-                ptr::null(),
-                0,
-                ffi::AV_NOPTS_VALUE,
-                ffi::AV_NOPTS_VALUE,
-                0,
-            );
-            if (*self.pkt).size > 0 {
-                self.send_and_receive(&mut frames)?;
-            }
-            // Flush decoder
             ffi::avcodec_send_packet(self.ctx, ptr::null());
             self.receive_frames(&mut frames)?;
         }
@@ -404,9 +454,7 @@ impl HwDecoder {
 
     unsafe fn send_and_receive(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
-        ffi::av_packet_unref(self.pkt);
         if ret < 0 {
-            // EAGAIN is OK — just means the decoder needs us to receive first
             if ret != ffi::AVERROR(libc::EAGAIN) && ret != ffi::AVERROR_EOF {
                 bail!("avcodec_send_packet error {ret}");
             }
@@ -424,59 +472,65 @@ impl HwDecoder {
                 bail!("avcodec_receive_frame error {ret}");
             }
 
-            // Transfer hw surface → CPU; let FFmpeg pick the best CPU format.
-            ffi::av_frame_unref(self.sw_frame);
-            let ret = ffi::av_hwframe_transfer_data(self.sw_frame, self.hw_frame, 0);
-            if ret < 0 {
-                ffi::av_frame_unref(self.hw_frame);
-                bail!("av_hwframe_transfer_data error {ret}");
-            }
+            let src_frame =
+                if std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.hw_frame).format)
+                    == self.hw_pix_fmt
+                {
+                    ffi::av_frame_unref(self.sw_frame);
+                    let ret = ffi::av_hwframe_transfer_data(self.sw_frame, self.hw_frame, 0);
+                    if ret < 0 {
+                        ffi::av_frame_unref(self.hw_frame);
+                        bail!("av_hwframe_transfer_data error {ret}");
+                    }
+                    self.sw_frame
+                } else {
+                    self.hw_frame
+                };
 
-            let w = (*self.sw_frame).width;
-            let h = (*self.sw_frame).height;
-            let src_fmt = std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.sw_frame).format);
+            let w = (*src_frame).width;
+            let h = (*src_frame).height;
+            let src_fmt = std::mem::transmute::<i32, ffi::AVPixelFormat>((*src_frame).format);
 
             // Ensure sws context matches current resolution and pixel format.
             self.ensure_sws(w, h, src_fmt)?;
 
-            // sws_scale NV12 → RGBA
+            // sws_scale NV12 → RGBX (opaque alpha baked in via RGBX target)
             ffi::av_frame_unref(self.rgba_frame);
-            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGBA as i32;
+            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGB0 as i32;
             (*self.rgba_frame).width = w;
             (*self.rgba_frame).height = h;
-            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 0);
+            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
             if ret < 0 {
                 bail!("failed to allocate RGBA frame buffer");
             }
 
             ffi::sws_scale(
                 self.sws,
-                (*self.sw_frame).data.as_ptr() as *const *const u8,
-                (*self.sw_frame).linesize.as_ptr(),
+                (*src_frame).data.as_ptr() as *const *const u8,
+                (*src_frame).linesize.as_ptr(),
                 0,
                 h,
                 (*self.rgba_frame).data.as_mut_ptr(),
                 (*self.rgba_frame).linesize.as_mut_ptr(),
             );
 
-            // Copy RGBA data out
+            // Single memcpy when stride == width*4, otherwise row-copy
             let stride = (*self.rgba_frame).linesize[0] as usize;
-            let width = w as usize;
+            let row_bytes = w as usize * 4;
             let height = h as usize;
-            let mut rgba = Vec::with_capacity(width * 4 * height);
-            let src = (*self.rgba_frame).data[0];
-            for row in 0..height {
-                let row_start = src.add(row * stride);
-                rgba.extend_from_slice(std::slice::from_raw_parts(row_start, width * 4));
-            }
-
-            // Qt draws RGBA images honoring the alpha channel. Some FFmpeg
-            // conversion paths leave alpha as 0, which makes the image fully
-            // transparent (appearing as a black screen over our black window).
-            // Force alpha to opaque.
-            for alpha in rgba[3..].iter_mut().step_by(4) {
-                *alpha = 0xFF;
-            }
+            let src_ptr = (*self.rgba_frame).data[0];
+            let rgba = if stride == row_bytes {
+                std::slice::from_raw_parts(src_ptr, row_bytes * height).to_vec()
+            } else {
+                let mut buf = Vec::with_capacity(row_bytes * height);
+                for row in 0..height {
+                    buf.extend_from_slice(std::slice::from_raw_parts(
+                        src_ptr.add(row * stride),
+                        row_bytes,
+                    ));
+                }
+                buf
+            };
 
             frames.push(DecodedFrame {
                 width: w as u32,
@@ -485,7 +539,9 @@ impl HwDecoder {
             });
 
             ffi::av_frame_unref(self.hw_frame);
-            ffi::av_frame_unref(self.sw_frame);
+            if src_frame == self.sw_frame {
+                ffi::av_frame_unref(self.sw_frame);
+            }
             ffi::av_frame_unref(self.rgba_frame);
         }
         Ok(())
@@ -509,7 +565,7 @@ impl HwDecoder {
             src_fmt,
             w,
             h,
-            ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+            ffi::AVPixelFormat::AV_PIX_FMT_RGB0,
             SwsFlags::SWS_FAST_BILINEAR as i32,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -537,6 +593,11 @@ impl Drop for HwDecoder {
             ffi::av_packet_free(&mut self.pkt);
             ffi::av_parser_close(self.parser);
             ffi::av_buffer_unref(&mut self.hw_device_ctx);
+            let opaque = (*self.ctx).opaque as *mut ffi::AVPixelFormat;
+            if !opaque.is_null() {
+                drop(Box::from_raw(opaque));
+                (*self.ctx).opaque = ptr::null_mut();
+            }
             ffi::avcodec_free_context(&mut self.ctx);
         }
     }
@@ -578,8 +639,7 @@ impl SwDecoder {
                 bail!("failed to allocate sw decoder context");
             }
 
-            (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
-            (*ctx).thread_count = 2;
+            apply_low_latency_decoder_flags(ctx);
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
@@ -618,31 +678,13 @@ impl SwDecoder {
     fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
-            let mut data = annex_b.as_ptr();
-            let mut data_size = annex_b.len() as i32;
-
-            while data_size > 0 {
-                let consumed = ffi::av_parser_parse2(
-                    self.parser,
-                    self.ctx,
-                    &mut (*self.pkt).data,
-                    &mut (*self.pkt).size,
-                    data,
-                    data_size,
-                    ffi::AV_NOPTS_VALUE,
-                    ffi::AV_NOPTS_VALUE,
-                    0,
-                );
-                if consumed < 0 {
-                    bail!("sw parser error");
-                }
-                data = data.add(consumed as usize);
-                data_size -= consumed;
-
-                if (*self.pkt).size > 0 {
-                    self.send_and_receive(&mut frames)?;
-                }
-            }
+            // Feed the complete access unit directly without re-parsing.
+            (*self.pkt).data = annex_b.as_ptr() as *mut u8;
+            (*self.pkt).size = annex_b.len() as i32;
+            self.send_and_receive(&mut frames)?;
+            // Do NOT call av_packet_unref here — we don't own the data pointer.
+            (*self.pkt).data = ptr::null_mut();
+            (*self.pkt).size = 0;
         }
         Ok(frames)
     }
@@ -650,20 +692,6 @@ impl SwDecoder {
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
-            ffi::av_parser_parse2(
-                self.parser,
-                self.ctx,
-                &mut (*self.pkt).data,
-                &mut (*self.pkt).size,
-                ptr::null(),
-                0,
-                ffi::AV_NOPTS_VALUE,
-                ffi::AV_NOPTS_VALUE,
-                0,
-            );
-            if (*self.pkt).size > 0 {
-                self.send_and_receive(&mut frames)?;
-            }
             ffi::avcodec_send_packet(self.ctx, ptr::null());
             self.receive_frames(&mut frames)?;
         }
@@ -672,7 +700,6 @@ impl SwDecoder {
 
     unsafe fn send_and_receive(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
-        ffi::av_packet_unref(self.pkt);
         if ret < 0 {
             if ret != ffi::AVERROR(libc::EAGAIN) && ret != ffi::AVERROR_EOF {
                 bail!("sw avcodec_send_packet error {ret}");
@@ -698,10 +725,10 @@ impl SwDecoder {
             self.ensure_sws(w, h, src_fmt)?;
 
             ffi::av_frame_unref(self.rgba_frame);
-            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGBA as i32;
+            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGB0 as i32;
             (*self.rgba_frame).width = w;
             (*self.rgba_frame).height = h;
-            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 0);
+            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
             if ret < 0 {
                 bail!("failed to allocate sw RGBA frame buffer");
             }
@@ -717,19 +744,21 @@ impl SwDecoder {
             );
 
             let stride = (*self.rgba_frame).linesize[0] as usize;
-            let width = w as usize;
+            let row_bytes = w as usize * 4;
             let height = h as usize;
-            let mut rgba = Vec::with_capacity(width * 4 * height);
-            let src = (*self.rgba_frame).data[0];
-            for row in 0..height {
-                let row_start = src.add(row * stride);
-                rgba.extend_from_slice(std::slice::from_raw_parts(row_start, width * 4));
-            }
-
-            // Force alpha opaque for Qt image drawing.
-            for alpha in rgba[3..].iter_mut().step_by(4) {
-                *alpha = 0xFF;
-            }
+            let src_ptr = (*self.rgba_frame).data[0];
+            let rgba = if stride == row_bytes {
+                std::slice::from_raw_parts(src_ptr, row_bytes * height).to_vec()
+            } else {
+                let mut buf = Vec::with_capacity(row_bytes * height);
+                for row in 0..height {
+                    buf.extend_from_slice(std::slice::from_raw_parts(
+                        src_ptr.add(row * stride),
+                        row_bytes,
+                    ));
+                }
+                buf
+            };
 
             frames.push(DecodedFrame {
                 width: w as u32,

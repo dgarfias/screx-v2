@@ -10,6 +10,7 @@ mod stream_server;
 mod uinput;
 mod usb;
 
+use std::fs;
 use std::net::UdpSocket;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -384,6 +385,14 @@ async fn main() -> Result<()> {
                 let session_stop = Arc::clone(&capture_stop);
                 let session_stop_flag = Arc::clone(&capture_stop_flag);
                 let session_refresh = Arc::clone(&capture_force_refresh);
+                let mut dump_capture_remaining = std::env::var("SCREX_DUMP_CAPTURE_FRAMES")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let mut dump_au_remaining = std::env::var("SCREX_DUMP_SENT_AUS")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
 
                 // Combined stop: global stop OR per-session stop (client disconnected)
                 let combined_stop = Arc::new(AtomicBool::new(false));
@@ -421,11 +430,24 @@ async fn main() -> Result<()> {
                     Arc::clone(&session_refresh),
                     Arc::new(AtomicBool::new(true)), // already started
                     |frame| {
+                        if dump_capture_remaining > 0 {
+                            dump_capture_frame_ppm(dump_capture_remaining, &frame);
+                            dump_capture_remaining -= 1;
+                        }
                         let force_idr = session_shared.force_idr.swap(false, Ordering::Relaxed);
                         let ts = session_shared.start_time.elapsed().as_millis() as u32;
 
                         match encoder.encode_frame(&frame, force_idr) {
                             Ok(aus) => {
+                                if dump_au_remaining > 0 {
+                                    for au in &aus {
+                                        if dump_au_remaining == 0 {
+                                            break;
+                                        }
+                                        dump_sent_access_unit(dump_au_remaining, codec_id, au.is_idr, &au.annex_b);
+                                        dump_au_remaining -= 1;
+                                    }
+                                }
                                 let use_usb = session_shared.usb_active.load(Ordering::Relaxed);
                                 let udp_addr = if !use_usb {
                                     *session_shared.client_addr.lock().unwrap()
@@ -549,4 +571,32 @@ async fn main() -> Result<()> {
 
     println!("screx cleanup complete, exiting");
     Ok(())
+}
+
+fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
+    let path = format!("/tmp/screx-daemon-capture-{index:03}.ppm");
+    let mut ppm = Vec::with_capacity(32 + frame.data.len() / 4 * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width, frame.height).as_bytes());
+    for px in frame.data.chunks_exact(4) {
+        ppm.extend_from_slice(&[px[2], px[1], px[0]]);
+    }
+    match fs::write(&path, ppm) {
+        Ok(()) => println!("[capture] dumped raw capture frame to {path}"),
+        Err(error) => eprintln!("[capture] failed to dump raw capture frame to {path}: {error}"),
+    }
+}
+
+fn dump_sent_access_unit(index: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
+    let ext = if codec_id == 0x01 { "h265" } else { "h264" };
+    let path = format!("/tmp/screx-daemon-au-{index:03}.{ext}");
+    match fs::write(&path, annex_b) {
+        Ok(()) => println!(
+            "[capture] dumped encoded access unit to {} codec={} idr={} bytes={}",
+            path,
+            codec_id,
+            is_idr,
+            annex_b.len()
+        ),
+        Err(error) => eprintln!("[capture] failed to dump encoded access unit to {path}: {error}"),
+    }
 }

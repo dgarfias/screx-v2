@@ -4,8 +4,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
+use cpal::{SampleFormat, StreamConfig};
 
 /// Daemon audio format constants.
 const SAMPLE_RATE: u32 = 48_000;
@@ -109,57 +110,15 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     /// Start audio playback. Returns a handle; drop it to stop.
-    pub fn start() -> anyhow::Result<Self> {
+    pub fn start() -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("no audio output device found"))?;
-
-        let config = StreamConfig {
-            channels: CHANNELS,
-            sample_rate: SAMPLE_RATE,
-            buffer_size: cpal::BufferSize::Default,
-        };
+            .ok_or_else(|| anyhow!("no audio output device found"))?;
 
         let ring: AudioSlot = Arc::new(Mutex::new(AudioRingBuffer::new()));
-        let ring_pull = Arc::clone(&ring);
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                if stop_flag.load(Ordering::Relaxed) {
-                    for sample in data.iter_mut() {
-                        *sample = 0;
-                    }
-                    return;
-                }
-
-                let byte_count = data.len() * BYTES_PER_SAMPLE;
-                let mut buf = vec![0u8; byte_count];
-
-                let read = if let Ok(mut ring) = ring_pull.lock() {
-                    ring.read(&mut buf)
-                } else {
-                    0
-                };
-
-                // Convert bytes to i16 samples (little-endian).
-                for (i, sample) in data.iter_mut().enumerate() {
-                    let byte_off = i * 2;
-                    if byte_off + 1 < read {
-                        *sample = i16::from_le_bytes([buf[byte_off], buf[byte_off + 1]]);
-                    } else {
-                        *sample = 0;
-                    }
-                }
-            },
-            move |err| {
-                eprintln!("[audio_player] stream error: {err}");
-            },
-            None,
-        )?;
+        let stream = build_best_output_stream(&device, Arc::clone(&ring), Arc::clone(&stop))?;
 
         stream.play()?;
 
@@ -189,6 +148,159 @@ impl AudioPlayer {
     pub fn clear(&self) {
         if let Ok(mut ring) = self.ring.lock() {
             ring.clear();
+        }
+    }
+}
+
+fn build_best_output_stream(
+    device: &cpal::Device,
+    ring: AudioSlot,
+    stop: Arc<AtomicBool>,
+) -> Result<cpal::Stream> {
+    let mut attempts: Vec<(StreamConfig, SampleFormat, String)> = Vec::new();
+
+    if let Ok(configs) = device.supported_output_configs() {
+        for range in configs {
+            if range.channels() != CHANNELS {
+                continue;
+            }
+            if range.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= range.max_sample_rate() {
+                let cfg = range.with_sample_rate(SAMPLE_RATE).config();
+                attempts.push((
+                    cfg,
+                    range.sample_format(),
+                    "matched 48k stereo config".into(),
+                ));
+            }
+        }
+    }
+
+    if let Ok(default_cfg) = device.default_output_config() {
+        attempts.push((
+            default_cfg.config(),
+            default_cfg.sample_format(),
+            "default output config".into(),
+        ));
+    }
+
+    if attempts.is_empty() {
+        return Err(anyhow!("no usable audio output configurations found"));
+    }
+
+    let mut last_error = None;
+    for (config, sample_format, label) in attempts {
+        match build_output_stream_for_format(
+            device,
+            &config,
+            sample_format,
+            Arc::clone(&ring),
+            Arc::clone(&stop),
+        ) {
+            Ok(stream) => {
+                println!(
+                    "[audio_player] using {}: {}ch @ {} Hz ({:?})",
+                    label, config.channels, config.sample_rate, sample_format
+                );
+                return Ok(stream);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[audio_player] output config failed: {}: {}ch @ {} Hz ({:?}): {error:#}",
+                    label, config.channels, config.sample_rate, sample_format
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to open audio output stream")))
+}
+
+fn build_output_stream_for_format(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    ring: AudioSlot,
+    stop: Arc<AtomicBool>,
+) -> Result<cpal::Stream> {
+    match sample_format {
+        SampleFormat::I16 => build_typed_output_stream::<i16>(device, config, ring, stop),
+        SampleFormat::U16 => build_typed_output_stream::<u16>(device, config, ring, stop),
+        SampleFormat::F32 => build_typed_output_stream::<f32>(device, config, ring, stop),
+        other => Err(anyhow!("unsupported sample format: {other:?}")),
+    }
+}
+
+fn build_typed_output_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    ring: AudioSlot,
+    stop: Arc<AtomicBool>,
+) -> Result<cpal::Stream>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = config.channels as usize;
+    let ring_pull = Arc::clone(&ring);
+    let stop_flag = Arc::clone(&stop);
+
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
+                write_output_data::<T>(data, channels, &ring_pull, &stop_flag);
+            },
+            move |err| {
+                eprintln!("[audio_player] stream error: {err}");
+            },
+            None,
+        )
+        .context("build output stream")
+}
+
+fn write_output_data<T>(data: &mut [T], channels: usize, ring: &AudioSlot, stop: &Arc<AtomicBool>)
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    if stop.load(Ordering::Relaxed) {
+        for sample in data.iter_mut() {
+            *sample = T::from_sample(0.0);
+        }
+        return;
+    }
+
+    let frames = if channels == 0 {
+        0
+    } else {
+        data.len() / channels
+    };
+    let mut buf = vec![0u8; frames * CHANNELS as usize * BYTES_PER_SAMPLE];
+    let read = if let Ok(mut ring) = ring.lock() {
+        ring.read(&mut buf)
+    } else {
+        0
+    };
+
+    for frame_idx in 0..frames {
+        let src_off = frame_idx * CHANNELS as usize * BYTES_PER_SAMPLE;
+        let left = if src_off + 1 < read {
+            i16::from_le_bytes([buf[src_off], buf[src_off + 1]]) as f32 / i16::MAX as f32
+        } else {
+            0.0
+        };
+        let right = if src_off + 3 < read {
+            i16::from_le_bytes([buf[src_off + 2], buf[src_off + 3]]) as f32 / i16::MAX as f32
+        } else {
+            0.0
+        };
+
+        for ch in 0..channels {
+            let sample = match ch {
+                0 => left,
+                1 => right,
+                _ => 0.0,
+            };
+            data[frame_idx * channels + ch] = T::from_sample(sample);
         }
     }
 }

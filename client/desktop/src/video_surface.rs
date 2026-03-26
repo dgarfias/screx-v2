@@ -201,8 +201,9 @@ impl QQuickItem for VideoSurface {
                 imageNode->setOwnsTexture(true);
             }
 
-            QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBA8888);
-            auto texture = window->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
+            QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBX8888);
+            auto ownedImage = image.copy();
+            auto texture = window->createTextureFromImage(ownedImage, QQuickWindow::TextureIsOpaque);
             imageNode->setTexture(texture);
             imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
             imageNode->setSourceRect(0, 0, w, h);

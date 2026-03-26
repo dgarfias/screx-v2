@@ -40,6 +40,15 @@ const MAX_FEC_SHARDS: usize = 127;
 const PACING_THRESHOLD: usize = 20;
 const PACING_DELAY: Duration = Duration::from_micros(10);
 
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn should_log_debug(counter: u64) -> bool {
     counter <= 12 || counter.is_power_of_two() || counter % 25 == 0
 }
@@ -931,6 +940,18 @@ impl UdpSender {
     ) -> Result<()> {
         let payload = &au.annex_b;
         let is_idr = au.is_idr;
+        if std::env::var_os("SCREX_LOG_SENT_AUS").is_some() {
+            let prefix_len = payload.len().min(24);
+            println!(
+                "[stream/send] frame_id={} codec={} idr={} bytes={} fnv=0x{:016x} prefix={:02x?}",
+                self.frame_id,
+                codec_id,
+                is_idr,
+                payload.len(),
+                fnv1a64(payload),
+                &payload[..prefix_len]
+            );
+        }
 
         let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 

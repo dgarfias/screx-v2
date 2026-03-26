@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,10 @@ const UDP_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(50);
+const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const UDP_SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
+const VIDEO_LOG_INTERVAL: u32 = 120;
+const MAX_VIDEO_DECODE_QUEUE: usize = 4;
 const MAGIC_PAIR: &[u8] = b"SCREX_PAIR";
 const MAGIC_HELLO: &[u8] = b"SCREX_HELLO";
 const MAGIC_PIN: &[u8] = b"SCREX_PIN\0";
@@ -52,9 +57,43 @@ const FLAG_IDR: u8 = 0x01;
 const FLAG_AUDIO: u8 = 0x02;
 const TAG_LEN: usize = 16;
 
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn should_send_pli(last_pli_at: &mut Option<Instant>) -> bool {
+    let allowed = last_pli_at
+        .map(|instant| instant.elapsed() >= PLI_MIN_INTERVAL)
+        .unwrap_or(true);
+    if allowed {
+        *last_pli_at = Some(Instant::now());
+    }
+    allowed
+}
+
+fn should_send_pli_shared(last_pli_at: &Mutex<Option<Instant>>) -> bool {
+    let mut guard = match last_pli_at.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    let allowed = guard
+        .map(|instant| instant.elapsed() >= PLI_MIN_INTERVAL)
+        .unwrap_or(true);
+    if allowed {
+        *guard = Some(Instant::now());
+    }
+    allowed
+}
+
 #[derive(Clone)]
 pub struct BackendHandle {
     tx: Sender<BackendCommand>,
+    control: Arc<Mutex<Option<Arc<ControlSender>>>>,
 }
 
 impl BackendHandle {
@@ -109,16 +148,36 @@ impl BackendHandle {
     }
 
     pub fn send_mouse_move(&self, x: u16, y: u16) {
+        // Bypass the command channel — send directly on the control connection
+        // to minimize mouse latency.
+        if let Ok(guard) = self.control.lock() {
+            if let Some(ref ctl) = *guard {
+                let _ = crate::input::send_mouse_abs(ctl, x, y);
+                return;
+            }
+        }
         let _ = self.tx.send(BackendCommand::SendMouseMove { x, y });
     }
 
     pub fn send_mouse_button(&self, button: u8, pressed: bool) {
+        if let Ok(guard) = self.control.lock() {
+            if let Some(ref ctl) = *guard {
+                let _ = crate::input::send_mouse_button(ctl, button, pressed);
+                return;
+            }
+        }
         let _ = self
             .tx
             .send(BackendCommand::SendMouseButton { button, pressed });
     }
 
     pub fn send_mouse_scroll(&self, dy: i16) {
+        if let Ok(guard) = self.control.lock() {
+            if let Some(ref ctl) = *guard {
+                let _ = crate::input::send_mouse_scroll(ctl, dy);
+                return;
+            }
+        }
         let _ = self.tx.send(BackendCommand::SendMouseScroll { dy });
     }
 }
@@ -127,6 +186,9 @@ enum BackendCommand {
     Connect {
         host: String,
         speaker_enabled: bool,
+    },
+    RetryBlankStream {
+        session_id: u64,
     },
     SubmitPin {
         pin: String,
@@ -201,12 +263,18 @@ where
     let ui = Arc::new(ui);
     let worker_tx = tx.clone();
 
+    let control_slot: Arc<Mutex<Option<Arc<ControlSender>>>> = Arc::new(Mutex::new(None));
+    let worker_control_slot = Arc::clone(&control_slot);
     thread::spawn(move || {
         let mut worker = BackendWorker::new(rx, worker_tx, ui, frame_slot);
+        worker.control_slot = Some(worker_control_slot);
         worker.run();
     });
 
-    BackendHandle { tx }
+    BackendHandle {
+        tx,
+        control: control_slot,
+    }
 }
 
 struct BackendWorker {
@@ -218,6 +286,8 @@ struct BackendWorker {
     pending_pairing: Option<PendingPairing>,
     next_session_id: u64,
     frame_slot: FrameSlot,
+    blank_stream_retry_attempted: bool,
+    control_slot: Option<Arc<Mutex<Option<Arc<ControlSender>>>>>,
 }
 
 impl BackendWorker {
@@ -236,6 +306,8 @@ impl BackendWorker {
             pending_pairing: None,
             next_session_id: 1,
             frame_slot,
+            blank_stream_retry_attempted: false,
+            control_slot: None,
         }
     }
 
@@ -245,7 +317,13 @@ impl BackendWorker {
                 BackendCommand::Connect {
                     host,
                     speaker_enabled,
-                } => self.handle_connect(host, speaker_enabled),
+                } => {
+                    self.blank_stream_retry_attempted = false;
+                    self.handle_connect(host, speaker_enabled)
+                }
+                BackendCommand::RetryBlankStream { session_id } => {
+                    self.handle_retry_blank_stream(session_id)
+                }
                 BackendCommand::SubmitPin { pin } => self.handle_submit_pin(pin),
                 BackendCommand::Disconnect => self.handle_disconnect(false),
                 BackendCommand::SetSpeaker { enabled } => self.handle_set_speaker(enabled),
@@ -334,7 +412,7 @@ impl BackendWorker {
 
         match establish_session(&mut self.storage, &host_input) {
             Ok(ConnectResult::Established(bootstrap)) => {
-                self.activate_session(bootstrap, speaker_enabled);
+                self.activate_session(bootstrap, host_input, speaker_enabled);
             }
             Ok(ConnectResult::PinRequired(pending)) => {
                 self.pending_pairing = Some(pending);
@@ -374,7 +452,8 @@ impl BackendWorker {
         match complete_pairing(&mut self.storage, pending, &pin) {
             Ok(bootstrap) => {
                 // Speaker is enabled by default on fresh connections.
-                self.activate_session(bootstrap, true);
+                let reconnect_host = bootstrap.display_host.clone();
+                self.activate_session(bootstrap, reconnect_host, true);
             }
             Err(error) => {
                 (self.ui)(UiEvent::SetConnecting(false));
@@ -386,7 +465,12 @@ impl BackendWorker {
         }
     }
 
-    fn activate_session(&mut self, bootstrap: SessionBootstrap, speaker_enabled: bool) {
+    fn activate_session(
+        &mut self,
+        bootstrap: SessionBootstrap,
+        reconnect_host: String,
+        speaker_enabled: bool,
+    ) {
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
@@ -477,6 +561,13 @@ impl BackendWorker {
             audio_player.as_ref().map(Arc::clone),
         );
 
+        // Publish control sender for direct mouse/keyboard access
+        if let Some(ref slot) = self.control_slot {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(Arc::clone(&control));
+            }
+        }
+
         self.active = Some(ActiveSession {
             session_id,
             control,
@@ -485,11 +576,36 @@ impl BackendWorker {
             audio_player,
             mic_capture: None,
             webcam_capture: None,
+            reconnect_host,
+            speaker_enabled,
         });
+    }
+
+    fn handle_retry_blank_stream(&mut self, session_id: u64) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.session_id != session_id || self.blank_stream_retry_attempted {
+            return;
+        }
+
+        self.blank_stream_retry_attempted = true;
+        let host = active.reconnect_host.clone();
+        let speaker_enabled = active.speaker_enabled;
+        (self.ui)(UiEvent::SetStatus(
+            "The initial desktop video looked blank. Retrying the session once.".into(),
+        ));
+        self.handle_connect(host, speaker_enabled);
     }
 
     fn handle_disconnect(&mut self, quiet: bool) {
         self.pending_pairing = None;
+        // Clear the direct control reference
+        if let Some(ref slot) = self.control_slot {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = None;
+            }
+        }
         if let Some(active) = self.active.take() {
             // Tell the daemon to tear down virtual devices if active
             let _ = active.control.send_peripheral_state(PERIPH_MOUSE, false);
@@ -675,6 +791,8 @@ struct ActiveSession {
     audio_player: Option<Arc<AudioPlayer>>,
     mic_capture: Option<MicCapture>,
     webcam_capture: Option<WebcamCapture>,
+    reconnect_host: String,
+    speaker_enabled: bool,
 }
 
 const PERIPH_MOUSE: u8 = 0x01;
@@ -1045,14 +1163,26 @@ fn spawn_udp_runtime(
         let mut av_sync = AvSyncState::default();
         let mut stats = StreamStats::default();
         let mut last_packet = Instant::now();
-        let mut decoder: Option<VideoDecoder> = None;
-        let mut current_codec_id: Option<u8> = None;
         let mut has_received_first_frame = false;
         let mut last_completed_frame_id: u32 = 0;
-        let mut waiting_for_idr = false;
+        let mut last_pli_at: Option<Instant> = None;
         let mut video_packet_count: u64 = 0;
         let mut audio_packet_count: u64 = 0;
+
+        let mut decoder: Option<VideoDecoder> = None;
+        let mut current_codec_id: Option<u8> = None;
         let mut decoded_frame_count: u64 = 0;
+        let mut mostly_black_frame_count: u32 = 0;
+        let mut blank_stream_retry_queued = false;
+
+        let mut debug_dump_au_remaining = std::env::var("SCREX_DUMP_ACCESS_UNITS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut debug_dump_remaining = std::env::var("SCREX_DUMP_DECODED_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
 
         while !stop.load(Ordering::Relaxed) {
             match receiver.recv(&mut buffer) {
@@ -1084,6 +1214,8 @@ fn spawn_udp_runtime(
                     };
 
                     stats.note_packet(size);
+
+                    // --- Audio path ---
                     if (flags & FLAG_AUDIO) != 0 {
                         audio_packet_count = audio_packet_count.wrapping_add(1);
                         if audio_packet_count == 1 || audio_packet_count % 200 == 0 {
@@ -1108,207 +1240,164 @@ fn spawn_udp_runtime(
                             }
                             audio_frames.remove(&frame_id);
                         }
-                    } else {
-                        video_packet_count = video_packet_count.wrapping_add(1);
-                        if video_packet_count == 1 || video_packet_count % 200 == 0 {
-                            println!(
-                                "[desktop/video] packets={} codec={} frame_id={} chunk={}/{} payload={}B flags=0x{:02x}",
-                                video_packet_count,
-                                codec_id,
-                                frame_id,
-                                chunk_idx + 1,
-                                total_data,
-                                payload_len,
-                                flags
-                            );
-                        }
-                        let codec_label = if codec_id == 0x01 { "H.265" } else { "H.264" };
-                        ui(UiEvent::SetCodecLabel(format!("{codec_label} · UDP live")));
+                        continue;
+                    }
 
-                        if has_received_first_frame
-                            && frame_id < last_completed_frame_id
-                            && (last_completed_frame_id - frame_id) < 0x8000_0000
-                        {
-                            println!(
-                                "[desktop/video] dropping stale frame packet frame_id={} last_completed={}",
-                                frame_id,
-                                last_completed_frame_id
-                            );
-                            continue;
-                        }
+                    // --- Video path ---
+                    video_packet_count = video_packet_count.wrapping_add(1);
+                    if video_packet_count == 1 || video_packet_count % 200 == 0 {
+                        println!(
+                            "[desktop/video] packets={} codec={} frame_id={} chunk={}/{} payload={}B flags=0x{:02x}",
+                            video_packet_count, codec_id, frame_id, chunk_idx + 1, total_data, payload_len, flags
+                        );
+                    }
 
-                        let assembly = video_frames.entry(frame_id).or_insert_with(|| {
-                            FrameAssembly::new(
-                                total_data,
-                                total_parity,
-                                (flags & FLAG_IDR) != 0,
-                                timestamp_ms,
-                            )
-                        });
-                        assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
+                    // Drop stale packets for already-completed frames
+                    if has_received_first_frame
+                        && frame_id < last_completed_frame_id
+                        && (last_completed_frame_id - frame_id) < 0x8000_0000
+                    {
+                        continue;
+                    }
 
-                        if assembly.is_complete() {
-                            if let Some(annex_b) = assembly.reassemble() {
-                                if has_received_first_frame
-                                    && frame_id < last_completed_frame_id
-                                    && (last_completed_frame_id - frame_id) < 0x8000_0000
-                                {
-                                    println!(
-                                        "[desktop/video] dropping stale complete frame_id={} last_completed={}",
-                                        frame_id,
-                                        last_completed_frame_id
-                                    );
-                                    video_frames.remove(&frame_id);
-                                    continue;
-                                }
+                    let assembly = video_frames.entry(frame_id).or_insert_with(|| {
+                        FrameAssembly::new(
+                            total_data,
+                            total_parity,
+                            codec_id,
+                            (flags & FLAG_IDR) != 0,
+                            timestamp_ms,
+                        )
+                    });
+                    assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
 
-                                if has_received_first_frame
-                                    && frame_id > last_completed_frame_id + 1
-                                {
-                                    let gap = frame_id - last_completed_frame_id - 1;
-                                    if gap > 0 && gap < 0x8000_0000 {
+                    if assembly.is_complete() {
+                        if let Some(annex_b) = assembly.reassemble() {
+                            video_frames.remove(&frame_id);
+
+                            // Gap detection -> request PLI (throttled), but NO frame dropping
+                            if has_received_first_frame && frame_id > last_completed_frame_id + 1 {
+                                let gap = frame_id - last_completed_frame_id - 1;
+                                if gap > 0 && gap < 0x8000_0000 {
+                                    if should_send_pli(&mut last_pli_at) {
                                         println!(
-                                            "[desktop/video] frame gap detected: last={} current={} gap={} -> PLI",
-                                            last_completed_frame_id,
-                                            frame_id,
-                                            gap
+                                            "[desktop/video] frame gap: last={} current={} gap={} -> PLI",
+                                            last_completed_frame_id, frame_id, gap,
                                         );
                                         let _ = control.send_pli();
-                                        waiting_for_idr = true;
                                     }
                                 }
+                            }
 
-                                println!(
-                                    "[desktop/video] reassembled frame_id={} bytes={} codec={} idr={} ts={}ms",
+                            last_completed_frame_id = frame_id;
+                            has_received_first_frame = true;
+                            av_sync.update_video(timestamp_ms);
+                            stats.note_frame();
+
+                            if debug_dump_au_remaining > 0 {
+                                dump_access_unit(
                                     frame_id,
-                                    annex_b.len(),
                                     codec_id,
                                     (flags & FLAG_IDR) != 0,
-                                    timestamp_ms
+                                    &annex_b,
                                 );
+                                debug_dump_au_remaining -= 1;
+                            }
 
-                                let is_idr = (flags & FLAG_IDR) != 0;
-                                if waiting_for_idr && !is_idr {
-                                    println!(
-                                        "[desktop/video] dropping non-IDR frame {} while waiting for recovery",
-                                        frame_id
-                                    );
-                                    video_frames.remove(&frame_id);
-                                    continue;
-                                }
-
-                                if waiting_for_idr && is_idr {
-                                    println!(
-                                        "[desktop/video] recovery IDR received at frame {} - recreating decoder",
-                                        frame_id
-                                    );
-                                    decoder = None;
-                                    current_codec_id = None;
-                                    waiting_for_idr = false;
-                                }
-
-                                // Ensure decoder matches the current codec
-                                let need_new_decoder =
-                                    current_codec_id.map_or(true, |c| c != codec_id);
-                                if need_new_decoder {
-                                    let codec = CodecId::from_transport_id(codec_id);
-                                    match VideoDecoder::new(codec) {
-                                        Ok(dec) => {
-                                            let hw_label = match codec {
-                                                CodecId::H264 => "H.264",
-                                                CodecId::H265 => "H.265",
-                                            };
-                                            ui(UiEvent::SetCodecLabel(format!(
-                                                "{hw_label} · HW decode · UDP live"
-                                            )));
-                                            decoder = Some(dec);
-                                            current_codec_id = Some(codec_id);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[backend] decoder init failed: {e:#}");
-                                            decoder = None;
-                                            current_codec_id = None;
-                                        }
+                            // Ensure decoder matches codec
+                            let need_new_decoder = current_codec_id.map_or(true, |c| c != codec_id);
+                            if need_new_decoder {
+                                let codec = CodecId::from_transport_id(codec_id);
+                                match VideoDecoder::new(codec) {
+                                    Ok(dec) => {
+                                        decoder = Some(dec);
+                                        current_codec_id = Some(codec_id);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[backend] decoder init failed: {e:#}");
+                                        decoder = None;
+                                        current_codec_id = None;
                                     }
                                 }
+                            }
 
-                                if let Some(dec) = &mut decoder {
-                                    match dec.decode(&annex_b) {
-                                        Ok(decoded_frames) => {
-                                            for df in decoded_frames {
-                                                decoded_frame_count =
-                                                    decoded_frame_count.wrapping_add(1);
-                                                if decoded_frame_count == 1
-                                                    || decoded_frame_count % 60 == 0
-                                                {
-                                                    println!(
-                                                        "[desktop/video] decoded_frames={} latest={}x{} rgba={}B",
-                                                        decoded_frame_count,
-                                                        df.width,
-                                                        df.height,
-                                                        df.rgba.len()
-                                                    );
-                                                }
-                                                // Push to shared frame slot for paint()
-                                                if let Ok(mut slot) = frame_slot.lock() {
-                                                    ui(UiEvent::SetResolutionLabel(format!(
-                                                        "{} x {}",
-                                                        df.width, df.height
-                                                    )));
-                                                    *slot = Some(RawFrame {
-                                                        width: df.width,
-                                                        height: df.height,
-                                                        rgba: df.rgba,
-                                                    });
-                                                    if decoded_frame_count == 1
-                                                        || decoded_frame_count % 60 == 0
+                            // Decode inline — every frame goes to FFmpeg, no dropping
+                            if let Some(dec) = &mut decoder {
+                                let t0 = Instant::now();
+                                match dec.decode(&annex_b) {
+                                    Ok(decoded_frames) => {
+                                        let decode_us = t0.elapsed().as_micros();
+                                        for df in decoded_frames {
+                                            decoded_frame_count =
+                                                decoded_frame_count.wrapping_add(1);
+                                            if decoded_frame_count <= 90 {
+                                                let pct = non_black_pixel_percent(&df.rgba);
+                                                if pct < 0.5 {
+                                                    mostly_black_frame_count =
+                                                        mostly_black_frame_count.saturating_add(1);
+                                                    if mostly_black_frame_count >= 30
+                                                        && !blank_stream_retry_queued
                                                     {
-                                                        println!(
-                                                            "[desktop/video] frame slot updated decoded_frames={} latest={}x{}",
-                                                            decoded_frame_count,
-                                                            df.width,
-                                                            df.height
+                                                        blank_stream_retry_queued = true;
+                                                        let _ = tx.send(
+                                                            BackendCommand::RetryBlankStream {
+                                                                session_id,
+                                                            },
                                                         );
                                                     }
+                                                } else {
+                                                    mostly_black_frame_count = 0;
                                                 }
-                                                crate::video_surface::request_video_surface_update(
+                                            }
+                                            if debug_dump_remaining > 0 {
+                                                dump_decoded_frame_ppm(
+                                                    decoded_frame_count,
+                                                    df.width,
+                                                    df.height,
+                                                    &df.rgba,
+                                                );
+                                                debug_dump_remaining -= 1;
+                                            }
+                                            let w = df.width;
+                                            let h = df.height;
+                                            let au_len = annex_b.len();
+                                            let t1 = Instant::now();
+                                            if let Ok(mut slot) = frame_slot.lock() {
+                                                *slot = Some(RawFrame {
+                                                    width: df.width,
+                                                    height: df.height,
+                                                    rgba: df.rgba,
+                                                });
+                                            }
+                                            crate::video_surface::request_video_surface_update();
+                                            let present_us = t1.elapsed().as_micros();
+                                            if decoded_frame_count == 1
+                                                || decoded_frame_count % 60 == 0
+                                            {
+                                                println!(
+                                                    "[desktop/video] frame={} decode={}us present={}us size={}x{} au={}B",
+                                                    decoded_frame_count, decode_us, present_us,
+                                                    w, h, au_len,
                                                 );
                                             }
                                         }
-                                        Err(e) => {
-                                            eprintln!("[backend] decode error: {e:#}");
-                                            stats.dropped_frames =
-                                                stats.dropped_frames.saturating_add(1);
-                                            decoder = None;
-                                            current_codec_id = None;
-                                            waiting_for_idr = true;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[backend] decode error: {e:#}");
+                                        if should_send_pli(&mut last_pli_at) {
                                             let _ = control.send_pli();
                                         }
                                     }
                                 }
-
-                                av_sync.update_video(timestamp_ms);
-                                stats.note_frame();
-                                last_completed_frame_id = frame_id;
-                                has_received_first_frame = true;
-                            } else {
-                                stats.dropped_frames = stats.dropped_frames.saturating_add(1);
-                                waiting_for_idr = true;
-                                let _ = control.send_pli();
                             }
+                        } else {
                             video_frames.remove(&frame_id);
                         }
                     }
 
-                    prune_expired_frames(&mut video_frames, &mut stats, &control);
-                    if let Some(update) = stats.sample(av_sync.estimate_transport_latency_ms()) {
-                        ui(UiEvent::SetStats {
-                            fps: update.fps,
-                            bitrate_mbps: update.bitrate_mbps,
-                            latency_ms: update.latency_ms,
-                            dropped_frames: stats.dropped_frames,
-                        });
-                    }
+                    // Prune expired incomplete assemblies — simple retain
+                    let now = Instant::now();
+                    video_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
                 }
                 Err(error)
                     if matches!(
@@ -1332,29 +1421,17 @@ fn spawn_udp_runtime(
                     return;
                 }
             }
+
+            if let Some(update) = stats.sample(av_sync.estimate_transport_latency_ms()) {
+                ui(UiEvent::SetStats {
+                    fps: update.fps,
+                    bitrate_mbps: update.bitrate_mbps,
+                    latency_ms: update.latency_ms,
+                    dropped_frames: stats.dropped_frames,
+                });
+            }
         }
     });
-}
-
-fn prune_expired_frames(
-    frames: &mut HashMap<u32, FrameAssembly>,
-    stats: &mut StreamStats,
-    control: &ControlSender,
-) {
-    let mut expired = Vec::new();
-    for (frame_id, assembly) in frames.iter() {
-        if assembly.created_at.elapsed() > FRAME_TIMEOUT {
-            expired.push(*frame_id);
-        }
-    }
-
-    if !expired.is_empty() {
-        for frame_id in expired {
-            frames.remove(&frame_id);
-            stats.dropped_frames = stats.dropped_frames.saturating_add(1);
-        }
-        let _ = control.send_pli();
-    }
 }
 
 pub struct ControlSender {
@@ -1455,6 +1532,7 @@ pub struct UdpSender {
 impl UdpSender {
     pub fn new(server_addr: SocketAddr, session_key: [u8; 32]) -> Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", 0)).context("bind UDP client socket")?;
+        tune_udp_socket(&socket).ok();
         socket
             .connect(server_addr)
             .with_context(|| format!("connect UDP socket to {server_addr}"))?;
@@ -1481,6 +1559,33 @@ impl UdpSender {
             .context("send encrypted UDP packet")?;
         Ok(())
     }
+}
+
+fn tune_udp_socket(socket: &UdpSocket) -> Result<()> {
+    let fd = socket.as_raw_fd();
+    let value = UDP_SOCKET_BUFFER_BYTES;
+    let value_ptr = &value as *const _ as *const libc::c_void;
+    let value_len = std::mem::size_of_val(&value) as libc::socklen_t;
+
+    let recv_rc =
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len) };
+    if recv_rc != 0 {
+        return Err(anyhow!(
+            "setsockopt SO_RCVBUF failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let send_rc =
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, value_ptr, value_len) };
+    if send_rc != 0 {
+        return Err(anyhow!(
+            "setsockopt SO_SNDBUF failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1579,17 +1684,28 @@ struct FrameAssembly {
     total_data: usize,
     total_parity: usize,
     created_at: Instant,
+    codec_id: u8,
+    is_idr: bool,
+    timestamp_ms: u32,
     shards: HashMap<usize, Vec<u8>>,
     actual_lengths: HashMap<usize, usize>,
 }
 
 impl FrameAssembly {
-    fn new(total_data: usize, total_parity: usize, _is_idr: bool, timestamp_ms: u32) -> Self {
-        let _ = timestamp_ms;
+    fn new(
+        total_data: usize,
+        total_parity: usize,
+        codec_id: u8,
+        is_idr: bool,
+        timestamp_ms: u32,
+    ) -> Self {
         Self {
             total_data,
             total_parity,
             created_at: Instant::now(),
+            codec_id,
+            is_idr,
+            timestamp_ms,
             shards: HashMap::new(),
             actual_lengths: HashMap::new(),
         }
@@ -1604,6 +1720,10 @@ impl FrameAssembly {
         if self.total_parity == 0 {
             return (0..self.total_data).all(|index| self.shards.contains_key(&index));
         }
+        self.shards.len() >= self.total_data
+    }
+
+    fn can_recover(&self) -> bool {
         self.shards.len() >= self.total_data
     }
 
@@ -1662,6 +1782,14 @@ struct AudioAssembly {
     shards: HashMap<usize, Vec<u8>>,
 }
 
+struct VideoAccessUnit {
+    frame_id: u32,
+    codec_id: u8,
+    timestamp_ms: u32,
+    is_idr: bool,
+    annex_b: Vec<u8>,
+}
+
 impl AudioAssembly {
     fn new(total_data: usize) -> Self {
         Self {
@@ -1698,6 +1826,109 @@ struct EndpointInfo {
     server_addr: SocketAddr,
     display_host: String,
     endpoint_key: String,
+}
+
+fn dump_decoded_frame_ppm(frame_index: u64, width: u32, height: u32, rgba: &[u8]) {
+    let path = format!("/tmp/screx-decoded-frame-{frame_index:06}.ppm");
+    let pixel_count = rgba.len() / 4;
+    let non_black = rgba
+        .chunks_exact(4)
+        .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        .count();
+
+    let mut ppm = Vec::with_capacity(32 + pixel_count * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", width, height).as_bytes());
+    for px in rgba.chunks_exact(4) {
+        ppm.extend_from_slice(&px[..3]);
+    }
+
+    match fs::write(&path, ppm) {
+        Ok(()) => {
+            let pct = if pixel_count == 0 {
+                0.0
+            } else {
+                (non_black as f64 * 100.0) / (pixel_count as f64)
+            };
+            println!(
+                "[desktop/video] dumped decoded frame {} to {} (non_black={:.1}%)",
+                frame_index, path, pct
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[desktop/video] failed to dump decoded frame {} to {}: {}",
+                frame_index, path, error
+            );
+        }
+    }
+}
+
+fn non_black_pixel_percent(rgba: &[u8]) -> f64 {
+    let pixel_count = rgba.len() / 4;
+    if pixel_count == 0 {
+        return 0.0;
+    }
+    let non_black = rgba
+        .chunks_exact(4)
+        .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        .count();
+    (non_black as f64 * 100.0) / (pixel_count as f64)
+}
+
+fn dump_access_unit(frame_id: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
+    let ext = if codec_id == 0x01 { "h265" } else { "h264" };
+    let path = format!("/tmp/screx-au-{frame_id:06}.{ext}");
+    match fs::write(&path, annex_b) {
+        Ok(()) => {
+            let prefix_len = annex_b.len().min(24);
+            println!(
+                "[desktop/video] dumped access unit frame_id={} codec={} idr={} bytes={} path={} prefix={:02x?}",
+                frame_id,
+                codec_id,
+                is_idr,
+                annex_b.len(),
+                path,
+                &annex_b[..prefix_len]
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[desktop/video] failed to dump access unit frame_id={} to {}: {}",
+                frame_id, path, error
+            );
+        }
+    }
+}
+
+fn normalize_annex_b_access_unit(mut data: Vec<u8>, frame_id: u32) -> Vec<u8> {
+    if let Some(offset) = find_annex_b_start_code(&data) {
+        if offset > 0 {
+            let prefix = &data[..offset.min(24)];
+            println!(
+                "[desktop/video] stripping non-Annex-B prefix frame_id={} bytes={} prefix={:02x?}",
+                frame_id, offset, prefix
+            );
+            data.drain(..offset);
+        }
+    }
+    data
+}
+
+fn find_annex_b_start_code(data: &[u8]) -> Option<usize> {
+    if data.len() < 3 {
+        return None;
+    }
+    for i in 0..(data.len() - 2) {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                return Some(i);
+            }
+            if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_endpoint(host_input: &str) -> Result<EndpointInfo> {

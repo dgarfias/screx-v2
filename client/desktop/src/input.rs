@@ -73,89 +73,44 @@ pub fn send_qt_key_action(
     modifiers: i32,
     pressed: bool,
 ) -> Result<()> {
-    let log_key = should_log_key(qt_key, text);
+    // Modifier keys (Shift, Ctrl, Alt, Meta) should NOT be sent as RAWKEY
+    // because our KEY combo packets already encode modifier state.
+    // Sending RAWKEY for modifiers causes them to get "stuck" on the remote side.
     if qt_key_is_modifier(qt_key) {
-        if let Some(hid_usage) = qt_key_to_hid(qt_key) {
-            if log_key {
-                println!(
-                    "[desktop/key/send] modifier rawkey key=0x{:x} text={:?} mods=0x{:x} hid=0x{:x} pressed={}",
-                    qt_key, text, modifiers, hid_usage, pressed
-                );
-            }
-            return send_raw_key(control, hid_usage, pressed);
-        }
         return Ok(());
     }
 
     let combo_mods = qt_modifiers_to_combo(modifiers, qt_key);
     let special = qt_key_to_special(qt_key);
     let text = sanitize_key_text(text);
-    let uses_key_packet = special.is_some() || text.is_some();
 
     if pressed {
         if combo_mods != 0 {
             if let Some(code) = special {
-                if log_key {
-                    println!(
-                        "[desktop/key/send] combo-special key=0x{:x} mods=0x{:x} code=0x{:x}",
-                        qt_key, combo_mods, code
-                    );
-                }
                 return send_key_combo_special(control, combo_mods, code);
             }
             if let Some(text) = text.as_deref() {
-                if log_key {
-                    println!(
-                        "[desktop/key/send] combo-text key=0x{:x} mods=0x{:x} text={:?}",
-                        qt_key, combo_mods, text
-                    );
-                }
                 return send_key_combo_text(control, combo_mods, text);
             }
         } else {
             if let Some(code) = special {
-                if log_key {
-                    println!(
-                        "[desktop/key/send] special key=0x{:x} code=0x{:x}",
-                        qt_key, code
-                    );
-                }
                 return send_key_special(control, code);
             }
             if let Some(text) = text.as_deref() {
-                if log_key {
-                    println!("[desktop/key/send] text key=0x{:x} text={:?}", qt_key, text);
-                }
                 return send_key_text(control, text);
             }
         }
     }
 
-    if uses_key_packet {
-        if log_key {
-            println!(
-                "[desktop/key/send] key-packet press-only key=0x{:x} pressed={} text={:?} special={:?}",
-                qt_key, pressed, text, special
-            );
-        }
+    // KEY text/special packets are press-only (like iPad soft keyboard).
+    // No release event needed for those.
+    if special.is_some() || text.is_some() {
         return Ok(());
     }
 
+    // Fallback: keys with no text and no special mapping use RAWKEY
     if let Some(hid_usage) = qt_key_to_hid(qt_key) {
-        if log_key {
-            println!(
-                "[desktop/key/send] rawkey key=0x{:x} text={:?} mods=0x{:x} hid=0x{:x} pressed={}",
-                qt_key, text, modifiers, hid_usage, pressed
-            );
-        }
         return send_raw_key(control, hid_usage, pressed);
-    }
-
-    if log_key {
-        println!(
-            "[desktop/key/send] dropped unmapped key=0x{:x} text={:?} mods=0x{:x} pressed={}",
-            qt_key, text, modifiers, pressed
-        );
     }
 
     Ok(())
