@@ -31,6 +31,7 @@ const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
 
 static MOUSE_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RAWKEY_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
+static KEY_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -317,9 +318,20 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(KEY_MAGIC) && ctrl.len() > KEY_MAGIC.len() {
         let key_data = &ctrl[KEY_MAGIC.len()..];
+        let count = KEY_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let key_type = key_data.first().copied().unwrap_or(0);
+        if count == 1 || count % 50 == 0 || matches!(key_type, 0x02 | 0x04) {
+            println!(
+                "[control] parsed KEY packets={count} len={} type=0x{key_type:02x} bytes={:02x?}",
+                key_data.len(),
+                key_data
+            );
+        }
         let mut kb = shared.virtual_keyboard.lock().unwrap();
         if let Some(ref mut keyboard) = *kb {
             crate::uinput::handle_key_packet(keyboard, key_data);
+        } else {
+            eprintln!("[control] KEY packet dropped: no virtual keyboard available");
         }
         return;
     }
