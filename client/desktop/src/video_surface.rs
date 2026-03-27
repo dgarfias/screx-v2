@@ -204,7 +204,9 @@ impl QQuickItem for VideoSurface {
             QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBX8888);
             auto ownedImage = image.copy();
             auto texture = window->createTextureFromImage(ownedImage, QQuickWindow::TextureIsOpaque);
+            texture->setFiltering(QSGTexture::Linear);
             imageNode->setTexture(texture);
+            imageNode->setFiltering(QSGTexture::Linear);
             imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
             imageNode->setSourceRect(0, 0, w, h);
             return imageNode;

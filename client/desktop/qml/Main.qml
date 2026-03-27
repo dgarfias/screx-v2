@@ -397,16 +397,6 @@ ApplicationWindow {
                             focus: AppState.connected && AppState.keyboard_enabled
                             activeFocusOnTab: false
                         }
-
-                        Text {
-                            anchors.left: parent.left
-                            anchors.bottom: parent.bottom
-                            anchors.margins: 12
-                            text: AppState.status_text
-                            color: "#8e8e93"
-                            font.family: uiFont()
-                            font.pixelSize: 12
-                        }
                     }
                 }
             }

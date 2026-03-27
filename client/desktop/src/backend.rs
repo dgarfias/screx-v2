@@ -205,6 +205,10 @@ enum BackendCommand {
         port: u16,
     },
     ClearRecentConnections,
+    UpdateDaemonHostname {
+        session_id: u64,
+        hostname: String,
+    },
 }
 
 #[derive(Clone)]
@@ -398,6 +402,19 @@ impl BackendWorker {
                     self.storage.clear_recent_connections();
                     self.push_connections_to_ui();
                 }
+                BackendCommand::UpdateDaemonHostname {
+                    session_id,
+                    hostname,
+                } => {
+                    if let Some(ref active) = self.active {
+                        if active.session_id == session_id {
+                            let port = active.server_port;
+                            let host = &active.reconnect_host;
+                            self.storage.update_connection_name(host, port, &hostname);
+                            self.push_connections_to_ui();
+                        }
+                    }
+                }
             }
         }
     }
@@ -577,6 +594,7 @@ impl BackendWorker {
             mic_capture: None,
             webcam_capture: None,
             reconnect_host,
+            server_port: bootstrap.server_addr.port(),
             speaker_enabled,
         });
     }
@@ -791,6 +809,7 @@ struct ActiveSession {
     mic_capture: Option<MicCapture>,
     webcam_capture: Option<WebcamCapture>,
     reconnect_host: String,
+    server_port: u16,
     speaker_enabled: bool,
 }
 
@@ -1102,7 +1121,11 @@ fn spawn_control_receiver(
                     .trim()
                     .to_string();
                 if !hostname.is_empty() {
-                    ui(UiEvent::SetSessionTitle(hostname));
+                    ui(UiEvent::SetSessionTitle(hostname.clone()));
+                    let _ = tx.send(BackendCommand::UpdateDaemonHostname {
+                        session_id,
+                        hostname,
+                    });
                 }
             }
         }
@@ -2028,6 +2051,15 @@ impl AppStorage {
         self.state
             .recent_connections
             .retain(|c| c.host != host || c.port != port);
+        self.save().ok();
+    }
+
+    fn update_connection_name(&mut self, host: &str, port: u16, name: &str) {
+        for c in &mut self.state.recent_connections {
+            if c.host == host && c.port == port {
+                c.name = name.to_string();
+            }
+        }
         self.save().ok();
     }
 
