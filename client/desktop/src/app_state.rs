@@ -316,11 +316,16 @@ pub struct AppState {
             if !self.connected {
                 return;
             }
-            let delta = (dy / 120.0 * 3.0) as i16; // normalize wheel delta
-            if delta != 0 {
-                if let Some(backend) = self.backend.clone() {
-                    backend.send_mouse_scroll(delta);
-                }
+            // Accumulate fractional scroll like iPad does
+            self.scroll_accumulator += dy / 120.0;
+            let whole_steps = self.scroll_accumulator as i32;
+            if whole_steps == 0 {
+                return;
+            }
+            self.scroll_accumulator -= whole_steps as f32;
+            let delta = (whole_steps.max(-32).min(32)) as i16;
+            if let Some(backend) = self.backend.clone() {
+                backend.send_mouse_scroll(delta);
             }
         }
     ),
@@ -333,6 +338,7 @@ pub struct AppState {
 
     backend: Option<BackendHandle>,
     mouse_log_count: u32,
+    scroll_accumulator: f32,
 }
 
 impl AppState {
@@ -571,6 +577,7 @@ impl Default for AppState {
             warp_cursor: Default::default(),
             backend: None,
             mouse_log_count: 0,
+            scroll_accumulator: 0.0,
         }
     }
 }
