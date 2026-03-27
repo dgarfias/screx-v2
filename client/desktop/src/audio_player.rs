@@ -309,8 +309,8 @@ fn cpal_playback_loop(ring: &AudioSlot, stop: &Arc<AtomicBool>) -> Result<()> {
     };
 
     println!(
-        "[audio_player] using cpal: {}ch @ {} Hz ({:?})",
-        stream_config.channels, stream_config.sample_rate.0, sample_format
+        "[audio_player] using cpal: {}ch @ {:?} ({:?})",
+        stream_config.channels, stream_config.sample_rate, sample_format
     );
 
     stream.play()?;
