@@ -61,6 +61,8 @@ pub struct AppState {
 
     pub keyboard_enabled: qt_property!(bool; NOTIFY keyboard_enabled_changed),
     pub keyboard_enabled_changed: qt_signal!(),
+    pub mouse_grabbed: qt_property!(bool; NOTIFY mouse_grabbed_changed),
+    pub mouse_grabbed_changed: qt_signal!(),
 
     pub info_visible: qt_property!(bool; NOTIFY info_visible_changed),
     pub info_visible_changed: qt_signal!(),
@@ -88,6 +90,9 @@ pub struct AppState {
 
     pub pin_prompt_visible: qt_property!(bool; NOTIFY pin_prompt_visible_changed),
     pub pin_prompt_visible_changed: qt_signal!(),
+
+    pub connections_json: qt_property!(QString; NOTIFY connections_json_changed),
+    pub connections_json_changed: qt_signal!(),
 
     pub fps: qt_property!(u32; NOTIFY fps_changed),
     pub fps_changed: qt_signal!(),
@@ -120,7 +125,45 @@ pub struct AppState {
                 backend.connect(trimmed, self.speaker_enabled);
             } else {
                 self.set_status("Desktop backend is not ready yet.");
-                self.set_connecting(false);
+            }
+        }
+    ),
+
+    pub connect_recent: qt_method!(
+        fn connect_recent(&mut self, host: QString, port: i32) {
+            let h = host.to_string();
+            let endpoint = if port == 42069 {
+                h.clone()
+            } else {
+                format!("{}:{}", h, port)
+            };
+            self.connect_to_host(endpoint.into());
+        }
+    ),
+
+    pub toggle_pinned_connection: qt_method!(
+        fn toggle_pinned_connection(&mut self, host: QString, port: i32) {
+            self.ensure_backend();
+            if let Some(backend) = self.backend.clone() {
+                backend.toggle_pinned(host.to_string(), port as u16);
+            }
+        }
+    ),
+
+    pub delete_connection: qt_method!(
+        fn delete_connection(&mut self, host: QString, port: i32) {
+            self.ensure_backend();
+            if let Some(backend) = self.backend.clone() {
+                backend.delete_connection(host.to_string(), port as u16);
+            }
+        }
+    ),
+
+    pub clear_recent_connections: qt_method!(
+        fn clear_recent_connections(&mut self) {
+            self.ensure_backend();
+            if let Some(backend) = self.backend.clone() {
+                backend.clear_recent_connections();
             }
         }
     ),
@@ -234,6 +277,13 @@ pub struct AppState {
             }
             let x = (norm_x.clamp(0.0, 1.0) * 65535.0) as u16;
             let y = (norm_y.clamp(0.0, 1.0) * 65535.0) as u16;
+            if self.mouse_log_count < 5 {
+                self.mouse_log_count += 1;
+                println!(
+                    "[desktop/mouse] norm=({:.4}, {:.4}) abs=({}, {})",
+                    norm_x, norm_y, x, y
+                );
+            }
             if let Some(backend) = self.backend.clone() {
                 backend.send_mouse_move(x, y);
             }
@@ -275,7 +325,14 @@ pub struct AppState {
         }
     ),
 
+    pub warp_cursor: qt_method!(
+        fn warp_cursor(&mut self, x: f32, y: f32) {
+            crate::warp_cursor_to(x as i32, y as i32);
+        }
+    ),
+
     backend: Option<BackendHandle>,
+    mouse_log_count: u32,
 }
 
 impl AppState {
@@ -308,7 +365,8 @@ impl AppState {
                     .unwrap_or(false)
             }));
         });
-        self.backend = Some(backend);
+        self.backend = Some(backend.clone());
+        backend.load_connections();
     }
 
     fn handle_global_key_event(
@@ -380,6 +438,27 @@ impl AppState {
             }
             UiEvent::PinRequired(value) => self.set_pin_prompt_text(&value),
             UiEvent::ClearPinPrompt => self.set_pin_prompt_text(""),
+            UiEvent::SetConnections(conns) => {
+                #[derive(serde::Serialize)]
+                struct Entry {
+                    host: String,
+                    port: u16,
+                    name: String,
+                    pinned: bool,
+                }
+                let entries: Vec<Entry> = conns
+                    .into_iter()
+                    .map(|c| Entry {
+                        host: c.host,
+                        port: c.port,
+                        name: c.name,
+                        pinned: c.pinned,
+                    })
+                    .collect();
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
+                self.connections_json = QString::from(json.as_str());
+                self.connections_json_changed();
+            }
         }
     }
 
@@ -441,6 +520,8 @@ impl Default for AppState {
             camera_enabled: false,
             camera_enabled_changed: Default::default(),
             keyboard_enabled: true,
+            mouse_grabbed: false,
+            mouse_grabbed_changed: Default::default(),
             keyboard_enabled_changed: Default::default(),
             info_visible: true,
             info_visible_changed: Default::default(),
@@ -459,6 +540,12 @@ impl Default for AppState {
             pin_prompt_text: QString::from(""),
             pin_prompt_text_changed: Default::default(),
             pin_prompt_visible: false,
+            connections_json: QString::from(crate::backend::load_connections_json().as_str()),
+            connections_json_changed: Default::default(),
+            connect_recent: Default::default(),
+            toggle_pinned_connection: Default::default(),
+            delete_connection: Default::default(),
+            clear_recent_connections: Default::default(),
             pin_prompt_visible_changed: Default::default(),
             fps: 0,
             fps_changed: Default::default(),
@@ -481,7 +568,9 @@ impl Default for AppState {
             send_mouse_move: Default::default(),
             send_mouse_button: Default::default(),
             send_mouse_scroll: Default::default(),
+            warp_cursor: Default::default(),
             backend: None,
+            mouse_log_count: 0,
         }
     }
 }

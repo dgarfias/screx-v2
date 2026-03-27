@@ -1,12 +1,14 @@
 //! Audio playback adapter — receives raw PCM s16le 48kHz stereo from daemon,
-//! jitters it in a ring buffer, and drives cpal output.
+//! jitters it in a ring buffer, and writes to system audio output.
+//!
+//! Linux: uses libpulse-simple (works with PipeWire via its PulseAudio compat).
+//! macOS/Windows: uses cpal.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use anyhow::{anyhow, Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use anyhow::{anyhow, Result};
 
 /// Daemon audio format constants.
 const SAMPLE_RATE: u32 = 48_000;
@@ -17,17 +19,8 @@ const BYTES_PER_MS: usize = (SAMPLE_RATE as usize * CHANNELS as usize * BYTES_PE
 /// Ring buffer capacity (~500 ms).
 const RING_CAPACITY: usize = BYTES_PER_MS * 500;
 
-/// Target pre-buffer before first playback pull (ms).
-const TARGET_BUFFER_MS: usize = 30;
-const TARGET_BUFFER_BYTES: usize = TARGET_BUFFER_MS * BYTES_PER_MS;
-
-/// Drift thresholds (ms).
-const DRIFT_DROP_MS: i64 = -40; // too far behind → discard
-const DRIFT_TRIM_MS: i64 = 60; // too far ahead → trim down
-
 pub type AudioSlot = Arc<Mutex<AudioRingBuffer>>;
 
-/// Lock-free-ish ring buffer for PCM audio.
 pub struct AudioRingBuffer {
     storage: Vec<u8>,
     read_pos: usize,
@@ -48,7 +41,6 @@ impl AudioRingBuffer {
     pub fn write(&mut self, data: &[u8]) {
         for &byte in data {
             if self.count >= RING_CAPACITY {
-                // Overwrite oldest
                 self.read_pos = (self.read_pos + 1) % RING_CAPACITY;
                 self.count -= 1;
             }
@@ -67,204 +59,278 @@ impl AudioRingBuffer {
         }
         n
     }
-
-    pub fn discard(&mut self, bytes: usize) {
-        let n = bytes.min(self.count);
-        self.read_pos = (self.read_pos + n) % RING_CAPACITY;
-        self.count -= n;
-    }
-
-    pub fn clear(&mut self) {
-        self.read_pos = 0;
-        self.write_pos = 0;
-        self.count = 0;
-    }
-
-    pub fn available(&self) -> usize {
-        self.count
-    }
-
-    /// Apply drift correction similar to the iPad audio player.
-    /// `drift_ms` = packet_timestamp - expected_daemon_time_now.
-    pub fn apply_drift(&mut self, drift_ms: i64) {
-        if drift_ms < DRIFT_DROP_MS {
-            // Client is behind; discard some audio to catch up.
-            let discard = ((-drift_ms) as usize * BYTES_PER_MS) & !3; // align to 4 bytes
-            self.discard(discard);
-        } else if drift_ms > DRIFT_TRIM_MS {
-            // Client has excess buffered; trim down to target.
-            if self.count > TARGET_BUFFER_BYTES {
-                let excess = self.count - TARGET_BUFFER_BYTES;
-                self.discard(excess);
-            }
-        }
-    }
 }
 
 /// Handle to the running audio playback stream.
 pub struct AudioPlayer {
-    _stream: cpal::Stream,
     ring: AudioSlot,
     stop: Arc<AtomicBool>,
+    _thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AudioPlayer {
-    /// Start audio playback. Returns a handle; drop it to stop.
     pub fn start() -> Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no audio output device found"))?;
-
         let ring: AudioSlot = Arc::new(Mutex::new(AudioRingBuffer::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let stream = build_best_output_stream(&device, Arc::clone(&ring), Arc::clone(&stop))?;
 
-        stream.play()?;
+        #[cfg(target_os = "linux")]
+        let handle = {
+            let ring_clone = Arc::clone(&ring);
+            let stop_clone = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                if let Err(e) = pulse_playback_loop(&ring_clone, &stop_clone) {
+                    eprintln!("[audio_player] pulseaudio playback failed: {e:#}");
+                }
+            });
+            Some(handle)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let handle = {
+            let ring_clone = Arc::clone(&ring);
+            let stop_clone = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                if let Err(e) = cpal_playback_loop(&ring_clone, &stop_clone) {
+                    eprintln!("[audio_player] cpal playback failed: {e:#}");
+                }
+            });
+            Some(handle)
+        };
 
         Ok(Self {
-            _stream: stream,
             ring,
             stop,
+            _thread: handle,
         })
     }
 
-    /// Enqueue raw PCM s16le stereo 48kHz bytes from the daemon.
     pub fn enqueue(&self, pcm: &[u8]) {
         if let Ok(mut ring) = self.ring.lock() {
             ring.write(pcm);
         }
     }
+}
 
-    /// Enqueue with optional drift correction.
-    pub fn enqueue_with_drift(&self, pcm: &[u8], drift_ms: i64) {
-        if let Ok(mut ring) = self.ring.lock() {
-            ring.write(pcm);
-            ring.apply_drift(drift_ms);
-        }
-    }
-
-    /// Clear the buffer (e.g. on gap resume).
-    pub fn clear(&self) {
-        if let Ok(mut ring) = self.ring.lock() {
-            ring.clear();
-        }
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
-fn build_best_output_stream(
-    device: &cpal::Device,
-    ring: AudioSlot,
-    stop: Arc<AtomicBool>,
-) -> Result<cpal::Stream> {
-    let mut attempts: Vec<(StreamConfig, SampleFormat, String)> = Vec::new();
+// ── Linux: libpulse-simple ──
 
-    if let Ok(configs) = device.supported_output_configs() {
-        for range in configs {
-            if range.channels() != CHANNELS {
-                continue;
-            }
-            if range.min_sample_rate() <= SAMPLE_RATE && SAMPLE_RATE <= range.max_sample_rate() {
-                let cfg = range.with_sample_rate(SAMPLE_RATE).config();
-                attempts.push((
-                    cfg,
-                    range.sample_format(),
-                    "matched 48k stereo config".into(),
-                ));
-            }
-        }
+#[cfg(target_os = "linux")]
+fn pulse_playback_loop(ring: &AudioSlot, stop: &Arc<AtomicBool>) -> Result<()> {
+    use std::ffi::CString;
+    use std::ptr;
+
+    // libpulse-simple FFI
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    enum pa_stream_direction_t {
+        PA_STREAM_PLAYBACK = 1,
     }
 
-    if let Ok(default_cfg) = device.default_output_config() {
-        attempts.push((
-            default_cfg.config(),
-            default_cfg.sample_format(),
-            "default output config".into(),
-        ));
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    enum pa_sample_format_t {
+        PA_SAMPLE_S16LE = 3,
     }
 
-    if attempts.is_empty() {
-        return Err(anyhow!("no usable audio output configurations found"));
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct pa_sample_spec {
+        format: pa_sample_format_t,
+        rate: u32,
+        channels: u8,
     }
 
-    let mut last_error = None;
-    for (config, sample_format, label) in attempts {
-        match build_output_stream_for_format(
-            device,
-            &config,
-            sample_format,
-            Arc::clone(&ring),
-            Arc::clone(&stop),
-        ) {
-            Ok(stream) => {
-                println!(
-                    "[audio_player] using {}: {}ch @ {} Hz ({:?})",
-                    label, config.channels, config.sample_rate, sample_format
-                );
-                return Ok(stream);
-            }
-            Err(error) => {
-                eprintln!(
-                    "[audio_player] output config failed: {}: {}ch @ {} Hz ({:?}): {error:#}",
-                    label, config.channels, config.sample_rate, sample_format
-                );
-                last_error = Some(error);
-            }
-        }
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct pa_buffer_attr {
+        maxlength: u32,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        fragsize: u32,
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("failed to open audio output stream")))
-}
+    #[allow(non_camel_case_types)]
+    enum pa_simple {}
 
-fn build_output_stream_for_format(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    sample_format: SampleFormat,
-    ring: AudioSlot,
-    stop: Arc<AtomicBool>,
-) -> Result<cpal::Stream> {
-    match sample_format {
-        SampleFormat::I16 => build_typed_output_stream::<i16>(device, config, ring, stop),
-        SampleFormat::U16 => build_typed_output_stream::<u16>(device, config, ring, stop),
-        SampleFormat::F32 => build_typed_output_stream::<f32>(device, config, ring, stop),
-        other => Err(anyhow!("unsupported sample format: {other:?}")),
+    extern "C" {
+        fn pa_simple_new(
+            server: *const libc::c_char,
+            name: *const libc::c_char,
+            dir: pa_stream_direction_t,
+            dev: *const libc::c_char,
+            stream_name: *const libc::c_char,
+            ss: *const pa_sample_spec,
+            map: *const libc::c_void,
+            attr: *const pa_buffer_attr,
+            error: *mut libc::c_int,
+        ) -> *mut pa_simple;
+        fn pa_simple_write(
+            s: *mut pa_simple,
+            data: *const libc::c_void,
+            bytes: usize,
+            error: *mut libc::c_int,
+        ) -> libc::c_int;
+        fn pa_simple_free(s: *mut pa_simple);
+        fn pa_strerror(error: libc::c_int) -> *const libc::c_char;
     }
-}
 
-fn build_typed_output_stream<T>(
-    device: &cpal::Device,
-    config: &StreamConfig,
-    ring: AudioSlot,
-    stop: Arc<AtomicBool>,
-) -> Result<cpal::Stream>
-where
-    T: cpal::SizedSample + cpal::FromSample<f32>,
-{
-    let channels = config.channels as usize;
-    let ring_pull = Arc::clone(&ring);
-    let stop_flag = Arc::clone(&stop);
+    let app_name = CString::new("Screx").unwrap();
+    let stream_name = CString::new("Desktop Audio").unwrap();
+    let ss = pa_sample_spec {
+        format: pa_sample_format_t::PA_SAMPLE_S16LE,
+        rate: SAMPLE_RATE,
+        channels: CHANNELS as u8,
+    };
+    // Low-latency buffer attrs
+    let frame_bytes = (BYTES_PER_MS * 20) as u32; // 20ms
+    let attr = pa_buffer_attr {
+        maxlength: u32::MAX,
+        tlength: frame_bytes,
+        prebuf: 0,
+        minreq: u32::MAX,
+        fragsize: u32::MAX,
+    };
 
-    device
-        .build_output_stream(
-            config,
-            move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
-                write_output_data::<T>(data, channels, &ring_pull, &stop_flag);
-            },
-            move |err| {
-                eprintln!("[audio_player] stream error: {err}");
-            },
-            None,
+    let mut err: libc::c_int = 0;
+    let pa = unsafe {
+        pa_simple_new(
+            ptr::null(),
+            app_name.as_ptr(),
+            pa_stream_direction_t::PA_STREAM_PLAYBACK,
+            ptr::null(),
+            stream_name.as_ptr(),
+            &ss,
+            ptr::null(),
+            &attr,
+            &mut err,
         )
-        .context("build output stream")
+    };
+    if pa.is_null() {
+        let msg = unsafe {
+            let p = pa_strerror(err);
+            if p.is_null() {
+                "unknown error".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return Err(anyhow!("pa_simple_new failed: {msg}"));
+    }
+
+    println!(
+        "[audio_player] using PulseAudio: {}ch @ {} Hz s16le",
+        CHANNELS, SAMPLE_RATE
+    );
+
+    // Write loop: pull from ring buffer, write to PA
+    let chunk_bytes = BYTES_PER_MS * 10; // 10ms chunks
+    let mut buf = vec![0u8; chunk_bytes];
+
+    while !stop.load(Ordering::Relaxed) {
+        let read = if let Ok(mut ring) = ring.lock() {
+            ring.read(&mut buf)
+        } else {
+            0
+        };
+
+        if read == 0 {
+            // No data — write silence to keep the stream alive
+            buf.iter_mut().for_each(|b| *b = 0);
+        }
+
+        let write_len = if read > 0 { read } else { chunk_bytes };
+        let ret = unsafe {
+            pa_simple_write(pa, buf.as_ptr() as *const libc::c_void, write_len, &mut err)
+        };
+        if ret < 0 {
+            let msg = unsafe {
+                let p = pa_strerror(err);
+                if p.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            eprintln!("[audio_player] pa_simple_write error: {msg}");
+            break;
+        }
+    }
+
+    unsafe { pa_simple_free(pa) };
+    Ok(())
 }
 
-fn write_output_data<T>(data: &mut [T], channels: usize, ring: &AudioSlot, stop: &Arc<AtomicBool>)
+// ── macOS / Windows: cpal ──
+
+#[cfg(not(target_os = "linux"))]
+fn cpal_playback_loop(ring: &AudioSlot, stop: &Arc<AtomicBool>) -> Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow!("no audio output device found"))?;
+
+    let config = device.default_output_config()?;
+    let sample_format = config.sample_format();
+    let stream_config = config.config();
+
+    let ring_pull = Arc::clone(ring);
+    let stop_flag = Arc::clone(stop);
+    let channels = stream_config.channels as usize;
+
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _| cpal_write::<f32>(data, channels, &ring_pull, &stop_flag),
+            |err| eprintln!("[audio_player] stream error: {err}"),
+            None,
+        )?,
+        SampleFormat::I16 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [i16], _| cpal_write::<i16>(data, channels, &ring_pull, &stop_flag),
+            |err| eprintln!("[audio_player] stream error: {err}"),
+            None,
+        )?,
+        SampleFormat::U16 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [u16], _| cpal_write::<u16>(data, channels, &ring_pull, &stop_flag),
+            |err| eprintln!("[audio_player] stream error: {err}"),
+            None,
+        )?,
+        other => return Err(anyhow!("unsupported sample format: {other:?}")),
+    };
+
+    println!(
+        "[audio_player] using cpal: {}ch @ {} Hz ({:?})",
+        stream_config.channels, stream_config.sample_rate.0, sample_format
+    );
+
+    stream.play()?;
+
+    // Block until stopped
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cpal_write<T>(data: &mut [T], channels: usize, ring: &AudioSlot, stop: &Arc<AtomicBool>)
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     if stop.load(Ordering::Relaxed) {
-        for sample in data.iter_mut() {
-            *sample = T::from_sample(0.0);
+        for s in data.iter_mut() {
+            *s = T::from_sample(0.0);
         }
         return;
     }
@@ -302,11 +368,5 @@ where
             };
             data[frame_idx * channels + ch] = T::from_sample(sample);
         }
-    }
-}
-
-impl Drop for AudioPlayer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
     }
 }

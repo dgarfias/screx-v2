@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,9 +35,6 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(50);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const UDP_SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
-const VIDEO_LOG_INTERVAL: u32 = 120;
-const MAX_VIDEO_DECODE_QUEUE: usize = 4;
 const MAGIC_PAIR: &[u8] = b"SCREX_PAIR";
 const MAGIC_HELLO: &[u8] = b"SCREX_HELLO";
 const MAGIC_PIN: &[u8] = b"SCREX_PIN\0";
@@ -57,15 +54,6 @@ const FLAG_IDR: u8 = 0x01;
 const FLAG_AUDIO: u8 = 0x02;
 const TAG_LEN: usize = 16;
 
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn should_send_pli(last_pli_at: &mut Option<Instant>) -> bool {
     let allowed = last_pli_at
         .map(|instant| instant.elapsed() >= PLI_MIN_INTERVAL)
@@ -76,24 +64,9 @@ fn should_send_pli(last_pli_at: &mut Option<Instant>) -> bool {
     allowed
 }
 
-fn should_send_pli_shared(last_pli_at: &Mutex<Option<Instant>>) -> bool {
-    let mut guard = match last_pli_at.lock() {
-        Ok(guard) => guard,
-        Err(_) => return false,
-    };
-    let allowed = guard
-        .map(|instant| instant.elapsed() >= PLI_MIN_INTERVAL)
-        .unwrap_or(true);
-    if allowed {
-        *guard = Some(Instant::now());
-    }
-    allowed
-}
-
 #[derive(Clone)]
 pub struct BackendHandle {
     tx: Sender<BackendCommand>,
-    control: Arc<Mutex<Option<Arc<ControlSender>>>>,
 }
 
 impl BackendHandle {
@@ -132,10 +105,22 @@ impl BackendHandle {
         let _ = self.tx.send(BackendCommand::SetKeyboard { enabled });
     }
 
-    pub fn send_key_event(&self, hid_usage: u16, pressed: bool) {
+    pub fn load_connections(&self) {
+        let _ = self.tx.send(BackendCommand::LoadConnections);
+    }
+
+    pub fn toggle_pinned(&self, host: String, port: u16) {
+        let _ = self.tx.send(BackendCommand::TogglePinned { host, port });
+    }
+
+    pub fn delete_connection(&self, host: String, port: u16) {
         let _ = self
             .tx
-            .send(BackendCommand::SendKeyEvent { hid_usage, pressed });
+            .send(BackendCommand::DeleteConnection { host, port });
+    }
+
+    pub fn clear_recent_connections(&self) {
+        let _ = self.tx.send(BackendCommand::ClearRecentConnections);
     }
 
     pub fn send_key_action(&self, qt_key: i32, text: String, modifiers: i32, pressed: bool) {
@@ -148,36 +133,16 @@ impl BackendHandle {
     }
 
     pub fn send_mouse_move(&self, x: u16, y: u16) {
-        // Bypass the command channel — send directly on the control connection
-        // to minimize mouse latency.
-        if let Ok(guard) = self.control.lock() {
-            if let Some(ref ctl) = *guard {
-                let _ = crate::input::send_mouse_abs(ctl, x, y);
-                return;
-            }
-        }
         let _ = self.tx.send(BackendCommand::SendMouseMove { x, y });
     }
 
     pub fn send_mouse_button(&self, button: u8, pressed: bool) {
-        if let Ok(guard) = self.control.lock() {
-            if let Some(ref ctl) = *guard {
-                let _ = crate::input::send_mouse_button(ctl, button, pressed);
-                return;
-            }
-        }
         let _ = self
             .tx
             .send(BackendCommand::SendMouseButton { button, pressed });
     }
 
     pub fn send_mouse_scroll(&self, dy: i16) {
-        if let Ok(guard) = self.control.lock() {
-            if let Some(ref ctl) = *guard {
-                let _ = crate::input::send_mouse_scroll(ctl, dy);
-                return;
-            }
-        }
         let _ = self.tx.send(BackendCommand::SendMouseScroll { dy });
     }
 }
@@ -209,10 +174,6 @@ enum BackendCommand {
     SetKeyboard {
         enabled: bool,
     },
-    SendKeyEvent {
-        hid_usage: u16,
-        pressed: bool,
-    },
     SendKeyAction {
         qt_key: i32,
         text: String,
@@ -234,6 +195,16 @@ enum BackendCommand {
         session_id: u64,
         reason: String,
     },
+    LoadConnections,
+    TogglePinned {
+        host: String,
+        port: u16,
+    },
+    DeleteConnection {
+        host: String,
+        port: u16,
+    },
+    ClearRecentConnections,
 }
 
 #[derive(Clone)]
@@ -253,6 +224,34 @@ pub enum UiEvent {
     },
     PinRequired(String),
     ClearPinPrompt,
+    SetConnections(Vec<RecentConnection>),
+}
+
+/// Load connections from disk as JSON string for eager UI initialization.
+pub fn load_connections_json() -> String {
+    match AppStorage::load() {
+        Ok(storage) => {
+            let conns = storage.get_connections();
+            #[derive(serde::Serialize)]
+            struct Entry {
+                host: String,
+                port: u16,
+                name: String,
+                pinned: bool,
+            }
+            let entries: Vec<Entry> = conns
+                .iter()
+                .map(|c| Entry {
+                    host: c.host.clone(),
+                    port: c.port,
+                    name: c.name.clone(),
+                    pinned: c.pinned,
+                })
+                .collect();
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
+        }
+        Err(_) => "[]".into(),
+    }
 }
 
 pub fn spawn_backend<F>(ui: F, frame_slot: FrameSlot) -> BackendHandle
@@ -263,18 +262,12 @@ where
     let ui = Arc::new(ui);
     let worker_tx = tx.clone();
 
-    let control_slot: Arc<Mutex<Option<Arc<ControlSender>>>> = Arc::new(Mutex::new(None));
-    let worker_control_slot = Arc::clone(&control_slot);
     thread::spawn(move || {
         let mut worker = BackendWorker::new(rx, worker_tx, ui, frame_slot);
-        worker.control_slot = Some(worker_control_slot);
         worker.run();
     });
 
-    BackendHandle {
-        tx,
-        control: control_slot,
-    }
+    BackendHandle { tx }
 }
 
 struct BackendWorker {
@@ -287,7 +280,6 @@ struct BackendWorker {
     next_session_id: u64,
     frame_slot: FrameSlot,
     blank_stream_retry_attempted: bool,
-    control_slot: Option<Arc<Mutex<Option<Arc<ControlSender>>>>>,
 }
 
 impl BackendWorker {
@@ -307,7 +299,6 @@ impl BackendWorker {
             next_session_id: 1,
             frame_slot,
             blank_stream_retry_attempted: false,
-            control_slot: None,
         }
     }
 
@@ -336,11 +327,6 @@ impl BackendWorker {
                         "Keyboard forwarding {}.",
                         if enabled { "active" } else { "paused" }
                     )));
-                }
-                BackendCommand::SendKeyEvent { hid_usage, pressed } => {
-                    if let Some(ref active) = self.active {
-                        let _ = crate::input::send_raw_key(&active.control, hid_usage, pressed);
-                    }
                 }
                 BackendCommand::SendKeyAction {
                     qt_key,
@@ -396,6 +382,21 @@ impl BackendWorker {
                             dropped_frames: 0,
                         });
                     }
+                }
+                BackendCommand::LoadConnections => {
+                    self.push_connections_to_ui();
+                }
+                BackendCommand::TogglePinned { host, port } => {
+                    self.storage.toggle_pinned(&host, port);
+                    self.push_connections_to_ui();
+                }
+                BackendCommand::DeleteConnection { host, port } => {
+                    self.storage.delete_connection(&host, port);
+                    self.push_connections_to_ui();
+                }
+                BackendCommand::ClearRecentConnections => {
+                    self.storage.clear_recent_connections();
+                    self.push_connections_to_ui();
                 }
             }
         }
@@ -514,6 +515,12 @@ impl BackendWorker {
         let title = bootstrap.display_host.clone();
         (self.ui)(UiEvent::ClearPinPrompt);
         (self.ui)(UiEvent::SetSessionTitle(title.clone()));
+
+        // Remember this connection
+        let port = bootstrap.server_addr.port();
+        self.storage
+            .remember_connection(&title, &bootstrap.display_host, port);
+        self.push_connections_to_ui();
         (self.ui)(UiEvent::SetTransportLabel("Network".into()));
         (self.ui)(UiEvent::SetCodecLabel("Negotiating stream".into()));
         (self.ui)(UiEvent::SetResolutionLabel("Receiving stream".into()));
@@ -561,13 +568,6 @@ impl BackendWorker {
             audio_player.as_ref().map(Arc::clone),
         );
 
-        // Publish control sender for direct mouse/keyboard access
-        if let Some(ref slot) = self.control_slot {
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(Arc::clone(&control));
-            }
-        }
-
         self.active = Some(ActiveSession {
             session_id,
             control,
@@ -598,14 +598,13 @@ impl BackendWorker {
         self.handle_connect(host, speaker_enabled);
     }
 
+    fn push_connections_to_ui(&self) {
+        let conns = self.storage.get_connections().to_vec();
+        (self.ui)(UiEvent::SetConnections(conns));
+    }
+
     fn handle_disconnect(&mut self, quiet: bool) {
         self.pending_pairing = None;
-        // Clear the direct control reference
-        if let Some(ref slot) = self.control_slot {
-            if let Ok(mut guard) = slot.lock() {
-                *guard = None;
-            }
-        }
         if let Some(active) = self.active.take() {
             // Tell the daemon to tear down virtual devices if active
             let _ = active.control.send_peripheral_state(PERIPH_MOUSE, false);
@@ -1260,15 +1259,9 @@ fn spawn_udp_runtime(
                         continue;
                     }
 
-                    let assembly = video_frames.entry(frame_id).or_insert_with(|| {
-                        FrameAssembly::new(
-                            total_data,
-                            total_parity,
-                            codec_id,
-                            (flags & FLAG_IDR) != 0,
-                            timestamp_ms,
-                        )
-                    });
+                    let assembly = video_frames
+                        .entry(frame_id)
+                        .or_insert_with(|| FrameAssembly::new(total_data, total_parity));
                     assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
 
                     if assembly.is_complete() {
@@ -1446,6 +1439,7 @@ struct ControlWriter {
 
 impl ControlSender {
     fn new(stream: TcpStream, session_key: [u8; 32]) -> Result<Self> {
+        stream.set_nodelay(true).ok();
         Ok(Self {
             inner: Mutex::new(ControlWriter {
                 stream,
@@ -1468,7 +1462,6 @@ impl ControlSender {
         inner.stream.write_all(&body_len.to_be_bytes())?;
         inner.stream.write_all(&aad)?;
         inner.stream.write_all(&encrypted)?;
-        inner.stream.flush().ok();
         Ok(())
     }
 
@@ -1563,7 +1556,7 @@ impl UdpSender {
 
 fn tune_udp_socket(socket: &UdpSocket) -> Result<()> {
     let fd = socket.as_raw_fd();
-    let value = UDP_SOCKET_BUFFER_BYTES;
+    let value: libc::c_int = 4 * 1024 * 1024;
     let value_ptr = &value as *const _ as *const libc::c_void;
     let value_len = std::mem::size_of_val(&value) as libc::socklen_t;
 
@@ -1684,28 +1677,16 @@ struct FrameAssembly {
     total_data: usize,
     total_parity: usize,
     created_at: Instant,
-    codec_id: u8,
-    is_idr: bool,
-    timestamp_ms: u32,
     shards: HashMap<usize, Vec<u8>>,
     actual_lengths: HashMap<usize, usize>,
 }
 
 impl FrameAssembly {
-    fn new(
-        total_data: usize,
-        total_parity: usize,
-        codec_id: u8,
-        is_idr: bool,
-        timestamp_ms: u32,
-    ) -> Self {
+    fn new(total_data: usize, total_parity: usize) -> Self {
         Self {
             total_data,
             total_parity,
             created_at: Instant::now(),
-            codec_id,
-            is_idr,
-            timestamp_ms,
             shards: HashMap::new(),
             actual_lengths: HashMap::new(),
         }
@@ -1720,10 +1701,6 @@ impl FrameAssembly {
         if self.total_parity == 0 {
             return (0..self.total_data).all(|index| self.shards.contains_key(&index));
         }
-        self.shards.len() >= self.total_data
-    }
-
-    fn can_recover(&self) -> bool {
         self.shards.len() >= self.total_data
     }
 
@@ -1780,14 +1757,6 @@ impl FrameAssembly {
 struct AudioAssembly {
     total_data: usize,
     shards: HashMap<usize, Vec<u8>>,
-}
-
-struct VideoAccessUnit {
-    frame_id: u32,
-    codec_id: u8,
-    timestamp_ms: u32,
-    is_idr: bool,
-    annex_b: Vec<u8>,
 }
 
 impl AudioAssembly {
@@ -1900,37 +1869,6 @@ fn dump_access_unit(frame_id: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
     }
 }
 
-fn normalize_annex_b_access_unit(mut data: Vec<u8>, frame_id: u32) -> Vec<u8> {
-    if let Some(offset) = find_annex_b_start_code(&data) {
-        if offset > 0 {
-            let prefix = &data[..offset.min(24)];
-            println!(
-                "[desktop/video] stripping non-Annex-B prefix frame_id={} bytes={} prefix={:02x?}",
-                frame_id, offset, prefix
-            );
-            data.drain(..offset);
-        }
-    }
-    data
-}
-
-fn find_annex_b_start_code(data: &[u8]) -> Option<usize> {
-    if data.len() < 3 {
-        return None;
-    }
-    for i in 0..(data.len() - 2) {
-        if data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1 {
-                return Some(i);
-            }
-            if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
 fn resolve_endpoint(host_input: &str) -> Result<EndpointInfo> {
     let trimmed = host_input.trim();
     if trimmed.is_empty() {
@@ -1979,7 +1917,21 @@ fn parse_host_port(input: &str) -> (String, u16) {
 struct StoredState {
     device_id: Option<[u8; 16]>,
     pairings: HashMap<String, String>,
+    #[serde(default)]
+    recent_connections: Vec<RecentConnection>,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RecentConnection {
+    pub host: String,
+    pub port: u16,
+    pub name: String,
+    pub last_connected_at: u64, // unix timestamp seconds
+    pub pinned: bool,
+}
+
+const MAX_PINNED: usize = 10;
+const MAX_RECENT: usize = 5;
 
 #[derive(Default)]
 struct AppStorage {
@@ -2026,6 +1978,87 @@ impl AppStorage {
             .pairings
             .insert(endpoint_key.to_string(), encode_hex(&key));
         self.save()
+    }
+
+    fn remember_connection(&mut self, name: &str, host: &str, port: u16) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let existing_pinned = self
+            .state
+            .recent_connections
+            .iter()
+            .find(|c| c.host == host && c.port == port)
+            .map(|c| c.pinned)
+            .unwrap_or(false);
+
+        self.state
+            .recent_connections
+            .retain(|c| c.host != host || c.port != port);
+
+        self.state.recent_connections.insert(
+            0,
+            RecentConnection {
+                host: host.to_string(),
+                port,
+                name: name.to_string(),
+                last_connected_at: now,
+                pinned: existing_pinned,
+            },
+        );
+
+        self.normalize_connections();
+        self.save().ok();
+    }
+
+    fn toggle_pinned(&mut self, host: &str, port: u16) {
+        for c in &mut self.state.recent_connections {
+            if c.host == host && c.port == port {
+                c.pinned = !c.pinned;
+                break;
+            }
+        }
+        self.normalize_connections();
+        self.save().ok();
+    }
+
+    fn delete_connection(&mut self, host: &str, port: u16) {
+        self.state
+            .recent_connections
+            .retain(|c| c.host != host || c.port != port);
+        self.save().ok();
+    }
+
+    fn clear_recent_connections(&mut self) {
+        self.state.recent_connections.retain(|c| c.pinned);
+        self.save().ok();
+    }
+
+    fn normalize_connections(&mut self) {
+        let mut pinned: Vec<_> = self
+            .state
+            .recent_connections
+            .iter()
+            .filter(|c| c.pinned)
+            .cloned()
+            .collect();
+        let mut recent: Vec<_> = self
+            .state
+            .recent_connections
+            .iter()
+            .filter(|c| !c.pinned)
+            .cloned()
+            .collect();
+        pinned.truncate(MAX_PINNED);
+        recent.truncate(MAX_RECENT);
+        pinned.append(&mut recent);
+        self.state.recent_connections = pinned;
+    }
+
+    fn get_connections(&self) -> &[RecentConnection] {
+        &self.state.recent_connections
     }
 
     fn save(&self) -> Result<()> {

@@ -41,91 +41,177 @@ ApplicationWindow {
                 color: "#f2f2f7"
             }
 
-            Rectangle {
+            Flickable {
                 anchors.centerIn: parent
                 width: Math.min(parent.width - 48, 420)
-                implicitHeight: cardContent.implicitHeight + 48
-                radius: 16
-                color: "white"
-                border.color: "#e0e0e0"
-                border.width: 1
+                height: Math.min(contentHeight, parent.height - 48)
+                contentHeight: connectionCard.implicitHeight
+                clip: true
+                interactive: contentHeight > height
 
-                ColumnLayout {
-                    id: cardContent
-                    anchors.fill: parent
-                    anchors.margins: 24
-                    spacing: 16
+                Rectangle {
+                    id: connectionCard
+                    width: parent.width
+                    implicitHeight: cardCol.implicitHeight + 48
+                    radius: 16
+                    color: "white"
+                    border.color: "#e0e0e0"
+                    border.width: 1
+
+                    property var allConnections: {
+                        try { return JSON.parse(AppState.connections_json) }
+                        catch(e) { return [] }
+                    }
+                    property var pinnedList: allConnections.filter(function(c) { return c.pinned })
+                    property var recentList: allConnections.filter(function(c) { return !c.pinned })
 
                     ColumnLayout {
-                        spacing: 4
-                        Layout.fillWidth: true
+                        id: cardCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 24
+                        spacing: 16
 
-                        Label {
-                            text: "Screx"
-                            font.family: uiFont()
-                            font.pixelSize: 28
-                            font.weight: 700
-                            color: "#1c1c1e"
-                        }
-
-                        Label {
-                            text: AppState.connecting ? "Connecting" : "Idle"
-                            font.family: uiFont()
-                            font.pixelSize: 17
-                            font.weight: 600
-                            color: "#3a3a3c"
-                        }
-
-                        Label {
-                            text: AppState.status_text
-                            font.family: uiFont()
-                            font.pixelSize: 14
-                            color: "#8e8e93"
-                            wrapMode: Text.WordWrap
+                        // ── Header ──
+                        ColumnLayout {
+                            spacing: 4
                             Layout.fillWidth: true
+
+                            Label {
+                                text: "Screx"
+                                font.family: uiFont()
+                                font.pixelSize: 28
+                                font.weight: 700
+                                color: "#1c1c1e"
+                            }
+
+                            Label {
+                                text: AppState.connecting ? "Connecting" : "Idle"
+                                font.family: uiFont()
+                                font.pixelSize: 17
+                                font.weight: 600
+                                color: "#3a3a3c"
+                            }
+
+                            Label {
+                                text: AppState.status_text
+                                font.family: uiFont()
+                                font.pixelSize: 14
+                                color: "#8e8e93"
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
                         }
-                    }
 
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 10
-
-                        TextField {
-                            id: hostField
+                        // ── Host input + Connect ──
+                        RowLayout {
                             Layout.fillWidth: true
-                            placeholderText: "Daemon host or IP[:port]"
-                            font.family: uiFont()
-                            font.pixelSize: 16
-                            padding: 12
-                            enabled: !AppState.connecting
-                            background: Rectangle {
-                                radius: 10
-                                color: "#f2f2f7"
-                                border.color: hostField.activeFocus ? "#007aff" : "#d1d1d6"
-                                border.width: hostField.activeFocus ? 2 : 1
+                            spacing: 10
+
+                            TextField {
+                                id: hostField
+                                Layout.fillWidth: true
+                                placeholderText: "Daemon host or IP[:port]"
+                                font.family: uiFont()
+                                font.pixelSize: 16
+                                padding: 12
+                                color: "#1c1c1e"
+                                placeholderTextColor: "#8e8e93"
+                                enabled: !AppState.connecting
+                                background: Rectangle {
+                                    radius: 10
+                                    color: "#f2f2f7"
+                                    border.color: hostField.activeFocus ? "#007aff" : "#d1d1d6"
+                                    border.width: hostField.activeFocus ? 2 : 1
+                                }
+                                onAccepted: AppState.connect_to_host(text)
                             }
-                            onAccepted: AppState.connect_to_host(text)
+
+                            Button {
+                                text: AppState.connecting ? "Connecting..." : "Connect"
+                                enabled: !AppState.connecting && hostField.text.trim().length > 0
+                                font.family: uiFont()
+                                font.pixelSize: 16
+                                font.weight: 600
+                                onClicked: AppState.connect_to_host(hostField.text)
+                                background: Rectangle {
+                                    radius: 10
+                                    color: parent.enabled ? (parent.down ? "#0056b3" : "#007aff") : "#b0b0b8"
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: "white"
+                                    font: parent.font
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                padding: 12
+                            }
                         }
 
-                        Button {
-                            text: AppState.connecting ? "Connecting..." : "Connect"
-                            enabled: !AppState.connecting && hostField.text.trim().length > 0
-                            font.family: uiFont()
-                            font.pixelSize: 16
-                            font.weight: 600
-                            onClicked: AppState.connect_to_host(hostField.text)
-                            background: Rectangle {
-                                radius: 10
-                                color: parent.enabled ? (parent.down ? "#0056b3" : "#007aff") : "#b0b0b8"
+                        // ── Pinned ──
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            visible: connectionCard.pinnedList.length > 0
+
+                            Label {
+                                text: "PINNED"
+                                font.family: uiFont()
+                                font.pixelSize: 11
+                                font.weight: 700
+                                color: "#8e8e93"
                             }
-                            contentItem: Text {
-                                text: parent.text
-                                color: "white"
-                                font: parent.font
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
+
+                            Repeater {
+                                model: connectionCard.pinnedList
+                                delegate: connectionRowDelegate
                             }
-                            padding: 12
+                        }
+
+                        // ── Recent ──
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            visible: connectionCard.recentList.length > 0
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Label {
+                                    text: "RECENT"
+                                    font.family: uiFont()
+                                    font.pixelSize: 11
+                                    font.weight: 700
+                                    color: "#8e8e93"
+                                }
+                                Item { Layout.fillWidth: true }
+                                Button {
+                                    text: "Clear All"
+                                    font.family: uiFont()
+                                    font.pixelSize: 11
+                                    font.weight: 600
+                                    onClicked: AppState.clear_recent_connections()
+                                    background: Rectangle {
+                                        radius: 10
+                                        color: parent.down ? "#c0392b" : "#e74c3c"
+                                    }
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: "white"
+                                        font: parent.font
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    leftPadding: 10; rightPadding: 10
+                                    topPadding: 4; bottomPadding: 4
+                                }
+                            }
+
+                            Repeater {
+                                model: connectionCard.recentList
+                                delegate: connectionRowDelegate
+                            }
                         }
                     }
                 }
@@ -173,9 +259,14 @@ ApplicationWindow {
                                 model: [
                                     { label: "Speaker", active: AppState.speaker_enabled, action: function() { AppState.toggle_speaker() } },
                                     { label: "Mic", active: AppState.mic_enabled, action: function() { AppState.toggle_mic() } },
-                                    { label: "Cam", active: AppState.camera_enabled, action: function() { AppState.toggle_camera() } },
-                                    { label: "KB", active: AppState.keyboard_enabled, action: function() { AppState.toggle_keyboard() } },
-                                    { label: "Info", active: AppState.info_visible, action: function() { AppState.toggle_info() } }
+                                    { label: "Cam", active: AppState.camera_enabled, action: function() {
+                                        if (AppState.camera_enabled) {
+                                            AppState.toggle_camera()
+                                        } else {
+                                            camPopup.open()
+                                        }
+                                    } },
+                                    { label: "KB", active: AppState.keyboard_enabled, action: function() { AppState.toggle_keyboard() } }
                                 ]
 
                                 delegate: Button {
@@ -205,7 +296,6 @@ ApplicationWindow {
                             Item { Layout.fillWidth: true }
 
                             Text {
-                                visible: AppState.info_visible
                                 text: AppState.resolution_label + "  ·  " + AppState.fps + " fps  ·  " + AppState.bitrate_mbps.toFixed(1) + " Mbps"
                                 color: "#8e8e93"
                                 font.family: uiFont()
@@ -270,22 +360,14 @@ ApplicationWindow {
                             }
 
                             MouseArea {
+                                id: streamMouse
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
                                 cursorShape: AppState.connected ? Qt.BlankCursor : Qt.ArrowCursor
-                                property bool hasReceivedFirstMove: false
-
-                                onEntered: {
-                                    hasReceivedFirstMove = false
-                                }
 
                                 onPositionChanged: function(mouse) {
                                     if (!AppState.connected) return
-                                    if (!hasReceivedFirstMove) {
-                                        hasReceivedFirstMove = true
-                                        return
-                                    }
                                     const point = streamView.normalizedPoint(mouse.x, mouse.y)
                                     if (!point) return
                                     AppState.send_mouse_move(point.x, point.y)
@@ -328,6 +410,171 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+
+    // ── Shared connection row delegate (outside StackLayout) ──
+    Component {
+        id: connectionRowDelegate
+
+        Rectangle {
+            Layout.fillWidth: true
+            height: 44
+            radius: 10
+            color: rowMouse.containsMouse ? "#e8e8ed" : "#f2f2f7"
+
+            MouseArea {
+                id: rowMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                onClicked: AppState.connect_recent(modelData.host, modelData.port)
+            }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 4
+                anchors.rightMargin: 8
+                spacing: 6
+
+                Button {
+                    text: modelData.pinned ? "\u2605" : "\u2606"
+                    font.pixelSize: 18
+                    z: 1
+                    onClicked: AppState.toggle_pinned_connection(modelData.host, modelData.port)
+                    background: Rectangle { color: "transparent" }
+                    contentItem: Text {
+                        text: parent.text
+                        color: modelData.pinned ? "#ff9500" : "#c7c7cc"
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    implicitWidth: 32
+                    implicitHeight: 32
+                }
+
+                ColumnLayout {
+                    spacing: 1
+                    Layout.fillWidth: true
+                    Text {
+                        text: modelData.name || modelData.host
+                        color: "#1c1c1e"
+                        font.family: uiFont()
+                        font.pixelSize: 14
+                        font.weight: 600
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                    Text {
+                        text: modelData.host + (modelData.port !== 42069 ? ":" + modelData.port : "")
+                        color: "#8e8e93"
+                        font.family: uiFont()
+                        font.pixelSize: 11
+                    }
+                }
+
+                Text {
+                    text: "\u203A"
+                    font.pixelSize: 18
+                    color: "#c7c7cc"
+                }
+            }
+        }
+    }
+
+    // ── Camera resolution popup ──
+    Popup {
+        id: camPopup
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 340)
+        height: camPopupContent.implicitHeight + 32
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle {
+            radius: 12
+            color: "#1c1c1e"
+            border.color: "#3a3a3c"
+            border.width: 1
+        }
+
+        ColumnLayout {
+            id: camPopupContent
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 16
+            spacing: 12
+
+            Text {
+                text: "Select Camera Resolution"
+                color: "#ffffff"
+                font.family: uiFont()
+                font.pixelSize: 16
+                font.weight: 700
+            }
+
+            Repeater {
+                model: [
+                    "Auto \u00b7 1280 x 720 @ 30",
+                    "720p \u00b7 1280 x 720 @ 60",
+                    "1080p \u00b7 1920 x 1080 @ 30",
+                    "1080p \u00b7 1920 x 1080 @ 60"
+                ]
+
+                delegate: Button {
+                    Layout.fillWidth: true
+                    text: modelData
+                    font.family: uiFont()
+                    font.pixelSize: 13
+                    font.weight: 600
+                    onClicked: {
+                        AppState.select_camera_mode(modelData)
+                        AppState.toggle_camera()
+                        camPopup.close()
+                    }
+                    background: Rectangle {
+                        radius: 6
+                        color: parent.down ? "#3a3a3c" : "#2c2c2e"
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#ffffff"
+                        font: parent.font
+                        horizontalAlignment: Text.AlignLeft
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    leftPadding: 12
+                    rightPadding: 12
+                    topPadding: 8
+                    bottomPadding: 8
+                }
+            }
+
+            Button {
+                Layout.fillWidth: true
+                text: "Cancel"
+                font.family: uiFont()
+                font.pixelSize: 13
+                onClicked: camPopup.close()
+                background: Rectangle {
+                    radius: 6
+                    color: "transparent"
+                    border.color: "#3a3a3c"
+                    border.width: 1
+                }
+                contentItem: Text {
+                    text: parent.text
+                    color: "#8e8e93"
+                    font: parent.font
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                leftPadding: 12
+                rightPadding: 12
+                topPadding: 6
+                bottomPadding: 6
+            }
+        }
     }
 
     Rectangle {
@@ -379,6 +626,8 @@ ApplicationWindow {
                     font.family: uiFont()
                     font.pixelSize: 28
                     font.weight: 700
+                    color: "#1c1c1e"
+                    placeholderTextColor: "#8e8e93"
                     horizontalAlignment: Text.AlignHCenter
                     inputMethodHints: Qt.ImhDigitsOnly
                     maximumLength: 6

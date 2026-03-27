@@ -116,21 +116,6 @@ pub fn send_qt_key_action(
     Ok(())
 }
 
-fn should_log_key(qt_key: i32, text: &str) -> bool {
-    matches!(
-        qt_key,
-        0x01000003
-            | 0x01000004
-            | 0x01000005
-            | 0x01000001
-            | 0x01000000
-            | 0x01000012
-            | 0x01000013
-            | 0x01000014
-            | 0x01000015
-    ) || text.eq_ignore_ascii_case("s")
-}
-
 /// Sends an absolute mouse move to the daemon.
 /// `x`, `y` are in the range 0-65535 (full virtual display area).
 pub fn send_mouse_abs(control: &ControlSender, x: u16, y: u16) -> Result<()> {

@@ -22,6 +22,7 @@ cpp! {{
     #include <QtCore/QObject>
     #include <QtCore/QCoreApplication>
     #include <QtGui/QKeyEvent>
+    #include <QtGui/QCursor>
 
     class RustKeyFilter : public QObject {
     public:
@@ -75,6 +76,12 @@ cpp! {{
         qApp->installEventFilter(s_rustKeyFilter);
     }
 }}
+
+pub fn warp_cursor_to(x: i32, y: i32) {
+    cpp!(unsafe [x as "int", y as "int"] {
+        QCursor::setPos(x, y);
+    });
+}
 
 fn main() {
     // Register the custom video surface type so QML can instantiate it.

@@ -2,6 +2,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/main.rs");
     println!("cargo:rerun-if-changed=src/video_surface.rs");
 
+    // Link libpulse-simple on Linux for audio output
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-lib=pulse-simple");
+        println!("cargo:rustc-link-lib=pulse");
+    }
+
     let qt_include_path = std::env::var("DEP_QT_INCLUDE_PATH").unwrap();
     let mut config = cpp_build::Config::new();
     for f in std::env::var("DEP_QT_COMPILE_FLAGS")

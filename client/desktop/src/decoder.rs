@@ -48,7 +48,6 @@ impl CodecId {
 
 pub struct VideoDecoder {
     inner: DecoderInner,
-    codec: CodecId,
     /// Latest decoded resolution (updated every frame).
     pub last_width: u32,
     pub last_height: u32,
@@ -81,7 +80,6 @@ impl VideoDecoder {
             println!("[decoder] forcing software {label} decode via SCREX_FORCE_SW_DECODE");
             return Ok(Self {
                 inner: DecoderInner::Software(sw),
-                codec,
                 last_width: 0,
                 last_height: 0,
             });
@@ -94,7 +92,6 @@ impl VideoDecoder {
                 println!("[decoder] using VideoToolbox {label} hw decode");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
-                    codec,
                     last_width: 0,
                     last_height: 0,
                 });
@@ -108,7 +105,6 @@ impl VideoDecoder {
                 println!("[decoder] using D3D11VA {label} hw decode");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
-                    codec,
                     last_width: 0,
                     last_height: 0,
                 });
@@ -122,7 +118,6 @@ impl VideoDecoder {
                 println!("[decoder] using VA-API {label} hw decode");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
-                    codec,
                     last_width: 0,
                     last_height: 0,
                 });
@@ -136,7 +131,6 @@ impl VideoDecoder {
                 println!("[decoder] using CUDA/NVDEC {label} hw decode");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
-                    codec,
                     last_width: 0,
                     last_height: 0,
                 });
@@ -148,19 +142,12 @@ impl VideoDecoder {
         println!("[decoder] using software {label} decode (no hw accelerator available)");
         Ok(Self {
             inner: DecoderInner::Software(sw),
-            codec,
             last_width: 0,
             last_height: 0,
         })
     }
 
-    /// Current codec this decoder was opened for.
-    pub fn codec(&self) -> CodecId {
-        self.codec
-    }
-
     /// Feed one Annex-B access unit and collect any decoded frames.
-    /// Usually produces 0 or 1 frame per call.
     pub fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
         let frames = match &mut self.inner {
             DecoderInner::HwAccel(hw) => hw.decode(annex_b)?,
@@ -171,14 +158,6 @@ impl VideoDecoder {
             self.last_height = f.height;
         }
         Ok(frames)
-    }
-
-    /// Flush any remaining buffered frames (call at end of stream).
-    pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        match &mut self.inner {
-            DecoderInner::HwAccel(hw) => hw.flush(),
-            DecoderInner::Software(sw) => sw.flush(),
-        }
     }
 }
 
@@ -443,15 +422,6 @@ impl HwDecoder {
         Ok(frames)
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        let mut frames = Vec::new();
-        unsafe {
-            ffi::avcodec_send_packet(self.ctx, ptr::null());
-            self.receive_frames(&mut frames)?;
-        }
-        Ok(frames)
-    }
-
     unsafe fn send_and_receive(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
         if ret < 0 {
@@ -685,15 +655,6 @@ impl SwDecoder {
             // Do NOT call av_packet_unref here — we don't own the data pointer.
             (*self.pkt).data = ptr::null_mut();
             (*self.pkt).size = 0;
-        }
-        Ok(frames)
-    }
-
-    fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        let mut frames = Vec::new();
-        unsafe {
-            ffi::avcodec_send_packet(self.ctx, ptr::null());
-            self.receive_frames(&mut frames)?;
         }
         Ok(frames)
     }
