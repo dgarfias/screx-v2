@@ -329,7 +329,7 @@ fn handle_pair_request(
     println!();
     println!("╔══════════════════════════════════════╗");
     println!("║  PAIRING PIN:  {pin}                ║");
-    println!("║  Enter this PIN on your iPad         ║");
+    println!("║  Enter this PIN on your device       ║");
     println!("╚══════════════════════════════════════╝");
     println!();
 

@@ -1035,6 +1035,18 @@ final class StreamViewModel: ObservableObject {
     }
 
     func disconnect(detail: String? = nil) {
+        // Tell the daemon to tear down virtual devices if active
+        if cameraCapture.isRunning {
+            sendCameraDisable()
+        }
+        if micCapture.isRunning {
+            sendMicDisable()
+        }
+        // Speaker disable — the daemon will also clean up on disconnect,
+        // but sending it explicitly ensures a clean teardown path.
+        if audioPlayer.isOutputEnabled {
+            sendSpeakerTransportState(isEnabled: false)
+        }
         stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
@@ -1523,7 +1535,9 @@ final class StreamViewModel: ObservableObject {
     func toggleCamera() {
         if cameraCapture.isRunning {
             cameraCapture.stop()
+            sendCameraDisable()
         } else {
+            sendCameraEnable()
             cameraCapture.onJPEG = { [weak self] jpeg in
                 guard let self else { return }
                 let fid = self.camFrameId
@@ -1539,6 +1553,28 @@ final class StreamViewModel: ObservableObject {
         objectWillChange.send()
     }
 
+    /// Tells the daemon to create the virtual webcam with our capture profile.
+    private func sendCameraEnable() {
+        let profile: CameraCapture.CaptureProfile = activeTransport == .usb ? .usb : .network
+        let width = UInt16(profile.outputSize.width)
+        let height = UInt16(profile.outputSize.height)
+        let fps = UInt16(profile.targetFps)
+        if activeTransport == .usb {
+            usbListener?.sendCameraConfig(width: width, height: height, fps: fps)
+        } else {
+            networkControl?.sendCameraConfig(width: width, height: height, fps: fps)
+        }
+    }
+
+    /// Tells the daemon to destroy the virtual webcam.
+    private func sendCameraDisable() {
+        if activeTransport == .usb {
+            usbListener?.sendCameraConfig(width: 0, height: 0, fps: 0)
+        } else {
+            networkControl?.sendCameraConfig(width: 0, height: 0, fps: 0)
+        }
+    }
+
     var isCameraActive: Bool { cameraCapture.isRunning }
     var isCameraFront: Bool { cameraCapture.usingFront }
 
@@ -1552,7 +1588,9 @@ final class StreamViewModel: ObservableObject {
     func toggleMic() {
         if micCapture.isRunning {
             micCapture.stop()
+            sendMicDisable()
         } else {
+            sendMicEnable()
             micCapture.onOpusPacket = { [weak self] opusData in
                 guard let self else { return }
                 let seq = self.micSeq
@@ -1575,6 +1613,24 @@ final class StreamViewModel: ObservableObject {
     }
 
     var isMicActive: Bool { micCapture.isRunning }
+
+    /// Tells the daemon to create the virtual microphone device.
+    private func sendMicEnable() {
+        if activeTransport == .usb {
+            usbListener?.sendMicState(isEnabled: true)
+        } else {
+            networkControl?.sendMicState(isEnabled: true)
+        }
+    }
+
+    /// Tells the daemon to destroy the virtual microphone device.
+    private func sendMicDisable() {
+        if activeTransport == .usb {
+            usbListener?.sendMicState(isEnabled: false)
+        } else {
+            networkControl?.sendMicState(isEnabled: false)
+        }
+    }
 
     // MARK: - Speakers / Controllers
 

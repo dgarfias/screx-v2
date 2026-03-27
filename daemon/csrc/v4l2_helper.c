@@ -6,7 +6,7 @@
 
 /* Opens a v4l2loopback device as VIDEO_OUTPUT and sets MJPEG format.
    Returns the open fd on success, or a negative error code. */
-int screx_v4l2_open_output(const char *device, int width, int height) {
+int screx_v4l2_open_output(const char *device, int width, int height, int fps) {
     int fd = open(device, O_RDWR);
     if (fd < 0)
         return -1;
@@ -23,6 +23,19 @@ int screx_v4l2_open_output(const char *device, int width, int height) {
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
         close(fd);
         return -2;
+    }
+
+    if (fps > 0) {
+        struct v4l2_streamparm parm;
+        memset(&parm, 0, sizeof(parm));
+        parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        parm.parm.output.timeperframe.numerator = 1;
+        parm.parm.output.timeperframe.denominator = fps;
+
+        if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+            close(fd);
+            return -3;
+        }
     }
 
     return fd;

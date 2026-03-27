@@ -6,18 +6,22 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 const VIDEO_DEVICE: &str = "/dev/video10";
-const CARD_LABEL: &str = "Screx iPad Camera";
-pub const NETWORK_WIDTH: u32 = 1280;
-pub const NETWORK_HEIGHT: u32 = 720;
-pub const USB_WIDTH: u32 = 1920;
-pub const USB_HEIGHT: u32 = 1080;
+const CARD_LABEL: &str = "Screx Camera";
 const MAX_CAM_CHUNKS: u16 = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CameraConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
 
 extern "C" {
     fn screx_v4l2_open_output(
         device: *const libc::c_char,
         width: libc::c_int,
         height: libc::c_int,
+        fps: libc::c_int,
     ) -> libc::c_int;
 }
 
@@ -31,12 +35,9 @@ impl CamWriter {
     }
 }
 
-pub fn load_v4l2loopback(exclusive_caps: bool) -> Result<()> {
-    // Always reload cleanly to avoid stale device state
+pub fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
     if std::path::Path::new(VIDEO_DEVICE).exists() {
-        println!("[camera] removing stale v4l2loopback...");
-        let _ = Command::new("rmmod").arg("v4l2loopback").status();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        return Ok(());
     }
 
     let exclusive_caps_arg = if exclusive_caps {
@@ -76,12 +77,17 @@ pub fn load_v4l2loopback(exclusive_caps: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn create_cam_writer(width: u32, height: u32) -> Result<CamWriter> {
+pub fn create_cam_writer(config: CameraConfig) -> Result<CamWriter> {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
     let fd = unsafe {
-        screx_v4l2_open_output(device.as_ptr(), width as libc::c_int, height as libc::c_int)
+        screx_v4l2_open_output(
+            device.as_ptr(),
+            config.width as libc::c_int,
+            config.height as libc::c_int,
+            config.fps as libc::c_int,
+        )
     };
 
     match fd {
@@ -93,10 +99,17 @@ pub fn create_cam_writer(width: u32, height: u32) -> Result<CamWriter> {
             "VIDIOC_S_FMT failed on {VIDEO_DEVICE}: {}",
             std::io::Error::last_os_error()
         ),
+        -3 => anyhow::bail!(
+            "VIDIOC_S_PARM failed on {VIDEO_DEVICE}: {}",
+            std::io::Error::last_os_error()
+        ),
         fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
         fd => {
             let file = unsafe { File::from_raw_fd(fd) };
-            println!("[camera] writer ready: {width}x{height} MJPEG -> {VIDEO_DEVICE}");
+            println!(
+                "[camera] writer ready: {}x{} @ {}fps MJPEG -> {VIDEO_DEVICE}",
+                config.width, config.height, config.fps
+            );
             Ok(CamWriter { file })
         }
     }
