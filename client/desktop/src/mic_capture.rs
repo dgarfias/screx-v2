@@ -61,7 +61,6 @@ struct MicEncoder {
     encoder: Encoder,
     accumulator: Vec<f32>,
     mic_seq: u32,
-    encode_buf: Vec<u8>,
 }
 
 impl MicEncoder {
@@ -72,7 +71,6 @@ impl MicEncoder {
             encoder,
             accumulator: Vec::with_capacity(OPUS_FRAME_SAMPLES * 2),
             mic_seq: 0,
-            encode_buf: vec![0u8; OPUS_MAX_PACKET],
         })
     }
 
@@ -80,35 +78,40 @@ impl MicEncoder {
         for &s in samples {
             self.accumulator.push(s as f32 / i16::MAX as f32);
         }
-        while self.accumulator.len() >= OPUS_FRAME_SAMPLES {
-            let frame: Vec<f32> = self.accumulator.drain(..OPUS_FRAME_SAMPLES).collect();
-            self.encode_and_send(&frame, udp);
-        }
+        self.drain_and_send(udp);
     }
 
-    fn encode_and_send(&mut self, frame: &[f32], udp: &UdpSender) {
-        match self.encoder.encode_float(frame, &mut self.encode_buf) {
-            Ok(len) => {
-                let opus_data = &self.encode_buf[..len];
-                let mut packet = Vec::with_capacity(MIC_MAGIC.len() + 4 + opus_data.len());
-                packet.extend_from_slice(MIC_MAGIC);
-                packet.extend_from_slice(&self.mic_seq.to_be_bytes());
-                packet.extend_from_slice(opus_data);
-                self.mic_seq = self.mic_seq.wrapping_add(1);
-                if self.mic_seq == 1 || self.mic_seq % 100 == 0 {
-                    println!(
-                        "[mic_capture] sending opus packet seq={} opus_bytes={} total_bytes={}",
-                        self.mic_seq,
-                        len,
-                        packet.len()
-                    );
+    fn push_mono_f32(&mut self, samples: &[f32], udp: &UdpSender) {
+        self.accumulator.extend_from_slice(samples);
+        self.drain_and_send(udp);
+    }
+
+    fn drain_and_send(&mut self, udp: &UdpSender) {
+        let mut encode_buf = vec![0u8; OPUS_MAX_PACKET];
+        while self.accumulator.len() >= OPUS_FRAME_SAMPLES {
+            let frame: Vec<f32> = self.accumulator.drain(..OPUS_FRAME_SAMPLES).collect();
+            match self.encoder.encode_float(&frame, &mut encode_buf) {
+                Ok(len) => {
+                    let mut packet = Vec::with_capacity(MIC_MAGIC.len() + 4 + len);
+                    packet.extend_from_slice(MIC_MAGIC);
+                    packet.extend_from_slice(&self.mic_seq.to_be_bytes());
+                    packet.extend_from_slice(&encode_buf[..len]);
+                    self.mic_seq = self.mic_seq.wrapping_add(1);
+                    if self.mic_seq == 1 || self.mic_seq % 100 == 0 {
+                        println!(
+                            "[mic_capture] sending opus packet seq={} opus_bytes={} total_bytes={}",
+                            self.mic_seq,
+                            len,
+                            packet.len()
+                        );
+                    }
+                    if let Err(e) = udp.send_encrypted(&packet) {
+                        eprintln!("[mic_capture] send failed: {e}");
+                    }
                 }
-                if let Err(e) = udp.send_encrypted(&packet) {
-                    eprintln!("[mic_capture] send failed: {e}");
+                Err(e) => {
+                    eprintln!("[mic_capture] opus encode error: {e}");
                 }
-            }
-            Err(e) => {
-                eprintln!("[mic_capture] opus encode error: {e}");
             }
         }
     }
@@ -152,7 +155,6 @@ fn pulse_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
     }
 
     #[allow(non_camel_case_types)]
-    #[allow(non_camel_case_types)]
     enum pa_simple {}
 
     #[allow(clashing_extern_declarations)]
@@ -185,7 +187,7 @@ fn pulse_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
         rate: OPUS_SAMPLE_RATE,
         channels: 1,
     };
-    let fragsize = (OPUS_FRAME_SAMPLES * 2) as u32; // 20ms of s16 mono
+    let fragsize = (OPUS_FRAME_SAMPLES * 2) as u32;
     let attr = pa_buffer_attr {
         maxlength: u32::MAX,
         tlength: u32::MAX,
@@ -227,7 +229,7 @@ fn pulse_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
 
     let mut encoder = MicEncoder::new()?;
     let chunk_samples = OPUS_FRAME_SAMPLES;
-    let chunk_bytes = chunk_samples * 2; // s16 mono
+    let chunk_bytes = chunk_samples * 2;
     let mut buf = vec![0i16; chunk_samples];
 
     while !stop.load(Ordering::Relaxed) {
@@ -261,7 +263,10 @@ fn pulse_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
 // ── macOS / Windows: cpal recording ──
 
 #[cfg(not(target_os = "linux"))]
-fn cpal_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
+fn cpal_capture_loop(udp: &Arc<UdpSender>, stop: &Arc<AtomicBool>) -> Result<()> {
+    use std::sync::Mutex;
+
+    use anyhow::Context;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::StreamConfig;
 
@@ -294,7 +299,6 @@ fn cpal_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
             if stop_flag.load(Ordering::Relaxed) {
                 return;
             }
-            // Convert to mono
             let frames = data.len() / hw_channels;
             let mut mono = Vec::with_capacity(frames);
             for i in 0..frames {
@@ -304,7 +308,6 @@ fn cpal_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
                 }
                 mono.push(sum / hw_channels as f32);
             }
-            // TODO: resample if hw_rate != 48kHz
             if let Ok(mut enc) = encoder_cb.lock() {
                 enc.push_mono_f32(&mono, &udp_cb);
             }
@@ -318,8 +321,8 @@ fn cpal_capture_loop(udp: &UdpSender, stop: &Arc<AtomicBool>) -> Result<()> {
     stream.play()?;
 
     println!(
-        "[mic_capture] using cpal: {}ch @ {} Hz",
-        hw_channels, hw_rate.0
+        "[mic_capture] using cpal: {}ch @ {:?}",
+        hw_channels, hw_rate
     );
 
     while !stop.load(Ordering::Relaxed) {
