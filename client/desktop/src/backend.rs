@@ -308,111 +308,137 @@ impl BackendWorker {
 
     fn run(&mut self) {
         while let Ok(command) = self.rx.recv() {
-            match command {
-                BackendCommand::Connect {
-                    host,
-                    speaker_enabled,
-                } => {
-                    self.blank_stream_retry_attempted = false;
-                    self.handle_connect(host, speaker_enabled)
+            // Drain and coalesce: if multiple mouse moves queued, only send the latest
+            let command = self.coalesce_mouse(command);
+            self.dispatch(command);
+        }
+    }
+
+    /// Drain queued commands and keep only the latest mouse move,
+    /// dispatching any non-mouse commands encountered along the way.
+    fn coalesce_mouse(&mut self, initial: BackendCommand) -> BackendCommand {
+        let mut latest = initial;
+        loop {
+            match self.rx.try_recv() {
+                Ok(BackendCommand::SendMouseMove { x, y }) => {
+                    // Replace with newer position, skip the old one
+                    latest = BackendCommand::SendMouseMove { x, y };
                 }
-                BackendCommand::RetryBlankStream { session_id } => {
-                    self.handle_retry_blank_stream(session_id)
+                Ok(other) => {
+                    // Process non-mouse command immediately, keep draining
+                    self.dispatch(other);
                 }
-                BackendCommand::SubmitPin { pin } => self.handle_submit_pin(pin),
-                BackendCommand::Disconnect => self.handle_disconnect(false),
-                BackendCommand::SetSpeaker { enabled } => self.handle_set_speaker(enabled),
-                BackendCommand::SetCameraMode { mode } => self.handle_set_camera_mode(mode),
-                BackendCommand::SetMic { enabled } => self.handle_set_mic(enabled),
-                BackendCommand::SetCamera { enabled } => self.handle_set_camera(enabled),
-                BackendCommand::SetKeyboard { enabled } => {
-                    // Keyboard is always-on when connected; toggle is cosmetic state.
-                    (self.ui)(UiEvent::SetStatus(format!(
-                        "Keyboard forwarding {}.",
-                        if enabled { "active" } else { "paused" }
-                    )));
+                Err(_) => break,
+            }
+        }
+        latest
+    }
+
+    fn dispatch(&mut self, command: BackendCommand) {
+        match command {
+            BackendCommand::Connect {
+                host,
+                speaker_enabled,
+            } => {
+                self.blank_stream_retry_attempted = false;
+                self.handle_connect(host, speaker_enabled)
+            }
+            BackendCommand::RetryBlankStream { session_id } => {
+                self.handle_retry_blank_stream(session_id)
+            }
+            BackendCommand::SubmitPin { pin } => self.handle_submit_pin(pin),
+            BackendCommand::Disconnect => self.handle_disconnect(false),
+            BackendCommand::SetSpeaker { enabled } => self.handle_set_speaker(enabled),
+            BackendCommand::SetCameraMode { mode } => self.handle_set_camera_mode(mode),
+            BackendCommand::SetMic { enabled } => self.handle_set_mic(enabled),
+            BackendCommand::SetCamera { enabled } => self.handle_set_camera(enabled),
+            BackendCommand::SetKeyboard { enabled } => {
+                // Keyboard is always-on when connected; toggle is cosmetic state.
+                (self.ui)(UiEvent::SetStatus(format!(
+                    "Keyboard forwarding {}.",
+                    if enabled { "active" } else { "paused" }
+                )));
+            }
+            BackendCommand::SendKeyAction {
+                qt_key,
+                text,
+                modifiers,
+                pressed,
+            } => {
+                if let Some(ref active) = self.active {
+                    let _ = crate::input::send_qt_key_action(
+                        &active.control,
+                        qt_key,
+                        &text,
+                        modifiers,
+                        pressed,
+                    );
                 }
-                BackendCommand::SendKeyAction {
-                    qt_key,
-                    text,
-                    modifiers,
-                    pressed,
-                } => {
-                    if let Some(ref active) = self.active {
-                        let _ = crate::input::send_qt_key_action(
-                            &active.control,
-                            qt_key,
-                            &text,
-                            modifiers,
-                            pressed,
-                        );
-                    }
+            }
+            BackendCommand::SendMouseMove { x, y } => {
+                if let Some(ref active) = self.active {
+                    let _ = crate::input::send_mouse_abs(&active.control, x, y);
                 }
-                BackendCommand::SendMouseMove { x, y } => {
-                    if let Some(ref active) = self.active {
-                        let _ = crate::input::send_mouse_abs(&active.control, x, y);
-                    }
+            }
+            BackendCommand::SendMouseButton { button, pressed } => {
+                if let Some(ref active) = self.active {
+                    let _ = crate::input::send_mouse_button(&active.control, button, pressed);
                 }
-                BackendCommand::SendMouseButton { button, pressed } => {
-                    if let Some(ref active) = self.active {
-                        let _ = crate::input::send_mouse_button(&active.control, button, pressed);
-                    }
+            }
+            BackendCommand::SendMouseScroll { dy } => {
+                if let Some(ref active) = self.active {
+                    let _ = crate::input::send_mouse_scroll(&active.control, dy);
                 }
-                BackendCommand::SendMouseScroll { dy } => {
-                    if let Some(ref active) = self.active {
-                        let _ = crate::input::send_mouse_scroll(&active.control, dy);
-                    }
+            }
+            BackendCommand::SessionClosed { session_id, reason } => {
+                if self
+                    .active
+                    .as_ref()
+                    .map(|session| session.session_id == session_id)
+                    .unwrap_or(false)
+                {
+                    self.active = None;
+                    self.pending_pairing = None;
+                    (self.ui)(UiEvent::SetConnecting(false));
+                    (self.ui)(UiEvent::ClearPinPrompt);
+                    (self.ui)(UiEvent::SetConnected(false));
+                    (self.ui)(UiEvent::SetSessionTitle("No active session".into()));
+                    (self.ui)(UiEvent::SetStatus(reason));
+                    (self.ui)(UiEvent::SetCodecLabel("Waiting for stream".into()));
+                    (self.ui)(UiEvent::SetResolutionLabel("Pending".into()));
+                    (self.ui)(UiEvent::SetStats {
+                        fps: 0,
+                        bitrate_mbps: 0.0,
+                        latency_ms: 0,
+                        dropped_frames: 0,
+                    });
                 }
-                BackendCommand::SessionClosed { session_id, reason } => {
-                    if self
-                        .active
-                        .as_ref()
-                        .map(|session| session.session_id == session_id)
-                        .unwrap_or(false)
-                    {
-                        self.active = None;
-                        self.pending_pairing = None;
-                        (self.ui)(UiEvent::SetConnecting(false));
-                        (self.ui)(UiEvent::ClearPinPrompt);
-                        (self.ui)(UiEvent::SetConnected(false));
-                        (self.ui)(UiEvent::SetSessionTitle("No active session".into()));
-                        (self.ui)(UiEvent::SetStatus(reason));
-                        (self.ui)(UiEvent::SetCodecLabel("Waiting for stream".into()));
-                        (self.ui)(UiEvent::SetResolutionLabel("Pending".into()));
-                        (self.ui)(UiEvent::SetStats {
-                            fps: 0,
-                            bitrate_mbps: 0.0,
-                            latency_ms: 0,
-                            dropped_frames: 0,
-                        });
-                    }
-                }
-                BackendCommand::LoadConnections => {
-                    self.push_connections_to_ui();
-                }
-                BackendCommand::TogglePinned { host, port } => {
-                    self.storage.toggle_pinned(&host, port);
-                    self.push_connections_to_ui();
-                }
-                BackendCommand::DeleteConnection { host, port } => {
-                    self.storage.delete_connection(&host, port);
-                    self.push_connections_to_ui();
-                }
-                BackendCommand::ClearRecentConnections => {
-                    self.storage.clear_recent_connections();
-                    self.push_connections_to_ui();
-                }
-                BackendCommand::UpdateDaemonHostname {
-                    session_id,
-                    hostname,
-                } => {
-                    if let Some(ref active) = self.active {
-                        if active.session_id == session_id {
-                            let port = active.server_port;
-                            let host = &active.reconnect_host;
-                            self.storage.update_connection_name(host, port, &hostname);
-                            self.push_connections_to_ui();
-                        }
+            }
+            BackendCommand::LoadConnections => {
+                self.push_connections_to_ui();
+            }
+            BackendCommand::TogglePinned { host, port } => {
+                self.storage.toggle_pinned(&host, port);
+                self.push_connections_to_ui();
+            }
+            BackendCommand::DeleteConnection { host, port } => {
+                self.storage.delete_connection(&host, port);
+                self.push_connections_to_ui();
+            }
+            BackendCommand::ClearRecentConnections => {
+                self.storage.clear_recent_connections();
+                self.push_connections_to_ui();
+            }
+            BackendCommand::UpdateDaemonHostname {
+                session_id,
+                hostname,
+            } => {
+                if let Some(ref active) = self.active {
+                    if active.session_id == session_id {
+                        let port = active.server_port;
+                        let host = &active.reconnect_host;
+                        self.storage.update_connection_name(host, port, &hostname);
+                        self.push_connections_to_ui();
                     }
                 }
             }
@@ -420,9 +446,6 @@ impl BackendWorker {
     }
 
     fn handle_connect(&mut self, host_input: String, speaker_enabled: bool) {
-        self.handle_disconnect(true);
-        self.pending_pairing = None;
-
         (self.ui)(UiEvent::ClearPinPrompt);
         (self.ui)(UiEvent::SetConnecting(true));
         (self.ui)(UiEvent::SetConnected(false));
