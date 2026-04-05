@@ -23,11 +23,12 @@ const MOUSE_SCROLL: u8 = 0x03;
 /// `hid_usage`: USB HID usage code (e.g. 0x04 = 'a', 0x28 = Enter).
 /// `pressed`: true for key-down, false for key-up.
 pub fn send_raw_key(control: &ControlSender, hid_usage: u16, pressed: bool) -> Result<()> {
-    let mut payload = Vec::with_capacity(RAWKEY_MAGIC.len() + 3);
-    payload.extend_from_slice(RAWKEY_MAGIC);
-    payload.extend_from_slice(&hid_usage.to_be_bytes());
-    payload.push(if pressed { 1 } else { 0 });
-    control.send_payload(&payload)
+    let mut buf = [0u8; 32];
+    let len = RAWKEY_MAGIC.len() + 3;
+    buf[..RAWKEY_MAGIC.len()].copy_from_slice(RAWKEY_MAGIC);
+    buf[RAWKEY_MAGIC.len()..RAWKEY_MAGIC.len() + 2].copy_from_slice(&hid_usage.to_be_bytes());
+    buf[RAWKEY_MAGIC.len() + 2] = if pressed { 1 } else { 0 };
+    control.send_payload(&buf[..len])
 }
 
 pub fn send_key_text(control: &ControlSender, text: &str) -> Result<()> {
@@ -39,11 +40,12 @@ pub fn send_key_text(control: &ControlSender, text: &str) -> Result<()> {
 }
 
 pub fn send_key_special(control: &ControlSender, code: u8) -> Result<()> {
-    let mut payload = Vec::with_capacity(KEY_MAGIC.len() + 2);
-    payload.extend_from_slice(KEY_MAGIC);
-    payload.push(0x02);
-    payload.push(code);
-    control.send_payload(&payload)
+    let mut buf = [0u8; 16];
+    let len = KEY_MAGIC.len() + 2;
+    buf[..KEY_MAGIC.len()].copy_from_slice(KEY_MAGIC);
+    buf[KEY_MAGIC.len()] = 0x02;
+    buf[KEY_MAGIC.len() + 1] = code;
+    control.send_payload(&buf[..len])
 }
 
 pub fn send_key_combo_text(control: &ControlSender, mods: u8, text: &str) -> Result<()> {
@@ -119,34 +121,32 @@ pub fn send_qt_key_action(
 /// Sends an absolute mouse move to the daemon.
 /// `x`, `y` are in the range 0-65535 (full virtual display area).
 pub fn send_mouse_abs(control: &ControlSender, x: u16, y: u16) -> Result<()> {
-    let mut payload = Vec::with_capacity(MOUSE_MAGIC.len() + 5);
-    payload.extend_from_slice(MOUSE_MAGIC);
-    payload.push(MOUSE_MOVE_ABS);
-    payload.extend_from_slice(&x.to_be_bytes());
-    payload.extend_from_slice(&y.to_be_bytes());
-    control.send_payload(&payload)
+    let mut buf = [0u8; 16];
+    let m = MOUSE_MAGIC.len();
+    buf[..m].copy_from_slice(MOUSE_MAGIC);
+    buf[m] = MOUSE_MOVE_ABS;
+    buf[m + 1..m + 3].copy_from_slice(&x.to_be_bytes());
+    buf[m + 3..m + 5].copy_from_slice(&y.to_be_bytes());
+    control.send_payload(&buf[..m + 5])
 }
 
-/// Sends a mouse button event to the daemon.
-/// `button`: 1=left, 2=right, 3=middle.
-/// `pressed`: true for button-down, false for button-up.
 pub fn send_mouse_button(control: &ControlSender, button: u8, pressed: bool) -> Result<()> {
-    let mut payload = Vec::with_capacity(MOUSE_MAGIC.len() + 3);
-    payload.extend_from_slice(MOUSE_MAGIC);
-    payload.push(MOUSE_BUTTON);
-    payload.push(button);
-    payload.push(if pressed { 1 } else { 0 });
-    control.send_payload(&payload)
+    let mut buf = [0u8; 16];
+    let m = MOUSE_MAGIC.len();
+    buf[..m].copy_from_slice(MOUSE_MAGIC);
+    buf[m] = MOUSE_BUTTON;
+    buf[m + 1] = button;
+    buf[m + 2] = if pressed { 1 } else { 0 };
+    control.send_payload(&buf[..m + 3])
 }
 
-/// Sends a mouse scroll event to the daemon.
-/// `dy`: signed scroll delta (positive = up, negative = down).
 pub fn send_mouse_scroll(control: &ControlSender, dy: i16) -> Result<()> {
-    let mut payload = Vec::with_capacity(MOUSE_MAGIC.len() + 3);
-    payload.extend_from_slice(MOUSE_MAGIC);
-    payload.push(MOUSE_SCROLL);
-    payload.extend_from_slice(&dy.to_be_bytes());
-    control.send_payload(&payload)
+    let mut buf = [0u8; 16];
+    let m = MOUSE_MAGIC.len();
+    buf[..m].copy_from_slice(MOUSE_MAGIC);
+    buf[m] = MOUSE_SCROLL;
+    buf[m + 1..m + 3].copy_from_slice(&dy.to_be_bytes());
+    control.send_payload(&buf[..m + 3])
 }
 
 /// Maps a Qt key code to a USB HID usage code.

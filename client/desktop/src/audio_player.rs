@@ -39,24 +39,47 @@ impl AudioRingBuffer {
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        for &byte in data {
-            if self.count >= RING_CAPACITY {
-                self.read_pos = (self.read_pos + 1) % RING_CAPACITY;
-                self.count -= 1;
-            }
-            self.storage[self.write_pos] = byte;
-            self.write_pos = (self.write_pos + 1) % RING_CAPACITY;
-            self.count += 1;
+        let len = data.len();
+        if len == 0 {
+            return;
         }
+        // If data is larger than capacity, only keep the tail
+        let data = if len > RING_CAPACITY {
+            &data[len - RING_CAPACITY..]
+        } else {
+            data
+        };
+        let len = data.len();
+
+        // Overwrite oldest data if needed
+        if self.count + len > RING_CAPACITY {
+            let overflow = self.count + len - RING_CAPACITY;
+            self.read_pos = (self.read_pos + overflow) % RING_CAPACITY;
+            self.count -= overflow;
+        }
+
+        // Write in up to 2 contiguous chunks (wrap-around)
+        let first = (RING_CAPACITY - self.write_pos).min(len);
+        self.storage[self.write_pos..self.write_pos + first].copy_from_slice(&data[..first]);
+        if first < len {
+            self.storage[..len - first].copy_from_slice(&data[first..]);
+        }
+        self.write_pos = (self.write_pos + len) % RING_CAPACITY;
+        self.count += len;
     }
 
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         let n = out.len().min(self.count);
-        for slot in out[..n].iter_mut() {
-            *slot = self.storage[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % RING_CAPACITY;
-            self.count -= 1;
+        if n == 0 {
+            return 0;
         }
+        let first = (RING_CAPACITY - self.read_pos).min(n);
+        out[..first].copy_from_slice(&self.storage[self.read_pos..self.read_pos + first]);
+        if first < n {
+            out[first..n].copy_from_slice(&self.storage[..n - first]);
+        }
+        self.read_pos = (self.read_pos + n) % RING_CAPACITY;
+        self.count -= n;
         n
     }
 }

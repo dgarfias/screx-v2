@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio_player::AudioPlayer;
 use crate::decoder::{CodecId, VideoDecoder};
 use crate::mic_capture::MicCapture;
-use crate::video_surface::{FrameSlot, RawFrame};
+use crate::video_surface::{FrameSlotRef, RawFrame};
 use crate::webcam_capture::WebcamCapture;
 
 const DEFAULT_PORT: u16 = 9000;
@@ -258,7 +258,7 @@ pub fn load_connections_json() -> String {
     }
 }
 
-pub fn spawn_backend<F>(ui: F, frame_slot: FrameSlot) -> BackendHandle
+pub fn spawn_backend<F>(ui: F, frame_slot: FrameSlotRef) -> BackendHandle
 where
     F: Fn(UiEvent) + Send + Sync + 'static,
 {
@@ -282,7 +282,7 @@ struct BackendWorker {
     active: Option<ActiveSession>,
     pending_pairing: Option<PendingPairing>,
     next_session_id: u64,
-    frame_slot: FrameSlot,
+    frame_slot: FrameSlotRef,
     blank_stream_retry_attempted: bool,
 }
 
@@ -291,7 +291,7 @@ impl BackendWorker {
         rx: Receiver<BackendCommand>,
         tx: Sender<BackendCommand>,
         ui: Arc<dyn Fn(UiEvent) + Send + Sync>,
-        frame_slot: FrameSlot,
+        frame_slot: FrameSlotRef,
     ) -> Self {
         Self {
             rx,
@@ -1162,7 +1162,7 @@ fn spawn_udp_runtime(
     ui: Arc<dyn Fn(UiEvent) + Send + Sync>,
     tx: Sender<BackendCommand>,
     stop: Arc<AtomicBool>,
-    frame_slot: FrameSlot,
+    frame_slot: FrameSlotRef,
     audio_player: Option<Arc<AudioPlayer>>,
 ) {
     let keepalive_udp = Arc::clone(&udp);
@@ -1401,13 +1401,11 @@ fn spawn_udp_runtime(
                                             let h = df.height;
                                             let au_len = annex_b.len();
                                             let t1 = Instant::now();
-                                            if let Ok(mut slot) = frame_slot.lock() {
-                                                *slot = Some(RawFrame {
-                                                    width: df.width,
-                                                    height: df.height,
-                                                    rgba: df.rgba,
-                                                });
-                                            }
+                                            frame_slot.publish(Arc::new(RawFrame {
+                                                width: df.width,
+                                                height: df.height,
+                                                rgba: df.rgba,
+                                            }));
                                             crate::video_surface::request_video_surface_update();
                                             let present_us = t1.elapsed().as_micros();
                                             if decoded_frame_count == 1
@@ -1437,6 +1435,7 @@ fn spawn_udp_runtime(
                     // Prune expired incomplete assemblies — simple retain
                     let now = Instant::now();
                     video_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
+                    audio_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
                 }
                 Err(error)
                     if matches!(
@@ -1481,6 +1480,7 @@ struct ControlWriter {
     stream: TcpStream,
     cipher: SessionCipher,
     seq: u32,
+    send_buf: Vec<u8>,
 }
 
 impl ControlSender {
@@ -1491,6 +1491,7 @@ impl ControlSender {
                 stream,
                 cipher: SessionCipher::new(&session_key)?,
                 seq: 0,
+                send_buf: Vec::with_capacity(512),
             }),
         })
     }
@@ -1505,9 +1506,14 @@ impl ControlSender {
         let encrypted = inner.cipher.encrypt_vec(&nonce, &aad, payload)?;
         let body_len = (aad.len() + encrypted.len()) as u32;
 
-        inner.stream.write_all(&body_len.to_be_bytes())?;
-        inner.stream.write_all(&aad)?;
-        inner.stream.write_all(&encrypted)?;
+        let ControlWriter {
+            stream, send_buf, ..
+        } = &mut *inner;
+        send_buf.clear();
+        send_buf.extend_from_slice(&body_len.to_be_bytes());
+        send_buf.extend_from_slice(&aad);
+        send_buf.extend_from_slice(&encrypted);
+        stream.write_all(send_buf)?;
         Ok(())
     }
 
@@ -1565,7 +1571,13 @@ impl ControlSender {
 pub struct UdpSender {
     pub socket: UdpSocket,
     pub session_key: [u8; 32],
-    seq: Mutex<u32>,
+    inner: Mutex<UdpSenderInner>,
+}
+
+struct UdpSenderInner {
+    cipher: SessionCipher,
+    seq: u32,
+    send_buf: Vec<u8>,
 }
 
 impl UdpSender {
@@ -1578,23 +1590,26 @@ impl UdpSender {
         Ok(Self {
             socket,
             session_key,
-            seq: Mutex::new(0),
+            inner: Mutex::new(UdpSenderInner {
+                cipher: SessionCipher::new(&session_key)?,
+                seq: 0,
+                send_buf: Vec::with_capacity(2048),
+            }),
         })
     }
 
     pub fn send_encrypted(&self, payload: &[u8]) -> Result<()> {
-        let cipher = SessionCipher::new(&self.session_key)?;
-        let mut seq = self.seq.lock().unwrap();
-        let aad = seq.to_be_bytes();
-        let nonce = nonce_client(*seq);
-        let encrypted = cipher.encrypt_vec(&nonce, &aad, payload)?;
-        *seq = seq.wrapping_add(1);
+        let mut inner = self.inner.lock().unwrap();
+        let aad = inner.seq.to_be_bytes();
+        let nonce = nonce_client(inner.seq);
+        let encrypted = inner.cipher.encrypt_vec(&nonce, &aad, payload)?;
+        inner.seq = inner.seq.wrapping_add(1);
 
-        let mut packet = Vec::with_capacity(4 + encrypted.len());
-        packet.extend_from_slice(&aad);
-        packet.extend_from_slice(&encrypted);
+        inner.send_buf.clear();
+        inner.send_buf.extend_from_slice(&aad);
+        inner.send_buf.extend_from_slice(&encrypted);
         self.socket
-            .send(&packet)
+            .send(&inner.send_buf)
             .context("send encrypted UDP packet")?;
         Ok(())
     }
@@ -1802,6 +1817,7 @@ impl FrameAssembly {
 
 struct AudioAssembly {
     total_data: usize,
+    created_at: Instant,
     shards: HashMap<usize, Vec<u8>>,
 }
 
@@ -1809,6 +1825,7 @@ impl AudioAssembly {
     fn new(total_data: usize) -> Self {
         Self {
             total_data,
+            created_at: Instant::now(),
             shards: HashMap::new(),
         }
     }

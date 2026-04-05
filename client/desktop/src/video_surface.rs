@@ -5,8 +5,8 @@
 // scene graph callback uploads the latest frame into a QSGImageNode.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use cpp::cpp;
 use qmetaobject::prelude::*;
@@ -25,28 +25,74 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
 }
 
-pub type FrameSlot = Arc<Mutex<Option<RawFrame>>>;
+/// Lock-free frame slot: writer publishes Arc<RawFrame> via atomic pointer swap.
+/// Reader takes the latest frame without blocking the writer.
+pub struct FrameSlot {
+    ptr: AtomicPtr<Arc<RawFrame>>,
+}
 
-static GLOBAL_FRAME_SLOT: OnceLock<FrameSlot> = OnceLock::new();
+impl FrameSlot {
+    pub fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// Publish a new frame. Returns immediately without blocking.
+    pub fn publish(&self, frame: Arc<RawFrame>) {
+        let boxed = Box::into_raw(Box::new(frame));
+        let old = self.ptr.swap(boxed, Ordering::AcqRel);
+        if !old.is_null() {
+            // Drop the old frame
+            unsafe { drop(Box::from_raw(old)) };
+        }
+    }
+
+    /// Take the latest frame if one is available. Non-blocking.
+    pub fn take_latest(&self) -> Option<Arc<RawFrame>> {
+        let ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { *Box::from_raw(ptr) })
+        }
+    }
+}
+
+impl Drop for FrameSlot {
+    fn drop(&mut self) {
+        let ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
+    }
+}
+
+unsafe impl Send for FrameSlot {}
+unsafe impl Sync for FrameSlot {}
+
+pub type FrameSlotRef = Arc<FrameSlot>;
+
+static GLOBAL_FRAME_SLOT: OnceLock<FrameSlotRef> = OnceLock::new();
 static REQUEST_UPDATE: OnceLock<Box<dyn Fn(()) + Send + Sync>> = OnceLock::new();
 static UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
 static UPDATE_COUNT: AtomicU64 = AtomicU64::new(0);
 static UPDATE_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub fn init_global_frame_slot() -> FrameSlot {
+pub fn init_global_frame_slot() -> FrameSlotRef {
     if let Some(existing) = GLOBAL_FRAME_SLOT.get() {
         return existing.clone();
     }
-    let slot = Arc::new(Mutex::new(None));
+    let slot = Arc::new(FrameSlot::new());
     let _ = GLOBAL_FRAME_SLOT.set(slot.clone());
     slot
 }
 
-fn global_frame_slot() -> Option<&'static FrameSlot> {
+fn global_frame_slot() -> Option<&'static FrameSlotRef> {
     GLOBAL_FRAME_SLOT.get()
 }
 
-pub fn global_frame_slot_clone() -> FrameSlot {
+pub fn global_frame_slot_clone() -> FrameSlotRef {
     init_global_frame_slot()
 }
 
@@ -77,6 +123,7 @@ pub struct VideoSurface {
     pub content_width: qt_property!(f64; NOTIFY content_rect_changed),
     pub content_height: qt_property!(f64; NOTIFY content_rect_changed),
     pub content_rect_changed: qt_signal!(),
+    current_frame: Option<Arc<RawFrame>>,
 }
 
 impl Default for VideoSurface {
@@ -88,6 +135,7 @@ impl Default for VideoSurface {
             content_width: 0.0,
             content_height: 0.0,
             content_rect_changed: Default::default(),
+            current_frame: None,
         }
     }
 }
@@ -122,11 +170,13 @@ impl QQuickItem for VideoSurface {
             Some(s) => s,
             None => return node,
         };
-        let guard = match slot.lock() {
-            Ok(g) => g,
-            Err(_) => return node,
-        };
-        let frame = match guard.as_ref() {
+
+        // Take latest frame from the lock-free slot. If a new frame arrived
+        // since last paint, use it and keep it for future paints.
+        if let Some(new_frame) = slot.take_latest() {
+            self.current_frame = Some(new_frame);
+        }
+        let frame = match self.current_frame.as_ref() {
             Some(f) => f,
             None => {
                 let count = UPDATE_COUNT.load(Ordering::Relaxed);
@@ -202,8 +252,7 @@ impl QQuickItem for VideoSurface {
             }
 
             QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBX8888);
-            auto ownedImage = image.copy();
-            auto texture = window->createTextureFromImage(ownedImage, QQuickWindow::TextureIsOpaque);
+            auto texture = window->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
             texture->setFiltering(QSGTexture::Linear);
             imageNode->setTexture(texture);
             imageNode->setFiltering(QSGTexture::Linear);
