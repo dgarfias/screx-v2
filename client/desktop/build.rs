@@ -7,9 +7,12 @@ fn main() {
     {
         println!("cargo:rustc-link-lib=pulse-simple");
         println!("cargo:rustc-link-lib=pulse");
-        // VA-API + EGL for zero-copy video display
+        // VA-API + EGL + GL for zero-copy video display
         println!("cargo:rustc-link-lib=va");
+        println!("cargo:rustc-link-lib=va-drm");
         println!("cargo:rustc-link-lib=EGL");
+        println!("cargo:rustc-link-lib=GLESv2");
+        println!("cargo:rustc-link-lib=drm");
     }
 
     // macOS frameworks for zero-copy video display
@@ -40,6 +43,29 @@ fn main() {
     config
         .include(&qt_include_path)
         .include(format!("{qt_include_path}/QtGui"))
-        .include(format!("{qt_include_path}/QtCore"))
-        .build("src/main.rs");
+        .include(format!("{qt_include_path}/QtCore"));
+
+    // On Linux, add include paths for VA-API, EGL, libdrm, and FFmpeg headers
+    // which are used in the cpp! blocks in video_surface.rs.
+    #[cfg(target_os = "linux")]
+    {
+        // pkg-config paths for libva, egl, glesv2, libdrm, libavutil
+        for pkg in &["libva", "egl", "glesv2", "libdrm", "libavutil"] {
+            if let Ok(output) = std::process::Command::new("pkg-config")
+                .args(["--cflags-only-I", pkg])
+                .output()
+            {
+                if output.status.success() {
+                    let flags = String::from_utf8_lossy(&output.stdout);
+                    for flag in flags.split_whitespace() {
+                        if let Some(path) = flag.strip_prefix("-I") {
+                            config.include(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    config.build("src/main.rs");
 }

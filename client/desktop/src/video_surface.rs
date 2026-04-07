@@ -32,6 +32,22 @@ cpp! {{
     #include <CoreVideo/CoreVideo.h>
     #include <Metal/Metal.h>
     #endif
+    #ifdef __linux__
+    #include <EGL/egl.h>
+    #include <EGL/eglext.h>
+    #include <GLES2/gl2.h>
+    #include <GLES2/gl2ext.h>
+    // VA-API headers
+    #include <va/va.h>
+    #include <va/va_drmcommon.h>
+    // For the FFmpeg AVHWFramesContext/AVVAAPIDeviceContext structs
+    extern "C" {
+    #include <libavutil/hwcontext.h>
+    #include <libavutil/hwcontext_vaapi.h>
+    }
+    #include <unistd.h>  // close()
+    #include <drm_fourcc.h>
+    #endif
 }}
 
 pub struct RawFrame {
@@ -440,22 +456,283 @@ fn render_hw_frame_macos(
 
 // ---------------------------------------------------------------------------
 // Linux zero-copy: VA-API → DMA-BUF → EGLImage → GL texture → QSGOpenGLTexture
-// (Placeholder — not yet implemented)
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 fn render_hw_frame_linux(
-    _hw_frame: &HwFrame,
+    hw_frame: &HwFrame,
     raw_node: *mut c_void,
-    _item_ptr: *mut c_void,
-    _dest_x: f64,
-    _dest_y: f64,
-    _dest_w: f64,
-    _dest_h: f64,
+    item_ptr: *mut c_void,
+    dest_x: f64,
+    dest_y: f64,
+    dest_w: f64,
+    dest_h: f64,
 ) -> *mut c_void {
-    // TODO: Implement VA-API → EGL DMA-BUF → GL texture zero-copy path
-    eprintln!("[video_surface] Linux VA-API zero-copy not yet implemented, frame dropped");
-    raw_node
+    let surface_ptr = hw_frame.native_surface_ptr(); // VASurfaceID as void*
+    let frames_ctx = hw_frame.hw_frames_ctx(); // AVBufferRef*
+    let w = hw_frame.width as i32;
+    let h = hw_frame.height as i32;
+    let mut out_node = raw_node;
+
+    cpp!(unsafe [
+        mut out_node as "void*",
+        item_ptr as "QQuickItem*",
+        surface_ptr as "void*",
+        frames_ctx as "void*",    // AVBufferRef*
+        w as "int",
+        h as "int",
+        dest_x as "double",
+        dest_y as "double",
+        dest_w as "double",
+        dest_h as "double"
+    ] {
+        #ifdef __linux__
+        if (!item_ptr || !surface_ptr || !frames_ctx) return;
+        auto window = item_ptr->window();
+        if (!window) return;
+
+        // Verify Qt is using OpenGL
+        auto ri = window->rendererInterface();
+        if (!ri || ri->graphicsApi() != QSGRendererInterface::OpenGL) {
+            static bool s_warned = false;
+            if (!s_warned) {
+                qWarning("[video_surface/linux] Qt not using OpenGL (api=%d), cannot zero-copy",
+                         (int)ri->graphicsApi());
+                s_warned = true;
+            }
+            return;
+        }
+
+        // --- Extract VADisplay from FFmpeg's hw_frames_ctx ---
+        auto bufRef = static_cast<AVBufferRef*>(frames_ctx);
+        auto hwFramesCtx = reinterpret_cast<AVHWFramesContext*>(bufRef->data);
+        auto vaDevCtx = static_cast<AVVAAPIDeviceContext*>(hwFramesCtx->device_ctx->hwctx);
+        VADisplay vaDisplay = vaDevCtx->display;
+
+        VASurfaceID surfaceId = (VASurfaceID)(uintptr_t)surface_ptr;
+
+        // --- Persistent state ---
+        // EGL function pointers (resolved once via eglGetProcAddress)
+        static PFNEGLCREATEIMAGEKHRPROC s_eglCreateImageKHR = nullptr;
+        static PFNEGLDESTROYIMAGEKHRPROC s_eglDestroyImageKHR = nullptr;
+        static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC s_glEGLImageTargetTexture2DOES = nullptr;
+
+        // Ring buffer: we keep 2 frames worth of resources alive (current + previous)
+        // to avoid destroying a texture Qt's render pipeline is still using.
+        struct FrameResources {
+            EGLImageKHR eglImage = EGL_NO_IMAGE_KHR;
+            GLuint texId = 0;
+            int dmaBufFd = -1;
+        };
+        static FrameResources s_ring[2] = {};
+        static int s_ringIdx = 0;
+
+        // --- One-time EGL function resolution ---
+        if (!s_eglCreateImageKHR) {
+            s_eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)
+                eglGetProcAddress("eglCreateImageKHR");
+            s_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)
+                eglGetProcAddress("eglDestroyImageKHR");
+            s_glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
+                eglGetProcAddress("glEGLImageTargetTexture2DOES");
+            if (!s_eglCreateImageKHR || !s_eglDestroyImageKHR || !s_glEGLImageTargetTexture2DOES) {
+                qWarning("[video_surface/linux] required EGL extensions not available");
+                s_eglCreateImageKHR = nullptr;
+                return;
+            }
+        }
+
+        EGLDisplay eglDisplay = eglGetCurrentDisplay();
+        if (eglDisplay == EGL_NO_DISPLAY) {
+            static bool s_warned2 = false;
+            if (!s_warned2) {
+                qWarning("[video_surface/linux] no current EGL display");
+                s_warned2 = true;
+            }
+            return;
+        }
+
+        // --- Release oldest frame resources (from 2 frames ago) ---
+        auto& old = s_ring[s_ringIdx];
+        if (old.eglImage != EGL_NO_IMAGE_KHR) {
+            s_eglDestroyImageKHR(eglDisplay, old.eglImage);
+            old.eglImage = EGL_NO_IMAGE_KHR;
+        }
+        if (old.texId) {
+            glDeleteTextures(1, &old.texId);
+            old.texId = 0;
+        }
+        if (old.dmaBufFd >= 0) {
+            close(old.dmaBufFd);
+            old.dmaBufFd = -1;
+        }
+
+        // --- Sync VA-API surface (ensure decode is complete) ---
+        VAStatus vaSt = vaSyncSurface(vaDisplay, surfaceId);
+        if (vaSt != VA_STATUS_SUCCESS) {
+            qWarning("[video_surface/linux] vaSyncSurface failed: %d", vaSt);
+            return;
+        }
+
+        // --- Export DMA-BUF from VA-API surface ---
+        VADRMPRIMESurfaceDescriptor desc = {};
+        vaSt = vaExportSurfaceHandle(
+            vaDisplay, surfaceId,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+            &desc);
+        if (vaSt != VA_STATUS_SUCCESS) {
+            qWarning("[video_surface/linux] vaExportSurfaceHandle failed: %d", vaSt);
+            return;
+        }
+
+        // We only handle the first object (DMA-BUF fd).
+        // COMPOSED_LAYERS gives us a single layer with potentially multiple planes.
+        if (desc.num_objects < 1 || desc.num_layers < 1) {
+            for (uint32_t i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
+            qWarning("[video_surface/linux] unexpected descriptor: objects=%u layers=%u",
+                     desc.num_objects, desc.num_layers);
+            return;
+        }
+
+        // Build EGL attributes for DMA-BUF import.
+        // The composed layer has the DRM fourcc and per-plane offset/pitch.
+        auto& layer = desc.layers[0];
+        EGLint attribs[64];
+        int ai = 0;
+        attribs[ai++] = EGL_WIDTH;
+        attribs[ai++] = (EGLint)desc.width;
+        attribs[ai++] = EGL_HEIGHT;
+        attribs[ai++] = (EGLint)desc.height;
+        attribs[ai++] = EGL_LINUX_DRM_FOURCC_EXT;
+        attribs[ai++] = (EGLint)layer.drm_format;
+
+        // Plane 0
+        if (layer.num_planes >= 1) {
+            attribs[ai++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+            attribs[ai++] = desc.objects[layer.object_index[0]].fd;
+            attribs[ai++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+            attribs[ai++] = (EGLint)layer.offset[0];
+            attribs[ai++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+            attribs[ai++] = (EGLint)layer.pitch[0];
+            if (desc.objects[layer.object_index[0]].drm_format_modifier != 0 &&
+                desc.objects[layer.object_index[0]].drm_format_modifier != DRM_FORMAT_MOD_INVALID) {
+                attribs[ai++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[0]].drm_format_modifier & 0xFFFFFFFF);
+                attribs[ai++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[0]].drm_format_modifier >> 32);
+            }
+        }
+        // Plane 1 (UV for NV12)
+        if (layer.num_planes >= 2) {
+            attribs[ai++] = EGL_DMA_BUF_PLANE1_FD_EXT;
+            attribs[ai++] = desc.objects[layer.object_index[1]].fd;
+            attribs[ai++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
+            attribs[ai++] = (EGLint)layer.offset[1];
+            attribs[ai++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
+            attribs[ai++] = (EGLint)layer.pitch[1];
+            if (desc.objects[layer.object_index[1]].drm_format_modifier != 0 &&
+                desc.objects[layer.object_index[1]].drm_format_modifier != DRM_FORMAT_MOD_INVALID) {
+                attribs[ai++] = EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT;
+                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[1]].drm_format_modifier & 0xFFFFFFFF);
+                attribs[ai++] = EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT;
+                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[1]].drm_format_modifier >> 32);
+            }
+        }
+        // Plane 2 (rare, e.g. planar YUV420)
+        if (layer.num_planes >= 3) {
+            attribs[ai++] = EGL_DMA_BUF_PLANE2_FD_EXT;
+            attribs[ai++] = desc.objects[layer.object_index[2]].fd;
+            attribs[ai++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
+            attribs[ai++] = (EGLint)layer.offset[2];
+            attribs[ai++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
+            attribs[ai++] = (EGLint)layer.pitch[2];
+        }
+        attribs[ai++] = EGL_NONE;
+
+        // --- Create EGLImage from DMA-BUF ---
+        EGLImageKHR eglImage = s_eglCreateImageKHR(
+            eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+
+        // Close extra DMA-BUF fds we won't track (EGL has imported them).
+        // We keep fds alive until the ring slot is recycled; actually EGL
+        // may have dup'd them internally but being safe is better.
+        // Store the primary fd for cleanup; close any extras now.
+        int primaryFd = desc.objects[0].fd;
+        for (uint32_t i = 1; i < desc.num_objects; i++) {
+            close(desc.objects[i].fd);
+        }
+
+        if (eglImage == EGL_NO_IMAGE_KHR) {
+            close(primaryFd);
+            static bool s_warnedEgl = false;
+            if (!s_warnedEgl) {
+                qWarning("[video_surface/linux] eglCreateImageKHR failed (EGL error 0x%x), "
+                         "format=0x%08x planes=%u",
+                         eglGetError(), layer.drm_format, layer.num_planes);
+                s_warnedEgl = true;
+            }
+            return;
+        }
+
+        // --- Create GL texture from EGLImage ---
+        GLuint texId = 0;
+        glGenTextures(1, &texId);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, texId);
+        s_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, eglImage);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+        // Store in ring for deferred cleanup
+        old.eglImage = eglImage;
+        old.texId = texId;
+        old.dmaBufFd = primaryFd;
+        s_ringIdx = (s_ringIdx + 1) & 1;
+
+        // --- Wrap in QSGTexture ---
+        auto qsgTexture = QNativeInterface::QSGOpenGLTexture::fromNativeExternalOES(
+            texId, window, QSize(w, h), QQuickWindow::TextureIsOpaque);
+        if (!qsgTexture) {
+            static bool s_warnedQt = false;
+            if (!s_warnedQt) {
+                qWarning("[video_surface/linux] fromNativeExternalOES returned null");
+                s_warnedQt = true;
+            }
+            return;
+        }
+        qsgTexture->setFiltering(QSGTexture::Linear);
+
+        // --- Set up scene graph node ---
+        auto imageNode = static_cast<QSGImageNode*>((QSGNode*)out_node);
+        if (!imageNode) {
+            imageNode = window->createImageNode();
+            if (!imageNode) {
+                delete qsgTexture;
+                return;
+            }
+            imageNode->setOwnsTexture(false);
+            imageNode->setFiltering(QSGTexture::Linear);
+        }
+
+        auto oldTex = imageNode->texture();
+        imageNode->setTexture(qsgTexture);
+        if (oldTex) delete oldTex;
+
+        imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
+        imageNode->setSourceRect(0, 0, w, h);
+        out_node = (void*)imageNode;
+
+        static int s_frameCount = 0;
+        s_frameCount++;
+        if (s_frameCount <= 5 || (s_frameCount & 0xFF) == 0) {
+            qDebug("[video_surface/linux] zero-copy frame #%d: %dx%d fmt=0x%08x planes=%u node=%p",
+                   s_frameCount, w, h, layer.drm_format, layer.num_planes, imageNode);
+        }
+        #endif // __linux__
+    });
+
+    out_node
 }
 
 // ---------------------------------------------------------------------------
