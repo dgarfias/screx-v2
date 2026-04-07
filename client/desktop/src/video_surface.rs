@@ -859,6 +859,26 @@ fn render_hw_frame_windows(
             if (!window) return;
 
             auto *nv12Tex = static_cast<ID3D11Texture2D*>(surface_ptr);
+            auto *ri = window->rendererInterface();
+            if (!ri || ri->graphicsApi() != QSGRendererInterface::Direct3D11) {
+                static bool s_warnedApi = false;
+                if (!s_warnedApi) {
+                    qWarning("[video/win] Qt is not using Direct3D11 (api=%d)",
+                             ri ? int(ri->graphicsApi()) : -1);
+                    s_warnedApi = true;
+                }
+                return;
+            }
+            auto *qtDevice = static_cast<ID3D11Device*>(
+                ri->getResource(window, QSGRendererInterface::DeviceResource));
+            if (!qtDevice) {
+                static bool s_warnedQtDev = false;
+                if (!s_warnedQtDev) {
+                    qWarning("[video/win] Qt D3D11 device not available");
+                    s_warnedQtDev = true;
+                }
+                return;
+            }
 
             // --- Persistent state (created once, reused across frames) ---
             static ID3D11VideoDevice           *s_videoDevice    = nullptr;
@@ -866,6 +886,7 @@ fn render_hw_frame_windows(
             static ID3D11VideoProcessorEnumerator *s_enumerator  = nullptr;
             static ID3D11VideoProcessor        *s_videoProc      = nullptr;
             static ID3D11Texture2D             *s_bgraTex        = nullptr;
+            static ID3D11Texture2D             *s_qtTex          = nullptr;
             static ID3D11VideoProcessorOutputView *s_outputView  = nullptr;
             static int s_outW = 0, s_outH = 0;
 
@@ -898,6 +919,7 @@ fn render_hw_frame_windows(
             if (s_outW != w || s_outH != h) {
                 // Release old resources
                 if (s_outputView)  { s_outputView->Release();  s_outputView  = nullptr; }
+                if (s_qtTex)       { s_qtTex->Release();       s_qtTex       = nullptr; }
                 if (s_bgraTex)     { s_bgraTex->Release();     s_bgraTex     = nullptr; }
                 if (s_videoProc)   { s_videoProc->Release();   s_videoProc   = nullptr; }
                 if (s_enumerator)  { s_enumerator->Release();  s_enumerator  = nullptr; }
@@ -948,6 +970,7 @@ fn render_hw_frame_windows(
                 outDesc.SampleDesc.Count = 1;
                 outDesc.Usage            = D3D11_USAGE_DEFAULT;
                 outDesc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                outDesc.MiscFlags        = D3D11_RESOURCE_MISC_SHARED;
 
                 hr = device->CreateTexture2D(&outDesc, nullptr, &s_bgraTex);
                 if (FAILED(hr)) {
@@ -955,6 +978,43 @@ fn render_hw_frame_windows(
                     s_videoProc->Release();  s_videoProc  = nullptr;
                     s_enumerator->Release(); s_enumerator = nullptr;
                     return;
+                }
+
+                if (qtDevice != device) {
+                    IDXGIResource *dxgiRes = nullptr;
+                    hr = s_bgraTex->QueryInterface(
+                        __uuidof(IDXGIResource),
+                        reinterpret_cast<void**>(&dxgiRes));
+                    if (FAILED(hr) || !dxgiRes) {
+                        qWarning("[video/win] QueryInterface(IDXGIResource) failed: 0x%08lx", hr);
+                        s_bgraTex->Release();    s_bgraTex    = nullptr;
+                        s_videoProc->Release();  s_videoProc  = nullptr;
+                        s_enumerator->Release(); s_enumerator = nullptr;
+                        return;
+                    }
+
+                    HANDLE sharedHandle = nullptr;
+                    hr = dxgiRes->GetSharedHandle(&sharedHandle);
+                    dxgiRes->Release();
+                    if (FAILED(hr) || !sharedHandle) {
+                        qWarning("[video/win] GetSharedHandle failed: 0x%08lx", hr);
+                        s_bgraTex->Release();    s_bgraTex    = nullptr;
+                        s_videoProc->Release();  s_videoProc  = nullptr;
+                        s_enumerator->Release(); s_enumerator = nullptr;
+                        return;
+                    }
+
+                    hr = qtDevice->OpenSharedResource(
+                        sharedHandle,
+                        __uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&s_qtTex));
+                    if (FAILED(hr) || !s_qtTex) {
+                        qWarning("[video/win] OpenSharedResource failed: 0x%08lx", hr);
+                        s_bgraTex->Release();    s_bgraTex    = nullptr;
+                        s_videoProc->Release();  s_videoProc  = nullptr;
+                        s_enumerator->Release(); s_enumerator = nullptr;
+                        return;
+                    }
                 }
 
                 // Create output view
@@ -974,7 +1034,8 @@ fn render_hw_frame_windows(
 
                 s_outW = w;
                 s_outH = h;
-                qDebug("[video/win] D3D11 video processor created: %dx%d", w, h);
+                qDebug("[video/win] D3D11 video processor created: %dx%d shared=%s", w, h,
+                       qtDevice != device ? "yes" : "no");
             }
 
             // --- Per-frame: create input view for this array slice ---
@@ -1010,8 +1071,9 @@ fn render_hw_frame_windows(
             }
 
             // --- Wrap BGRA texture in QSGTexture via QSGD3D11Texture ---
+            ID3D11Texture2D *qtTex = s_qtTex ? s_qtTex : s_bgraTex;
             auto qsgTex = QNativeInterface::QSGD3D11Texture::fromNative(
-                static_cast<void*>(s_bgraTex), window, QSize(w, h),
+                static_cast<void*>(qtTex), window, QSize(w, h),
                 QQuickWindow::TextureIsOpaque);
             if (!qsgTex) {
                 static bool s_warned = false;
