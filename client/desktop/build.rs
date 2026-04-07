@@ -78,22 +78,20 @@ fn main() {
     // The D3D11/DXGI headers come from the Windows SDK (already in MSVC include path).
     #[cfg(target_os = "windows")]
     {
-        // Try to get FFmpeg include path from pkg-config or DEP env vars
-        if let Ok(ffmpeg_include) = std::env::var("DEP_FFMPEG_INCLUDE") {
-            config.include(&ffmpeg_include);
+        // FFMPEG_DIR is set by the user (same var that ffmpeg-sys-next uses).
+        // Expected layout: FFMPEG_DIR/include/libavutil/hwcontext.h
+        let mut found = false;
+        if let Ok(ffmpeg_dir) = std::env::var("FFMPEG_DIR") {
+            let inc = std::path::PathBuf::from(&ffmpeg_dir).join("include");
+            if inc.exists() {
+                config.include(&inc);
+                found = true;
+            }
         }
-        // Fallback: try pkg-config for libavutil
-        if let Ok(output) = std::process::Command::new("pkg-config")
-            .args(["--cflags-only-I", "libavutil"])
-            .output()
-        {
-            if output.status.success() {
-                let flags = String::from_utf8_lossy(&output.stdout);
-                for flag in flags.split_whitespace() {
-                    if let Some(path) = flag.strip_prefix("-I") {
-                        config.include(path);
-                    }
-                }
+        if !found {
+            // Fallback: try DEP_FFMPEG_INCLUDE (set by some ffmpeg-sys builds)
+            if let Ok(ffmpeg_include) = std::env::var("DEP_FFMPEG_INCLUDE") {
+                config.include(&ffmpeg_include);
             }
         }
     }
