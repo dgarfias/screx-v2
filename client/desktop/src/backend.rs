@@ -229,6 +229,7 @@ pub enum UiEvent {
     PinRequired(String),
     ClearPinPrompt,
     SetConnections(Vec<RecentConnection>),
+    SetCameraEnabled(bool),
 }
 
 /// Load connections from disk as JSON string for eager UI initialization.
@@ -809,6 +810,7 @@ impl BackendWorker {
                         Err(e) => {
                             // Camera open failed — tell daemon to tear down
                             let _ = active.control.send_camera_disable();
+                            (self.ui)(UiEvent::SetCameraEnabled(false));
                             (self.ui)(UiEvent::SetStatus(format!("Webcam start failed: {e:#}")));
                         }
                     }

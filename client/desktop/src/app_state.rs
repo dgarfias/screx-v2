@@ -444,6 +444,10 @@ impl AppState {
             }
             UiEvent::PinRequired(value) => self.set_pin_prompt_text(&value),
             UiEvent::ClearPinPrompt => self.set_pin_prompt_text(""),
+            UiEvent::SetCameraEnabled(value) => {
+                self.camera_enabled = value;
+                self.camera_enabled_changed();
+            }
             UiEvent::SetConnections(conns) => {
                 #[derive(serde::Serialize)]
                 struct Entry {
