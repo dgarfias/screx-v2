@@ -26,6 +26,10 @@ serde_json = "1"
 cpp_build = "0.5"
 semver = "1"
 
+[target.'cfg(windows)'.build-dependencies]
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+winresource = "0.1"
+
 [profile.dev]
 debug = 1
 

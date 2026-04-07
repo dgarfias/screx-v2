@@ -898,6 +898,8 @@ fn render_hw_frame_windows(
             auto *d3d11DevCtx = static_cast<AVD3D11VADeviceContext*>(framesCtx->device_ctx->hwctx);
             ID3D11Device *device = d3d11DevCtx->device;
             ID3D11DeviceContext *devCtx = d3d11DevCtx->device_context;
+            D3D11_TEXTURE2D_DESC srcDesc = {};
+            nv12Tex->GetDesc(&srcDesc);
 
             // --- One-time init: video device + video context ---
             if (!s_videoDevice) {
@@ -1105,6 +1107,13 @@ fn render_hw_frame_windows(
             stream.Enable        = TRUE;
             stream.pInputSurface = inputView;
 
+            RECT srcRect = { 0, 0, w, h };
+            RECT dstRect = { 0, 0, w, h };
+            RECT outRect = { 0, 0, w, h };
+            s_videoContext->VideoProcessorSetStreamSourceRect(s_videoProc, 0, TRUE, &srcRect);
+            s_videoContext->VideoProcessorSetStreamDestRect(s_videoProc, 0, TRUE, &dstRect);
+            s_videoContext->VideoProcessorSetOutputTargetRect(s_videoProc, TRUE, &outRect);
+
             // Use FFmpeg's lock to protect the device context (it's shared)
             d3d11DevCtx->lock(d3d11DevCtx->lock_ctx);
             hr = s_videoContext->VideoProcessorBlt(s_videoProc, s_outputView, 0, 1, &stream);
@@ -1177,8 +1186,8 @@ fn render_hw_frame_windows(
             static int s_fc = 0;
             s_fc++;
             if (s_fc <= 5 || (s_fc & 0xFF) == 0) {
-                qDebug("[video/win] zero-copy frame #%d: %dx%d slice=%u node=%p",
-                       s_fc, w, h, array_index, imageNode);
+                qDebug("[video/win] zero-copy frame #%d: visible=%dx%d tex=%ux%u slice=%u node=%p",
+                       s_fc, w, h, srcDesc.Width, srcDesc.Height, array_index, imageNode);
             }
             #endif // _WIN32
         });

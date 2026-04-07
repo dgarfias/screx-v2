@@ -1,4 +1,5 @@
 #![recursion_limit = "2048"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app_state;
 mod audio_player;

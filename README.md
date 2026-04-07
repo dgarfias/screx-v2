@@ -1,10 +1,15 @@
 # Screx
 
-Screx turns an iPad into a low-latency remote display for a Linux machine.
+Screx turns a Linux machine into a low-latency remote display host for iPad and desktop clients.
 
-You run a Linux daemon that creates a virtual monitor, then connect from the iPad app over Wi‑Fi or USB. The app can also forward touch, keyboard, mouse, controllers, microphone, speakers, and camera.
+You run a Linux daemon that creates a virtual monitor, then connect from either the iPad app or the desktop client over Wi-Fi or USB. The clients can also forward touch, keyboard, mouse, controllers, microphone, speakers, and camera.
 
 For implementation details and protocol documentation, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Clients
+
+- `client/ipad`: native iPad app for iPadOS
+- `client/desktop`: desktop client for macOS, Windows, and Linux
 
 ## Dependencies
 
@@ -66,6 +71,38 @@ cargo build --release
 
 Open `client/ipad/Screx.xcodeproj` in Xcode and build it to an iPad running iPadOS 16 or later.
 
+### Desktop client
+
+The desktop client lives in `client/desktop` and supports macOS, Windows, and Linux.
+
+It requires:
+
+- Rust
+- Qt 6 with Qt Quick / QML
+- FFmpeg development libraries
+
+#### macOS / Linux
+
+```bash
+cd client/desktop
+make build
+```
+
+- macOS output: `client/desktop/target/release/Screx.app`
+- Linux output: `client/desktop/target/release/screx-desktop`
+
+#### Windows
+
+Build from an x64 Visual Studio developer prompt with Qt on `PATH` and `FFMPEG_DIR` set to an FFmpeg `full_build-shared` directory.
+
+```bat
+cd client\desktop
+cargo build --release
+bundle-windows.bat release
+```
+
+Windows distribution output: `client\desktop\target\release\dist\screx-desktop.exe`
+
 ## Run
 
 ```bash
@@ -103,11 +140,11 @@ The daemon needs `sudo` because it creates and manages virtual display and input
 ## Use
 
 1. Start the daemon on Linux.
-2. Open the Screx app on the iPad.
+2. Open Screx on the iPad or launch the desktop client on macOS, Windows, or Linux.
 3. Choose one transport:
-   - **Network**: enter the Linux host/IP and tap `Connect`
-   - **USB**: tap `Connect via USB`
+    - **Network**: enter the Linux host/IP and tap `Connect`
+    - **USB**: tap `Connect via USB`
 4. If it is the first network connection, enter the PIN shown by the daemon.
 5. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
 
-The app remembers recent and pinned network targets, and the in-session toolbar gives access to keyboard, audio, camera, controllers, and connection info.
+The clients remember recent and pinned network targets, and the in-session controls give access to keyboard, audio, camera, controllers, and connection info.

@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/main.rs");
     println!("cargo:rerun-if-changed=src/video_surface.rs");
+    println!("cargo:rerun-if-changed=../ipad/Screx/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
 
     // Link libpulse-simple on Linux for audio output
     #[cfg(target_os = "linux")]
@@ -28,6 +29,7 @@ fn main() {
     {
         println!("cargo:rustc-link-lib=d3d11");
         println!("cargo:rustc-link-lib=dxgi");
+        embed_windows_icon();
     }
 
     let qt_include_path = std::env::var("DEP_QT_INCLUDE_PATH").unwrap();
@@ -97,4 +99,41 @@ fn main() {
     }
 
     config.build("src/main.rs");
+}
+
+#[cfg(target_os = "windows")]
+fn embed_windows_icon() {
+    use image::imageops::FilterType;
+    use std::path::{Path, PathBuf};
+
+    let icon_src = Path::new("../ipad/Screx/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
+    if !icon_src.exists() {
+        println!(
+            "cargo:warning=Windows icon source not found at {}",
+            icon_src.display()
+        );
+        return;
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ico_path = out_dir.join("AppIcon.ico");
+
+    let img = match image::open(icon_src) {
+        Ok(img) => img.resize_exact(256, 256, FilterType::Lanczos3),
+        Err(err) => {
+            println!("cargo:warning=Failed to read Windows icon source: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = img.save_with_format(&ico_path, image::ImageFormat::Ico) {
+        println!("cargo:warning=Failed to generate .ico file: {err}");
+        return;
+    }
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(ico_path.to_string_lossy().as_ref());
+    if let Err(err) = res.compile() {
+        println!("cargo:warning=Failed to compile Windows resources: {err}");
+    }
 }
