@@ -393,6 +393,17 @@ ApplicationWindow {
                             }
                         }
 
+                        // Timer-driven frame polling: calls VideoSurface.poll_frame()
+                        // at ~60Hz while connected. This decouples frame production
+                        // (decoder thread) from frame display (Qt render loop) and
+                        // prevents frame coalescing from causing stutter.
+                        Timer {
+                            interval: 16  // ~60 Hz
+                            running: AppState.connected
+                            repeat: true
+                            onTriggered: streamView.poll_frame()
+                        }
+
                         Item {
                             id: keyGrabber
                             anchors.fill: parent

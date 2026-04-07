@@ -11,7 +11,6 @@ use std::sync::{Arc, OnceLock};
 
 use cpp::cpp;
 use qmetaobject::prelude::*;
-use qmetaobject::{queued_callback, QPointer};
 
 use crate::decoder::HwFrame;
 
@@ -24,17 +23,15 @@ cpp! {{
     #include <QtQuick/QSGRendererInterface>
 }}
 
-// Platform-specific includes for zero-copy render paths
-#[cfg(target_os = "macos")]
+// Platform-specific includes for zero-copy render paths.
+// Use C preprocessor guards because cpp! blocks are always emitted
+// regardless of Rust #[cfg] attributes.
 cpp! {{
     #include <QtQuick/qsgtexture_platform.h>
+    #ifdef __APPLE__
     #include <CoreVideo/CoreVideo.h>
     #include <Metal/Metal.h>
-}}
-
-#[cfg(target_os = "linux")]
-cpp! {{
-    #include <QtQuick/qsgtexture_platform.h>
+    #endif
 }}
 
 pub struct RawFrame {
@@ -112,8 +109,9 @@ unsafe impl Sync for FrameSlot {}
 pub type FrameSlotRef = Arc<FrameSlot>;
 
 static GLOBAL_FRAME_SLOT: OnceLock<FrameSlotRef> = OnceLock::new();
-static REQUEST_UPDATE: OnceLock<Box<dyn Fn(()) + Send + Sync>> = OnceLock::new();
-static UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set to true by the decoder thread when a new frame is published.
+/// The QML timer's poll_frame() checks this to decide whether to call update().
+static HAS_NEW_FRAME: AtomicBool = AtomicBool::new(false);
 static UPDATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_global_frame_slot() -> FrameSlotRef {
@@ -133,18 +131,10 @@ pub fn global_frame_slot_clone() -> FrameSlotRef {
     init_global_frame_slot()
 }
 
+/// Called by the decoder thread after publishing a new frame to the slot.
+/// Sets a flag that the QML-side timer polls to trigger scene graph updates.
 pub fn request_video_surface_update() {
-    if !UPDATE_PENDING.swap(true, Ordering::AcqRel) {
-        if let Some(cb) = REQUEST_UPDATE.get() {
-            cb(());
-        } else {
-            UPDATE_PENDING.store(false, Ordering::Release);
-        }
-    }
-}
-
-fn clear_pending_update() {
-    UPDATE_PENDING.store(false, Ordering::Release);
+    HAS_NEW_FRAME.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +224,7 @@ fn render_hw_frame_macos(
         dest_w as "double",
         dest_h as "double"
     ] {
+        #ifdef __APPLE__
         if (!item_ptr || !pixbuf) return;
         auto window = item_ptr->window();
         if (!window) return;
@@ -309,7 +300,7 @@ fn render_hw_frame_macos(
                          [[err localizedDescription] UTF8String]);
                 return;
             }
-            qDebug("[video_surface] created NV12→BGRA Metal compute pipeline");
+            qDebug("[video_surface] created NV12->BGRA Metal compute pipeline");
         }
 
         auto cvPixbuf = static_cast<CVPixelBufferRef>(pixbuf);
@@ -374,7 +365,7 @@ fn render_hw_frame_macos(
                 qDebug("[video_surface] created %dx%d BGRA output texture", s_bgraW, s_bgraH);
             }
 
-            // Run the NV12→BGRA compute shader
+            // Run the NV12->BGRA compute shader
             id<MTLCommandQueue> cmdQueue = static_cast<id<MTLCommandQueue>>(
                 ri->getResource(window, QSGRendererInterface::CommandQueueResource));
             if (!cmdQueue) {
@@ -435,12 +426,13 @@ fn render_hw_frame_macos(
 
         static int s_frameCount = 0;
         s_frameCount++;
-        if (s_frameCount <= 5 || (s_frameCount / 300 * 300 == s_frameCount)) {
+        if (s_frameCount <= 5 || (s_frameCount & 0xFF) == 0) {
             qDebug("[video_surface] zero-copy frame #%d: %zux%zu %s, node=%p",
                    s_frameCount, cvW, cvH, isBGRA ? "BGRA" : "NV12->BGRA", imageNode);
         }
 
         CVMetalTextureCacheFlush(s_texCache, 0);
+        #endif // __APPLE__
     });
 
     out_node
@@ -478,6 +470,8 @@ pub struct VideoSurface {
     pub content_width: qt_property!(f64; NOTIFY content_rect_changed),
     pub content_height: qt_property!(f64; NOTIFY content_rect_changed),
     pub content_rect_changed: qt_signal!(),
+    /// Called by QML Timer every ~16ms. Checks for a new frame and calls update() if needed.
+    pub poll_frame: qt_method!(fn(&mut self)),
     current_frame: Option<Arc<DisplayFrame>>,
 }
 
@@ -490,7 +484,18 @@ impl Default for VideoSurface {
             content_width: 0.0,
             content_height: 0.0,
             content_rect_changed: Default::default(),
+            poll_frame: Default::default(),
             current_frame: None,
+        }
+    }
+}
+
+impl VideoSurface {
+    /// Called by QML Timer at ~60Hz.  If the decoder has published a new frame,
+    /// schedules a scene-graph update so `update_paint_node` runs this cycle.
+    fn poll_frame(&mut self) {
+        if HAS_NEW_FRAME.swap(false, Ordering::Acquire) {
+            <dyn QQuickItem>::update(self);
         }
     }
 }
@@ -503,23 +508,12 @@ impl QQuickItem for VideoSurface {
                 item->setFlag(QQuickItem::ItemHasContents, true);
             }
         });
-
-        let qptr = QPointer::from(&*self);
-        let cb = queued_callback(move |()| {
-            clear_pending_update();
-            if let Some(pinned) = qptr.as_pinned() {
-                let obj = pinned.borrow();
-                <dyn QQuickItem>::update(&*obj);
-            }
-        });
-        let _ = REQUEST_UPDATE.set(Box::new(cb));
     }
 
     fn update_paint_node(
         &mut self,
         mut node: qmetaobject::scenegraph::SGNode<qmetaobject::scenegraph::ContainerNode>,
     ) -> qmetaobject::scenegraph::SGNode<qmetaobject::scenegraph::ContainerNode> {
-        clear_pending_update();
         let slot = match global_frame_slot() {
             Some(s) => s,
             None => return node,
