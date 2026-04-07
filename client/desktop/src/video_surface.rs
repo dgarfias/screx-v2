@@ -455,7 +455,7 @@ fn render_hw_frame_macos(
 }
 
 // ---------------------------------------------------------------------------
-// Linux zero-copy: VA-API → DMA-BUF → EGLImage → GL texture → QSGOpenGLTexture
+// Linux zero-copy: VA-API -> DMA-BUF -> EGLImage (Y+UV) -> NV12 GLSL -> FBO -> QSGOpenGLTexture
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -469,7 +469,7 @@ fn render_hw_frame_linux(
     dest_h: f64,
 ) -> *mut c_void {
     let surface_ptr = hw_frame.native_surface_ptr(); // VASurfaceID as void*
-    let frames_ctx = hw_frame.hw_frames_ctx(); // AVBufferRef*
+    let frames_ctx = hw_frame.hw_frames_ctx();       // AVBufferRef*
     let w = hw_frame.width as i32;
     let h = hw_frame.height as i32;
     let mut out_node = raw_node;
@@ -478,7 +478,7 @@ fn render_hw_frame_linux(
         mut out_node as "void*",
         item_ptr as "QQuickItem*",
         surface_ptr as "void*",
-        frames_ctx as "void*",    // AVBufferRef*
+        frames_ctx as "void*",
         w as "int",
         h as "int",
         dest_x as "double",
@@ -491,250 +491,323 @@ fn render_hw_frame_linux(
         auto window = item_ptr->window();
         if (!window) return;
 
-        // Verify Qt is using OpenGL
         auto ri = window->rendererInterface();
         if (!ri || ri->graphicsApi() != QSGRendererInterface::OpenGL) {
             static bool s_warned = false;
             if (!s_warned) {
-                qWarning("[video_surface/linux] Qt not using OpenGL (api=%d), cannot zero-copy",
-                         (int)ri->graphicsApi());
+                qWarning("[video/linux] Qt not using OpenGL (api=%d)", (int)ri->graphicsApi());
                 s_warned = true;
             }
             return;
         }
 
-        // --- Extract VADisplay from FFmpeg's hw_frames_ctx ---
+        // --- Extract VADisplay ---
         auto bufRef = static_cast<AVBufferRef*>(frames_ctx);
         auto hwFramesCtx = reinterpret_cast<AVHWFramesContext*>(bufRef->data);
         auto vaDevCtx = static_cast<AVVAAPIDeviceContext*>(hwFramesCtx->device_ctx->hwctx);
         VADisplay vaDisplay = vaDevCtx->display;
-
         VASurfaceID surfaceId = (VASurfaceID)(uintptr_t)surface_ptr;
 
-        // --- Persistent state ---
-        // EGL function pointers (resolved once via eglGetProcAddress)
-        static PFNEGLCREATEIMAGEKHRPROC s_eglCreateImageKHR = nullptr;
-        static PFNEGLDESTROYIMAGEKHRPROC s_eglDestroyImageKHR = nullptr;
-        static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC s_glEGLImageTargetTexture2DOES = nullptr;
+        // --- EGL / GL function pointers (resolved once) ---
+        typedef EGLImageKHR (EGLAPIENTRYP PFN_eglCreateImageKHR)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*);
+        typedef EGLBoolean  (EGLAPIENTRYP PFN_eglDestroyImageKHR)(EGLDisplay, EGLImageKHR);
+        typedef void        (GL_APIENTRYP PFN_glEGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
 
-        // Ring buffer: we keep 2 frames worth of resources alive (current + previous)
-        // to avoid destroying a texture Qt's render pipeline is still using.
-        struct FrameResources {
-            EGLImageKHR eglImage = EGL_NO_IMAGE_KHR;
-            GLuint texId = 0;
-            int dmaBufFd = -1;
-        };
-        static FrameResources s_ring[2] = {};
-        static int s_ringIdx = 0;
+        static PFN_eglCreateImageKHR           s_eglCreateImage   = nullptr;
+        static PFN_eglDestroyImageKHR          s_eglDestroyImage  = nullptr;
+        static PFN_glEGLImageTargetTexture2DOES s_glEGLImageTarget = nullptr;
 
-        // --- One-time EGL function resolution ---
-        if (!s_eglCreateImageKHR) {
-            s_eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)
-                eglGetProcAddress("eglCreateImageKHR");
-            s_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)
-                eglGetProcAddress("eglDestroyImageKHR");
-            s_glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
-                eglGetProcAddress("glEGLImageTargetTexture2DOES");
-            if (!s_eglCreateImageKHR || !s_eglDestroyImageKHR || !s_glEGLImageTargetTexture2DOES) {
-                qWarning("[video_surface/linux] required EGL extensions not available");
-                s_eglCreateImageKHR = nullptr;
+        if (!s_eglCreateImage) {
+            s_eglCreateImage   = (PFN_eglCreateImageKHR)           eglGetProcAddress("eglCreateImageKHR");
+            s_eglDestroyImage  = (PFN_eglDestroyImageKHR)          eglGetProcAddress("eglDestroyImageKHR");
+            s_glEGLImageTarget = (PFN_glEGLImageTargetTexture2DOES)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+            if (!s_eglCreateImage || !s_eglDestroyImage || !s_glEGLImageTarget) {
+                qWarning("[video/linux] required EGL extensions not available");
+                s_eglCreateImage = nullptr;
                 return;
             }
         }
 
-        EGLDisplay eglDisplay = eglGetCurrentDisplay();
-        if (eglDisplay == EGL_NO_DISPLAY) {
-            static bool s_warned2 = false;
-            if (!s_warned2) {
-                qWarning("[video_surface/linux] no current EGL display");
-                s_warned2 = true;
+        EGLDisplay eglDisp = eglGetCurrentDisplay();
+        if (eglDisp == EGL_NO_DISPLAY) { return; }
+
+        // --- Persistent NV12->RGB conversion resources ---
+        static GLuint s_prog = 0;
+        static GLuint s_fbo = 0;
+        static GLuint s_fboTex = 0;
+        static int    s_fboW = 0, s_fboH = 0;
+        static GLuint s_vbo = 0;
+        static GLint  s_locTexY = -1;
+        static GLint  s_locTexUV = -1;
+
+        // Ring buffer for per-frame EGL/GL resources (2 frames deep)
+        struct PlaneRes {
+            EGLImageKHR imgY  = EGL_NO_IMAGE_KHR;
+            EGLImageKHR imgUV = EGL_NO_IMAGE_KHR;
+            GLuint texY = 0, texUV = 0;
+            int fd0 = -1, fd1 = -1;
+        };
+        static PlaneRes s_ring[2] = {};
+        static int s_ringIdx = 0;
+
+        // --- One-time: compile NV12->RGB shader + create quad ---
+        if (s_prog == 0) {
+            const char* vsSrc =
+                "#version 100\n"
+                "attribute vec2 a_pos;\n"
+                "attribute vec2 a_uv;\n"
+                "varying vec2 v_uv;\n"
+                "void main() {\n"
+                "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+                "  v_uv = a_uv;\n"
+                "}\n";
+            const char* fsSrc =
+                "#version 100\n"
+                "precision mediump float;\n"
+                "varying vec2 v_uv;\n"
+                "uniform sampler2D tex_y;\n"
+                "uniform sampler2D tex_uv;\n"
+                "void main() {\n"
+                "  float y  = texture2D(tex_y,  v_uv).r;\n"
+                "  float cb = texture2D(tex_uv, v_uv).r - 0.5;\n"
+                "  float cr = texture2D(tex_uv, v_uv).g - 0.5;\n"
+                "  y = (y - 0.0625) * 1.1644;\n"
+                "  float r = y + 1.7928 * cr;\n"
+                "  float g = y - 0.2133 * cb - 0.5330 * cr;\n"
+                "  float b = y + 2.1124 * cb;\n"
+                "  gl_FragColor = vec4(clamp(r,0.0,1.0), clamp(g,0.0,1.0), clamp(b,0.0,1.0), 1.0);\n"
+                "}\n";
+
+            auto compileSh = [](GLenum type, const char* src) -> GLuint {
+                GLuint s = glCreateShader(type);
+                glShaderSource(s, 1, &src, nullptr);
+                glCompileShader(s);
+                GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+                if (!ok) {
+                    char log[512]; glGetShaderInfoLog(s, 512, nullptr, log);
+                    qWarning("[video/linux] shader compile: %s", log);
+                    glDeleteShader(s); return 0;
+                }
+                return s;
+            };
+            GLuint vs = compileSh(GL_VERTEX_SHADER, vsSrc);
+            GLuint fs = compileSh(GL_FRAGMENT_SHADER, fsSrc);
+            if (!vs || !fs) { return; }
+            s_prog = glCreateProgram();
+            glAttachShader(s_prog, vs);
+            glAttachShader(s_prog, fs);
+            glBindAttribLocation(s_prog, 0, "a_pos");
+            glBindAttribLocation(s_prog, 1, "a_uv");
+            glLinkProgram(s_prog);
+            glDeleteShader(vs); glDeleteShader(fs);
+            GLint linked = 0; glGetProgramiv(s_prog, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[512]; glGetProgramInfoLog(s_prog, 512, nullptr, log);
+                qWarning("[video/linux] shader link: %s", log);
+                glDeleteProgram(s_prog); s_prog = 0; return;
             }
-            return;
+            s_locTexY  = glGetUniformLocation(s_prog, "tex_y");
+            s_locTexUV = glGetUniformLocation(s_prog, "tex_uv");
+
+            const float quad[] = {
+                -1, -1,  0, 0,
+                 1, -1,  1, 0,
+                -1,  1,  0, 1,
+                 1,  1,  1, 1,
+            };
+            glGenBuffers(1, &s_vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+            glGenFramebuffers(1, &s_fbo);
+            qDebug("[video/linux] NV12->RGB shader compiled, fbo=%u prog=%u", s_fbo, s_prog);
         }
 
-        // --- Release oldest frame resources (from 2 frames ago) ---
+        // --- Ensure FBO texture matches current resolution ---
+        if (s_fboW != w || s_fboH != h) {
+            if (s_fboTex) glDeleteTextures(1, &s_fboTex);
+            glGenTextures(1, &s_fboTex);
+            glBindTexture(GL_TEXTURE_2D, s_fboTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_fboTex, 0);
+            auto st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (st != GL_FRAMEBUFFER_COMPLETE) {
+                qWarning("[video/linux] FBO incomplete: 0x%x", st);
+                return;
+            }
+            s_fboW = w; s_fboH = h;
+            qDebug("[video/linux] FBO resized to %dx%d tex=%u", w, h, s_fboTex);
+        }
+
+        // --- Release oldest ring slot ---
         auto& old = s_ring[s_ringIdx];
-        if (old.eglImage != EGL_NO_IMAGE_KHR) {
-            s_eglDestroyImageKHR(eglDisplay, old.eglImage);
-            old.eglImage = EGL_NO_IMAGE_KHR;
-        }
-        if (old.texId) {
-            glDeleteTextures(1, &old.texId);
-            old.texId = 0;
-        }
-        if (old.dmaBufFd >= 0) {
-            close(old.dmaBufFd);
-            old.dmaBufFd = -1;
-        }
+        if (old.imgY  != EGL_NO_IMAGE_KHR) s_eglDestroyImage(eglDisp, old.imgY);
+        if (old.imgUV != EGL_NO_IMAGE_KHR) s_eglDestroyImage(eglDisp, old.imgUV);
+        if (old.texY)  glDeleteTextures(1, &old.texY);
+        if (old.texUV) glDeleteTextures(1, &old.texUV);
+        if (old.fd0 >= 0) close(old.fd0);
+        if (old.fd1 >= 0) close(old.fd1);
+        old = {};
+        old.fd0 = -1; old.fd1 = -1;
 
-        // --- Sync VA-API surface (ensure decode is complete) ---
-        VAStatus vaSt = vaSyncSurface(vaDisplay, surfaceId);
-        if (vaSt != VA_STATUS_SUCCESS) {
-            qWarning("[video_surface/linux] vaSyncSurface failed: %d", vaSt);
-            return;
-        }
+        // --- Sync + export DMA-BUF with SEPARATE_LAYERS ---
+        vaSyncSurface(vaDisplay, surfaceId);
 
-        // --- Export DMA-BUF from VA-API surface ---
         VADRMPRIMESurfaceDescriptor desc = {};
-        vaSt = vaExportSurfaceHandle(
+        VAStatus vaSt = vaExportSurfaceHandle(
             vaDisplay, surfaceId,
             VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
             &desc);
         if (vaSt != VA_STATUS_SUCCESS) {
-            qWarning("[video_surface/linux] vaExportSurfaceHandle failed: %d", vaSt);
+            qWarning("[video/linux] vaExportSurfaceHandle failed: %d", vaSt);
             return;
         }
 
-        // We only handle the first object (DMA-BUF fd).
-        // COMPOSED_LAYERS gives us a single layer with potentially multiple planes.
-        if (desc.num_objects < 1 || desc.num_layers < 1) {
+        if (desc.num_layers < 2) {
             for (uint32_t i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
-            qWarning("[video_surface/linux] unexpected descriptor: objects=%u layers=%u",
-                     desc.num_objects, desc.num_layers);
+            qWarning("[video/linux] expected 2 layers for NV12, got %u", desc.num_layers);
             return;
         }
 
-        // Build EGL attributes for DMA-BUF import.
-        // The composed layer has the DRM fourcc and per-plane offset/pitch.
-        auto& layer = desc.layers[0];
-        EGLint attribs[64];
-        int ai = 0;
-        attribs[ai++] = EGL_WIDTH;
-        attribs[ai++] = (EGLint)desc.width;
-        attribs[ai++] = EGL_HEIGHT;
-        attribs[ai++] = (EGLint)desc.height;
-        attribs[ai++] = EGL_LINUX_DRM_FOURCC_EXT;
-        attribs[ai++] = (EGLint)layer.drm_format;
-
-        // Plane 0
-        if (layer.num_planes >= 1) {
-            attribs[ai++] = EGL_DMA_BUF_PLANE0_FD_EXT;
-            attribs[ai++] = desc.objects[layer.object_index[0]].fd;
-            attribs[ai++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
-            attribs[ai++] = (EGLint)layer.offset[0];
-            attribs[ai++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
-            attribs[ai++] = (EGLint)layer.pitch[0];
-            if (desc.objects[layer.object_index[0]].drm_format_modifier != 0 &&
-                desc.objects[layer.object_index[0]].drm_format_modifier != DRM_FORMAT_MOD_INVALID) {
-                attribs[ai++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
-                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[0]].drm_format_modifier & 0xFFFFFFFF);
-                attribs[ai++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
-                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[0]].drm_format_modifier >> 32);
+        // Helper: import one plane as EGLImage + GL_TEXTURE_2D
+        auto importPlane = [&](int layerIdx, int planeW, int planeH, uint32_t drmFmt) -> bool {
+            auto& lay = desc.layers[layerIdx];
+            uint32_t objIdx = lay.object_index[0];
+            EGLint attr[32]; int ai2 = 0;
+            attr[ai2++] = EGL_WIDTH;  attr[ai2++] = planeW;
+            attr[ai2++] = EGL_HEIGHT; attr[ai2++] = planeH;
+            attr[ai2++] = EGL_LINUX_DRM_FOURCC_EXT; attr[ai2++] = (EGLint)drmFmt;
+            attr[ai2++] = EGL_DMA_BUF_PLANE0_FD_EXT;     attr[ai2++] = desc.objects[objIdx].fd;
+            attr[ai2++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;  attr[ai2++] = (EGLint)lay.offset[0];
+            attr[ai2++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;   attr[ai2++] = (EGLint)lay.pitch[0];
+            uint64_t mod = desc.objects[objIdx].drm_format_modifier;
+            if (mod != 0 && mod != DRM_FORMAT_MOD_INVALID) {
+                attr[ai2++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT; attr[ai2++] = (EGLint)(mod & 0xFFFFFFFF);
+                attr[ai2++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT; attr[ai2++] = (EGLint)(mod >> 32);
             }
-        }
-        // Plane 1 (UV for NV12)
-        if (layer.num_planes >= 2) {
-            attribs[ai++] = EGL_DMA_BUF_PLANE1_FD_EXT;
-            attribs[ai++] = desc.objects[layer.object_index[1]].fd;
-            attribs[ai++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
-            attribs[ai++] = (EGLint)layer.offset[1];
-            attribs[ai++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
-            attribs[ai++] = (EGLint)layer.pitch[1];
-            if (desc.objects[layer.object_index[1]].drm_format_modifier != 0 &&
-                desc.objects[layer.object_index[1]].drm_format_modifier != DRM_FORMAT_MOD_INVALID) {
-                attribs[ai++] = EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT;
-                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[1]].drm_format_modifier & 0xFFFFFFFF);
-                attribs[ai++] = EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT;
-                attribs[ai++] = (EGLint)(desc.objects[layer.object_index[1]].drm_format_modifier >> 32);
+            attr[ai2++] = EGL_NONE;
+
+            EGLImageKHR img = s_eglCreateImage(eglDisp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attr);
+            if (img == EGL_NO_IMAGE_KHR) {
+                qWarning("[video/linux] eglCreateImage plane %d failed (err=0x%x fmt=0x%08x %dx%d)",
+                         layerIdx, eglGetError(), drmFmt, planeW, planeH);
+                return false;
             }
-        }
-        // Plane 2 (rare, e.g. planar YUV420)
-        if (layer.num_planes >= 3) {
-            attribs[ai++] = EGL_DMA_BUF_PLANE2_FD_EXT;
-            attribs[ai++] = desc.objects[layer.object_index[2]].fd;
-            attribs[ai++] = EGL_DMA_BUF_PLANE2_OFFSET_EXT;
-            attribs[ai++] = (EGLint)layer.offset[2];
-            attribs[ai++] = EGL_DMA_BUF_PLANE2_PITCH_EXT;
-            attribs[ai++] = (EGLint)layer.pitch[2];
-        }
-        attribs[ai++] = EGL_NONE;
+            GLuint tex = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            s_glEGLImageTarget(GL_TEXTURE_2D, img);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
 
-        // --- Create EGLImage from DMA-BUF ---
-        EGLImageKHR eglImage = s_eglCreateImageKHR(
-            eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+            if (layerIdx == 0) { old.imgY = img; old.texY = tex; }
+            else                { old.imgUV = img; old.texUV = tex; }
+            return true;
+        };
 
-        // Close extra DMA-BUF fds we won't track (EGL has imported them).
-        // We keep fds alive until the ring slot is recycled; actually EGL
-        // may have dup'd them internally but being safe is better.
-        // Store the primary fd for cleanup; close any extras now.
-        int primaryFd = desc.objects[0].fd;
-        for (uint32_t i = 1; i < desc.num_objects; i++) {
-            close(desc.objects[i].fd);
-        }
-
-        if (eglImage == EGL_NO_IMAGE_KHR) {
-            close(primaryFd);
-            static bool s_warnedEgl = false;
-            if (!s_warnedEgl) {
-                qWarning("[video_surface/linux] eglCreateImageKHR failed (EGL error 0x%x), "
-                         "format=0x%08x planes=%u",
-                         eglGetError(), layer.drm_format, layer.num_planes);
-                s_warnedEgl = true;
-            }
+        // Import Y plane (R8, full res) and UV plane (GR88, half res)
+        if (!importPlane(0, w, h, DRM_FORMAT_R8) ||
+            !importPlane(1, w / 2, h / 2, DRM_FORMAT_GR88)) {
+            if (old.imgY  != EGL_NO_IMAGE_KHR) s_eglDestroyImage(eglDisp, old.imgY);
+            if (old.imgUV != EGL_NO_IMAGE_KHR) s_eglDestroyImage(eglDisp, old.imgUV);
+            if (old.texY)  glDeleteTextures(1, &old.texY);
+            if (old.texUV) glDeleteTextures(1, &old.texUV);
+            old = {}; old.fd0 = -1; old.fd1 = -1;
+            for (uint32_t i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
             return;
         }
 
-        // --- Create GL texture from EGLImage ---
-        GLuint texId = 0;
-        glGenTextures(1, &texId);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, texId);
-        s_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, eglImage);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-
-        // Store in ring for deferred cleanup
-        old.eglImage = eglImage;
-        old.texId = texId;
-        old.dmaBufFd = primaryFd;
+        // Track DMA-BUF fds for cleanup
+        old.fd0 = desc.objects[0].fd;
+        old.fd1 = (desc.num_objects > 1) ? (int)desc.objects[1].fd : -1;
+        for (uint32_t i = 2; i < desc.num_objects; i++) close(desc.objects[i].fd);
         s_ringIdx = (s_ringIdx + 1) & 1;
 
-        // --- Wrap in QSGTexture ---
-        auto qsgTexture = QNativeInterface::QSGOpenGLTexture::fromNativeExternalOES(
-            texId, window, QSize(w, h), QQuickWindow::TextureIsOpaque);
-        if (!qsgTexture) {
+        // --- Save Qt's GL state ---
+        GLint prevFbo = 0, prevProg = 0;
+        GLint prevVp[4] = {};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
+        glGetIntegerv(GL_VIEWPORT, prevVp);
+
+        // --- Render NV12->RGB into FBO ---
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+        glViewport(0, 0, w, h);
+        glUseProgram(s_prog);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, old.texY);
+        glUniform1i(s_locTexY, 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, old.texUV);
+        glUniform1i(s_locTexUV, 1);
+
+        glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void*)8);
+
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        // --- Restore Qt's GL state ---
+        glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+        glUseProgram(prevProg);
+        glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+        glActiveTexture(GL_TEXTURE0);
+
+        // --- Wrap FBO output texture in QSGTexture ---
+        auto qsgTex = QNativeInterface::QSGOpenGLTexture::fromNative(
+            s_fboTex, window, QSize(w, h), QQuickWindow::TextureIsOpaque);
+        if (!qsgTex) {
             static bool s_warnedQt = false;
             if (!s_warnedQt) {
-                qWarning("[video_surface/linux] fromNativeExternalOES returned null");
+                qWarning("[video/linux] fromNative returned null");
                 s_warnedQt = true;
             }
             return;
         }
-        qsgTexture->setFiltering(QSGTexture::Linear);
+        qsgTex->setFiltering(QSGTexture::Linear);
 
         // --- Set up scene graph node ---
         auto imageNode = static_cast<QSGImageNode*>((QSGNode*)out_node);
         if (!imageNode) {
             imageNode = window->createImageNode();
-            if (!imageNode) {
-                delete qsgTexture;
-                return;
-            }
+            if (!imageNode) { delete qsgTex; return; }
             imageNode->setOwnsTexture(false);
             imageNode->setFiltering(QSGTexture::Linear);
         }
-
-        auto oldTex = imageNode->texture();
-        imageNode->setTexture(qsgTexture);
-        if (oldTex) delete oldTex;
-
+        auto prevTex = imageNode->texture();
+        imageNode->setTexture(qsgTex);
+        if (prevTex) delete prevTex;
         imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
-        imageNode->setSourceRect(0, 0, w, h);
         out_node = (void*)imageNode;
 
-        static int s_frameCount = 0;
-        s_frameCount++;
-        if (s_frameCount <= 5 || (s_frameCount & 0xFF) == 0) {
-            qDebug("[video_surface/linux] zero-copy frame #%d: %dx%d fmt=0x%08x planes=%u node=%p",
-                   s_frameCount, w, h, layer.drm_format, layer.num_planes, imageNode);
+        static int s_fc = 0;
+        s_fc++;
+        if (s_fc <= 5 || (s_fc & 0xFF) == 0) {
+            qDebug("[video/linux] zero-copy frame #%d: %dx%d fbo=%u node=%p", s_fc, w, h, s_fboTex, imageNode);
         }
         #endif // __linux__
     });
 
     out_node
 }
-
 // ---------------------------------------------------------------------------
 // VideoSurface QQuickItem
 // ---------------------------------------------------------------------------
