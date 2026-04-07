@@ -469,7 +469,7 @@ fn render_hw_frame_linux(
     dest_h: f64,
 ) -> *mut c_void {
     let surface_ptr = hw_frame.native_surface_ptr(); // VASurfaceID as void*
-    let frames_ctx = hw_frame.hw_frames_ctx();       // AVBufferRef*
+    let frames_ctx = hw_frame.hw_frames_ctx(); // AVBufferRef*
     let w = hw_frame.width as i32;
     let h = hw_frame.height as i32;
     let mut out_node = raw_node;
@@ -743,6 +743,9 @@ fn render_hw_frame_linux(
         // --- Render NV12->RGB into FBO ---
         glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
         glViewport(0, 0, w, h);
+        glDisable(GL_BLEND);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(s_prog);
 
         glActiveTexture(GL_TEXTURE0);
