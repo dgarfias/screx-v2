@@ -1,13 +1,17 @@
 // Hardware-accelerated video decoder using FFmpeg.
 //
-// Decode pipeline:
-//   Annex-B H.264/H.265 access unit
-//   → avcodec_send_packet   (hw decoder: VideoToolbox/VA-API/D3D11VA/CUDA; fallback: sw)
-//   → avcodec_receive_frame  (hw surface or sw YUV)
-//   → av_hwframe_transfer_data  (hw → CPU NV12, no-op for sw)
+// Decode pipeline (zero-copy, macOS VideoToolbox BGRA):
+//   Annex-B → avcodec_send_packet → avcodec_receive_frame
+//   → HwFrame { AVFrame with CVPixelBufferRef in data[3] }
+//   → Display thread renders via CVMetalTextureCache → QSGMetalTexture
+//
+// Decode pipeline (fallback / software / CUDA):
+//   Annex-B → avcodec_send_packet → avcodec_receive_frame
+//   → av_hwframe_transfer_data (hw → CPU NV12)
 //   → sws_scale NV12 → RGBA
 //   → DecodedFrame { width, height, rgba }
 
+use std::ffi::c_void;
 use std::ptr;
 
 use anyhow::{bail, Context as _, Result};
@@ -18,14 +22,56 @@ use ffmpeg_sys_next as ffi;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A decoded RGBA frame ready for display.
-///
-/// Uses a pooled buffer to avoid per-frame heap allocation. When dropped, the
-/// inner `Vec` is returned to the pool for the next frame.
+/// A decoded RGBA frame ready for display (CPU readback path).
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// A hardware-decoded frame whose GPU surface is still alive.
+/// On macOS: data[3] is a CVPixelBufferRef (BGRA, IOSurface-backed).
+/// On Linux: data[3] is a VASurfaceID.
+/// Dropping this frees the AVFrame reference, releasing the GPU surface.
+pub struct HwFrame {
+    pub width: u32,
+    pub height: u32,
+    /// The hw pixel format (e.g. AV_PIX_FMT_VIDEOTOOLBOX).
+    pub hw_pix_fmt: i32,
+    frame: *mut ffi::AVFrame,
+}
+
+unsafe impl Send for HwFrame {}
+unsafe impl Sync for HwFrame {}
+
+impl HwFrame {
+    /// Get the native surface pointer (CVPixelBufferRef on macOS, VASurfaceID on Linux).
+    /// The pointer is valid as long as this HwFrame is alive.
+    pub fn native_surface_ptr(&self) -> *mut c_void {
+        unsafe { (*self.frame).data[3] as *mut c_void }
+    }
+
+    /// Get the hw_frames_ctx for accessing the underlying device context.
+    pub fn hw_frames_ctx(&self) -> *mut ffi::AVBufferRef {
+        unsafe { (*self.frame).hw_frames_ctx }
+    }
+}
+
+impl Drop for HwFrame {
+    fn drop(&mut self) {
+        if !self.frame.is_null() {
+            unsafe { ffi::av_frame_free(&mut self.frame) };
+        }
+    }
+}
+
+/// Output from the decoder: either a zero-copy GPU frame or a CPU RGBA frame.
+pub enum DecodedOutput {
+    /// Zero-copy: the GPU surface is still live. The render thread will
+    /// create a native texture (Metal/EGL/D3D11) from it.
+    HwFrame(HwFrame),
+    /// Fallback: fully decoded RGBA pixels in CPU memory.
+    Rgba(DecodedFrame),
 }
 
 /// Simple single-buffer pool: caller takes a pre-allocated Vec, fills it, and
@@ -91,6 +137,16 @@ pub struct VideoDecoder {
     /// Latest decoded resolution (updated every frame).
     pub last_width: u32,
     pub last_height: u32,
+    /// When true, HwDecoder returns HwFrame (GPU surface stays alive) instead
+    /// of doing readback + sws_scale. Enabled for VideoToolbox (macOS BGRA)
+    /// and VA-API (Linux, with GPU VPP to BGRA planned).
+    zero_copy: bool,
+}
+
+impl VideoDecoder {
+    pub fn is_zero_copy(&self) -> bool {
+        self.zero_copy
+    }
 }
 
 enum DecoderInner {
@@ -114,6 +170,7 @@ impl VideoDecoder {
             CodecId::H265 => "H.265",
         };
 
+        let no_zerocopy = std::env::var_os("SCREX_NO_ZEROCOPY").is_some();
         let force_software = std::env::var_os("SCREX_FORCE_SW_DECODE").is_some();
         if force_software {
             let sw = SwDecoder::new(codec)?;
@@ -122,6 +179,7 @@ impl VideoDecoder {
                 inner: DecoderInner::Software(sw),
                 last_width: 0,
                 last_height: 0,
+                zero_copy: false,
             });
         }
 
@@ -129,11 +187,16 @@ impl VideoDecoder {
         #[cfg(target_os = "macos")]
         {
             if let Ok(hw) = HwDecoder::new_videotoolbox(codec) {
-                println!("[decoder] using VideoToolbox {label} hw decode");
+                let zc = !no_zerocopy;
+                println!(
+                    "[decoder] using VideoToolbox {label} hw decode (zero_copy={})",
+                    zc
+                );
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
                     last_width: 0,
                     last_height: 0,
+                    zero_copy: zc,
                 });
             }
         }
@@ -142,11 +205,13 @@ impl VideoDecoder {
         #[cfg(target_os = "windows")]
         {
             if let Ok(hw) = HwDecoder::new_d3d11va(codec) {
-                println!("[decoder] using D3D11VA {label} hw decode");
+                // D3D11VA zero-copy not yet implemented.
+                println!("[decoder] using D3D11VA {label} hw decode (zero_copy=false)");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
                     last_width: 0,
                     last_height: 0,
+                    zero_copy: false,
                 });
             }
         }
@@ -155,11 +220,16 @@ impl VideoDecoder {
         #[cfg(target_os = "linux")]
         {
             if let Ok(hw) = HwDecoder::new_vaapi(codec) {
-                println!("[decoder] using VA-API {label} hw decode");
+                let zc = !no_zerocopy;
+                println!(
+                    "[decoder] using VA-API {label} hw decode (zero_copy={})",
+                    zc
+                );
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
                     last_width: 0,
                     last_height: 0,
+                    zero_copy: zc,
                 });
             }
         }
@@ -168,11 +238,13 @@ impl VideoDecoder {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             if let Ok(hw) = HwDecoder::new_cuda(codec) {
-                println!("[decoder] using CUDA/NVDEC {label} hw decode");
+                // CUDA zero-copy not yet implemented.
+                println!("[decoder] using CUDA/NVDEC {label} hw decode (zero_copy=false)");
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
                     last_width: 0,
                     last_height: 0,
+                    zero_copy: false,
                 });
             }
         }
@@ -184,6 +256,7 @@ impl VideoDecoder {
             inner: DecoderInner::Software(sw),
             last_width: 0,
             last_height: 0,
+            zero_copy: false,
         })
     }
 
@@ -192,14 +265,23 @@ impl VideoDecoder {
         &mut self,
         annex_b: &[u8],
         pool: &mut FrameBufferPool,
-    ) -> Result<Vec<DecodedFrame>> {
+    ) -> Result<Vec<DecodedOutput>> {
+        let zc = self.zero_copy;
         let frames = match &mut self.inner {
-            DecoderInner::HwAccel(hw) => hw.decode(annex_b, pool)?,
+            DecoderInner::HwAccel(hw) => hw.decode(annex_b, pool, zc)?,
             DecoderInner::Software(sw) => sw.decode(annex_b, pool)?,
         };
         for f in &frames {
-            self.last_width = f.width;
-            self.last_height = f.height;
+            match f {
+                DecodedOutput::HwFrame(hw) => {
+                    self.last_width = hw.width;
+                    self.last_height = hw.height;
+                }
+                DecodedOutput::Rgba(df) => {
+                    self.last_width = df.width;
+                    self.last_height = df.height;
+                }
+            }
         }
         Ok(frames)
     }
@@ -292,7 +374,7 @@ impl HwDecoder {
         };
         let hw_type = ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
         let device_path = "/dev/dri/renderD128";
-        Self::new_hw(decoder_name, hw_type, Some(device_path))
+        Self::new_hw(decoder_name, hw_type, Some(device_path), None)
     }
 
     /// CUDA / NVDEC (Linux + Windows).
@@ -304,19 +386,19 @@ impl HwDecoder {
         };
         let hw_type = ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA;
         let device_path = "0";
-        Self::new_hw(decoder_name, hw_type, Some(device_path))
+        Self::new_hw(decoder_name, hw_type, Some(device_path), None)
     }
 
     /// VideoToolbox (macOS).
+    /// VT outputs NV12 by default; the render path handles NV12→BGRA via Metal compute.
     #[cfg(target_os = "macos")]
     fn new_videotoolbox(codec: CodecId) -> Result<Self> {
         let decoder_name = match codec {
             CodecId::H264 => "h264",
             CodecId::H265 => "hevc",
         };
-        // VideoToolbox does not require a device path — pass NULL.
         let hw_type = ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-        Self::new_hw(decoder_name, hw_type, None)
+        Self::new_hw(decoder_name, hw_type, None, None)
     }
 
     /// D3D11VA (Windows).
@@ -328,13 +410,14 @@ impl HwDecoder {
         };
         // D3D11VA does not require a device path — pass NULL to use the default adapter.
         let hw_type = ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-        Self::new_hw(decoder_name, hw_type, None)
+        Self::new_hw(decoder_name, hw_type, None, None)
     }
 
     fn new_hw(
         decoder_name: &str,
         hw_type: ffi::AVHWDeviceType,
         device_path: Option<&str>,
+        sw_format_override: Option<ffi::AVPixelFormat>,
     ) -> Result<Self> {
         unsafe {
             let codec_cstr =
@@ -402,8 +485,47 @@ impl HwDecoder {
 
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
 
-            // For decoding we do NOT need hw_frames_ctx up front — the decoder
-            // allocates it internally once it knows the stream dimensions.
+            // If caller wants a specific sw_format (e.g. BGRA for VideoToolbox
+            // zero-copy), pre-create hw_frames_ctx so the decoder uses it.
+            if let Some(sw_fmt) = sw_format_override {
+                let frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
+                if frames_ref.is_null() {
+                    let opaque = (*ctx).opaque as *mut ffi::AVPixelFormat;
+                    if !opaque.is_null() {
+                        drop(Box::from_raw(opaque));
+                        (*ctx).opaque = ptr::null_mut();
+                    }
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to allocate hw_frames_ctx");
+                }
+                let fc = &mut *((*frames_ref).data as *mut ffi::AVHWFramesContext);
+                fc.format = hw_pix_fmt;
+                fc.sw_format = sw_fmt;
+                // Use a reasonable initial size — the decoder will adapt to the
+                // actual stream dimensions.
+                fc.width = 1920;
+                fc.height = 1080;
+                fc.initial_pool_size = 0; // dynamic pool
+                let ret = ffi::av_hwframe_ctx_init(frames_ref);
+                if ret < 0 {
+                    ffi::av_buffer_unref(&mut (frames_ref as *mut _));
+                    let opaque = (*ctx).opaque as *mut ffi::AVPixelFormat;
+                    if !opaque.is_null() {
+                        drop(Box::from_raw(opaque));
+                        (*ctx).opaque = ptr::null_mut();
+                    }
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to init hw_frames_ctx with sw_format override (error {ret})");
+                }
+                (*ctx).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+                ffi::av_buffer_unref(&mut (frames_ref as *mut _));
+                println!(
+                    "[decoder] pre-set hw_frames_ctx with sw_format={:?}",
+                    sw_fmt
+                );
+            }
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
@@ -458,13 +580,18 @@ impl HwDecoder {
         }
     }
 
-    fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedFrame>> {
+    fn decode(
+        &mut self,
+        annex_b: &[u8],
+        pool: &mut FrameBufferPool,
+        zero_copy: bool,
+    ) -> Result<Vec<DecodedOutput>> {
         let mut frames = Vec::new();
         unsafe {
             // Feed the complete access unit directly — no parser needed.
             (*self.pkt).data = annex_b.as_ptr() as *mut u8;
             (*self.pkt).size = annex_b.len() as i32;
-            self.send_and_receive(&mut frames, pool)?;
+            self.send_and_receive(&mut frames, pool, zero_copy)?;
             (*self.pkt).data = ptr::null_mut();
             (*self.pkt).size = 0;
         }
@@ -473,8 +600,9 @@ impl HwDecoder {
 
     unsafe fn send_and_receive(
         &mut self,
-        frames: &mut Vec<DecodedFrame>,
+        frames: &mut Vec<DecodedOutput>,
         pool: &mut FrameBufferPool,
+        zero_copy: bool,
     ) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
         if ret < 0 {
@@ -482,13 +610,14 @@ impl HwDecoder {
                 bail!("avcodec_send_packet error {ret}");
             }
         }
-        self.receive_frames(frames, pool)
+        self.receive_frames(frames, pool, zero_copy)
     }
 
     unsafe fn receive_frames(
         &mut self,
-        frames: &mut Vec<DecodedFrame>,
+        frames: &mut Vec<DecodedOutput>,
         pool: &mut FrameBufferPool,
+        zero_copy: bool,
     ) -> Result<()> {
         loop {
             let ret = ffi::avcodec_receive_frame(self.ctx, self.hw_frame);
@@ -501,6 +630,25 @@ impl HwDecoder {
 
             let frame_fmt = std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.hw_frame).format);
             let is_hw = frame_fmt == self.hw_pix_fmt;
+
+            // --- Zero-copy path: clone the AVFrame to keep the GPU surface alive ---
+            if zero_copy && is_hw {
+                let cloned = ffi::av_frame_clone(self.hw_frame);
+                if cloned.is_null() {
+                    ffi::av_frame_unref(self.hw_frame);
+                    bail!("av_frame_clone failed for zero-copy path");
+                }
+                let w = (*cloned).width as u32;
+                let h = (*cloned).height as u32;
+                frames.push(DecodedOutput::HwFrame(HwFrame {
+                    width: w,
+                    height: h,
+                    hw_pix_fmt: (*cloned).format,
+                    frame: cloned,
+                }));
+                ffi::av_frame_unref(self.hw_frame);
+                continue;
+            }
 
             // --- Readback path: GPU→CPU→sws_scale→RGBA ---
             let src_frame = if is_hw {
@@ -566,11 +714,11 @@ impl HwDecoder {
                 }
             }
 
-            frames.push(DecodedFrame {
+            frames.push(DecodedOutput::Rgba(DecodedFrame {
                 width: w as u32,
                 height: h as u32,
                 rgba,
-            });
+            }));
 
             ffi::av_frame_unref(self.hw_frame);
             if src_frame == self.sw_frame {
@@ -713,7 +861,7 @@ impl SwDecoder {
         }
     }
 
-    fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedFrame>> {
+    fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedOutput>> {
         let mut frames = Vec::new();
         unsafe {
             // Feed the complete access unit directly without re-parsing.
@@ -729,7 +877,7 @@ impl SwDecoder {
 
     unsafe fn send_and_receive(
         &mut self,
-        frames: &mut Vec<DecodedFrame>,
+        frames: &mut Vec<DecodedOutput>,
         pool: &mut FrameBufferPool,
     ) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
@@ -743,7 +891,7 @@ impl SwDecoder {
 
     unsafe fn receive_frames(
         &mut self,
-        frames: &mut Vec<DecodedFrame>,
+        frames: &mut Vec<DecodedOutput>,
         pool: &mut FrameBufferPool,
     ) -> Result<()> {
         loop {
@@ -803,11 +951,11 @@ impl SwDecoder {
                 }
             }
 
-            frames.push(DecodedFrame {
+            frames.push(DecodedOutput::Rgba(DecodedFrame {
                 width: w as u32,
                 height: h as u32,
                 rgba,
-            });
+            }));
 
             ffi::av_frame_unref(self.frame);
         }

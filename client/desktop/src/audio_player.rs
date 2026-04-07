@@ -1,6 +1,11 @@
 //! Audio playback adapter — receives raw PCM s16le 48kHz stereo from daemon,
 //! jitters it in a ring buffer, and writes to system audio output.
 //!
+//! Implements timestamp-based AV drift correction matching the iPad client:
+//! - Drops audio samples when audio lags behind video (drift < −40ms)
+//! - Trims audio buffer when audio leads video (drift > 60ms)
+//! - Flushes buffer on video gap resume (>2s with no video)
+//!
 //! Linux: uses libpulse-simple (works with PipeWire via its PulseAudio compat).
 //! macOS/Windows: uses cpal.
 
@@ -10,6 +15,8 @@ use std::thread;
 
 use anyhow::{anyhow, Result};
 
+use crate::backend::AvSyncState;
+
 /// Daemon audio format constants.
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
@@ -18,6 +25,17 @@ const BYTES_PER_MS: usize = (SAMPLE_RATE as usize * CHANNELS as usize * BYTES_PE
 
 /// Ring buffer capacity (~500 ms).
 const RING_CAPACITY: usize = BYTES_PER_MS * 500;
+
+/// Target buffer level for jitter absorption — 30ms like iPad.
+const TARGET_BUFFER_BYTES: usize = BYTES_PER_MS * 30;
+
+/// If audio timestamp is more than this many ms behind expected video time,
+/// discard audio to catch up.
+const DRIFT_DROP_THRESHOLD_MS: i32 = -40;
+
+/// If audio timestamp is more than this many ms ahead of expected video time,
+/// trim the buffer down to the target level.
+const DRIFT_TRIM_THRESHOLD_MS: i32 = 60;
 
 pub type AudioSlot = Arc<Mutex<AudioRingBuffer>>;
 
@@ -82,17 +100,32 @@ impl AudioRingBuffer {
         self.count -= n;
         n
     }
+
+    /// Discard `n` bytes from the read side without copying them out.
+    pub fn discard(&mut self, n: usize) {
+        let n = n.min(self.count);
+        self.read_pos = (self.read_pos + n) % RING_CAPACITY;
+        self.count -= n;
+    }
+
+    /// Reset the ring buffer to empty.
+    pub fn clear(&mut self) {
+        self.read_pos = 0;
+        self.write_pos = 0;
+        self.count = 0;
+    }
 }
 
 /// Handle to the running audio playback stream.
 pub struct AudioPlayer {
     ring: AudioSlot,
     stop: Arc<AtomicBool>,
+    av_sync: Arc<AvSyncState>,
     _thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AudioPlayer {
-    pub fn start() -> Result<Self> {
+    pub fn start(av_sync: Arc<AvSyncState>) -> Result<Self> {
         let ring: AudioSlot = Arc::new(Mutex::new(AudioRingBuffer::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -123,13 +156,46 @@ impl AudioPlayer {
         Ok(Self {
             ring,
             stop,
+            av_sync,
             _thread: handle,
         })
     }
 
-    pub fn enqueue(&self, pcm: &[u8]) {
+    /// Enqueue PCM audio data with an optional daemon-side timestamp for AV
+    /// drift correction.  Matches the iPad's `enqueueAudio(_:timestampMs:)`.
+    pub fn enqueue(&self, pcm: &[u8], timestamp_ms: u32) {
+        // If video just resumed after a gap (>2s), flush stale audio
+        if self.av_sync.consume_gap_resume() {
+            if let Ok(mut ring) = self.ring.lock() {
+                ring.clear();
+            }
+        }
+
         if let Ok(mut ring) = self.ring.lock() {
             ring.write(pcm);
+
+            // Drift correction — compare audio timestamp to expected video time
+            if let Some(expected_ts) = self.av_sync.expected_daemon_time_now() {
+                let drift = timestamp_ms.wrapping_sub(expected_ts) as i32;
+
+                if drift < DRIFT_DROP_THRESHOLD_MS {
+                    // Audio is behind video — discard some audio to catch up
+                    let drop_bytes = ((-drift) as usize * BYTES_PER_MS).min(ring.count);
+                    let aligned = (drop_bytes / 4) * 4; // align to sample frame
+                    if aligned > 0 {
+                        ring.discard(aligned);
+                    }
+                } else if drift > DRIFT_TRIM_THRESHOLD_MS {
+                    // Audio is ahead of video — trim buffer to target level
+                    if ring.count > TARGET_BUFFER_BYTES {
+                        let excess = ring.count - TARGET_BUFFER_BYTES;
+                        let aligned = (excess / 4) * 4;
+                        if aligned > 0 {
+                            ring.discard(aligned);
+                        }
+                    }
+                }
+            }
         }
     }
 }

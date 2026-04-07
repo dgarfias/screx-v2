@@ -20,9 +20,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::audio_player::AudioPlayer;
-use crate::decoder::{CodecId, FrameBufferPool, VideoDecoder};
+use crate::decoder::{CodecId, DecodedOutput, FrameBufferPool, VideoDecoder};
 use crate::mic_capture::MicCapture;
-use crate::video_surface::{FrameSlotRef, RawFrame};
+use crate::video_surface::{DisplayFrame, FrameSlotRef, RawFrame};
 use crate::webcam_capture::WebcamCapture;
 
 const DEFAULT_PORT: u16 = 9000;
@@ -33,7 +33,7 @@ const UDP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const UDP_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(250);
-const FRAME_TIMEOUT: Duration = Duration::from_millis(50);
+const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Message sent from the UDP receiver thread to the decoder thread.
 struct DecodeJob {
@@ -589,9 +589,12 @@ impl BackendWorker {
         let _ = control.send_peripheral_state(PERIPH_MOUSE, true);
         let _ = control.send_peripheral_state(PERIPH_KEYBOARD, true);
 
+        // Create shared AV sync state — passed to both audio player and UDP runtime.
+        let av_sync = Arc::new(AvSyncState::new());
+
         // Start audio playback before spawning UDP so the player is ready for PCM.
         let audio_player: Option<Arc<AudioPlayer>> = if speaker_enabled {
-            match AudioPlayer::start() {
+            match AudioPlayer::start(Arc::clone(&av_sync)) {
                 Ok(player) => Some(Arc::new(player)),
                 Err(e) => {
                     (self.ui)(UiEvent::SetStatus(format!(
@@ -621,6 +624,7 @@ impl BackendWorker {
             Arc::clone(&stop),
             Arc::clone(&self.frame_slot),
             audio_player.as_ref().map(Arc::clone),
+            Arc::clone(&av_sync),
         );
 
         self.active = Some(ActiveSession {
@@ -629,6 +633,7 @@ impl BackendWorker {
             udp: udp_sender,
             stop,
             audio_player,
+            av_sync,
             mic_capture: None,
             webcam_capture: None,
             reconnect_host,
@@ -713,7 +718,7 @@ impl BackendWorker {
             }
             if enabled {
                 if active.audio_player.is_none() {
-                    match AudioPlayer::start() {
+                    match AudioPlayer::start(Arc::clone(&active.av_sync)) {
                         Ok(player) => {
                             active.audio_player = Some(Arc::new(player));
                             (self.ui)(UiEvent::SetStatus("Speaker enabled.".into()));
@@ -847,6 +852,7 @@ struct ActiveSession {
     udp: Arc<UdpSender>,
     stop: Arc<AtomicBool>,
     audio_player: Option<Arc<AudioPlayer>>,
+    av_sync: Arc<AvSyncState>,
     mic_capture: Option<MicCapture>,
     webcam_capture: Option<WebcamCapture>,
     reconnect_host: String,
@@ -1182,6 +1188,7 @@ fn spawn_udp_runtime(
     stop: Arc<AtomicBool>,
     frame_slot: FrameSlotRef,
     audio_player: Option<Arc<AudioPlayer>>,
+    av_sync: Arc<AvSyncState>,
 ) {
     // Keepalive thread — unchanged
     let keepalive_udp = Arc::clone(&udp);
@@ -1263,59 +1270,85 @@ fn spawn_udp_runtime(
                 match dec.decode(&job.annex_b, &mut pool) {
                     Ok(decoded_frames) => {
                         let decode_us = t0.elapsed().as_micros();
-                        for df in decoded_frames {
+                        for output in decoded_frames {
                             decoded_frame_count = decoded_frame_count.wrapping_add(1);
                             let au_len = job.annex_b.len();
-                            let w = df.width;
-                            let h = df.height;
 
-                            // Black-frame detection for first 90 frames (sampled)
-                            if decoded_frame_count <= 90 {
-                                let pct = non_black_pixel_percent_sampled(&df.rgba);
-                                if pct < 0.5 {
-                                    mostly_black_frame_count =
-                                        mostly_black_frame_count.saturating_add(1);
-                                    if mostly_black_frame_count >= 30 && !blank_stream_retry_queued
-                                    {
-                                        blank_stream_retry_queued = true;
-                                        let _ = decode_tx_cmd
-                                            .send(BackendCommand::RetryBlankStream { session_id });
+                            match output {
+                                DecodedOutput::HwFrame(hw) => {
+                                    let w = hw.width;
+                                    let h = hw.height;
+
+                                    // Drop the old frame without recycling (it's a HwFrame, no RGBA buf)
+                                    let _ = frame_slot.take_latest();
+
+                                    let t1 = Instant::now();
+                                    frame_slot.publish(Arc::new(DisplayFrame::Hw(hw)));
+                                    crate::video_surface::request_video_surface_update();
+                                    let present_us = t1.elapsed().as_micros();
+                                    if decoded_frame_count == 1 || decoded_frame_count % 60 == 0 {
+                                        println!(
+                                            "[decoder-thread] frame={} decode={}us present={}us size={}x{} au={}B path=zero-copy",
+                                            decoded_frame_count, decode_us, present_us, w, h, au_len,
+                                        );
                                     }
-                                } else {
-                                    mostly_black_frame_count = 0;
                                 }
-                            }
-                            if debug_dump_remaining > 0 {
-                                dump_decoded_frame_ppm(
-                                    decoded_frame_count,
-                                    df.width,
-                                    df.height,
-                                    &df.rgba,
-                                );
-                                debug_dump_remaining -= 1;
-                            }
+                                DecodedOutput::Rgba(df) => {
+                                    let w = df.width;
+                                    let h = df.height;
 
-                            // Recycle the previous frame's RGBA buffer
-                            if let Some(old_frame) = frame_slot.take_latest() {
-                                if let Ok(old_rgba) = Arc::try_unwrap(old_frame) {
-                                    pool.recycle(old_rgba.rgba);
+                                    // Black-frame detection for first 90 frames (sampled)
+                                    if decoded_frame_count <= 90 {
+                                        let pct = non_black_pixel_percent_sampled(&df.rgba);
+                                        if pct < 0.5 {
+                                            mostly_black_frame_count =
+                                                mostly_black_frame_count.saturating_add(1);
+                                            if mostly_black_frame_count >= 30
+                                                && !blank_stream_retry_queued
+                                            {
+                                                blank_stream_retry_queued = true;
+                                                let _ = decode_tx_cmd.send(
+                                                    BackendCommand::RetryBlankStream { session_id },
+                                                );
+                                            }
+                                        } else {
+                                            mostly_black_frame_count = 0;
+                                        }
+                                    }
+                                    if debug_dump_remaining > 0 {
+                                        dump_decoded_frame_ppm(
+                                            decoded_frame_count,
+                                            df.width,
+                                            df.height,
+                                            &df.rgba,
+                                        );
+                                        debug_dump_remaining -= 1;
+                                    }
+
+                                    // Recycle the previous frame's RGBA buffer
+                                    if let Some(old_frame) = frame_slot.take_latest() {
+                                        if let Ok(old_display) = Arc::try_unwrap(old_frame) {
+                                            if let DisplayFrame::Rgba(old_raw) = old_display {
+                                                pool.recycle(old_raw.rgba);
+                                            }
+                                        }
+                                    }
+
+                                    let t1 = Instant::now();
+                                    frame_slot.publish(Arc::new(DisplayFrame::Rgba(RawFrame {
+                                        width: df.width,
+                                        height: df.height,
+                                        rgba: df.rgba,
+                                    })));
+                                    crate::video_surface::request_video_surface_update();
+                                    let present_us = t1.elapsed().as_micros();
+                                    if decoded_frame_count == 1 || decoded_frame_count % 60 == 0 {
+                                        println!(
+                                            "[decoder-thread] frame={} decode={}us present={}us size={}x{} au={}B path=readback",
+                                            decoded_frame_count, decode_us, present_us, w, h, au_len,
+                                        );
+                                    }
                                 }
-                            }
-
-                            let t1 = Instant::now();
-                            frame_slot.publish(Arc::new(RawFrame {
-                                width: df.width,
-                                height: df.height,
-                                rgba: df.rgba,
-                            }));
-                            crate::video_surface::request_video_surface_update();
-                            let present_us = t1.elapsed().as_micros();
-                            if decoded_frame_count == 1 || decoded_frame_count % 60 == 0 {
-                                println!(
-                                    "[decoder-thread] frame={} decode={}us present={}us size={}x{} au={}B",
-                                    decoded_frame_count, decode_us, present_us,
-                                    w, h, au_len,
-                                );
                             }
                         }
                     }
@@ -1358,7 +1391,6 @@ fn spawn_udp_runtime(
         let mut buffer = vec![0u8; UDP_HEADER_LEN + UDP_CHUNK_PAYLOAD + TAG_LEN];
         let mut video_frames: HashMap<u32, FrameAssembly> = HashMap::new();
         let mut audio_frames: HashMap<u32, AudioAssembly> = HashMap::new();
-        let mut av_sync = AvSyncState::default();
         let mut stats = StreamStats::default();
         let mut last_packet = Instant::now();
         let mut has_received_first_frame = false;
@@ -1419,7 +1451,7 @@ fn spawn_udp_runtime(
                         if assembly.is_complete() {
                             if let Some(pcm) = assembly.reassemble() {
                                 if let Some(ref player) = audio_player {
-                                    player.enqueue(&pcm);
+                                    player.enqueue(&pcm, timestamp_ms);
                                 }
                             }
                             audio_frames.remove(&frame_id);
@@ -1519,6 +1551,21 @@ fn spawn_udp_runtime(
                                         had_unrecoverable = true;
                                     }
                                 } else {
+                                    let needed = assembly.total_data;
+                                    let got = assembly.received_count;
+                                    let total = assembly.total_data + assembly.total_parity;
+                                    let is_idr = assembly.flags & 0x01 != 0;
+                                    let age_ms =
+                                        now.duration_since(assembly.created_at).as_millis();
+                                    println!(
+                                        "[desktop/video] dropped frame {} ({}) got {}/{} shards (need {}) age={}ms",
+                                        fid,
+                                        if is_idr { "IDR" } else { "P" },
+                                        got,
+                                        total,
+                                        needed,
+                                        age_ms,
+                                    );
                                     had_unrecoverable = true;
                                 }
                             }
@@ -1749,21 +1796,33 @@ impl UdpSender {
 
 fn tune_udp_socket(socket: &UdpSocket) -> Result<()> {
     let fd = socket.as_raw_fd();
-    let value: libc::c_int = 4 * 1024 * 1024;
+    // Try 8 MB first, fall back to 4 MB.  macOS halves the value internally
+    // so we request double what we actually want.
+    let mut value: libc::c_int = 8 * 1024 * 1024;
     let value_ptr = &value as *const _ as *const libc::c_void;
     let value_len = std::mem::size_of_val(&value) as libc::socklen_t;
 
     let recv_rc =
         unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len) };
     if recv_rc != 0 {
-        return Err(anyhow!(
-            "setsockopt SO_RCVBUF failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        // Retry with smaller buffer
+        value = 4 * 1024 * 1024;
+        let value_ptr = &value as *const _ as *const libc::c_void;
+        let recv_rc = unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len)
+        };
+        if recv_rc != 0 {
+            return Err(anyhow!(
+                "setsockopt SO_RCVBUF failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
 
+    let send_value: libc::c_int = 4 * 1024 * 1024;
+    let send_ptr = &send_value as *const _ as *const libc::c_void;
     let send_rc =
-        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, value_ptr, value_len) };
+        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, send_ptr, value_len) };
     if send_rc != 0 {
         return Err(anyhow!(
             "setsockopt SO_SNDBUF failed: {}",
@@ -1797,24 +1856,83 @@ fn parse_camera_mode(mode: &str) -> Option<CameraConfig> {
     })
 }
 
-#[derive(Default)]
-struct AvSyncState {
-    last_video_ts: u32,
-    last_video_wall: Option<Instant>,
+/// Thread-safe AV sync state — shared between the UDP receiver thread and the
+/// audio player.  Mirrors the iPad's `AVSyncState` class.
+pub struct AvSyncState {
+    inner: Mutex<AvSyncInner>,
 }
 
+struct AvSyncInner {
+    last_video_ts: u32,
+    last_video_wall: Option<Instant>,
+    gap_resume: bool,
+}
+
+/// How long without a video frame before we consider it a gap (clear audio buf).
+const AV_GAP_THRESHOLD: Duration = Duration::from_secs(2);
+
 impl AvSyncState {
-    fn update_video(&mut self, timestamp_ms: u32) {
-        self.last_video_ts = timestamp_ms;
-        self.last_video_wall = Some(Instant::now());
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(AvSyncInner {
+                last_video_ts: 0,
+                last_video_wall: None,
+                gap_resume: false,
+            }),
+        }
     }
 
-    fn estimate_transport_latency_ms(&self) -> u32 {
-        let Some(wall) = self.last_video_wall else {
-            return 0;
-        };
-        let elapsed = wall.elapsed().as_millis() as u32;
-        elapsed.min(999)
+    /// Called by the UDP receiver when a video frame completes assembly.
+    pub fn update_video(&self, timestamp_ms: u32) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let now = Instant::now();
+            if let Some(prev_wall) = inner.last_video_wall {
+                if now.duration_since(prev_wall) >= AV_GAP_THRESHOLD {
+                    inner.gap_resume = true;
+                }
+            }
+            inner.last_video_ts = timestamp_ms;
+            inner.last_video_wall = Some(now);
+        }
+    }
+
+    /// Returns `true` once after video resumes from a gap. Consuming — resets
+    /// after read.  The audio player uses this to flush its ring buffer.
+    pub fn consume_gap_resume(&self) -> bool {
+        if let Ok(mut inner) = self.inner.lock() {
+            let val = inner.gap_resume;
+            inner.gap_resume = false;
+            val
+        } else {
+            false
+        }
+    }
+
+    /// Extrapolate what daemon timestamp should be "right now" based on the last
+    /// video frame and local wall-clock elapsed time.
+    pub fn expected_daemon_time_now(&self) -> Option<u32> {
+        if let Ok(inner) = self.inner.lock() {
+            let wall = inner.last_video_wall?;
+            if wall.elapsed() > Duration::from_secs(1) {
+                return None; // stale
+            }
+            let elapsed_ms = wall.elapsed().as_millis() as u32;
+            Some(inner.last_video_ts.wrapping_add(elapsed_ms))
+        } else {
+            None
+        }
+    }
+
+    pub fn estimate_transport_latency_ms(&self) -> u32 {
+        if let Ok(inner) = self.inner.lock() {
+            let Some(wall) = inner.last_video_wall else {
+                return 0;
+            };
+            let elapsed = wall.elapsed().as_millis() as u32;
+            elapsed.min(999)
+        } else {
+            0
+        }
     }
 }
 
