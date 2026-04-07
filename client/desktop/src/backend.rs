@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1413,8 +1416,20 @@ fn spawn_udp_runtime(
         let mut last_recv_log = Instant::now();
         let mut last_prune = Instant::now();
 
-        // Use poll(2) to wait for data with a timeout, so we can check the
-        // stop flag periodically without burning CPU in a spin-loop.
+        // Use poll(2) (Unix) or recv_timeout (Windows) to wait for data
+        // with a timeout, so we can check the stop flag periodically.
+        #[cfg(unix)]
+        {
+            receiver.set_nonblocking(true).ok();
+        }
+        #[cfg(windows)]
+        {
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .ok();
+        }
+
+        #[cfg(unix)]
         let poll_fd = libc::pollfd {
             fd: receiver.as_raw_fd(),
             events: libc::POLLIN,
@@ -1422,25 +1437,62 @@ fn spawn_udp_runtime(
         };
 
         while !stop.load(Ordering::Relaxed) {
-            // --- Phase 1: Wait for at least one packet via poll() ---
-            let mut pfd = poll_fd; // copy (revents must be mutable)
-            let poll_rc = unsafe {
-                libc::poll(&mut pfd, 1, 50 /* ms */)
-            };
-            if poll_rc <= 0 {
-                // timeout or error — check stop flag & data timeout
-                if last_packet.elapsed() >= UDP_DATA_TIMEOUT {
-                    let _ = tx.send(BackendCommand::SessionClosed {
-                        session_id,
-                        reason: "UDP media timed out. The daemon stopped sending data.".into(),
-                    });
-                    return;
+            // --- Phase 1: Wait for at least one packet ---
+            #[cfg(unix)]
+            {
+                let mut pfd = poll_fd;
+                let poll_rc = unsafe {
+                    libc::poll(&mut pfd, 1, 50 /* ms */)
+                };
+                if poll_rc <= 0 {
+                    if last_packet.elapsed() >= UDP_DATA_TIMEOUT {
+                        let _ = tx.send(BackendCommand::SessionClosed {
+                            session_id,
+                            reason: "UDP media timed out. The daemon stopped sending data.".into(),
+                        });
+                        return;
+                    }
+                    continue;
                 }
-                continue;
+            }
+
+            #[cfg(windows)]
+            {
+                // On Windows, try a blocking recv with timeout as our "poll"
+                match receiver.recv(&mut pkt_ring[0]) {
+                    Ok(size) => {
+                        pkt_sizes[0] = size;
+                        // We got one packet; we'll drain more below starting from index 1
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if last_packet.elapsed() >= UDP_DATA_TIMEOUT {
+                            let _ = tx.send(BackendCommand::SessionClosed {
+                                session_id,
+                                reason: "UDP media timed out. The daemon stopped sending data."
+                                    .into(),
+                            });
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
             }
 
             // --- Phase 2: Drain the socket as fast as possible ---
-            let mut batch_count = 0;
+            #[cfg(unix)]
+            let drain_start = 0;
+            #[cfg(windows)]
+            let drain_start = 1; // already got one packet in Phase 1
+
+            // Switch to nonblocking for drain (Windows needs this temporarily)
+            #[cfg(windows)]
+            receiver.set_nonblocking(true).ok();
+
+            let mut batch_count = drain_start;
             loop {
                 if batch_count >= BATCH_SIZE {
                     break;
@@ -1453,6 +1505,15 @@ fn spawn_udp_runtime(
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
+            }
+
+            // Restore blocking+timeout for Windows
+            #[cfg(windows)]
+            {
+                receiver.set_nonblocking(false).ok();
+                receiver
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .ok();
             }
 
             if batch_count == 0 {
@@ -1869,53 +1930,128 @@ impl UdpSender {
 }
 
 fn tune_udp_socket(socket: &UdpSocket) -> Result<()> {
-    let fd = socket.as_raw_fd();
-    // Try 8 MB first, fall back to 4 MB.  macOS halves the value internally
-    // so we request double what we actually want.
-    let mut value: libc::c_int = 8 * 1024 * 1024;
-    let value_ptr = &value as *const _ as *const libc::c_void;
-    let value_len = std::mem::size_of_val(&value) as libc::socklen_t;
-
-    let recv_rc =
-        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len) };
-    if recv_rc != 0 {
-        // Retry with smaller buffer
-        value = 4 * 1024 * 1024;
+    // Platform-specific socket tuning for large UDP buffers.
+    #[cfg(unix)]
+    {
+        let fd = socket.as_raw_fd();
+        let mut value: libc::c_int = 8 * 1024 * 1024;
         let value_ptr = &value as *const _ as *const libc::c_void;
+        let value_len = std::mem::size_of_val(&value) as libc::socklen_t;
+
         let recv_rc = unsafe {
             libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len)
         };
         if recv_rc != 0 {
+            value = 4 * 1024 * 1024;
+            let value_ptr = &value as *const _ as *const libc::c_void;
+            let recv_rc = unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, value_ptr, value_len)
+            };
+            if recv_rc != 0 {
+                return Err(anyhow!(
+                    "setsockopt SO_RCVBUF failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        let mut actual: libc::c_int = 0;
+        let mut actual_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut actual as *mut _ as *mut libc::c_void,
+                &mut actual_len,
+            );
+        }
+        println!("[udp] SO_RCVBUF requested={} actual={}", value, actual);
+
+        let send_value: libc::c_int = 4 * 1024 * 1024;
+        let send_ptr = &send_value as *const _ as *const libc::c_void;
+        let send_rc =
+            unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, send_ptr, value_len) };
+        if send_rc != 0 {
             return Err(anyhow!(
-                "setsockopt SO_RCVBUF failed: {}",
+                "setsockopt SO_SNDBUF failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
     }
 
-    // Verify what we actually got
-    let mut actual: libc::c_int = 0;
-    let mut actual_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &mut actual as *mut _ as *mut libc::c_void,
-            &mut actual_len,
-        );
-    }
-    println!("[udp] SO_RCVBUF requested={} actual={}", value, actual);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        // On Windows, libc::setsockopt uses *const i8 instead of *const c_void.
+        // Use the ws2_32 API directly via libc's Windows bindings.
+        let sock = socket.as_raw_socket() as usize;
 
-    let send_value: libc::c_int = 4 * 1024 * 1024;
-    let send_ptr = &send_value as *const _ as *const libc::c_void;
-    let send_rc =
-        unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, send_ptr, value_len) };
-    if send_rc != 0 {
-        return Err(anyhow!(
-            "setsockopt SO_SNDBUF failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        // Windows SOL_SOCKET = 0xffff, SO_RCVBUF = 0x1002, SO_SNDBUF = 0x1001
+        const SOL_SOCKET: i32 = 0xffff_u16 as i32;
+        const SO_RCVBUF: i32 = 0x1002;
+        const SO_SNDBUF: i32 = 0x1001;
+
+        let mut value: i32 = 8 * 1024 * 1024;
+        let value_len = std::mem::size_of::<i32>() as i32;
+
+        let recv_rc = unsafe {
+            libc::setsockopt(
+                sock as _,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &value as *const _ as *const i8,
+                value_len,
+            )
+        };
+        if recv_rc != 0 {
+            value = 4 * 1024 * 1024;
+            let recv_rc = unsafe {
+                libc::setsockopt(
+                    sock as _,
+                    SOL_SOCKET,
+                    SO_RCVBUF,
+                    &value as *const _ as *const i8,
+                    value_len,
+                )
+            };
+            if recv_rc != 0 {
+                return Err(anyhow!(
+                    "setsockopt SO_RCVBUF failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        let mut actual: i32 = 0;
+        let mut actual_len: i32 = std::mem::size_of::<i32>() as i32;
+        unsafe {
+            libc::getsockopt(
+                sock as _,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &mut actual as *mut _ as *mut i8,
+                &mut actual_len,
+            );
+        }
+        println!("[udp] SO_RCVBUF requested={} actual={}", value, actual);
+
+        let send_value: i32 = 4 * 1024 * 1024;
+        let send_rc = unsafe {
+            libc::setsockopt(
+                sock as _,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &send_value as *const _ as *const i8,
+                value_len,
+            )
+        };
+        if send_rc != 0 {
+            return Err(anyhow!(
+                "setsockopt SO_SNDBUF failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
     }
 
     Ok(())
