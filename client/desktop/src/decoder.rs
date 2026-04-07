@@ -223,7 +223,10 @@ impl VideoDecoder {
         #[cfg(target_os = "windows")]
         {
             if let Ok(hw) = HwDecoder::new_d3d11va(codec) {
-                let zc = !no_zerocopy;
+                // Qt's D3D11 native texture wrapper is still rejecting the
+                // handed-off texture on Windows, so keep hardware decode but
+                // use the stable CPU-backed display path for now.
+                let zc = false;
                 println!(
                     "[decoder] using D3D11VA {label} hw decode (zero_copy={})",
                     zc
