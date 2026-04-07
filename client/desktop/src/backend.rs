@@ -32,7 +32,6 @@ const UDP_CHUNK_PAYLOAD: usize = 1400;
 const UDP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const UDP_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
-const UDP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Message sent from the UDP receiver thread to the decoder thread.
@@ -1375,7 +1374,7 @@ fn spawn_udp_runtime(
                 return;
             }
         };
-        receiver.set_read_timeout(Some(UDP_READ_TIMEOUT)).ok();
+        receiver.set_nonblocking(true).ok();
 
         let cipher = match SessionCipher::new(&udp.session_key) {
             Ok(cipher) => cipher,
@@ -1388,7 +1387,15 @@ fn spawn_udp_runtime(
             }
         };
 
-        let mut buffer = vec![0u8; UDP_HEADER_LEN + UDP_CHUNK_PAYLOAD + TAG_LEN];
+        // Pre-allocate a batch of packet buffers.  We drain the kernel
+        // socket buffer as fast as possible into these, then process them
+        // in a second pass so that the socket never stalls waiting on our
+        // per-packet bookkeeping.
+        const BATCH_SIZE: usize = 256;
+        const PKT_BUF_SIZE: usize = UDP_HEADER_LEN + UDP_CHUNK_PAYLOAD + TAG_LEN;
+        let mut pkt_ring: Vec<Vec<u8>> = (0..BATCH_SIZE).map(|_| vec![0u8; PKT_BUF_SIZE]).collect();
+        let mut pkt_sizes: Vec<usize> = vec![0; BATCH_SIZE];
+
         let mut video_frames: HashMap<u32, FrameAssembly> = HashMap::new();
         let mut audio_frames: HashMap<u32, AudioAssembly> = HashMap::new();
         let mut stats = StreamStats::default();
@@ -1398,213 +1405,278 @@ fn spawn_udp_runtime(
         let mut last_pli_at: Option<Instant> = None;
         let mut video_packet_count: u64 = 0;
         let mut audio_packet_count: u64 = 0;
+        let mut decrypt_fail_count: u64 = 0;
+        let mut stale_drop_count: u64 = 0;
+        let mut total_recv_count: u64 = 0;
+        let mut completed_frame_count: u64 = 0;
+        let mut dropped_frame_count: u64 = 0;
+        let mut last_recv_log = Instant::now();
         let mut last_prune = Instant::now();
 
+        // Use poll(2) to wait for data with a timeout, so we can check the
+        // stop flag periodically without burning CPU in a spin-loop.
+        let poll_fd = libc::pollfd {
+            fd: receiver.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
         while !stop.load(Ordering::Relaxed) {
-            match receiver.recv(&mut buffer) {
-                Ok(size) => {
-                    last_packet = Instant::now();
-                    if size < UDP_HEADER_LEN {
-                        continue;
-                    }
-
-                    let (header, payload_all) = buffer[..size].split_at_mut(UDP_HEADER_LEN);
-                    let frame_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-                    let chunk_idx = u16::from_be_bytes([header[4], header[5]]);
-                    let total_data = u16::from_be_bytes([header[6], header[7]]) as usize;
-                    let total_parity = u16::from_be_bytes([header[8], header[9]]) as usize;
-                    let flags = header[10];
-                    let codec_id = header[11];
-                    let payload_len = u16::from_be_bytes([header[12], header[13]]) as usize;
-                    let timestamp_ms =
-                        u32::from_be_bytes([header[14], header[15], header[16], header[17]]);
-
-                    if frame_id == u32::MAX && total_data == 0 {
-                        continue;
-                    }
-
-                    let payload = payload_all;
-                    let nonce = nonce_server(frame_id, chunk_idx, flags);
-                    let Some(plaintext) = cipher.decrypt(&nonce, header, payload) else {
-                        continue;
-                    };
-
-                    stats.note_packet(size);
-
-                    // --- Audio path ---
-                    if (flags & FLAG_AUDIO) != 0 {
-                        audio_packet_count = audio_packet_count.wrapping_add(1);
-                        if audio_packet_count == 1 || audio_packet_count % 200 == 0 {
-                            println!(
-                                "[desktop/audio] packets={} frame_id={} chunk={}/{} payload={}B",
-                                audio_packet_count,
-                                frame_id,
-                                chunk_idx + 1,
-                                total_data,
-                                payload_len
-                            );
-                        }
-                        let assembly = audio_frames
-                            .entry(frame_id)
-                            .or_insert_with(|| AudioAssembly::new(total_data));
-                        assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
-                        if assembly.is_complete() {
-                            if let Some(pcm) = assembly.reassemble() {
-                                if let Some(ref player) = audio_player {
-                                    player.enqueue(&pcm, timestamp_ms);
-                                }
-                            }
-                            audio_frames.remove(&frame_id);
-                        }
-                        continue;
-                    }
-
-                    // --- Video path ---
-                    video_packet_count = video_packet_count.wrapping_add(1);
-                    if video_packet_count == 1 || video_packet_count % 200 == 0 {
-                        println!(
-                            "[desktop/video] packets={} codec={} frame_id={} chunk={}/{} payload={}B flags=0x{:02x}",
-                            video_packet_count, codec_id, frame_id, chunk_idx + 1, total_data, payload_len, flags
-                        );
-                    }
-
-                    // Drop stale packets for already-completed frames
-                    if has_received_first_frame
-                        && frame_id < last_completed_frame_id
-                        && (last_completed_frame_id - frame_id) < 0x8000_0000
-                    {
-                        continue;
-                    }
-
-                    let assembly = video_frames.entry(frame_id).or_insert_with(|| {
-                        FrameAssembly::new(total_data, total_parity, codec_id, flags, timestamp_ms)
-                    });
-                    assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
-
-                    if assembly.is_complete() {
-                        if let Some(annex_b) = assembly.reassemble() {
-                            video_frames.remove(&frame_id);
-
-                            // Gap detection -> request PLI (throttled)
-                            if has_received_first_frame && frame_id > last_completed_frame_id + 1 {
-                                let gap = frame_id - last_completed_frame_id - 1;
-                                if gap > 0 && gap < 0x8000_0000 {
-                                    if should_send_pli(&mut last_pli_at) {
-                                        println!(
-                                            "[desktop/video] frame gap: last={} current={} gap={} -> PLI",
-                                            last_completed_frame_id, frame_id, gap,
-                                        );
-                                        let _ = control.send_pli();
-                                    }
-                                }
-                            }
-
-                            last_completed_frame_id = frame_id;
-                            has_received_first_frame = true;
-                            av_sync.update_video(timestamp_ms);
-                            stats.note_frame();
-
-                            // Send to decoder thread (unbounded — never drops frames)
-                            let job = DecodeJob {
-                                annex_b,
-                                frame_id,
-                                codec_id,
-                                flags,
-                                timestamp_ms,
-                            };
-                            let _ = decode_tx.send(job);
-                        } else {
-                            video_frames.remove(&frame_id);
-                        }
-                    }
-
-                    // Prune expired incomplete assemblies — every 100ms
-                    // Like the iPad client: try FEC recovery before dropping,
-                    // and send PLI if frames had to be discarded.
-                    if last_prune.elapsed() >= Duration::from_millis(100) {
-                        let now = Instant::now();
-                        let mut expired_ids = Vec::new();
-                        let mut had_unrecoverable = false;
-
-                        for (&fid, assembly) in video_frames.iter() {
-                            if now.duration_since(assembly.created_at) > FRAME_TIMEOUT {
-                                expired_ids.push(fid);
-                            }
-                        }
-
-                        for fid in expired_ids {
-                            if let Some(assembly) = video_frames.remove(&fid) {
-                                if assembly.can_recover() {
-                                    // Late FEC recovery — enough shards arrived but
-                                    // is_complete() was never true inline (e.g. shards
-                                    // for a no-parity frame arrived out of order).
-                                    if let Some(annex_b) = assembly.reassemble() {
-                                        let job = DecodeJob {
-                                            annex_b,
-                                            frame_id: fid,
-                                            codec_id: assembly.codec_id,
-                                            flags: assembly.flags,
-                                            timestamp_ms: assembly.timestamp_ms,
-                                        };
-                                        let _ = decode_tx.send(job);
-                                    } else {
-                                        had_unrecoverable = true;
-                                    }
-                                } else {
-                                    let needed = assembly.total_data;
-                                    let got = assembly.received_count;
-                                    let total = assembly.total_data + assembly.total_parity;
-                                    let is_idr = assembly.flags & 0x01 != 0;
-                                    let age_ms =
-                                        now.duration_since(assembly.created_at).as_millis();
-                                    println!(
-                                        "[desktop/video] dropped frame {} ({}) got {}/{} shards (need {}) age={}ms",
-                                        fid,
-                                        if is_idr { "IDR" } else { "P" },
-                                        got,
-                                        total,
-                                        needed,
-                                        age_ms,
-                                    );
-                                    had_unrecoverable = true;
-                                }
-                            }
-                        }
-
-                        // Send PLI when frames were genuinely lost
-                        if had_unrecoverable {
-                            if should_send_pli(&mut last_pli_at) {
-                                println!("[desktop/video] unrecoverable frame(s) expired -> PLI");
-                                let _ = control.send_pli();
-                            }
-                        }
-
-                        audio_frames
-                            .retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
-                        last_prune = now;
-                    }
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if last_packet.elapsed() >= UDP_DATA_TIMEOUT {
-                        let _ = tx.send(BackendCommand::SessionClosed {
-                            session_id,
-                            reason: "UDP media timed out. The daemon stopped sending data.".into(),
-                        });
-                        return;
-                    }
-                }
-                Err(error) => {
+            // --- Phase 1: Wait for at least one packet via poll() ---
+            let mut pfd = poll_fd; // copy (revents must be mutable)
+            let poll_rc = unsafe {
+                libc::poll(&mut pfd, 1, 50 /* ms */)
+            };
+            if poll_rc <= 0 {
+                // timeout or error — check stop flag & data timeout
+                if last_packet.elapsed() >= UDP_DATA_TIMEOUT {
                     let _ = tx.send(BackendCommand::SessionClosed {
                         session_id,
-                        reason: format!("UDP receive failed: {error}"),
+                        reason: "UDP media timed out. The daemon stopped sending data.".into(),
                     });
                     return;
                 }
+                continue;
+            }
+
+            // --- Phase 2: Drain the socket as fast as possible ---
+            let mut batch_count = 0;
+            loop {
+                if batch_count >= BATCH_SIZE {
+                    break;
+                }
+                match receiver.recv(&mut pkt_ring[batch_count]) {
+                    Ok(size) => {
+                        pkt_sizes[batch_count] = size;
+                        batch_count += 1;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+
+            if batch_count == 0 {
+                continue;
+            }
+            last_packet = Instant::now();
+            total_recv_count += batch_count as u64;
+
+            if last_recv_log.elapsed() >= Duration::from_secs(2) {
+                let elapsed = last_recv_log.elapsed().as_secs_f64();
+                println!(
+                    "[desktop/udp] recv rate: {:.0} pkt/s (total={} batch={} completed={} dropped={} decrypt_fail={} stale_drop={})",
+                    total_recv_count as f64 / elapsed,
+                    total_recv_count,
+                    batch_count,
+                    completed_frame_count,
+                    dropped_frame_count,
+                    decrypt_fail_count,
+                    stale_drop_count,
+                );
+                total_recv_count = 0;
+                completed_frame_count = 0;
+                dropped_frame_count = 0;
+                decrypt_fail_count = 0;
+                stale_drop_count = 0;
+                last_recv_log = Instant::now();
+            }
+
+            // --- Phase 3: Process the batch ---
+            for pkt_i in 0..batch_count {
+                let size = pkt_sizes[pkt_i];
+                let buffer = &mut pkt_ring[pkt_i];
+                if size < UDP_HEADER_LEN {
+                    continue;
+                }
+
+                let (header, payload_all) = buffer[..size].split_at_mut(UDP_HEADER_LEN);
+                let frame_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+                let chunk_idx = u16::from_be_bytes([header[4], header[5]]);
+                let total_data = u16::from_be_bytes([header[6], header[7]]) as usize;
+                let total_parity = u16::from_be_bytes([header[8], header[9]]) as usize;
+                let flags = header[10];
+                let codec_id = header[11];
+                let payload_len = u16::from_be_bytes([header[12], header[13]]) as usize;
+                let timestamp_ms =
+                    u32::from_be_bytes([header[14], header[15], header[16], header[17]]);
+
+                if frame_id == u32::MAX && total_data == 0 {
+                    continue;
+                }
+
+                let payload = payload_all;
+                let nonce = nonce_server(frame_id, chunk_idx, flags);
+                let Some(plaintext) = cipher.decrypt(&nonce, header, payload) else {
+                    decrypt_fail_count += 1;
+                    if decrypt_fail_count <= 5 || decrypt_fail_count % 200 == 0 {
+                        println!(
+                            "[desktop/video] decrypt FAILED #{} frame={} chunk={}/{}",
+                            decrypt_fail_count,
+                            frame_id,
+                            chunk_idx + 1,
+                            total_data
+                        );
+                    }
+                    continue;
+                };
+
+                stats.note_packet(size);
+
+                // --- Audio path ---
+                if (flags & FLAG_AUDIO) != 0 {
+                    audio_packet_count = audio_packet_count.wrapping_add(1);
+                    if audio_packet_count == 1 || audio_packet_count % 200 == 0 {
+                        println!(
+                            "[desktop/audio] packets={} frame_id={} chunk={}/{} payload={}B",
+                            audio_packet_count,
+                            frame_id,
+                            chunk_idx + 1,
+                            total_data,
+                            payload_len
+                        );
+                    }
+                    let assembly = audio_frames
+                        .entry(frame_id)
+                        .or_insert_with(|| AudioAssembly::new(total_data));
+                    assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
+                    if assembly.is_complete() {
+                        if let Some(pcm) = assembly.reassemble() {
+                            if let Some(ref player) = audio_player {
+                                player.enqueue(&pcm, timestamp_ms);
+                            }
+                        }
+                        audio_frames.remove(&frame_id);
+                    }
+                    continue;
+                }
+
+                // --- Video path ---
+                video_packet_count = video_packet_count.wrapping_add(1);
+                if video_packet_count == 1 || video_packet_count % 200 == 0 {
+                    println!(
+                            "[desktop/video] packets={} codec={} frame_id={} chunk={}/{} payload={}B flags=0x{:02x}",
+                            video_packet_count, codec_id, frame_id, chunk_idx + 1, total_data, payload_len, flags
+                        );
+                }
+
+                // Drop stale packets for already-completed frames
+                if has_received_first_frame
+                    && frame_id < last_completed_frame_id
+                    && (last_completed_frame_id - frame_id) < 0x8000_0000
+                {
+                    stale_drop_count += 1;
+                    if stale_drop_count <= 5 || stale_drop_count % 200 == 0 {
+                        println!(
+                            "[desktop/video] STALE drop #{} frame={} (last_completed={})",
+                            stale_drop_count, frame_id, last_completed_frame_id
+                        );
+                    }
+                    continue;
+                }
+
+                let assembly = video_frames.entry(frame_id).or_insert_with(|| {
+                    FrameAssembly::new(total_data, total_parity, codec_id, flags, timestamp_ms)
+                });
+                assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
+
+                if assembly.is_complete() {
+                    if let Some(annex_b) = assembly.reassemble() {
+                        video_frames.remove(&frame_id);
+
+                        // Gap detection -> request PLI (throttled)
+                        if has_received_first_frame && frame_id > last_completed_frame_id + 1 {
+                            let gap = frame_id - last_completed_frame_id - 1;
+                            if gap > 0 && gap < 0x8000_0000 {
+                                if should_send_pli(&mut last_pli_at) {
+                                    println!(
+                                            "[desktop/video] frame gap: last={} current={} gap={} -> PLI",
+                                            last_completed_frame_id, frame_id, gap,
+                                        );
+                                    let _ = control.send_pli();
+                                }
+                            }
+                        }
+
+                        last_completed_frame_id = frame_id;
+                        has_received_first_frame = true;
+                        av_sync.update_video(timestamp_ms);
+                        stats.note_frame();
+                        completed_frame_count += 1;
+
+                        // Send to decoder thread (unbounded — never drops frames)
+                        let job = DecodeJob {
+                            annex_b,
+                            frame_id,
+                            codec_id,
+                            flags,
+                            timestamp_ms,
+                        };
+                        let _ = decode_tx.send(job);
+                    } else {
+                        video_frames.remove(&frame_id);
+                    }
+                }
+            } // end for pkt_i in 0..batch_count
+
+            // Prune expired incomplete assemblies — every 100ms
+            // Like the iPad client: try FEC recovery before dropping,
+            // and send PLI if frames had to be discarded.
+            if last_prune.elapsed() >= Duration::from_millis(100) {
+                let now = Instant::now();
+                let mut expired_ids = Vec::new();
+                let mut had_unrecoverable = false;
+
+                for (&fid, assembly) in video_frames.iter() {
+                    if now.duration_since(assembly.created_at) > FRAME_TIMEOUT {
+                        expired_ids.push(fid);
+                    }
+                }
+
+                for fid in expired_ids {
+                    if let Some(assembly) = video_frames.remove(&fid) {
+                        if assembly.can_recover() {
+                            if let Some(annex_b) = assembly.reassemble() {
+                                let job = DecodeJob {
+                                    annex_b,
+                                    frame_id: fid,
+                                    codec_id: assembly.codec_id,
+                                    flags: assembly.flags,
+                                    timestamp_ms: assembly.timestamp_ms,
+                                };
+                                let _ = decode_tx.send(job);
+                            } else {
+                                had_unrecoverable = true;
+                            }
+                        } else {
+                            let needed = assembly.total_data;
+                            let got = assembly.received_count;
+                            let total = assembly.total_data + assembly.total_parity;
+                            let is_idr = assembly.flags & 0x01 != 0;
+                            let age_ms = now.duration_since(assembly.created_at).as_millis();
+                            println!(
+                                    "[desktop/video] dropped frame {} ({}) got {}/{} shards (need {}) age={}ms",
+                                    fid,
+                                    if is_idr { "IDR" } else { "P" },
+                                    got,
+                                    total,
+                                    needed,
+                                    age_ms,
+                                );
+                            had_unrecoverable = true;
+                            dropped_frame_count += 1;
+                        }
+                    }
+                }
+
+                if had_unrecoverable {
+                    if should_send_pli(&mut last_pli_at) {
+                        println!("[desktop/video] unrecoverable frame(s) expired -> PLI");
+                        let _ = control.send_pli();
+                    }
+                }
+
+                audio_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
+                last_prune = now;
             }
 
             if let Some(update) = stats.sample(av_sync.estimate_transport_latency_ms()) {
@@ -1735,6 +1807,7 @@ impl ControlSender {
 pub struct UdpSender {
     pub socket: UdpSocket,
     pub session_key: [u8; 32],
+    pub server_addr: SocketAddr,
     inner: Mutex<UdpSenderInner>,
 }
 
@@ -1754,6 +1827,7 @@ impl UdpSender {
         Ok(Self {
             socket,
             session_key,
+            server_addr,
             inner: Mutex::new(UdpSenderInner {
                 cipher: SessionCipher::new(&session_key)?,
                 seq: 0,
@@ -1818,6 +1892,20 @@ fn tune_udp_socket(socket: &UdpSocket) -> Result<()> {
             ));
         }
     }
+
+    // Verify what we actually got
+    let mut actual: libc::c_int = 0;
+    let mut actual_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut actual as *mut _ as *mut libc::c_void,
+            &mut actual_len,
+        );
+    }
+    println!("[udp] SO_RCVBUF requested={} actual={}", value, actual);
 
     let send_value: libc::c_int = 4 * 1024 * 1024;
     let send_ptr = &send_value as *const _ as *const libc::c_void;
