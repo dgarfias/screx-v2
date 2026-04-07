@@ -882,13 +882,14 @@ fn render_hw_frame_windows(
 
             // --- Persistent state (created once, reused across frames) ---
             static ID3D11VideoDevice           *s_videoDevice    = nullptr;
-            static ID3D11VideoContext           *s_videoContext   = nullptr;
+            static ID3D11VideoContext          *s_videoContext   = nullptr;
             static ID3D11VideoProcessorEnumerator *s_enumerator  = nullptr;
             static ID3D11VideoProcessor        *s_videoProc      = nullptr;
             static ID3D11Texture2D             *s_bgraTex        = nullptr;
             static ID3D11Texture2D             *s_qtSharedTex    = nullptr;
             static ID3D11Texture2D             *s_qtTex          = nullptr;
             static ID3D11VideoProcessorOutputView *s_outputView  = nullptr;
+            static DXGI_FORMAT                  s_outFormat      = DXGI_FORMAT_UNKNOWN;
             static int s_outW = 0, s_outH = 0;
 
             // --- Get device from FFmpeg's hw context ---
@@ -962,17 +963,23 @@ fn render_hw_frame_windows(
                 outputCS.YCbCr_Matrix = 1; // BT.709
                 s_videoContext->VideoProcessorSetOutputColorSpace(s_videoProc, &outputCS);
 
-                // Create BGRA output texture
+                UINT rgbaSupport = 0;
+                bool useRgba = SUCCEEDED(s_enumerator->CheckVideoProcessorFormat(
+                    DXGI_FORMAT_R8G8B8A8_UNORM, &rgbaSupport))
+                    && (rgbaSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT);
+                s_outFormat = useRgba ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+
+                // Create video-processor output texture.
                 D3D11_TEXTURE2D_DESC outDesc = {};
                 outDesc.Width            = (UINT)w;
                 outDesc.Height           = (UINT)h;
                 outDesc.MipLevels        = 1;
                 outDesc.ArraySize        = 1;
-                outDesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+                outDesc.Format           = s_outFormat;
                 outDesc.SampleDesc.Count = 1;
                 outDesc.Usage            = D3D11_USAGE_DEFAULT;
-                outDesc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                outDesc.MiscFlags        = D3D11_RESOURCE_MISC_SHARED;
+                outDesc.BindFlags        = D3D11_BIND_RENDER_TARGET;
+                outDesc.MiscFlags        = qtDevice != device ? D3D11_RESOURCE_MISC_SHARED : 0;
 
                 hr = device->CreateTexture2D(&outDesc, nullptr, &s_bgraTex);
                 if (FAILED(hr)) {
@@ -1018,20 +1025,42 @@ fn render_hw_frame_windows(
                         return;
                     }
 
-                    // Qt's texture wrapper is happier with a normal local texture
-                    // on its own device than with the imported shared resource.
-                    D3D11_TEXTURE2D_DESC qtDesc = outDesc;
-                    qtDesc.MiscFlags = 0;
-                    hr = qtDevice->CreateTexture2D(&qtDesc, nullptr, &s_qtTex);
-                    if (FAILED(hr) || !s_qtTex) {
-                        qWarning("[video/win] Qt CreateTexture2D failed: 0x%08lx", hr);
-                        s_qtSharedTex->Release(); s_qtSharedTex = nullptr;
-                        s_bgraTex->Release();     s_bgraTex     = nullptr;
-                        s_videoProc->Release();   s_videoProc   = nullptr;
-                        s_enumerator->Release();  s_enumerator  = nullptr;
-                        return;
-                    }
                 }
+
+                // Qt only ever sees a plain sampled texture on its own device.
+                D3D11_TEXTURE2D_DESC qtDesc = {};
+                qtDesc.Width            = (UINT)w;
+                qtDesc.Height           = (UINT)h;
+                qtDesc.MipLevels        = 1;
+                qtDesc.ArraySize        = 1;
+                qtDesc.Format           = s_outFormat;
+                qtDesc.SampleDesc.Count = 1;
+                qtDesc.Usage            = D3D11_USAGE_DEFAULT;
+                qtDesc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+                qtDesc.MiscFlags        = 0;
+                hr = qtDevice->CreateTexture2D(&qtDesc, nullptr, &s_qtTex);
+                if (FAILED(hr) || !s_qtTex) {
+                    qWarning("[video/win] Qt CreateTexture2D failed: 0x%08lx", hr);
+                    if (s_qtSharedTex) { s_qtSharedTex->Release(); s_qtSharedTex = nullptr; }
+                    s_bgraTex->Release();     s_bgraTex     = nullptr;
+                    s_videoProc->Release();   s_videoProc   = nullptr;
+                    s_enumerator->Release();  s_enumerator  = nullptr;
+                    return;
+                }
+
+                ID3D11ShaderResourceView *testSrv = nullptr;
+                hr = qtDevice->CreateShaderResourceView(s_qtTex, nullptr, &testSrv);
+                if (FAILED(hr) || !testSrv) {
+                    qWarning("[video/win] self-check CreateShaderResourceView failed: 0x%08lx format=%u bind=0x%x",
+                             hr, (unsigned)s_outFormat, (unsigned)qtDesc.BindFlags);
+                    s_qtTex->Release();       s_qtTex       = nullptr;
+                    if (s_qtSharedTex) { s_qtSharedTex->Release(); s_qtSharedTex = nullptr; }
+                    s_bgraTex->Release();     s_bgraTex     = nullptr;
+                    s_videoProc->Release();   s_videoProc   = nullptr;
+                    s_enumerator->Release();  s_enumerator  = nullptr;
+                    return;
+                }
+                testSrv->Release();
 
                 // Create output view
                 D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
@@ -1050,8 +1079,10 @@ fn render_hw_frame_windows(
 
                 s_outW = w;
                 s_outH = h;
-                qDebug("[video/win] D3D11 video processor created: %dx%d shared=%s", w, h,
-                       qtDevice != device ? "yes" : "no");
+                qDebug("[video/win] D3D11 video processor created: %dx%d shared=%s fmt=%s",
+                       w, h,
+                       qtDevice != device ? "yes" : "no",
+                       s_outFormat == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA" : "BGRA");
             }
 
             // --- Per-frame: create input view for this array slice ---
@@ -1086,13 +1117,22 @@ fn render_hw_frame_windows(
                 return;
             }
 
+            auto *qtCtx = static_cast<ID3D11DeviceContext*>(
+                ri->getResource(window, QSGRendererInterface::DeviceContextResource));
+            if (!qtCtx || !s_qtTex) {
+                static bool s_warnedQtCtx = false;
+                if (!s_warnedQtCtx) {
+                    qWarning("[video/win] Qt D3D11 context or sampled texture unavailable");
+                    s_warnedQtCtx = true;
+                }
+                return;
+            }
+
             if (qtDevice != device) {
-                auto *qtCtx = static_cast<ID3D11DeviceContext*>(
-                    ri->getResource(window, QSGRendererInterface::DeviceContextResource));
-                if (!qtCtx || !s_qtSharedTex || !s_qtTex) {
+                if (!s_qtSharedTex) {
                     static bool s_warnedQtCtx = false;
                     if (!s_warnedQtCtx) {
-                        qWarning("[video/win] Qt D3D11 context or textures unavailable");
+                        qWarning("[video/win] Qt shared texture unavailable");
                         s_warnedQtCtx = true;
                     }
                     return;
@@ -1102,12 +1142,13 @@ fn render_hw_frame_windows(
                 devCtx->Flush();
                 qtCtx->CopyResource(s_qtTex, s_qtSharedTex);
                 qtCtx->Flush();
+            } else {
+                devCtx->CopyResource(s_qtTex, s_bgraTex);
             }
 
-            // --- Wrap BGRA texture in QSGTexture via QSGD3D11Texture ---
-            ID3D11Texture2D *qtTex = (qtDevice != device) ? s_qtTex : s_bgraTex;
+            // --- Wrap sampled Qt-local texture in QSGTexture ---
             auto qsgTex = QNativeInterface::QSGD3D11Texture::fromNative(
-                static_cast<void*>(qtTex), window, QSize(w, h),
+                static_cast<void*>(s_qtTex), window, QSize(w, h),
                 QQuickWindow::TextureIsOpaque);
             if (!qsgTex) {
                 static bool s_warned = false;
