@@ -886,6 +886,7 @@ fn render_hw_frame_windows(
             static ID3D11VideoProcessorEnumerator *s_enumerator  = nullptr;
             static ID3D11VideoProcessor        *s_videoProc      = nullptr;
             static ID3D11Texture2D             *s_bgraTex        = nullptr;
+            static ID3D11Texture2D             *s_qtSharedTex    = nullptr;
             static ID3D11Texture2D             *s_qtTex          = nullptr;
             static ID3D11VideoProcessorOutputView *s_outputView  = nullptr;
             static int s_outW = 0, s_outH = 0;
@@ -920,6 +921,7 @@ fn render_hw_frame_windows(
                 // Release old resources
                 if (s_outputView)  { s_outputView->Release();  s_outputView  = nullptr; }
                 if (s_qtTex)       { s_qtTex->Release();       s_qtTex       = nullptr; }
+                if (s_qtSharedTex) { s_qtSharedTex->Release(); s_qtSharedTex = nullptr; }
                 if (s_bgraTex)     { s_bgraTex->Release();     s_bgraTex     = nullptr; }
                 if (s_videoProc)   { s_videoProc->Release();   s_videoProc   = nullptr; }
                 if (s_enumerator)  { s_enumerator->Release();  s_enumerator  = nullptr; }
@@ -1007,12 +1009,26 @@ fn render_hw_frame_windows(
                     hr = qtDevice->OpenSharedResource(
                         sharedHandle,
                         __uuidof(ID3D11Texture2D),
-                        reinterpret_cast<void**>(&s_qtTex));
-                    if (FAILED(hr) || !s_qtTex) {
+                        reinterpret_cast<void**>(&s_qtSharedTex));
+                    if (FAILED(hr) || !s_qtSharedTex) {
                         qWarning("[video/win] OpenSharedResource failed: 0x%08lx", hr);
                         s_bgraTex->Release();    s_bgraTex    = nullptr;
                         s_videoProc->Release();  s_videoProc  = nullptr;
                         s_enumerator->Release(); s_enumerator = nullptr;
+                        return;
+                    }
+
+                    // Qt's texture wrapper is happier with a normal local texture
+                    // on its own device than with the imported shared resource.
+                    D3D11_TEXTURE2D_DESC qtDesc = outDesc;
+                    qtDesc.MiscFlags = 0;
+                    hr = qtDevice->CreateTexture2D(&qtDesc, nullptr, &s_qtTex);
+                    if (FAILED(hr) || !s_qtTex) {
+                        qWarning("[video/win] Qt CreateTexture2D failed: 0x%08lx", hr);
+                        s_qtSharedTex->Release(); s_qtSharedTex = nullptr;
+                        s_bgraTex->Release();     s_bgraTex     = nullptr;
+                        s_videoProc->Release();   s_videoProc   = nullptr;
+                        s_enumerator->Release();  s_enumerator  = nullptr;
                         return;
                     }
                 }
@@ -1070,8 +1086,26 @@ fn render_hw_frame_windows(
                 return;
             }
 
+            if (qtDevice != device) {
+                auto *qtCtx = static_cast<ID3D11DeviceContext*>(
+                    ri->getResource(window, QSGRendererInterface::DeviceContextResource));
+                if (!qtCtx || !s_qtSharedTex || !s_qtTex) {
+                    static bool s_warnedQtCtx = false;
+                    if (!s_warnedQtCtx) {
+                        qWarning("[video/win] Qt D3D11 context or textures unavailable");
+                        s_warnedQtCtx = true;
+                    }
+                    return;
+                }
+
+                // Make the producer's writes visible before the consumer device copies.
+                devCtx->Flush();
+                qtCtx->CopyResource(s_qtTex, s_qtSharedTex);
+                qtCtx->Flush();
+            }
+
             // --- Wrap BGRA texture in QSGTexture via QSGD3D11Texture ---
-            ID3D11Texture2D *qtTex = s_qtTex ? s_qtTex : s_bgraTex;
+            ID3D11Texture2D *qtTex = (qtDevice != device) ? s_qtTex : s_bgraTex;
             auto qsgTex = QNativeInterface::QSGD3D11Texture::fromNative(
                 static_cast<void*>(qtTex), window, QSize(w, h),
                 QQuickWindow::TextureIsOpaque);
