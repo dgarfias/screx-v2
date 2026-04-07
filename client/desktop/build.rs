@@ -23,6 +23,13 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=IOSurface");
     }
 
+    // Windows libraries for D3D11VA zero-copy video display
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=d3d11");
+        println!("cargo:rustc-link-lib=dxgi");
+    }
+
     let qt_include_path = std::env::var("DEP_QT_INCLUDE_PATH").unwrap();
     let mut config = cpp_build::Config::new();
     for f in std::env::var("DEP_QT_COMPILE_FLAGS")
@@ -61,6 +68,30 @@ fn main() {
                         if let Some(path) = flag.strip_prefix("-I") {
                             config.include(path);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // On Windows, add FFmpeg include path for hwcontext_d3d11va.h.
+    // The D3D11/DXGI headers come from the Windows SDK (already in MSVC include path).
+    #[cfg(target_os = "windows")]
+    {
+        // Try to get FFmpeg include path from pkg-config or DEP env vars
+        if let Ok(ffmpeg_include) = std::env::var("DEP_FFMPEG_INCLUDE") {
+            config.include(&ffmpeg_include);
+        }
+        // Fallback: try pkg-config for libavutil
+        if let Ok(output) = std::process::Command::new("pkg-config")
+            .args(["--cflags-only-I", "libavutil"])
+            .output()
+        {
+            if output.status.success() {
+                let flags = String::from_utf8_lossy(&output.stdout);
+                for flag in flags.split_whitespace() {
+                    if let Some(path) = flag.strip_prefix("-I") {
+                        config.include(path);
                     }
                 }
             }

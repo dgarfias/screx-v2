@@ -3,6 +3,7 @@
 // Renders decoded frames via:
 //   - Zero-copy (macOS): CVPixelBuffer → CVMetalTextureCache → MTLTexture → QSGMetalTexture
 //   - Zero-copy (Linux): VASurface → DMA-BUF → EGLImage → GL texture → QSGOpenGLTexture
+//   - Zero-copy (Windows): D3D11VA texture → Video Processor Blt → BGRA → QSGD3D11Texture
 //   - Fallback (all):    RGBA pixels → QImage → createTextureFromImage
 
 use std::ffi::c_void;
@@ -47,6 +48,15 @@ cpp! {{
     }
     #include <unistd.h>  // close()
     #include <drm_fourcc.h>
+    #endif
+    #ifdef _WIN32
+    #include <d3d11.h>
+    #include <dxgi.h>
+    // FFmpeg D3D11VA hardware context
+    extern "C" {
+    #include <libavutil/hwcontext.h>
+    #include <libavutil/hwcontext_d3d11va.h>
+    }
     #endif
 }}
 
@@ -812,6 +822,234 @@ fn render_hw_frame_linux(
     out_node
 }
 // ---------------------------------------------------------------------------
+// Windows D3D11VA zero-copy: NV12 → BGRA via D3D11 Video Processor
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "windows")]
+fn render_hw_frame_windows(
+    hw_frame: &HwFrame,
+    raw_node: *mut c_void,
+    item_ptr: *mut c_void,
+    dest_x: f64,
+    dest_y: f64,
+    dest_w: f64,
+    dest_h: f64,
+) -> *mut c_void {
+    let surface_ptr = hw_frame.native_surface_ptr(); // ID3D11Texture2D*
+    let array_index = hw_frame.native_array_index() as u32;
+    let hw_ctx_ptr = hw_frame.hw_frames_ctx(); // AVBufferRef*
+    let w = hw_frame.width as i32;
+    let h = hw_frame.height as i32;
+
+    let mut out_node = raw_node;
+
+    unsafe {
+        cpp!([
+            surface_ptr as "void*",
+            array_index as "uint32_t",
+            hw_ctx_ptr as "void*",
+            w as "int", h as "int",
+            item_ptr as "QQuickItem*",
+            dest_x as "double", dest_y as "double",
+            dest_w as "double", dest_h as "double",
+            mut out_node as "void*"
+        ] {
+            #ifdef _WIN32
+            if (!item_ptr || !surface_ptr || !hw_ctx_ptr) return;
+            auto *window = item_ptr->window();
+            if (!window) return;
+
+            auto *nv12Tex = static_cast<ID3D11Texture2D*>(surface_ptr);
+
+            // --- Persistent state (created once, reused across frames) ---
+            static ID3D11VideoDevice           *s_videoDevice    = nullptr;
+            static ID3D11VideoContext           *s_videoContext   = nullptr;
+            static ID3D11VideoProcessorEnumerator *s_enumerator  = nullptr;
+            static ID3D11VideoProcessor        *s_videoProc      = nullptr;
+            static ID3D11Texture2D             *s_bgraTex        = nullptr;
+            static ID3D11VideoProcessorOutputView *s_outputView  = nullptr;
+            static int s_outW = 0, s_outH = 0;
+
+            // --- Get device from FFmpeg's hw context ---
+            auto *avBufRef = static_cast<AVBufferRef*>(hw_ctx_ptr);
+            auto *framesCtx = reinterpret_cast<AVHWFramesContext*>(avBufRef->data);
+            auto *d3d11DevCtx = static_cast<AVD3D11VADeviceContext*>(framesCtx->device_ctx->hwctx);
+            ID3D11Device *device = d3d11DevCtx->device;
+            ID3D11DeviceContext *devCtx = d3d11DevCtx->device_context;
+
+            // --- One-time init: video device + video context ---
+            if (!s_videoDevice) {
+                HRESULT hr = device->QueryInterface(__uuidof(ID3D11VideoDevice),
+                                                     reinterpret_cast<void**>(&s_videoDevice));
+                if (FAILED(hr)) {
+                    qWarning("[video/win] QueryInterface(ID3D11VideoDevice) failed: 0x%08lx", hr);
+                    return;
+                }
+                hr = devCtx->QueryInterface(__uuidof(ID3D11VideoContext),
+                                             reinterpret_cast<void**>(&s_videoContext));
+                if (FAILED(hr)) {
+                    qWarning("[video/win] QueryInterface(ID3D11VideoContext) failed: 0x%08lx", hr);
+                    s_videoDevice->Release(); s_videoDevice = nullptr;
+                    return;
+                }
+                qDebug("[video/win] D3D11 video processor interfaces obtained");
+            }
+
+            // --- Recreate enumerator + processor + output texture on resolution change ---
+            if (s_outW != w || s_outH != h) {
+                // Release old resources
+                if (s_outputView)  { s_outputView->Release();  s_outputView  = nullptr; }
+                if (s_bgraTex)     { s_bgraTex->Release();     s_bgraTex     = nullptr; }
+                if (s_videoProc)   { s_videoProc->Release();   s_videoProc   = nullptr; }
+                if (s_enumerator)  { s_enumerator->Release();  s_enumerator  = nullptr; }
+
+                // Create enumerator
+                D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
+                contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+                contentDesc.InputFrameRate   = { 30, 1 };
+                contentDesc.InputWidth       = (UINT)w;
+                contentDesc.InputHeight      = (UINT)h;
+                contentDesc.OutputFrameRate  = { 30, 1 };
+                contentDesc.OutputWidth      = (UINT)w;
+                contentDesc.OutputHeight     = (UINT)h;
+                contentDesc.Usage            = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+                HRESULT hr = s_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &s_enumerator);
+                if (FAILED(hr)) {
+                    qWarning("[video/win] CreateVideoProcessorEnumerator failed: 0x%08lx", hr);
+                    return;
+                }
+
+                // Create video processor
+                hr = s_videoDevice->CreateVideoProcessor(s_enumerator, 0, &s_videoProc);
+                if (FAILED(hr)) {
+                    qWarning("[video/win] CreateVideoProcessor failed: 0x%08lx", hr);
+                    s_enumerator->Release(); s_enumerator = nullptr;
+                    return;
+                }
+
+                // Set color space: BT.709 limited → RGB full
+                D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputCS = {};
+                inputCS.YCbCr_Matrix  = 1; // BT.709
+                inputCS.Nominal_Range = 1; // 16-235
+                s_videoContext->VideoProcessorSetStreamColorSpace(s_videoProc, 0, &inputCS);
+
+                D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputCS = {};
+                outputCS.RGB_Range    = 0; // full range 0-255
+                outputCS.YCbCr_Matrix = 1; // BT.709
+                s_videoContext->VideoProcessorSetOutputColorSpace(s_videoProc, &outputCS);
+
+                // Create BGRA output texture
+                D3D11_TEXTURE2D_DESC outDesc = {};
+                outDesc.Width            = (UINT)w;
+                outDesc.Height           = (UINT)h;
+                outDesc.MipLevels        = 1;
+                outDesc.ArraySize        = 1;
+                outDesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+                outDesc.SampleDesc.Count = 1;
+                outDesc.Usage            = D3D11_USAGE_DEFAULT;
+                outDesc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+                hr = device->CreateTexture2D(&outDesc, nullptr, &s_bgraTex);
+                if (FAILED(hr)) {
+                    qWarning("[video/win] CreateTexture2D (BGRA output) failed: 0x%08lx", hr);
+                    s_videoProc->Release();  s_videoProc  = nullptr;
+                    s_enumerator->Release(); s_enumerator = nullptr;
+                    return;
+                }
+
+                // Create output view
+                D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+                ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                ovd.Texture2D.MipSlice = 0;
+
+                hr = s_videoDevice->CreateVideoProcessorOutputView(
+                    s_bgraTex, s_enumerator, &ovd, &s_outputView);
+                if (FAILED(hr)) {
+                    qWarning("[video/win] CreateVideoProcessorOutputView failed: 0x%08lx", hr);
+                    s_bgraTex->Release();    s_bgraTex    = nullptr;
+                    s_videoProc->Release();  s_videoProc  = nullptr;
+                    s_enumerator->Release(); s_enumerator = nullptr;
+                    return;
+                }
+
+                s_outW = w;
+                s_outH = h;
+                qDebug("[video/win] D3D11 video processor created: %dx%d", w, h);
+            }
+
+            // --- Per-frame: create input view for this array slice ---
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+            ivd.FourCC        = 0;
+            ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            ivd.Texture2D.MipSlice   = 0;
+            ivd.Texture2D.ArraySlice = array_index;
+
+            ID3D11VideoProcessorInputView *inputView = nullptr;
+            HRESULT hr = s_videoDevice->CreateVideoProcessorInputView(
+                nv12Tex, s_enumerator, &ivd, &inputView);
+            if (FAILED(hr)) {
+                qWarning("[video/win] CreateVideoProcessorInputView failed: 0x%08lx", hr);
+                return;
+            }
+
+            // --- NV12 → BGRA via Video Processor Blt ---
+            D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+            stream.Enable        = TRUE;
+            stream.pInputSurface = inputView;
+
+            // Use FFmpeg's lock to protect the device context (it's shared)
+            d3d11DevCtx->lock(d3d11DevCtx->lock_ctx);
+            hr = s_videoContext->VideoProcessorBlt(s_videoProc, s_outputView, 0, 1, &stream);
+            d3d11DevCtx->unlock(d3d11DevCtx->lock_ctx);
+
+            inputView->Release();
+
+            if (FAILED(hr)) {
+                qWarning("[video/win] VideoProcessorBlt failed: 0x%08lx", hr);
+                return;
+            }
+
+            // --- Wrap BGRA texture in QSGTexture via QSGD3D11Texture ---
+            auto qsgTex = QNativeInterface::QSGD3D11Texture::fromNative(
+                static_cast<void*>(s_bgraTex), window, QSize(w, h),
+                QQuickWindow::TextureIsOpaque);
+            if (!qsgTex) {
+                static bool s_warned = false;
+                if (!s_warned) {
+                    qWarning("[video/win] QSGD3D11Texture::fromNative returned null");
+                    s_warned = true;
+                }
+                return;
+            }
+            qsgTex->setFiltering(QSGTexture::Linear);
+
+            // --- Set up scene graph node ---
+            auto imageNode = static_cast<QSGImageNode*>((QSGNode*)out_node);
+            if (!imageNode) {
+                imageNode = window->createImageNode();
+                if (!imageNode) { delete qsgTex; return; }
+                imageNode->setOwnsTexture(false);
+                imageNode->setFiltering(QSGTexture::Linear);
+            }
+            auto prevTex = imageNode->texture();
+            imageNode->setTexture(qsgTex);
+            if (prevTex) delete prevTex;
+            imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
+            out_node = (void*)imageNode;
+
+            static int s_fc = 0;
+            s_fc++;
+            if (s_fc <= 5 || (s_fc & 0xFF) == 0) {
+                qDebug("[video/win] zero-copy frame #%d: %dx%d slice=%u node=%p",
+                       s_fc, w, h, array_index, imageNode);
+            }
+            #endif // _WIN32
+        });
+    }
+
+    out_node
+}
+// ---------------------------------------------------------------------------
 // VideoSurface QQuickItem
 // ---------------------------------------------------------------------------
 
@@ -947,7 +1185,19 @@ impl QQuickItem for VideoSurface {
                         dest_h,
                     )
                 }
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                #[cfg(target_os = "windows")]
+                {
+                    render_hw_frame_windows(
+                        hw_frame,
+                        node.raw,
+                        item as *mut c_void,
+                        dest_x,
+                        dest_y,
+                        dest_w,
+                        dest_h,
+                    )
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
                 {
                     // No zero-copy support on this platform — should not happen
                     // because the decoder wouldn't return HwFrame.

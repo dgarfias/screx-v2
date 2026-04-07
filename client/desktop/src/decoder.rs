@@ -32,6 +32,7 @@ pub struct DecodedFrame {
 /// A hardware-decoded frame whose GPU surface is still alive.
 /// On macOS: data[3] is a CVPixelBufferRef (BGRA, IOSurface-backed).
 /// On Linux: data[3] is a VASurfaceID.
+/// On Windows: data[0] is an ID3D11Texture2D*, data[1] is the array slice index.
 /// Dropping this frees the AVFrame reference, releasing the GPU surface.
 pub struct HwFrame {
     pub width: u32,
@@ -45,10 +46,27 @@ unsafe impl Send for HwFrame {}
 unsafe impl Sync for HwFrame {}
 
 impl HwFrame {
-    /// Get the native surface pointer (CVPixelBufferRef on macOS, VASurfaceID on Linux).
+    /// Get the native surface pointer (CVPixelBufferRef on macOS, VASurfaceID on Linux,
+    /// ID3D11Texture2D* on Windows).
     /// The pointer is valid as long as this HwFrame is alive.
     pub fn native_surface_ptr(&self) -> *mut c_void {
-        unsafe { (*self.frame).data[3] as *mut c_void }
+        unsafe {
+            // D3D11VA stores texture in data[0], others store in data[3]
+            #[cfg(target_os = "windows")]
+            {
+                (*self.frame).data[0] as *mut c_void
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                (*self.frame).data[3] as *mut c_void
+            }
+        }
+    }
+
+    /// Get the D3D11VA texture array slice index (Windows only).
+    /// Returns data[1] as intptr_t — the index into the texture array.
+    pub fn native_array_index(&self) -> usize {
+        unsafe { (*self.frame).data[1] as usize }
     }
 
     /// Get the hw_frames_ctx for accessing the underlying device context.
@@ -205,13 +223,16 @@ impl VideoDecoder {
         #[cfg(target_os = "windows")]
         {
             if let Ok(hw) = HwDecoder::new_d3d11va(codec) {
-                // D3D11VA zero-copy not yet implemented.
-                println!("[decoder] using D3D11VA {label} hw decode (zero_copy=false)");
+                let zc = !no_zerocopy;
+                println!(
+                    "[decoder] using D3D11VA {label} hw decode (zero_copy={})",
+                    zc
+                );
                 return Ok(Self {
                     inner: DecoderInner::HwAccel(hw),
                     last_width: 0,
                     last_height: 0,
-                    zero_copy: false,
+                    zero_copy: zc,
                 });
             }
         }
