@@ -35,6 +35,11 @@ mkdir "%DIST%"
 echo === Copying executable ===
 copy "%EXE%" "%DIST%\"
 
+echo === Copying application icon ===
+if exist "..\ipad\Screx\Assets.xcassets\AppIcon.appiconset\AppIcon.png" (
+    copy "..\ipad\Screx\Assets.xcassets\AppIcon.appiconset\AppIcon.png" "%DIST%\AppIcon.png" >nul
+)
+
 echo === Deploying Qt runtime ===
 where windeployqt >nul 2>&1
 if errorlevel 1 (

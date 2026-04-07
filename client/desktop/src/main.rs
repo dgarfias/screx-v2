@@ -22,8 +22,12 @@ cpp! {{
     #include <QtCore/QEvent>
     #include <QtCore/QObject>
     #include <QtCore/QCoreApplication>
+    #include <QtCore/QDir>
+    #include <QtCore/QFileInfo>
     #include <QtGui/QKeyEvent>
     #include <QtGui/QCursor>
+    #include <QtGui/QGuiApplication>
+    #include <QtGui/QIcon>
 
     class RustKeyFilter : public QObject {
     public:
@@ -76,6 +80,24 @@ cpp! {{
         s_rustKeyFilter = new RustKeyFilter();
         qApp->installEventFilter(s_rustKeyFilter);
     }
+
+    static void installAppWindowIcon() {
+        if (!qApp) {
+            return;
+        }
+
+        const QString appDir = QCoreApplication::applicationDirPath();
+        const QString pngPath = appDir + QDir::separator() + QStringLiteral("AppIcon.png");
+        const QString icoPath = appDir + QDir::separator() + QStringLiteral("AppIcon.ico");
+
+        if (QFileInfo::exists(pngPath)) {
+            QGuiApplication::setWindowIcon(QIcon(pngPath));
+            return;
+        }
+        if (QFileInfo::exists(icoPath)) {
+            QGuiApplication::setWindowIcon(QIcon(icoPath));
+        }
+    }
 }}
 
 pub fn warp_cursor_to(x: i32, y: i32) {
@@ -106,6 +128,7 @@ fn main() {
     let mut engine = QmlEngine::new();
     cpp!(unsafe [] {
         installRustKeyFilter();
+        installAppWindowIcon();
     });
     engine.load_data(include_str!("../qml/Main.qml").into());
 
