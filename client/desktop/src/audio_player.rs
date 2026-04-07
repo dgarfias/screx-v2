@@ -309,25 +309,47 @@ fn cpal_playback_loop(ring: &AudioSlot, stop: &Arc<AtomicBool>) -> Result<()> {
     let stop_flag = Arc::clone(stop);
     let channels = stream_config.channels as usize;
 
+    // Pre-allocate a scratch buffer for the audio callback — avoids heap
+    // allocation on every invocation (~200×/sec at 48 kHz / 256 frames).
+    // Wrapped in a RefCell so the non-mut closure can mutate it.
+    use std::cell::RefCell;
+    let scratch = RefCell::new(Vec::<u8>::new());
+
     let stream = match sample_format {
         SampleFormat::F32 => device.build_output_stream(
             &stream_config,
-            move |data: &mut [f32], _| cpal_write::<f32>(data, channels, &ring_pull, &stop_flag),
+            move |data: &mut [f32], _| {
+                cpal_write::<f32>(data, channels, &ring_pull, &stop_flag, &scratch)
+            },
             |err| eprintln!("[audio_player] stream error: {err}"),
             None,
         )?,
-        SampleFormat::I16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [i16], _| cpal_write::<i16>(data, channels, &ring_pull, &stop_flag),
-            |err| eprintln!("[audio_player] stream error: {err}"),
-            None,
-        )?,
-        SampleFormat::U16 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [u16], _| cpal_write::<u16>(data, channels, &ring_pull, &stop_flag),
-            |err| eprintln!("[audio_player] stream error: {err}"),
-            None,
-        )?,
+        SampleFormat::I16 => {
+            let ring_pull = Arc::clone(ring);
+            let stop_flag = Arc::clone(stop);
+            let scratch = RefCell::new(Vec::<u8>::new());
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [i16], _| {
+                    cpal_write::<i16>(data, channels, &ring_pull, &stop_flag, &scratch)
+                },
+                |err| eprintln!("[audio_player] stream error: {err}"),
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let ring_pull = Arc::clone(ring);
+            let stop_flag = Arc::clone(stop);
+            let scratch = RefCell::new(Vec::<u8>::new());
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [u16], _| {
+                    cpal_write::<u16>(data, channels, &ring_pull, &stop_flag, &scratch)
+                },
+                |err| eprintln!("[audio_player] stream error: {err}"),
+                None,
+            )?
+        }
         other => return Err(anyhow!("unsupported sample format: {other:?}")),
     };
 
@@ -347,8 +369,13 @@ fn cpal_playback_loop(ring: &AudioSlot, stop: &Arc<AtomicBool>) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cpal_write<T>(data: &mut [T], channels: usize, ring: &AudioSlot, stop: &Arc<AtomicBool>)
-where
+fn cpal_write<T>(
+    data: &mut [T],
+    channels: usize,
+    ring: &AudioSlot,
+    stop: &Arc<AtomicBool>,
+    scratch: &std::cell::RefCell<Vec<u8>>,
+) where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     if stop.load(Ordering::Relaxed) {
@@ -363,9 +390,13 @@ where
     } else {
         data.len() / channels
     };
-    let mut buf = vec![0u8; frames * CHANNELS as usize * BYTES_PER_SAMPLE];
+    let needed = frames * CHANNELS as usize * BYTES_PER_SAMPLE;
+    let mut buf = scratch.borrow_mut();
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
     let read = if let Ok(mut ring) = ring.lock() {
-        ring.read(&mut buf)
+        ring.read(&mut buf[..needed])
     } else {
         0
     };

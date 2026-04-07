@@ -1,8 +1,6 @@
 // Qt Quick video surface backed by the scene graph.
 //
-// The backend writes decoded RGBA frames into a global frame slot, then calls
-// `request_video_surface_update()`. The QQuickItem invalidates itself and the
-// scene graph callback uploads the latest frame into a QSGImageNode.
+// Renders decoded RGBA frames via QSGImageNode + createTextureFromImage.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -17,6 +15,7 @@ cpp! {{
     #include <QtQuick/QQuickItem>
     #include <QtQuick/QQuickWindow>
     #include <QtQuick/QSGImageNode>
+    #include <QtQuick/QSGTexture>
 }}
 
 pub struct RawFrame {
@@ -43,7 +42,6 @@ impl FrameSlot {
         let boxed = Box::into_raw(Box::new(frame));
         let old = self.ptr.swap(boxed, Ordering::AcqRel);
         if !old.is_null() {
-            // Drop the old frame
             unsafe { drop(Box::from_raw(old)) };
         }
     }
@@ -77,7 +75,6 @@ static GLOBAL_FRAME_SLOT: OnceLock<FrameSlotRef> = OnceLock::new();
 static REQUEST_UPDATE: OnceLock<Box<dyn Fn(()) + Send + Sync>> = OnceLock::new();
 static UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
 static UPDATE_COUNT: AtomicU64 = AtomicU64::new(0);
-static UPDATE_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_global_frame_slot() -> FrameSlotRef {
     if let Some(existing) = GLOBAL_FRAME_SLOT.get() {
@@ -103,17 +100,72 @@ pub fn request_video_surface_update() {
         } else {
             UPDATE_PENDING.store(false, Ordering::Release);
         }
-    } else {
-        let skipped = UPDATE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if skipped == 1 || skipped % 120 == 0 {
-            println!("[desktop/video] coalesced pending updates={skipped}");
-        }
     }
 }
 
 fn clear_pending_update() {
     UPDATE_PENDING.store(false, Ordering::Release);
 }
+
+// ---------------------------------------------------------------------------
+// RGBA upload path
+// ---------------------------------------------------------------------------
+
+fn render_rgba_frame(
+    frame: &RawFrame,
+    raw_node: *mut c_void,
+    item_ptr: *mut c_void,
+    dest_x: f64,
+    dest_y: f64,
+    dest_w: f64,
+    dest_h: f64,
+) -> *mut c_void {
+    let w = frame.width as i32;
+    let h = frame.height as i32;
+    let data_ptr = frame.rgba.as_ptr();
+    let mut out_node = raw_node;
+
+    cpp!(unsafe [
+        mut out_node as "void*",
+        item_ptr as "QQuickItem*",
+        data_ptr as "const uchar*",
+        w as "int",
+        h as "int",
+        dest_x as "double",
+        dest_y as "double",
+        dest_w as "double",
+        dest_h as "double"
+    ] {
+        if (!item_ptr) return;
+        auto window = item_ptr->window();
+        if (!window) return;
+
+        auto imageNode = static_cast<QSGImageNode*>((QSGNode*)out_node);
+        if (!imageNode) {
+            imageNode = window->createImageNode();
+            if (!imageNode) return;
+            imageNode->setOwnsTexture(true);
+            imageNode->setFiltering(QSGTexture::Linear);
+        }
+
+        QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBX8888);
+        auto texture = window->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
+        if (texture) {
+            texture->setFiltering(QSGTexture::Linear);
+            imageNode->setTexture(texture);
+        }
+
+        imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
+        imageNode->setSourceRect(0, 0, w, h);
+        out_node = (void*)imageNode;
+    });
+
+    out_node
+}
+
+// ---------------------------------------------------------------------------
+// VideoSurface QQuickItem
+// ---------------------------------------------------------------------------
 
 #[derive(QObject)]
 pub struct VideoSurface {
@@ -158,7 +210,6 @@ impl QQuickItem for VideoSurface {
             }
         });
         let _ = REQUEST_UPDATE.set(Box::new(cb));
-        println!("[desktop/video] video surface component completed (ItemHasContents set)");
     }
 
     fn update_paint_node(
@@ -171,25 +222,17 @@ impl QQuickItem for VideoSurface {
             None => return node,
         };
 
-        // Take latest frame from the lock-free slot. If a new frame arrived
-        // since last paint, use it and keep it for future paints.
         if let Some(new_frame) = slot.take_latest() {
             self.current_frame = Some(new_frame);
         }
         let frame = match self.current_frame.as_ref() {
             Some(f) => f,
-            None => {
-                let count = UPDATE_COUNT.load(Ordering::Relaxed);
-                if count == 0 || count % 120 == 0 {
-                    println!("[desktop/video] update_paint_node had no frame available");
-                }
-                return node;
-            }
+            None => return node,
         };
 
         let w = frame.width as i32;
         let h = frame.height as i32;
-        if w <= 0 || h <= 0 || frame.rgba.len() < (w as usize * h as usize * 4) {
+        if w <= 0 || h <= 0 {
             return node;
         }
 
@@ -198,6 +241,7 @@ impl QQuickItem for VideoSurface {
             return node;
         }
 
+        // Letterbox computation
         let src_aspect = w as f64 / h as f64;
         let dst_aspect = item_rect.width / item_rect.height;
         let (dw, dh) = if src_aspect > dst_aspect {
@@ -225,52 +269,21 @@ impl QQuickItem for VideoSurface {
             self.content_rect_changed();
         }
 
-        let item = self.get_cpp_object();
-        let data_ptr = frame.rgba.as_ptr();
-        let raw = node.raw;
-
-        let new_raw = cpp!(unsafe [
-            raw as "QSGNode*",
-            item as "QQuickItem*",
-            data_ptr as "const uchar*",
-            w as "int",
-            h as "int",
-            dest_x as "double",
-            dest_y as "double",
-            dest_w as "double",
-            dest_h as "double"
-        ] -> *mut c_void as "void*" {
-            if (!item) return raw;
-            auto window = item->window();
-            if (!window) return raw;
-
-            auto imageNode = static_cast<QSGImageNode*>(raw);
-            if (!imageNode) {
-                imageNode = window->createImageNode();
-                if (!imageNode) return raw;
-                imageNode->setOwnsTexture(true);
-            }
-
-            QImage image(data_ptr, w, h, w * 4, QImage::Format_RGBX8888);
-            auto texture = window->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
-            texture->setFiltering(QSGTexture::Linear);
-            imageNode->setTexture(texture);
-            imageNode->setFiltering(QSGTexture::Linear);
-            imageNode->setRect(dest_x, dest_y, dest_w, dest_h);
-            imageNode->setSourceRect(0, 0, w, h);
-            return imageNode;
-        });
-
-        node.raw = new_raw;
-
-        let count = UPDATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % 120 == 0 {
-            println!(
-                "[desktop/video] scenegraph updates={} frame={}x{} item={:.0}x{:.0}",
-                count, w, h, item_rect.width, item_rect.height
-            );
+        if frame.rgba.len() < (w as usize * h as usize * 4) {
+            return node;
         }
+        let item = self.get_cpp_object();
+        node.raw = render_rgba_frame(
+            frame.as_ref(),
+            node.raw,
+            item as *mut c_void,
+            dest_x,
+            dest_y,
+            dest_w,
+            dest_h,
+        );
 
+        UPDATE_COUNT.fetch_add(1, Ordering::Relaxed);
         node
     }
 }

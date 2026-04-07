@@ -2,7 +2,7 @@
 //
 // Decode pipeline:
 //   Annex-B H.264/H.265 access unit
-//   → avcodec_send_packet   (hw decoder: VA-API or CUDA/NVDEC; fallback: sw)
+//   → avcodec_send_packet   (hw decoder: VideoToolbox/VA-API/D3D11VA/CUDA; fallback: sw)
 //   → avcodec_receive_frame  (hw surface or sw YUV)
 //   → av_hwframe_transfer_data  (hw → CPU NV12, no-op for sw)
 //   → sws_scale NV12 → RGBA
@@ -19,10 +19,50 @@ use ffmpeg_sys_next as ffi;
 // ---------------------------------------------------------------------------
 
 /// A decoded RGBA frame ready for display.
+///
+/// Uses a pooled buffer to avoid per-frame heap allocation. When dropped, the
+/// inner `Vec` is returned to the pool for the next frame.
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// Simple single-buffer pool: caller takes a pre-allocated Vec, fills it, and
+/// it gets recycled when the previous frame is no longer referenced.
+pub struct FrameBufferPool {
+    spare: Option<Vec<u8>>,
+}
+
+impl FrameBufferPool {
+    pub fn new() -> Self {
+        Self { spare: None }
+    }
+
+    /// Take a buffer from the pool (or allocate a new one).
+    /// The buffer is cleared but retains its capacity.
+    fn take(&mut self, needed: usize) -> Vec<u8> {
+        if let Some(mut buf) = self.spare.take() {
+            buf.clear();
+            if buf.capacity() >= needed {
+                return buf;
+            }
+            // Capacity too small — drop and allocate fresh
+        }
+        Vec::with_capacity(needed)
+    }
+
+    /// Return a buffer to the pool for reuse.
+    pub fn recycle(&mut self, buf: Vec<u8>) {
+        // Keep the larger buffer
+        if self
+            .spare
+            .as_ref()
+            .map_or(true, |s| buf.capacity() > s.capacity())
+        {
+            self.spare = Some(buf);
+        }
+    }
 }
 
 /// Which video codec the incoming stream uses.
@@ -148,10 +188,14 @@ impl VideoDecoder {
     }
 
     /// Feed one Annex-B access unit and collect any decoded frames.
-    pub fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
+    pub fn decode(
+        &mut self,
+        annex_b: &[u8],
+        pool: &mut FrameBufferPool,
+    ) -> Result<Vec<DecodedFrame>> {
         let frames = match &mut self.inner {
-            DecoderInner::HwAccel(hw) => hw.decode(annex_b)?,
-            DecoderInner::Software(sw) => sw.decode(annex_b)?,
+            DecoderInner::HwAccel(hw) => hw.decode(annex_b, pool)?,
+            DecoderInner::Software(sw) => sw.decode(annex_b, pool)?,
         };
         for f in &frames {
             self.last_width = f.width;
@@ -198,6 +242,9 @@ struct HwDecoder {
     sws_height: i32,
     sws_src_fmt: ffi::AVPixelFormat,
     rgba_frame: *mut ffi::AVFrame,
+    /// Cached RGBA frame buffer dimensions — skip av_frame_get_buffer when unchanged.
+    rgba_buf_width: i32,
+    rgba_buf_height: i32,
 }
 
 unsafe impl Send for HwDecoder {}
@@ -405,34 +452,44 @@ impl HwDecoder {
                 sws_height: 0,
                 sws_src_fmt: ffi::AVPixelFormat::AV_PIX_FMT_NONE,
                 rgba_frame,
+                rgba_buf_width: 0,
+                rgba_buf_height: 0,
             })
         }
     }
 
-    fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
+    fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
             // Feed the complete access unit directly — no parser needed.
             (*self.pkt).data = annex_b.as_ptr() as *mut u8;
             (*self.pkt).size = annex_b.len() as i32;
-            self.send_and_receive(&mut frames)?;
+            self.send_and_receive(&mut frames, pool)?;
             (*self.pkt).data = ptr::null_mut();
             (*self.pkt).size = 0;
         }
         Ok(frames)
     }
 
-    unsafe fn send_and_receive(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
+    unsafe fn send_and_receive(
+        &mut self,
+        frames: &mut Vec<DecodedFrame>,
+        pool: &mut FrameBufferPool,
+    ) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
         if ret < 0 {
             if ret != ffi::AVERROR(libc::EAGAIN) && ret != ffi::AVERROR_EOF {
                 bail!("avcodec_send_packet error {ret}");
             }
         }
-        self.receive_frames(frames)
+        self.receive_frames(frames, pool)
     }
 
-    unsafe fn receive_frames(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
+    unsafe fn receive_frames(
+        &mut self,
+        frames: &mut Vec<DecodedFrame>,
+        pool: &mut FrameBufferPool,
+    ) -> Result<()> {
         loop {
             let ret = ffi::avcodec_receive_frame(self.ctx, self.hw_frame);
             if ret == ffi::AVERROR(libc::EAGAIN) || ret == ffi::AVERROR_EOF {
@@ -442,20 +499,21 @@ impl HwDecoder {
                 bail!("avcodec_receive_frame error {ret}");
             }
 
-            let src_frame =
-                if std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.hw_frame).format)
-                    == self.hw_pix_fmt
-                {
-                    ffi::av_frame_unref(self.sw_frame);
-                    let ret = ffi::av_hwframe_transfer_data(self.sw_frame, self.hw_frame, 0);
-                    if ret < 0 {
-                        ffi::av_frame_unref(self.hw_frame);
-                        bail!("av_hwframe_transfer_data error {ret}");
-                    }
-                    self.sw_frame
-                } else {
-                    self.hw_frame
-                };
+            let frame_fmt = std::mem::transmute::<i32, ffi::AVPixelFormat>((*self.hw_frame).format);
+            let is_hw = frame_fmt == self.hw_pix_fmt;
+
+            // --- Readback path: GPU→CPU→sws_scale→RGBA ---
+            let src_frame = if is_hw {
+                ffi::av_frame_unref(self.sw_frame);
+                let ret = ffi::av_hwframe_transfer_data(self.sw_frame, self.hw_frame, 0);
+                if ret < 0 {
+                    ffi::av_frame_unref(self.hw_frame);
+                    bail!("av_hwframe_transfer_data error {ret}");
+                }
+                self.sw_frame
+            } else {
+                self.hw_frame
+            };
 
             let w = (*src_frame).width;
             let h = (*src_frame).height;
@@ -464,15 +522,21 @@ impl HwDecoder {
             // Ensure sws context matches current resolution and pixel format.
             self.ensure_sws(w, h, src_fmt)?;
 
-            // sws_scale NV12 → RGBX (opaque alpha baked in via RGBX target)
-            ffi::av_frame_unref(self.rgba_frame);
-            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGB0 as i32;
-            (*self.rgba_frame).width = w;
-            (*self.rgba_frame).height = h;
-            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
-            if ret < 0 {
-                bail!("failed to allocate RGBA frame buffer");
+            // Reuse the RGBA frame buffer when resolution is unchanged.
+            if self.rgba_buf_width != w || self.rgba_buf_height != h {
+                ffi::av_frame_unref(self.rgba_frame);
+                (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGB0 as i32;
+                (*self.rgba_frame).width = w;
+                (*self.rgba_frame).height = h;
+                let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
+                if ret < 0 {
+                    bail!("failed to allocate RGBA frame buffer");
+                }
+                self.rgba_buf_width = w;
+                self.rgba_buf_height = h;
             }
+            // Make the frame writable (refcount == 1) so sws_scale can write into it.
+            ffi::av_frame_make_writable(self.rgba_frame);
 
             ffi::sws_scale(
                 self.sws,
@@ -484,23 +548,23 @@ impl HwDecoder {
                 (*self.rgba_frame).linesize.as_mut_ptr(),
             );
 
-            // Single memcpy when stride == width*4, otherwise row-copy
+            // Copy RGBA data into a pooled buffer (avoids per-frame heap allocation)
             let stride = (*self.rgba_frame).linesize[0] as usize;
             let row_bytes = w as usize * 4;
             let height = h as usize;
             let src_ptr = (*self.rgba_frame).data[0];
-            let rgba = if stride == row_bytes {
-                std::slice::from_raw_parts(src_ptr, row_bytes * height).to_vec()
+            let needed = row_bytes * height;
+            let mut rgba = pool.take(needed);
+            if stride == row_bytes {
+                rgba.extend_from_slice(std::slice::from_raw_parts(src_ptr, needed));
             } else {
-                let mut buf = Vec::with_capacity(row_bytes * height);
                 for row in 0..height {
-                    buf.extend_from_slice(std::slice::from_raw_parts(
+                    rgba.extend_from_slice(std::slice::from_raw_parts(
                         src_ptr.add(row * stride),
                         row_bytes,
                     ));
                 }
-                buf
-            };
+            }
 
             frames.push(DecodedFrame {
                 width: w as u32,
@@ -512,7 +576,6 @@ impl HwDecoder {
             if src_frame == self.sw_frame {
                 ffi::av_frame_unref(self.sw_frame);
             }
-            ffi::av_frame_unref(self.rgba_frame);
         }
         Ok(())
     }
@@ -587,6 +650,9 @@ struct SwDecoder {
     sws_height: i32,
     sws_src_fmt: ffi::AVPixelFormat,
     rgba_frame: *mut ffi::AVFrame,
+    /// Cached RGBA frame buffer dimensions — skip av_frame_get_buffer when unchanged.
+    rgba_buf_width: i32,
+    rgba_buf_height: i32,
 }
 
 unsafe impl Send for SwDecoder {}
@@ -641,17 +707,19 @@ impl SwDecoder {
                 sws_height: 0,
                 sws_src_fmt: ffi::AVPixelFormat::AV_PIX_FMT_NONE,
                 rgba_frame,
+                rgba_buf_width: 0,
+                rgba_buf_height: 0,
             })
         }
     }
 
-    fn decode(&mut self, annex_b: &[u8]) -> Result<Vec<DecodedFrame>> {
+    fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
         unsafe {
             // Feed the complete access unit directly without re-parsing.
             (*self.pkt).data = annex_b.as_ptr() as *mut u8;
             (*self.pkt).size = annex_b.len() as i32;
-            self.send_and_receive(&mut frames)?;
+            self.send_and_receive(&mut frames, pool)?;
             // Do NOT call av_packet_unref here — we don't own the data pointer.
             (*self.pkt).data = ptr::null_mut();
             (*self.pkt).size = 0;
@@ -659,17 +727,25 @@ impl SwDecoder {
         Ok(frames)
     }
 
-    unsafe fn send_and_receive(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
+    unsafe fn send_and_receive(
+        &mut self,
+        frames: &mut Vec<DecodedFrame>,
+        pool: &mut FrameBufferPool,
+    ) -> Result<()> {
         let ret = ffi::avcodec_send_packet(self.ctx, self.pkt);
         if ret < 0 {
             if ret != ffi::AVERROR(libc::EAGAIN) && ret != ffi::AVERROR_EOF {
                 bail!("sw avcodec_send_packet error {ret}");
             }
         }
-        self.receive_frames(frames)
+        self.receive_frames(frames, pool)
     }
 
-    unsafe fn receive_frames(&mut self, frames: &mut Vec<DecodedFrame>) -> Result<()> {
+    unsafe fn receive_frames(
+        &mut self,
+        frames: &mut Vec<DecodedFrame>,
+        pool: &mut FrameBufferPool,
+    ) -> Result<()> {
         loop {
             let ret = ffi::avcodec_receive_frame(self.ctx, self.frame);
             if ret == ffi::AVERROR(libc::EAGAIN) || ret == ffi::AVERROR_EOF {
@@ -685,14 +761,20 @@ impl SwDecoder {
 
             self.ensure_sws(w, h, src_fmt)?;
 
-            ffi::av_frame_unref(self.rgba_frame);
-            (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGB0 as i32;
-            (*self.rgba_frame).width = w;
-            (*self.rgba_frame).height = h;
-            let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
-            if ret < 0 {
-                bail!("failed to allocate sw RGBA frame buffer");
+            // Reuse the RGBA frame buffer when resolution is unchanged.
+            if self.rgba_buf_width != w || self.rgba_buf_height != h {
+                ffi::av_frame_unref(self.rgba_frame);
+                (*self.rgba_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_RGBA as i32;
+                (*self.rgba_frame).width = w;
+                (*self.rgba_frame).height = h;
+                let ret = ffi::av_frame_get_buffer(self.rgba_frame, 32);
+                if ret < 0 {
+                    bail!("failed to allocate sw RGBA frame buffer");
+                }
+                self.rgba_buf_width = w;
+                self.rgba_buf_height = h;
             }
+            ffi::av_frame_make_writable(self.rgba_frame);
 
             ffi::sws_scale(
                 self.sws,
@@ -708,18 +790,18 @@ impl SwDecoder {
             let row_bytes = w as usize * 4;
             let height = h as usize;
             let src_ptr = (*self.rgba_frame).data[0];
-            let rgba = if stride == row_bytes {
-                std::slice::from_raw_parts(src_ptr, row_bytes * height).to_vec()
+            let needed = row_bytes * height;
+            let mut rgba = pool.take(needed);
+            if stride == row_bytes {
+                rgba.extend_from_slice(std::slice::from_raw_parts(src_ptr, needed));
             } else {
-                let mut buf = Vec::with_capacity(row_bytes * height);
                 for row in 0..height {
-                    buf.extend_from_slice(std::slice::from_raw_parts(
+                    rgba.extend_from_slice(std::slice::from_raw_parts(
                         src_ptr.add(row * stride),
                         row_bytes,
                     ));
                 }
-                buf
-            };
+            }
 
             frames.push(DecodedFrame {
                 width: w as u32,
@@ -728,7 +810,6 @@ impl SwDecoder {
             });
 
             ffi::av_frame_unref(self.frame);
-            ffi::av_frame_unref(self.rgba_frame);
         }
         Ok(())
     }

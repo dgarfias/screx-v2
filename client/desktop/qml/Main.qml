@@ -362,15 +362,17 @@ ApplicationWindow {
                             MouseArea {
                                 id: streamMouse
                                 anchors.fill: parent
-                                hoverEnabled: true
+                                hoverEnabled: AppState.connected
                                 acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
                                 cursorShape: AppState.connected ? Qt.BlankCursor : Qt.ArrowCursor
 
                                 onPositionChanged: function(mouse) {
                                     if (!AppState.connected) return
-                                    const point = streamView.normalizedPoint(mouse.x, mouse.y)
-                                    if (!point) return
-                                    AppState.send_mouse_move(point.x, point.y)
+                                    AppState.send_mouse_move_raw(
+                                        mouse.x, mouse.y,
+                                        streamView.content_x, streamView.content_y,
+                                        streamView.content_width, streamView.content_height
+                                    )
                                 }
 
                                 onPressed: function(mouse) {

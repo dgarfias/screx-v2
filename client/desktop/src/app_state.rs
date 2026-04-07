@@ -1,9 +1,10 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use qmetaobject::prelude::*;
 use qmetaobject::{queued_callback, QPointer};
 
-use crate::backend::{BackendHandle, UiEvent};
+use crate::backend::{BackendHandle, ControlSender, UiEvent};
 
 const GLOBAL_KEY_SHORTCUT_OVERRIDE: i32 = 0;
 const GLOBAL_KEY_PRESS: i32 = 1;
@@ -263,7 +264,15 @@ pub struct AppState {
             if !self.keyboard_enabled || !self.connected {
                 return;
             }
-            if let Some(backend) = self.backend.clone() {
+            if let Some(ref control) = self.direct_control {
+                let _ = crate::input::send_qt_key_action(
+                    control,
+                    qt_key,
+                    &text.to_string(),
+                    modifiers,
+                    pressed,
+                );
+            } else if let Some(backend) = self.backend.clone() {
                 backend.send_key_action(qt_key, text.to_string(), modifiers, pressed);
             }
         }
@@ -271,20 +280,33 @@ pub struct AppState {
 
     pub send_mouse_move: qt_method!(
         fn send_mouse_move(&mut self, norm_x: f32, norm_y: f32) {
-            self.ensure_backend();
             if !self.connected {
                 return;
             }
             let x = (norm_x.clamp(0.0, 1.0) * 65535.0) as u16;
             let y = (norm_y.clamp(0.0, 1.0) * 65535.0) as u16;
-            if self.mouse_log_count < 5 {
-                self.mouse_log_count += 1;
-                println!(
-                    "[desktop/mouse] norm=({:.4}, {:.4}) abs=({}, {})",
-                    norm_x, norm_y, x, y
-                );
+            if let Some(ref control) = self.direct_control {
+                let _ = crate::input::send_mouse_abs(control, x, y);
+            } else if let Some(ref backend) = self.backend {
+                backend.send_mouse_move(x, y);
             }
-            if let Some(backend) = self.backend.clone() {
+        }
+    ),
+
+    /// QML sends raw pixel coordinates plus the content rect — normalization
+    /// happens here in Rust, avoiding the JS {x,y} object allocation per move.
+    pub send_mouse_move_raw: qt_method!(
+        fn send_mouse_move_raw(&mut self, px: f64, py: f64, cx: f64, cy: f64, cw: f64, ch: f64) {
+            if !self.connected || cw <= 0.0 || ch <= 0.0 {
+                return;
+            }
+            let norm_x = ((px - cx) / cw).clamp(0.0, 1.0);
+            let norm_y = ((py - cy) / ch).clamp(0.0, 1.0);
+            let x = (norm_x * 65535.0) as u16;
+            let y = (norm_y * 65535.0) as u16;
+            if let Some(ref control) = self.direct_control {
+                let _ = crate::input::send_mouse_abs(control, x, y);
+            } else if let Some(ref backend) = self.backend {
                 backend.send_mouse_move(x, y);
             }
         }
@@ -292,7 +314,6 @@ pub struct AppState {
 
     pub send_mouse_button: qt_method!(
         fn send_mouse_button(&mut self, button: i32, pressed: bool) {
-            self.ensure_backend();
             if !self.connected {
                 return;
             }
@@ -304,7 +325,9 @@ pub struct AppState {
                 4 => 2u8, // Middle
                 _ => return,
             };
-            if let Some(backend) = self.backend.clone() {
+            if let Some(ref control) = self.direct_control {
+                let _ = crate::input::send_mouse_button(control, btn, pressed);
+            } else if let Some(ref backend) = self.backend {
                 backend.send_mouse_button(btn, pressed);
             }
         }
@@ -312,7 +335,6 @@ pub struct AppState {
 
     pub send_mouse_scroll: qt_method!(
         fn send_mouse_scroll(&mut self, dy: f32) {
-            self.ensure_backend();
             if !self.connected {
                 return;
             }
@@ -324,7 +346,9 @@ pub struct AppState {
             }
             self.scroll_accumulator -= whole_steps as f32;
             let delta = (whole_steps.max(-32).min(32)) as i16;
-            if let Some(backend) = self.backend.clone() {
+            if let Some(ref control) = self.direct_control {
+                let _ = crate::input::send_mouse_scroll(control, delta);
+            } else if let Some(ref backend) = self.backend {
                 backend.send_mouse_scroll(delta);
             }
         }
@@ -337,7 +361,7 @@ pub struct AppState {
     ),
 
     backend: Option<BackendHandle>,
-    mouse_log_count: u32,
+    direct_control: Option<Arc<ControlSender>>,
     scroll_accumulator: f32,
 }
 
@@ -402,13 +426,18 @@ impl AppState {
         match phase {
             GLOBAL_KEY_SHORTCUT_OVERRIDE => true,
             GLOBAL_KEY_PRESS | GLOBAL_KEY_RELEASE => {
-                if let Some(backend) = self.backend.clone() {
-                    backend.send_key_action(
+                let pressed = phase == GLOBAL_KEY_PRESS;
+                if let Some(ref control) = self.direct_control {
+                    let _ = crate::input::send_qt_key_action(
+                        control,
                         qt_key,
-                        text_string,
+                        &text_string,
                         modifiers,
-                        phase == GLOBAL_KEY_PRESS,
+                        pressed,
                     );
+                    true
+                } else if let Some(backend) = self.backend.clone() {
+                    backend.send_key_action(qt_key, text_string, modifiers, pressed);
                     true
                 } else {
                     false
@@ -468,6 +497,9 @@ impl AppState {
                 let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
                 self.connections_json = QString::from(json.as_str());
                 self.connections_json_changed();
+            }
+            UiEvent::SetDirectControl(ctrl) => {
+                self.direct_control = ctrl;
             }
         }
     }
@@ -576,11 +608,12 @@ impl Default for AppState {
             select_camera_mode: Default::default(),
             send_key_event: Default::default(),
             send_mouse_move: Default::default(),
+            send_mouse_move_raw: Default::default(),
             send_mouse_button: Default::default(),
             send_mouse_scroll: Default::default(),
             warp_cursor: Default::default(),
             backend: None,
-            mouse_log_count: 0,
+            direct_control: None,
             scroll_accumulator: 0.0,
         }
     }

@@ -20,7 +20,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::audio_player::AudioPlayer;
-use crate::decoder::{CodecId, VideoDecoder};
+use crate::decoder::{CodecId, FrameBufferPool, VideoDecoder};
 use crate::mic_capture::MicCapture;
 use crate::video_surface::{FrameSlotRef, RawFrame};
 use crate::webcam_capture::WebcamCapture;
@@ -35,6 +35,14 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(50);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Message sent from the UDP receiver thread to the decoder thread.
+struct DecodeJob {
+    annex_b: Vec<u8>,
+    frame_id: u32,
+    codec_id: u8,
+    flags: u8,
+    timestamp_ms: u32,
+}
 const MAGIC_PAIR: &[u8] = b"SCREX_PAIR";
 const MAGIC_HELLO: &[u8] = b"SCREX_HELLO";
 const MAGIC_PIN: &[u8] = b"SCREX_PIN\0";
@@ -230,6 +238,9 @@ pub enum UiEvent {
     ClearPinPrompt,
     SetConnections(Vec<RecentConnection>),
     SetCameraEnabled(bool),
+    /// Give the UI thread a direct handle to the TCP control sender
+    /// so mouse/key events bypass the mpsc channel entirely.
+    SetDirectControl(Option<Arc<ControlSender>>),
 }
 
 /// Load connections from disk as JSON string for eager UI initialization.
@@ -402,6 +413,7 @@ impl BackendWorker {
                     self.pending_pairing = None;
                     (self.ui)(UiEvent::SetConnecting(false));
                     (self.ui)(UiEvent::ClearPinPrompt);
+                    (self.ui)(UiEvent::SetDirectControl(None));
                     (self.ui)(UiEvent::SetConnected(false));
                     (self.ui)(UiEvent::SetSessionTitle("No active session".into()));
                     (self.ui)(UiEvent::SetStatus(reason));
@@ -449,6 +461,7 @@ impl BackendWorker {
     fn handle_connect(&mut self, host_input: String, speaker_enabled: bool) {
         (self.ui)(UiEvent::ClearPinPrompt);
         (self.ui)(UiEvent::SetConnecting(true));
+        (self.ui)(UiEvent::SetDirectControl(None));
         (self.ui)(UiEvent::SetConnected(false));
         (self.ui)(UiEvent::SetStatus(format!("Connecting to {host_input}...")));
 
@@ -566,6 +579,7 @@ impl BackendWorker {
         (self.ui)(UiEvent::SetCodecLabel("Negotiating stream".into()));
         (self.ui)(UiEvent::SetResolutionLabel("Receiving stream".into()));
         (self.ui)(UiEvent::SetConnecting(false));
+        (self.ui)(UiEvent::SetDirectControl(Some(Arc::clone(&control))));
         (self.ui)(UiEvent::SetConnected(true));
         (self.ui)(UiEvent::SetStatus(format!(
             "Session established with {title}. Waiting for UDP media..."
@@ -665,6 +679,7 @@ impl BackendWorker {
             if !quiet {
                 (self.ui)(UiEvent::SetConnecting(false));
                 (self.ui)(UiEvent::ClearPinPrompt);
+                (self.ui)(UiEvent::SetDirectControl(None));
                 (self.ui)(UiEvent::SetConnected(false));
                 (self.ui)(UiEvent::SetSessionTitle("No active session".into()));
                 (self.ui)(UiEvent::SetStatus(
@@ -682,6 +697,7 @@ impl BackendWorker {
         } else if !quiet {
             (self.ui)(UiEvent::SetConnecting(false));
             (self.ui)(UiEvent::ClearPinPrompt);
+            (self.ui)(UiEvent::SetDirectControl(None));
             (self.ui)(UiEvent::SetConnected(false));
             (self.ui)(UiEvent::SetStatus("No active session.".into()));
         }
@@ -1167,6 +1183,7 @@ fn spawn_udp_runtime(
     frame_slot: FrameSlotRef,
     audio_player: Option<Arc<AudioPlayer>>,
 ) {
+    // Keepalive thread — unchanged
     let keepalive_udp = Arc::clone(&udp);
     let keepalive_stop = Arc::clone(&stop);
     thread::spawn(move || {
@@ -1180,6 +1197,140 @@ fn spawn_udp_runtime(
         }
     });
 
+    // Bounded decode channel: UDP thread → decoder thread.
+    // Capacity of 4 gives enough buffering without unbounded growth.
+    let (decode_tx, decode_rx) = mpsc::channel::<DecodeJob>();
+
+    // --- Decoder thread ---
+    let decode_stop = Arc::clone(&stop);
+    let _decode_ui = Arc::clone(&ui);
+    let decode_tx_cmd = tx.clone();
+    let decode_control = Arc::clone(&control);
+    thread::spawn(move || {
+        let mut decoder: Option<VideoDecoder> = None;
+        let mut current_codec_id: Option<u8> = None;
+        let mut pool = FrameBufferPool::new();
+        let mut decoded_frame_count: u64 = 0;
+        let mut mostly_black_frame_count: u32 = 0;
+        let mut blank_stream_retry_queued = false;
+        let mut last_pli_at: Option<Instant> = None;
+
+        let mut debug_dump_au_remaining = std::env::var("SCREX_DUMP_ACCESS_UNITS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut debug_dump_remaining = std::env::var("SCREX_DUMP_DECODED_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        while !decode_stop.load(Ordering::Relaxed) {
+            let job = match decode_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+            if debug_dump_au_remaining > 0 {
+                dump_access_unit(
+                    job.frame_id,
+                    job.codec_id,
+                    (job.flags & FLAG_IDR) != 0,
+                    &job.annex_b,
+                );
+                debug_dump_au_remaining -= 1;
+            }
+
+            // Ensure decoder matches codec
+            let need_new_decoder = current_codec_id.map_or(true, |c| c != job.codec_id);
+            if need_new_decoder {
+                let codec = CodecId::from_transport_id(job.codec_id);
+                match VideoDecoder::new(codec) {
+                    Ok(dec) => {
+                        decoder = Some(dec);
+                        current_codec_id = Some(job.codec_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[decoder-thread] decoder init failed: {e:#}");
+                        decoder = None;
+                        current_codec_id = None;
+                    }
+                }
+            }
+
+            if let Some(dec) = &mut decoder {
+                let t0 = Instant::now();
+                match dec.decode(&job.annex_b, &mut pool) {
+                    Ok(decoded_frames) => {
+                        let decode_us = t0.elapsed().as_micros();
+                        for df in decoded_frames {
+                            decoded_frame_count = decoded_frame_count.wrapping_add(1);
+                            let au_len = job.annex_b.len();
+                            let w = df.width;
+                            let h = df.height;
+
+                            // Black-frame detection for first 90 frames (sampled)
+                            if decoded_frame_count <= 90 {
+                                let pct = non_black_pixel_percent_sampled(&df.rgba);
+                                if pct < 0.5 {
+                                    mostly_black_frame_count =
+                                        mostly_black_frame_count.saturating_add(1);
+                                    if mostly_black_frame_count >= 30 && !blank_stream_retry_queued
+                                    {
+                                        blank_stream_retry_queued = true;
+                                        let _ = decode_tx_cmd
+                                            .send(BackendCommand::RetryBlankStream { session_id });
+                                    }
+                                } else {
+                                    mostly_black_frame_count = 0;
+                                }
+                            }
+                            if debug_dump_remaining > 0 {
+                                dump_decoded_frame_ppm(
+                                    decoded_frame_count,
+                                    df.width,
+                                    df.height,
+                                    &df.rgba,
+                                );
+                                debug_dump_remaining -= 1;
+                            }
+
+                            // Recycle the previous frame's RGBA buffer
+                            if let Some(old_frame) = frame_slot.take_latest() {
+                                if let Ok(old_rgba) = Arc::try_unwrap(old_frame) {
+                                    pool.recycle(old_rgba.rgba);
+                                }
+                            }
+
+                            let t1 = Instant::now();
+                            frame_slot.publish(Arc::new(RawFrame {
+                                width: df.width,
+                                height: df.height,
+                                rgba: df.rgba,
+                            }));
+                            crate::video_surface::request_video_surface_update();
+                            let present_us = t1.elapsed().as_micros();
+                            if decoded_frame_count == 1 || decoded_frame_count % 60 == 0 {
+                                println!(
+                                    "[decoder-thread] frame={} decode={}us present={}us size={}x{} au={}B",
+                                    decoded_frame_count, decode_us, present_us,
+                                    w, h, au_len,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[decoder-thread] decode error: {e:#}");
+                        if should_send_pli(&mut last_pli_at) {
+                            let _ = decode_control.send_pli();
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // --- UDP receiver thread ---
     thread::spawn(move || {
         let receiver = match udp.socket.try_clone() {
             Ok(socket) => socket,
@@ -1215,21 +1366,7 @@ fn spawn_udp_runtime(
         let mut last_pli_at: Option<Instant> = None;
         let mut video_packet_count: u64 = 0;
         let mut audio_packet_count: u64 = 0;
-
-        let mut decoder: Option<VideoDecoder> = None;
-        let mut current_codec_id: Option<u8> = None;
-        let mut decoded_frame_count: u64 = 0;
-        let mut mostly_black_frame_count: u32 = 0;
-        let mut blank_stream_retry_queued = false;
-
-        let mut debug_dump_au_remaining = std::env::var("SCREX_DUMP_ACCESS_UNITS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-        let mut debug_dump_remaining = std::env::var("SCREX_DUMP_DECODED_FRAMES")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
+        let mut last_prune = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
             match receiver.recv(&mut buffer) {
@@ -1307,16 +1444,16 @@ fn spawn_udp_runtime(
                         continue;
                     }
 
-                    let assembly = video_frames
-                        .entry(frame_id)
-                        .or_insert_with(|| FrameAssembly::new(total_data, total_parity));
+                    let assembly = video_frames.entry(frame_id).or_insert_with(|| {
+                        FrameAssembly::new(total_data, total_parity, codec_id, flags, timestamp_ms)
+                    });
                     assembly.add_chunk(chunk_idx as usize, plaintext, payload_len);
 
                     if assembly.is_complete() {
                         if let Some(annex_b) = assembly.reassemble() {
                             video_frames.remove(&frame_id);
 
-                            // Gap detection -> request PLI (throttled), but NO frame dropping
+                            // Gap detection -> request PLI (throttled)
                             if has_received_first_frame && frame_id > last_completed_frame_id + 1 {
                                 let gap = frame_id - last_completed_frame_id - 1;
                                 if gap > 0 && gap < 0x8000_0000 {
@@ -1335,109 +1472,70 @@ fn spawn_udp_runtime(
                             av_sync.update_video(timestamp_ms);
                             stats.note_frame();
 
-                            if debug_dump_au_remaining > 0 {
-                                dump_access_unit(
-                                    frame_id,
-                                    codec_id,
-                                    (flags & FLAG_IDR) != 0,
-                                    &annex_b,
-                                );
-                                debug_dump_au_remaining -= 1;
-                            }
-
-                            // Ensure decoder matches codec
-                            let need_new_decoder = current_codec_id.map_or(true, |c| c != codec_id);
-                            if need_new_decoder {
-                                let codec = CodecId::from_transport_id(codec_id);
-                                match VideoDecoder::new(codec) {
-                                    Ok(dec) => {
-                                        decoder = Some(dec);
-                                        current_codec_id = Some(codec_id);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[backend] decoder init failed: {e:#}");
-                                        decoder = None;
-                                        current_codec_id = None;
-                                    }
-                                }
-                            }
-
-                            // Decode inline — every frame goes to FFmpeg, no dropping
-                            if let Some(dec) = &mut decoder {
-                                let t0 = Instant::now();
-                                match dec.decode(&annex_b) {
-                                    Ok(decoded_frames) => {
-                                        let decode_us = t0.elapsed().as_micros();
-                                        for df in decoded_frames {
-                                            decoded_frame_count =
-                                                decoded_frame_count.wrapping_add(1);
-                                            if decoded_frame_count <= 90 {
-                                                let pct = non_black_pixel_percent(&df.rgba);
-                                                if pct < 0.5 {
-                                                    mostly_black_frame_count =
-                                                        mostly_black_frame_count.saturating_add(1);
-                                                    if mostly_black_frame_count >= 30
-                                                        && !blank_stream_retry_queued
-                                                    {
-                                                        blank_stream_retry_queued = true;
-                                                        let _ = tx.send(
-                                                            BackendCommand::RetryBlankStream {
-                                                                session_id,
-                                                            },
-                                                        );
-                                                    }
-                                                } else {
-                                                    mostly_black_frame_count = 0;
-                                                }
-                                            }
-                                            if debug_dump_remaining > 0 {
-                                                dump_decoded_frame_ppm(
-                                                    decoded_frame_count,
-                                                    df.width,
-                                                    df.height,
-                                                    &df.rgba,
-                                                );
-                                                debug_dump_remaining -= 1;
-                                            }
-                                            let w = df.width;
-                                            let h = df.height;
-                                            let au_len = annex_b.len();
-                                            let t1 = Instant::now();
-                                            frame_slot.publish(Arc::new(RawFrame {
-                                                width: df.width,
-                                                height: df.height,
-                                                rgba: df.rgba,
-                                            }));
-                                            crate::video_surface::request_video_surface_update();
-                                            let present_us = t1.elapsed().as_micros();
-                                            if decoded_frame_count == 1
-                                                || decoded_frame_count % 60 == 0
-                                            {
-                                                println!(
-                                                    "[desktop/video] frame={} decode={}us present={}us size={}x{} au={}B",
-                                                    decoded_frame_count, decode_us, present_us,
-                                                    w, h, au_len,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[backend] decode error: {e:#}");
-                                        if should_send_pli(&mut last_pli_at) {
-                                            let _ = control.send_pli();
-                                        }
-                                    }
-                                }
-                            }
+                            // Send to decoder thread (unbounded — never drops frames)
+                            let job = DecodeJob {
+                                annex_b,
+                                frame_id,
+                                codec_id,
+                                flags,
+                                timestamp_ms,
+                            };
+                            let _ = decode_tx.send(job);
                         } else {
                             video_frames.remove(&frame_id);
                         }
                     }
 
-                    // Prune expired incomplete assemblies — simple retain
-                    let now = Instant::now();
-                    video_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
-                    audio_frames.retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
+                    // Prune expired incomplete assemblies — every 100ms
+                    // Like the iPad client: try FEC recovery before dropping,
+                    // and send PLI if frames had to be discarded.
+                    if last_prune.elapsed() >= Duration::from_millis(100) {
+                        let now = Instant::now();
+                        let mut expired_ids = Vec::new();
+                        let mut had_unrecoverable = false;
+
+                        for (&fid, assembly) in video_frames.iter() {
+                            if now.duration_since(assembly.created_at) > FRAME_TIMEOUT {
+                                expired_ids.push(fid);
+                            }
+                        }
+
+                        for fid in expired_ids {
+                            if let Some(assembly) = video_frames.remove(&fid) {
+                                if assembly.can_recover() {
+                                    // Late FEC recovery — enough shards arrived but
+                                    // is_complete() was never true inline (e.g. shards
+                                    // for a no-parity frame arrived out of order).
+                                    if let Some(annex_b) = assembly.reassemble() {
+                                        let job = DecodeJob {
+                                            annex_b,
+                                            frame_id: fid,
+                                            codec_id: assembly.codec_id,
+                                            flags: assembly.flags,
+                                            timestamp_ms: assembly.timestamp_ms,
+                                        };
+                                        let _ = decode_tx.send(job);
+                                    } else {
+                                        had_unrecoverable = true;
+                                    }
+                                } else {
+                                    had_unrecoverable = true;
+                                }
+                            }
+                        }
+
+                        // Send PLI when frames were genuinely lost
+                        if had_unrecoverable {
+                            if should_send_pli(&mut last_pli_at) {
+                                println!("[desktop/video] unrecoverable frame(s) expired -> PLI");
+                                let _ = control.send_pli();
+                            }
+                        }
+
+                        audio_frames
+                            .retain(|_, a| now.duration_since(a.created_at) <= FRAME_TIMEOUT);
+                        last_prune = now;
+                    }
                 }
                 Err(error)
                     if matches!(
@@ -1505,16 +1603,33 @@ impl ControlSender {
 
         let aad = seq.to_be_bytes();
         let nonce = nonce_control_client(seq);
-        let encrypted = inner.cipher.encrypt_vec(&nonce, &aad, payload)?;
-        let body_len = (aad.len() + encrypted.len()) as u32;
 
+        // Encrypt in-place within send_buf to avoid separate allocation.
+        // Layout: [body_len:4] [aad:4] [encrypted_payload] [tag:16]
         let ControlWriter {
-            stream, send_buf, ..
+            stream,
+            send_buf,
+            cipher,
+            ..
         } = &mut *inner;
         send_buf.clear();
-        send_buf.extend_from_slice(&body_len.to_be_bytes());
+        // Reserve space for: 4 (len) + 4 (aad) + payload.len() + 16 (tag)
+        let total = 4 + aad.len() + payload.len() + 16;
+        send_buf.reserve(total);
+        // Placeholder for body_len (filled after encryption)
+        send_buf.extend_from_slice(&[0u8; 4]);
         send_buf.extend_from_slice(&aad);
-        send_buf.extend_from_slice(&encrypted);
+        let encrypt_start = send_buf.len();
+        send_buf.extend_from_slice(payload);
+        let nonce = Nonce::assume_unique_for_key(nonce);
+        let tag = cipher
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(&aad[..]), &mut send_buf[encrypt_start..])
+            .map_err(|_| anyhow!("AES-GCM encrypt failed"))?;
+        send_buf.extend_from_slice(tag.as_ref());
+        // Fill in body_len = everything after the 4-byte length prefix
+        let body_len = (send_buf.len() - 4) as u32;
+        send_buf[..4].copy_from_slice(&body_len.to_be_bytes());
         stream.write_all(send_buf)?;
         Ok(())
     }
@@ -1602,16 +1717,31 @@ impl UdpSender {
 
     pub fn send_encrypted(&self, payload: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let aad = inner.seq.to_be_bytes();
-        let nonce = nonce_client(inner.seq);
-        let encrypted = inner.cipher.encrypt_vec(&nonce, &aad, payload)?;
+        let seq = inner.seq;
         inner.seq = inner.seq.wrapping_add(1);
 
-        inner.send_buf.clear();
-        inner.send_buf.extend_from_slice(&aad);
-        inner.send_buf.extend_from_slice(&encrypted);
+        let aad = seq.to_be_bytes();
+        let nonce_bytes = nonce_client(seq);
+
+        // Encrypt in-place within send_buf to avoid per-call allocation.
+        // Layout: [aad:4] [encrypted_payload] [tag:16]
+        let UdpSenderInner {
+            cipher, send_buf, ..
+        } = &mut *inner;
+        send_buf.clear();
+        let total = aad.len() + payload.len() + TAG_LEN;
+        send_buf.reserve(total);
+        send_buf.extend_from_slice(&aad);
+        let encrypt_start = send_buf.len();
+        send_buf.extend_from_slice(payload);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let tag = cipher
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(&aad[..]), &mut send_buf[encrypt_start..])
+            .map_err(|_| anyhow!("AES-GCM encrypt failed"))?;
+        send_buf.extend_from_slice(tag.as_ref());
         self.socket
-            .send(&inner.send_buf)
+            .send(send_buf)
             .context("send encrypted UDP packet")?;
         Ok(())
     }
@@ -1740,62 +1870,101 @@ struct FrameAssembly {
     total_data: usize,
     total_parity: usize,
     created_at: Instant,
-    shards: HashMap<usize, Vec<u8>>,
-    actual_lengths: HashMap<usize, usize>,
+    /// Contiguous buffer: `total_shards * UDP_CHUNK_PAYLOAD` bytes.
+    /// Each shard occupies a fixed-size slot to avoid per-chunk Vec allocation.
+    shard_buf: Vec<u8>,
+    /// Tracks which shard slots have been filled.
+    present: Vec<bool>,
+    /// Actual (pre-padding) payload length for each shard.
+    actual_lengths: Vec<usize>,
+    received_count: usize,
+    codec_id: u8,
+    flags: u8,
+    timestamp_ms: u32,
 }
 
 impl FrameAssembly {
-    fn new(total_data: usize, total_parity: usize) -> Self {
+    fn new(
+        total_data: usize,
+        total_parity: usize,
+        codec_id: u8,
+        flags: u8,
+        timestamp_ms: u32,
+    ) -> Self {
+        let total_shards = total_data + total_parity;
         Self {
             total_data,
             total_parity,
             created_at: Instant::now(),
-            shards: HashMap::new(),
-            actual_lengths: HashMap::new(),
+            shard_buf: vec![0u8; total_shards * UDP_CHUNK_PAYLOAD],
+            present: vec![false; total_shards],
+            actual_lengths: vec![0usize; total_shards],
+            received_count: 0,
+            codec_id,
+            flags,
+            timestamp_ms,
         }
     }
 
     fn add_chunk(&mut self, index: usize, payload: &[u8], actual_len: usize) {
-        self.shards.entry(index).or_insert_with(|| payload.to_vec());
-        self.actual_lengths.entry(index).or_insert(actual_len);
+        let total_shards = self.total_data + self.total_parity;
+        if index >= total_shards {
+            return;
+        }
+        if self.present[index] {
+            return; // duplicate
+        }
+        // Copy payload into the fixed-size slot (zero-padded by initialization).
+        let offset = index * UDP_CHUNK_PAYLOAD;
+        let copy_len = payload.len().min(UDP_CHUNK_PAYLOAD);
+        self.shard_buf[offset..offset + copy_len].copy_from_slice(&payload[..copy_len]);
+        self.present[index] = true;
+        self.actual_lengths[index] = actual_len;
+        self.received_count += 1;
     }
 
     fn is_complete(&self) -> bool {
         if self.total_parity == 0 {
-            return (0..self.total_data).all(|index| self.shards.contains_key(&index));
+            return (0..self.total_data).all(|i| self.present[i]);
         }
-        self.shards.len() >= self.total_data
+        self.received_count >= self.total_data
+    }
+
+    /// Whether enough shards are present to reconstruct via FEC.
+    fn can_recover(&self) -> bool {
+        self.received_count >= self.total_data
     }
 
     fn reassemble(&self) -> Option<Vec<u8>> {
-        if (0..self.total_data).all(|index| self.shards.contains_key(&index)) {
+        let all_data_present = (0..self.total_data).all(|i| self.present[i]);
+        if all_data_present {
             return Some(self.assemble_present_data());
         }
-        if self.total_parity == 0 || self.shards.len() < self.total_data {
+        if self.total_parity == 0 || self.received_count < self.total_data {
             return None;
         }
 
+        // FEC recovery path: build shard array from the contiguous buffer.
         let total_shards = self.total_data + self.total_parity;
-        let mut shards = vec![None; total_shards];
-        for (index, shard) in &self.shards {
-            let mut data = shard.clone();
-            if data.len() < UDP_CHUNK_PAYLOAD {
-                data.resize(UDP_CHUNK_PAYLOAD, 0);
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+        for i in 0..total_shards {
+            if self.present[i] {
+                let offset = i * UDP_CHUNK_PAYLOAD;
+                shards[i] = Some(self.shard_buf[offset..offset + UDP_CHUNK_PAYLOAD].to_vec());
             }
-            shards[*index] = Some(data);
         }
 
         let rs = ReedSolomon::new(self.total_data, self.total_parity).ok()?;
         rs.reconstruct(&mut shards).ok()?;
 
         let mut out = Vec::new();
-        for index in 0..self.total_data {
-            let shard = shards[index].as_ref()?;
-            let actual_len = self
-                .actual_lengths
-                .get(&index)
-                .copied()
-                .unwrap_or(shard.len());
+        for i in 0..self.total_data {
+            let shard = shards[i].as_ref()?;
+            let actual_len = if self.actual_lengths[i] > 0 {
+                self.actual_lengths[i]
+            } else {
+                shard.len()
+            };
             out.extend_from_slice(&shard[..actual_len.min(shard.len())]);
         }
         Some(out)
@@ -1803,14 +1972,16 @@ impl FrameAssembly {
 
     fn assemble_present_data(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        for index in 0..self.total_data {
-            if let Some(shard) = self.shards.get(&index) {
-                let actual_len = self
-                    .actual_lengths
-                    .get(&index)
-                    .copied()
-                    .unwrap_or(shard.len());
-                out.extend_from_slice(&shard[..actual_len.min(shard.len())]);
+        for i in 0..self.total_data {
+            if self.present[i] {
+                let offset = i * UDP_CHUNK_PAYLOAD;
+                let actual_len = if self.actual_lengths[i] > 0 {
+                    self.actual_lengths[i]
+                } else {
+                    UDP_CHUNK_PAYLOAD
+                };
+                let end = offset + actual_len.min(UDP_CHUNK_PAYLOAD);
+                out.extend_from_slice(&self.shard_buf[offset..end]);
             }
         }
         out
@@ -1820,7 +1991,11 @@ impl FrameAssembly {
 struct AudioAssembly {
     total_data: usize,
     created_at: Instant,
-    shards: HashMap<usize, Vec<u8>>,
+    /// Contiguous buffer: `total_data * UDP_CHUNK_PAYLOAD` bytes.
+    shard_buf: Vec<u8>,
+    present: Vec<bool>,
+    actual_lengths: Vec<usize>,
+    received_count: usize,
 }
 
 impl AudioAssembly {
@@ -1828,16 +2003,30 @@ impl AudioAssembly {
         Self {
             total_data,
             created_at: Instant::now(),
-            shards: HashMap::new(),
+            shard_buf: vec![0u8; total_data * UDP_CHUNK_PAYLOAD],
+            present: vec![false; total_data],
+            actual_lengths: vec![0usize; total_data],
+            received_count: 0,
         }
     }
 
-    fn add_chunk(&mut self, index: usize, payload: &[u8], _actual_len: usize) {
-        self.shards.entry(index).or_insert_with(|| payload.to_vec());
+    fn add_chunk(&mut self, index: usize, payload: &[u8], actual_len: usize) {
+        if index >= self.total_data {
+            return;
+        }
+        if self.present[index] {
+            return; // duplicate
+        }
+        let offset = index * UDP_CHUNK_PAYLOAD;
+        let copy_len = payload.len().min(UDP_CHUNK_PAYLOAD);
+        self.shard_buf[offset..offset + copy_len].copy_from_slice(&payload[..copy_len]);
+        self.present[index] = true;
+        self.actual_lengths[index] = actual_len;
+        self.received_count += 1;
     }
 
     fn is_complete(&self) -> bool {
-        self.shards.len() >= self.total_data
+        self.received_count >= self.total_data
     }
 
     fn reassemble(&self) -> Option<Vec<u8>> {
@@ -1846,11 +2035,17 @@ impl AudioAssembly {
         }
         let mut out = Vec::new();
         for i in 0..self.total_data {
-            if let Some(shard) = self.shards.get(&i) {
-                out.extend_from_slice(shard);
-            } else {
+            if !self.present[i] {
                 return None;
             }
+            let offset = i * UDP_CHUNK_PAYLOAD;
+            let actual_len = if self.actual_lengths[i] > 0 {
+                self.actual_lengths[i]
+            } else {
+                UDP_CHUNK_PAYLOAD
+            };
+            let end = offset + actual_len.min(UDP_CHUNK_PAYLOAD);
+            out.extend_from_slice(&self.shard_buf[offset..end]);
         }
         Some(out)
     }
@@ -1907,6 +2102,27 @@ fn non_black_pixel_percent(rgba: &[u8]) -> f64 {
         .filter(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
         .count();
     (non_black as f64 * 100.0) / (pixel_count as f64)
+}
+
+/// Sampled version: checks every 16th pixel for performance.
+fn non_black_pixel_percent_sampled(rgba: &[u8]) -> f64 {
+    let pixel_count = rgba.len() / 4;
+    if pixel_count == 0 {
+        return 0.0;
+    }
+    let step = 16;
+    let mut sampled = 0u64;
+    let mut non_black = 0u64;
+    for px in rgba.chunks_exact(4).step_by(step) {
+        sampled += 1;
+        if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+            non_black += 1;
+        }
+    }
+    if sampled == 0 {
+        return 0.0;
+    }
+    (non_black as f64 * 100.0) / (sampled as f64)
 }
 
 fn dump_access_unit(frame_id: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
