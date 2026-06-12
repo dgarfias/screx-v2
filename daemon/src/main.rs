@@ -59,7 +59,7 @@ struct Cli {
     framerate: u32,
 
     /// Keyframe interval (in frames)
-    #[arg(short, long, default_value_t = 30)]
+    #[arg(short, long, default_value_t = 90)]
     keyframe: u32,
 
     /// Encoder bitrate (e.g. 8000000, 8M, 500K)
@@ -77,6 +77,10 @@ struct Cli {
     /// Video codec: h264, h265
     #[arg(short, long, default_value = "h264")]
     codec: String,
+
+    /// Capture backend: evdi, vkms
+    #[arg(long, default_value = "evdi")]
+    capture_backend: String,
 
     /// Enable detailed diagnostic logs
     #[arg(short, long, default_value_t = false)]
@@ -109,6 +113,7 @@ enum Commands {
 #[derive(Debug, Clone)]
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
+    capture_backend: capture::CaptureBackend,
     codec: encode::VideoCodec,
     width: u32,
     height: u32,
@@ -123,6 +128,7 @@ impl AppConfig {
     fn from_cli(cli: &Cli) -> Self {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
+            capture_backend: capture::CaptureBackend::from_str(&cli.capture_backend),
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.width,
             height: cli.height,
@@ -163,7 +169,10 @@ async fn main() -> Result<()> {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let shared = Arc::new(stream_server::SharedState::new(config.camera_exclusive_caps));
+    let shared = Arc::new(stream_server::SharedState::new(
+        config.camera_exclusive_caps,
+        config.bitrate_bps,
+    ));
 
     // UDP socket for streaming
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
@@ -176,6 +185,24 @@ async fn main() -> Result<()> {
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
             &sndbuf as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        let low_delay_tos: libc::c_int = 0x88;
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            &low_delay_tos as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        let priority: libc::c_int = 6;
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &priority as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
@@ -279,6 +306,8 @@ async fn main() -> Result<()> {
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
             shared_d.capture_start.store(false, Ordering::Release);
+            let (_, cvar) = &*shared_d.capture_start_signal;
+            cvar.notify_all();
         }));
     }
 
@@ -320,6 +349,7 @@ async fn main() -> Result<()> {
         width: config.width,
         height: config.height,
         fps: config.fps,
+        backend: config.capture_backend,
     };
     let enc_config = encode::EncoderConfig {
         bitrate_bps: config.bitrate_bps,
@@ -340,6 +370,7 @@ async fn main() -> Result<()> {
         .replace(Arc::clone(&force_refresh));
 
     let capture_start = Arc::clone(&shared.capture_start);
+    let capture_start_signal = Arc::clone(&shared.capture_start_signal);
     let capture_stop_flag = Arc::clone(&shared.capture_stop_flag);
 
     let capture_thread = thread::Builder::new()
@@ -357,7 +388,14 @@ async fn main() -> Result<()> {
                     if capture_stop.load(Ordering::Relaxed) {
                         return Ok(());
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let (lock, cvar) = &*capture_start_signal;
+                    let guard = lock.lock().unwrap();
+                    if !capture_start.load(Ordering::Acquire) && !capture_stop.load(Ordering::Relaxed)
+                    {
+                        let _ = cvar
+                            .wait_timeout(guard, std::time::Duration::from_millis(20))
+                            .unwrap();
+                    }
                 }
 
                 // Reset the stop flag for this capture session
@@ -378,6 +416,9 @@ async fn main() -> Result<()> {
                 if let Some(key) = *capture_shared.session_key.lock().unwrap() {
                     sender.set_cipher(crypto::SessionCipher::new(&key));
                 }
+                // Pin the UDP source address to the IP the client dialed
+                // (multi-homed hosts may otherwise reply from another IP).
+                sender.set_source(*capture_shared.udp_source.lock().unwrap());
 
                 println!("[capture] starting EVDI capture session");
 
@@ -419,6 +460,8 @@ async fn main() -> Result<()> {
                             eprintln!("[capture] failed to spawn watchdog thread: {e}");
                             capture_stop_flag.store(true, Ordering::SeqCst);
                             capture_start.store(false, Ordering::Release);
+                            let (_, cvar) = &*capture_start_signal;
+                            cvar.notify_all();
                             std::thread::sleep(std::time::Duration::from_secs(1));
                             continue;
                         }
@@ -436,6 +479,13 @@ async fn main() -> Result<()> {
                         }
                         let force_idr = session_shared.force_idr.swap(false, Ordering::Relaxed);
                         let ts = session_shared.start_time.elapsed().as_millis() as u32;
+                        let tuning = session_shared.current_stream_tuning();
+
+                        if tuning.bitrate_bps != encoder.bitrate_bps() {
+                            if let Err(e) = encoder.reconfigure_bitrate(tuning.bitrate_bps) {
+                                eprintln!("[pipeline] encoder retune failed: {e:#}");
+                            }
+                        }
 
                         match encoder.encode_frame(&frame, force_idr) {
                             Ok(aus) => {
@@ -472,7 +522,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     if let Some(addr) = udp_addr {
-                                        if let Err(e) = sender.send_frame(au, addr, ts, codec_id) {
+                                        if let Err(e) = sender.send_frame(au, addr, ts, codec_id, tuning) {
                                             eprintln!("[pipeline] send error: {e:#}");
                                         }
                                     }
@@ -493,6 +543,8 @@ async fn main() -> Result<()> {
 
                 // Reset capture_start so we wait for the next client
                 capture_start.store(false, Ordering::Release);
+                let (_, cvar) = &*capture_start_signal;
+                cvar.notify_all();
             }
 
             Ok(())
@@ -543,6 +595,10 @@ async fn main() -> Result<()> {
     println!("\nshutdown requested (ctrl-c)");
     stop.store(true, Ordering::SeqCst);
     shared.capture_stop_flag.store(true, Ordering::SeqCst);
+    {
+        let (_, cvar) = &*shared.capture_start_signal;
+        cvar.notify_all();
+    }
 
     // Cleanup remaining resources
     *shared.virtual_keyboard.lock().unwrap() = None;

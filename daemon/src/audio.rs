@@ -228,6 +228,7 @@ pub fn run_audio_capture(
         } else {
             sender.clear_cipher();
         }
+        sender.set_source(*shared.udp_source.lock().unwrap());
 
         println!(
             "[audio] capturing from {monitor_source} via parec (pid {})",
@@ -267,6 +268,7 @@ pub fn run_audio_capture(
                     let current_session_key = *shared.session_key.lock().unwrap();
                     if current_session_key != active_session_key {
                         active_session_key = current_session_key;
+                        sender.set_source(*shared.udp_source.lock().unwrap());
                         if let Some(key) = active_session_key {
                             sender.set_cipher(crate::crypto::SessionCipher::new(&key));
                             crate::vlog!("[audio] refreshed UDP audio cipher for new session");

@@ -40,6 +40,9 @@ pub struct SessionInfo {
     pub session_id: u64,
     pub session_key: [u8; 32],
     pub client_addr: std::net::SocketAddr,
+    /// Local IP the client dialed for the TCP handshake; used to pin the
+    /// source address of daemon→client UDP on multi-homed hosts.
+    pub local_ip: Option<std::net::IpAddr>,
 }
 
 pub struct PairingState {
@@ -214,6 +217,7 @@ pub fn run_pairing_server(
                 match handle_handshake(&mut stream, addr, &pairing) {
                     Ok(mut session) => {
                         session.session_id = reserved_session_id;
+                        session.local_ip = stream.local_addr().ok().map(|a| a.ip());
                         println!("[pairing] handshake with {addr} completed");
                         *session_tx.lock().unwrap() = Some(session.clone());
                         let shared_control = Arc::clone(&shared);
@@ -424,6 +428,7 @@ fn handle_pair_request(
 
     let session = SessionInfo {
         session_id: 0,
+        local_ip: None,
         session_key,
         client_addr: addr,
     };
@@ -477,6 +482,7 @@ fn handle_pair_already_paired(
 
     let session = SessionInfo {
         session_id: 0,
+        local_ip: None,
         session_key,
         client_addr: addr,
     };
@@ -535,6 +541,7 @@ fn handle_hello_request(
 
     let session = SessionInfo {
         session_id: 0,
+        local_ip: None,
         session_key,
         client_addr: addr,
     };
