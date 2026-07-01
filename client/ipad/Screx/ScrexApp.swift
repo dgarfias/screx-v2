@@ -335,11 +335,11 @@ final class StreamViewModel: ObservableObject {
 
     /// Configures the shared AVAudioSession based on whether the in-app microphone is active.
     ///
-    /// When the mic is OFF, use `.playback` with `.mixWithOthers` so Bluetooth headphones
-    /// route output over the high-quality A2DP profile. When the mic is ON, use `.playAndRecord`
-    /// with `[.defaultToSpeaker, .mixWithOthers, .allowBluetooth]` so the system default input
-    /// can be a Bluetooth HFP mic. We always use the system default route and do not force a
-    /// speaker override or add any picker UI.
+    /// We always keep the category as `.playAndRecord` so iOS honors the low-latency IO buffer
+    /// duration. The Bluetooth option changes based on mic state:
+    /// - Mic OFF: `.allowBluetoothA2DP` routes Bluetooth output over the high-quality A2DP profile.
+    /// - Mic ON: `.allowBluetooth` lets the system default input be a Bluetooth HFP mic.
+    /// We always use the system default route and do not force a speaker override or add any picker UI.
     func configureAudioSession() {
         configureAudioSession(micActive: micCapture.isRunning)
     }
@@ -347,15 +347,14 @@ final class StreamViewModel: ObservableObject {
     private func configureAudioSession(micActive: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
-            if micActive {
-                try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth])
-            } else {
-                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            }
+            let options: AVAudioSession.CategoryOptions = micActive
+                ? [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
+                : [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP]
+            try session.setCategory(.playAndRecord, mode: .default, options: options)
             try session.setPreferredSampleRate(48000)
             try session.setPreferredIOBufferDuration(0.01)
             try session.setActive(true)
-            print("[app] audio session configured: mic=\(micActive), category=\(session.category), sampleRate=\(session.sampleRate), ioBufferDuration=\(session.ioBufferDuration)")
+            print("[app] audio session configured: mic=\(micActive), options=\(options), sampleRate=\(session.sampleRate), ioBufferDuration=\(session.ioBufferDuration)")
         } catch {
             print("[app] audio session configuration failed: \(error)")
         }
@@ -1602,12 +1601,14 @@ final class StreamViewModel: ObservableObject {
     // MARK: - Microphone
 
     func toggleMic() {
+        let speakerWasEnabled = audioPlayer.isOutputEnabled
         if micCapture.isRunning {
             micCapture.stop()
             sendMicDisable()
             configureAudioSession()
-            audioPlayer.restart()
-            sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
+            if speakerWasEnabled {
+                resetSpeakerOutput()
+            }
         } else {
             configureAudioSession(micActive: true)
             sendMicEnable()
@@ -1628,10 +1629,21 @@ final class StreamViewModel: ObservableObject {
                 }
             }
             micCapture.start()
-            audioPlayer.restart()
-            sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
+            if speakerWasEnabled {
+                resetSpeakerOutput()
+            }
         }
         objectWillChange.send()
+    }
+
+    /// Re-synchronizes playback with the daemon by turning the speaker off and back on.
+    /// This produces the off-on transition the daemon needs to restart its audio stream.
+    private func resetSpeakerOutput() {
+        guard audioPlayer.isOutputEnabled else { return }
+        audioPlayer.setOutputEnabled(false)
+        sendSpeakerTransportState(isEnabled: false)
+        audioPlayer.setOutputEnabled(true)
+        sendSpeakerTransportState(isEnabled: true)
     }
 
     var isMicActive: Bool { micCapture.isRunning }
