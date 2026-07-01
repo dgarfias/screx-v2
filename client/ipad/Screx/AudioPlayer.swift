@@ -134,6 +134,17 @@ final class AudioPlayer {
         print("[audio] playback engine stopped")
     }
 
+    func restart() {
+        guard engine.isRunning else { return }
+        engine.stop()
+        do {
+            try engine.start()
+            print("[audio] playback engine restarted")
+        } catch {
+            print("[audio] engine restart failed: \(error)")
+        }
+    }
+
     func setOutputEnabled(_ enabled: Bool) {
         guard enabled != isOutputEnabled else { return }
         isOutputEnabled = enabled

@@ -14,21 +14,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .default,
-                options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
-            )
-            try session.setPreferredSampleRate(48000)
-            try session.setPreferredIOBufferDuration(0.01)
-            try session.setActive(true)
-            print("[app] audio session: rate=\(session.sampleRate)Hz, ioBufferDuration=\(session.ioBufferDuration)")
-        } catch {
-            print("[app] audio session setup failed: \(error)")
-        }
-
+        model.configureAudioSession()
         return true
     }
 
@@ -345,6 +331,34 @@ final class StreamViewModel: ObservableObject {
 
     private func log(_ message: String) {
         print("[app] \(message)")
+    }
+
+    /// Configures the shared AVAudioSession based on whether the in-app microphone is active.
+    ///
+    /// When the mic is OFF, use `.playback` with `.mixWithOthers` so Bluetooth headphones
+    /// route output over the high-quality A2DP profile. When the mic is ON, use `.playAndRecord`
+    /// with `[.defaultToSpeaker, .mixWithOthers, .allowBluetooth]` so the system default input
+    /// can be a Bluetooth HFP mic. We always use the system default route and do not force a
+    /// speaker override or add any picker UI.
+    func configureAudioSession() {
+        configureAudioSession(micActive: micCapture.isRunning)
+    }
+
+    private func configureAudioSession(micActive: Bool) {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if micActive {
+                try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .mixWithOthers, .allowBluetooth])
+            } else {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            }
+            try session.setPreferredSampleRate(48000)
+            try session.setPreferredIOBufferDuration(0.01)
+            try session.setActive(true)
+            print("[app] audio session configured: mic=\(micActive), category=\(session.category), sampleRate=\(session.sampleRate), ioBufferDuration=\(session.ioBufferDuration)")
+        } catch {
+            print("[app] audio session configuration failed: \(error)")
+        }
     }
 
     var pinnedConnections: [RecentConnection] {
@@ -1025,6 +1039,7 @@ final class StreamViewModel: ObservableObject {
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
+        configureAudioSession()
         cameraCapture.stop()
         stopPeripheralMonitoring()
         if preservedHealth.isTerminalFailure {
@@ -1061,6 +1076,7 @@ final class StreamViewModel: ObservableObject {
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
+        configureAudioSession()
         cameraCapture.stop()
         stopPeripheralMonitoring()
         lastNetEndpoint = nil
@@ -1589,7 +1605,10 @@ final class StreamViewModel: ObservableObject {
         if micCapture.isRunning {
             micCapture.stop()
             sendMicDisable()
+            configureAudioSession()
+            audioPlayer.restart()
         } else {
+            configureAudioSession(micActive: true)
             sendMicEnable()
             micCapture.onOpusPacket = { [weak self] opusData in
                 guard let self else { return }
@@ -1608,6 +1627,7 @@ final class StreamViewModel: ObservableObject {
                 }
             }
             micCapture.start()
+            audioPlayer.restart()
         }
         objectWillChange.send()
     }
