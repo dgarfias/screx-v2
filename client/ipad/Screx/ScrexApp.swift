@@ -1607,6 +1607,7 @@ final class StreamViewModel: ObservableObject {
             sendMicDisable()
             configureAudioSession()
             audioPlayer.restart()
+            sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
         } else {
             configureAudioSession(micActive: true)
             sendMicEnable()
@@ -1628,6 +1629,7 @@ final class StreamViewModel: ObservableObject {
             }
             micCapture.start()
             audioPlayer.restart()
+            sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
         }
         objectWillChange.send()
     }
