@@ -48,6 +48,7 @@ pub struct SessionInfo {
 pub struct PairingState {
     paired_devices: HashMap<String, PairedDevice>, // device_id (hex) -> PairedDevice
     config_path: PathBuf,
+    daemon_device_id: [u8; DEVICE_ID_LEN],
     pending_pin: Mutex<Option<PendingPairing>>,
 }
 
@@ -75,11 +76,23 @@ impl PairingState {
             println!("[pairing] loaded {count} paired device(s)");
         }
 
+        let daemon_id_path = config_dir().join("daemon_id");
+        let daemon_device_id = load_or_create_daemon_id(&daemon_id_path);
+        println!(
+            "[pairing] daemon device id: {}",
+            hex_encode(&daemon_device_id)
+        );
+
         Self {
             paired_devices,
             config_path,
+            daemon_device_id,
             pending_pin: Mutex::new(None),
         }
+    }
+
+    pub fn daemon_device_id(&self) -> [u8; DEVICE_ID_LEN] {
+        self.daemon_device_id
     }
 
     fn save(&self) {
@@ -163,6 +176,34 @@ fn config_dir() -> PathBuf {
     } else {
         PathBuf::from("/tmp/screx")
     }
+}
+
+fn load_or_create_daemon_id(path: &PathBuf) -> [u8; DEVICE_ID_LEN] {
+    if let Ok(hex) = fs::read_to_string(path) {
+        let hex = hex.trim();
+        if hex.len() == DEVICE_ID_LEN * 2 {
+            if let Some(bytes) = hex_decode(hex) {
+                if bytes.len() == DEVICE_ID_LEN {
+                    let mut id = [0u8; DEVICE_ID_LEN];
+                    id.copy_from_slice(&bytes);
+                    return id;
+                }
+            }
+        }
+    }
+
+    let rng = SystemRandom::new();
+    let mut id = [0u8; DEVICE_ID_LEN];
+    rand_bytes_into(&rng, &mut id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, hex_encode(&id));
+    id
+}
+
+fn rand_bytes_into(rng: &SystemRandom, buf: &mut [u8]) {
+    ring::rand::SecureRandom::fill(rng, buf).expect("rng fill");
 }
 
 const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
@@ -267,18 +308,34 @@ fn handle_handshake(
     addr: std::net::SocketAddr,
     pairing: &Arc<Mutex<PairingState>>,
 ) -> Result<SessionInfo> {
-    // Read the first message to determine if this is PAIR or HELLO
-    let mut header = [0u8; 12]; // max magic length
-    stream.read_exact(&mut header)?;
+    // The handshake may require more than one round trip. If a client sends
+    // HELLO with a stale/missing key, we send REJECT and keep the connection
+    // open so the client can immediately retry with PAIR on the same socket.
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if attempts > 3 {
+            anyhow::bail!("too many handshake attempts from {addr}");
+        }
 
-    if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
-        crate::vlog!("[pairing] handshake type=PAIR from {addr}");
-        handle_pair_request(stream, addr, &header, pairing)
-    } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
-        crate::vlog!("[pairing] handshake type=HELLO from {addr}");
-        handle_hello_request(stream, addr, &header, pairing)
-    } else {
-        anyhow::bail!("unknown handshake magic");
+        let mut header = [0u8; 12]; // max magic length
+        stream.read_exact(&mut header)?;
+
+        if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
+            crate::vlog!("[pairing] handshake type=PAIR from {addr}");
+            return handle_pair_request(stream, addr, &header, pairing);
+        } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
+            crate::vlog!("[pairing] handshake type=HELLO from {addr}");
+            match handle_hello_request(stream, addr, &header, pairing)? {
+                Some(session) => return Ok(session),
+                None => {
+                    // REJECT sent; loop back to read the client's PAIR retry.
+                    continue;
+                }
+            }
+        } else {
+            anyhow::bail!("unknown handshake magic");
+        }
     }
 }
 
@@ -303,13 +360,14 @@ fn handle_pair_request(
     let device_id_hex = hex_encode(&device_id);
     println!("[pairing] pair request from device {device_id_hex}");
 
-    // Check if already paired — if so, treat like a HELLO with fresh ECDH
+    // A PAIR request always means the client wants to run the full PIN pairing
+    // flow. This happens on first pairing, after the client lost its key, or
+    // when connecting from a new IP address. Upgrading to a session from a
+    // PAIR request is unsafe because the client may not have the pairing key.
     {
         let ps = pairing.lock().unwrap();
         if ps.is_paired(&device_id_hex) {
-            crate::vlog!("[pairing] device {device_id_hex} already paired, upgrading to session");
-            drop(ps);
-            return handle_pair_already_paired(stream, addr, &device_id, &client_pubkey, pairing);
+            crate::vlog!("[pairing] device {device_id_hex} already paired; re-pairing");
         }
     }
 
@@ -408,18 +466,20 @@ fn handle_pair_request(
     let session_key = crypto::hkdf_sha256(&pairing_key, &session_salt, b"screx-session");
 
     // Store the pairing
-    {
+    let daemon_device_id = {
         let mut ps = pairing.lock().unwrap();
         ps.store_device(&device_id, &pairing_key, &format!("{}", addr.ip()));
         *ps.pending_pin.lock().unwrap() = None;
-    }
+        ps.daemon_device_id()
+    };
 
     println!("[pairing] device {device_id_hex} paired successfully");
 
-    // Send OK: SCREX_OK(10) + session_salt(32) + hmac(32)
+    // Send OK: SCREX_OK(10) + daemon_device_id(16) + session_salt(32) + hmac(32)
     let verify_hmac = crypto::hmac_sha256(&session_key, b"server-verify");
-    let mut ok_msg = Vec::with_capacity(10 + 32 + HMAC_LEN);
+    let mut ok_msg = Vec::with_capacity(10 + DEVICE_ID_LEN + 32 + HMAC_LEN);
     ok_msg.extend_from_slice(MAGIC_OK);
+    ok_msg.extend_from_slice(&daemon_device_id);
     ok_msg.extend_from_slice(&session_salt);
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
@@ -436,67 +496,12 @@ fn handle_pair_request(
     Ok(session)
 }
 
-fn handle_pair_already_paired(
-    stream: &mut TcpStream,
-    addr: std::net::SocketAddr,
-    device_id: &[u8; DEVICE_ID_LEN],
-    client_pubkey: &[u8; PUBKEY_LEN],
-    pairing: &Arc<Mutex<PairingState>>,
-) -> Result<SessionInfo> {
-    let device_id_hex = hex_encode(device_id);
-    let pairing_key = pairing
-        .lock()
-        .unwrap()
-        .get_pairing_key(&device_id_hex)
-        .context("paired device key not found")?;
-
-    // Generate server ECDH keypair for forward secrecy
-    let rng = SystemRandom::new();
-    let server_private = EphemeralPrivateKey::generate(&X25519, &rng)
-        .map_err(|e| anyhow::anyhow!("X25519 keygen: {e}"))?;
-    let server_public = server_private
-        .compute_public_key()
-        .map_err(|e| anyhow::anyhow!("X25519 pubkey: {e}"))?;
-
-    let client_pub = UnparsedPublicKey::new(&X25519, client_pubkey);
-    let ecdh_secret =
-        agreement::agree_ephemeral(server_private, &client_pub, |shared| shared.to_vec())
-            .map_err(|_| anyhow::anyhow!("X25519 agreement failed"))?;
-
-    // Derive session key from pairing_key + ECDH
-    let mut ikm = Vec::new();
-    ikm.extend_from_slice(&pairing_key);
-    ikm.extend_from_slice(&ecdh_secret);
-    let session_key = crypto::hkdf_sha256(&ikm, b"screx-reconnect-salt", b"screx-session");
-
-    let verify_hmac = crypto::hmac_sha256(&session_key, b"server-verify");
-
-    // Send OK: SCREX_OK(10) + server_pubkey(32) + hmac(32)
-    let mut ok_msg = Vec::with_capacity(10 + PUBKEY_LEN + HMAC_LEN);
-    ok_msg.extend_from_slice(MAGIC_OK);
-    ok_msg.extend_from_slice(server_public.as_ref());
-    ok_msg.extend_from_slice(&verify_hmac);
-    stream.write_all(&ok_msg)?;
-    stream.flush()?;
-    crate::vlog!("[pairing] sent reconnect OK to {addr} for device {device_id_hex}");
-
-    let session = SessionInfo {
-        session_id: 0,
-        local_ip: None,
-        session_key,
-        client_addr: addr,
-    };
-
-    println!("[pairing] reconnected paired device {device_id_hex}");
-    Ok(session)
-}
-
 fn handle_hello_request(
     stream: &mut TcpStream,
     addr: std::net::SocketAddr,
     header_buf: &[u8; 12],
     pairing: &Arc<Mutex<PairingState>>,
-) -> Result<SessionInfo> {
+) -> Result<Option<SessionInfo>> {
     // SCREX_HELLO is 11 bytes, 1 byte of device_id in header_buf[11]
     // Read remaining: device_id(15) + client_nonce(32) = 47 bytes
     let mut rest = [0u8; 47];
@@ -512,11 +517,16 @@ fn handle_hello_request(
     let device_id_hex = hex_encode(&device_id);
     println!("[pairing] hello from device {device_id_hex}");
 
-    let pairing_key = pairing
-        .lock()
-        .unwrap()
-        .get_pairing_key(&device_id_hex)
-        .context("unknown device — not paired")?;
+    let ps = pairing.lock().unwrap();
+    let Some(pairing_key) = ps.get_pairing_key(&device_id_hex) else {
+        drop(ps);
+        println!("[pairing] hello from unknown/unpaired device {device_id_hex}, sending REJECT");
+        let _ = stream.write_all(MAGIC_REJECT);
+        let _ = stream.flush();
+        return Ok(None);
+    };
+    let daemon_device_id = ps.daemon_device_id();
+    drop(ps);
 
     // Generate server nonce
     let rng = SystemRandom::new();
@@ -530,9 +540,10 @@ fn handle_hello_request(
 
     let verify_hmac = crypto::hmac_sha256(&session_key, b"server-verify");
 
-    // Send OK: SCREX_OK(10) + server_nonce(32) + hmac(32)
-    let mut ok_msg = Vec::with_capacity(10 + NONCE_LEN + HMAC_LEN);
+    // Send OK: SCREX_OK(10) + daemon_device_id(16) + server_nonce(32) + hmac(32)
+    let mut ok_msg = Vec::with_capacity(10 + DEVICE_ID_LEN + NONCE_LEN + HMAC_LEN);
     ok_msg.extend_from_slice(MAGIC_OK);
+    ok_msg.extend_from_slice(&daemon_device_id);
     ok_msg.extend_from_slice(&server_nonce);
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
@@ -547,7 +558,7 @@ fn handle_hello_request(
     };
 
     println!("[pairing] session established with paired device {device_id_hex}");
-    Ok(session)
+    Ok(Some(session))
 }
 
 fn run_control_loop(
