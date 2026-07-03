@@ -5,6 +5,7 @@ import CryptoKit
 import Network
 import GameController
 import UIKit
+import os
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -266,6 +267,31 @@ final class ScrexRootViewController: GCEventViewController {
     }
 }
 
+/// Lock-free (when atomics are available) or low-contention traffic counter.
+/// Uses OSAllocatedUnfairLock as a portable fallback so we don't need to add
+/// swift-atomics to the Xcode project.
+final class TrafficCounter: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock()
+    private var rx: UInt64 = 0
+    private var tx: UInt64 = 0
+
+    func add(rx: UInt64, tx: UInt64) {
+        lock.withLock {
+            self.rx &+= rx
+            self.tx &+= tx
+        }
+    }
+
+    func readAndReset() -> (rx: UInt64, tx: UInt64) {
+        lock.withLock {
+            let result = (rx, tx)
+            rx = 0
+            tx = 0
+            return result
+        }
+    }
+}
+
 @MainActor
 final class StreamViewModel: ObservableObject {
     @Published var status: String = "Enter a daemon host or IP to connect."
@@ -309,10 +335,7 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
     private var trafficTimer: DispatchSourceTimer?
-    private var totalRxBytes: UInt64 = 0
-    private var totalTxBytes: UInt64 = 0
-    private var previousRxBytes: UInt64 = 0
-    private var previousTxBytes: UInt64 = 0
+    private nonisolated let trafficCounter = TrafficCounter()
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -610,10 +633,7 @@ final class StreamViewModel: ObservableObject {
         timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let rxDelta = self.totalRxBytes &- self.previousRxBytes
-            let txDelta = self.totalTxBytes &- self.previousTxBytes
-            self.previousRxBytes = self.totalRxBytes
-            self.previousTxBytes = self.totalTxBytes
+            let (rxDelta, txDelta) = self.trafficCounter.readAndReset()
             self.receiveRateText = formatByteRate(Double(rxDelta))
             self.sendRateText = formatByteRate(Double(txDelta))
         }
@@ -621,12 +641,9 @@ final class StreamViewModel: ObservableObject {
         trafficTimer = timer
     }
 
-    private func recordTraffic(rxBytes: Int = 0, txBytes: Int = 0) {
-        if rxBytes > 0 {
-            totalRxBytes = totalRxBytes &+ UInt64(rxBytes)
-        }
-        if txBytes > 0 {
-            totalTxBytes = totalTxBytes &+ UInt64(txBytes)
+    private nonisolated func recordTraffic(rxBytes: Int = 0, txBytes: Int = 0) {
+        if rxBytes > 0 || txBytes > 0 {
+            trafficCounter.add(rx: UInt64(rxBytes), tx: UInt64(txBytes))
         }
     }
 
@@ -673,10 +690,7 @@ final class StreamViewModel: ObservableObject {
         let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
         self.usbListener = usb
         self.sessionDisplayName = "USB device"
-        self.totalRxBytes = 0
-        self.totalTxBytes = 0
-        self.previousRxBytes = 0
-        self.previousTxBytes = 0
+        _ = self.trafficCounter.readAndReset()
 
         usb.onEvent = { [weak self] event in
             Task { @MainActor in
@@ -702,9 +716,7 @@ final class StreamViewModel: ObservableObject {
             }
         }
         usb.onTraffic = { [weak self] rxBytes, txBytes in
-            Task { @MainActor in
-                self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
-            }
+            self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
         }
         usb.onHostname = { [weak self] hostname in
             Task { @MainActor in
@@ -841,10 +853,7 @@ final class StreamViewModel: ObservableObject {
 
         applyConnectionHealth(.connecting, detail: "Connecting to \(name).", transport: .network)
         sessionDisplayName = name
-        totalRxBytes = 0
-        totalTxBytes = 0
-        previousRxBytes = 0
-        previousTxBytes = 0
+        _ = trafficCounter.readAndReset()
 
         // Extract host string from endpoint
         let host: String
@@ -889,12 +898,8 @@ final class StreamViewModel: ObservableObject {
                     }
                 }
                 self.networkControl = control
-                control.onTraffic = { [weak self, weak control] rxBytes, txBytes in
-                    Task { @MainActor in
-                        guard let self, let control else { return }
-                        guard self.networkControl === control else { return }
-                        self.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
-                    }
+                control.onTraffic = { [weak self] rxBytes, txBytes in
+                    self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
                 }
                 control.onHostname = { [weak self, weak control] hostname in
                     Task { @MainActor in
@@ -969,12 +974,8 @@ final class StreamViewModel: ObservableObject {
             controlClient?.sendPli()
         }
         self.stream = client
-        client.onTraffic = { [weak self, weak client] rxBytes, txBytes in
-            Task { @MainActor in
-                guard let self, let client else { return }
-                guard self.stream === client else { return }
-                self.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
-            }
+        client.onTraffic = { [weak self] rxBytes, txBytes in
+            self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
         }
 
         client.onEvent = { [weak self, weak client] event in

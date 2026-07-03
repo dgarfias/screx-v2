@@ -251,8 +251,9 @@ async fn main() -> Result<()> {
     }
     match uinput::VirtualKeyboard::new() {
         Ok(kb) => {
-            *shared.virtual_keyboard.lock().unwrap() = Some(kb);
-            println!("[main] virtual keyboard ready");
+            *shared.virtual_keyboard.lock().unwrap() = None;
+            *shared.keyboard_worker.lock().unwrap() = Some(uinput::KeyboardWorker::new(kb));
+            println!("[main] virtual keyboard ready (worker thread)");
         }
         Err(e) => {
             eprintln!("[main] virtual keyboard failed (keyboard disabled): {e:#}");
@@ -494,7 +495,7 @@ async fn main() -> Result<()> {
                                         if dump_au_remaining == 0 {
                                             break;
                                         }
-                                        dump_sent_access_unit(dump_au_remaining, codec_id, au.is_idr, &au.annex_b);
+                                        dump_sent_access_unit(dump_au_remaining, codec_id, au.is_idr, &*au.annex_b);
                                         dump_au_remaining -= 1;
                                     }
                                 }
@@ -510,7 +511,7 @@ async fn main() -> Result<()> {
                                         let mut usb = session_shared.usb_sender.lock().unwrap();
                                         if let Some(ref mut tcp) = *usb {
                                             if let Err(e) =
-                                                tcp.send_video(&au.annex_b, au.is_idr, ts, codec_id)
+                                                tcp.send_video(&*au.annex_b, au.is_idr, ts, codec_id)
                                             {
                                                 eprintln!("[pipeline] USB send error: {e:#}");
                                                 drop(usb);
@@ -602,6 +603,7 @@ async fn main() -> Result<()> {
 
     // Cleanup remaining resources
     *shared.virtual_keyboard.lock().unwrap() = None;
+    *shared.keyboard_worker.lock().unwrap() = None;
     *shared.virtual_touch.lock().unwrap() = None;
     *shared.virtual_mouse.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;

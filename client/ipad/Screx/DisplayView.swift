@@ -456,6 +456,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
         guard let onTouch else { return }
 
         var contacts = Data()
+        contacts.reserveCapacity(touches.count * 8)
         var count: UInt8 = 0
 
         for touch in touches {
@@ -476,6 +477,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
         guard count > 0 else { return }
 
         var packet = Data()
+        packet.reserveCapacity(1 + contacts.count)
         packet.append(count)
         packet.append(contacts)
         onTouch(packet)

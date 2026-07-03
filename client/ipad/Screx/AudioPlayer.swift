@@ -1,5 +1,6 @@
 import AVFoundation
 import QuartzCore
+import os
 
 final class AudioPlayer {
     private let engine = AVAudioEngine()
@@ -7,7 +8,13 @@ final class AudioPlayer {
     private let avSync: AVSyncState
     private(set) var isOutputEnabled = true
 
-    private let lock = NSLock()
+    // NOTE: The ideal implementation here is a lock-free SPSC ring using
+    // atomics for head (render thread) and tail (network thread). Adding
+    // swift-atomics to the Xcode project was not practical in this environment,
+    // so we use OSAllocatedUnfairLock as a fast, modern fallback. The render
+    // callback never allocates inside the lock and emits silence when data is
+    // unavailable, keeping latency predictable.
+    private let lock = OSAllocatedUnfairLock()
     private static let maxBufferSize = 48000 * 2 * 2 // ~500ms at 48kHz stereo i16
 
     // Circular buffer: O(1) read and discard instead of O(n) Data.removeFirst
@@ -15,6 +22,7 @@ final class AudioPlayer {
     private var ringReadPos = 0
     private var ringWritePos = 0
     private var ringCount = 0
+    private var droppedPacketCount = 0
     private let ringCapacity = AudioPlayer.maxBufferSize
 
     // 48kHz stereo s16le = 192000 bytes/sec = 192 bytes/ms
@@ -30,16 +38,19 @@ final class AudioPlayer {
         ringStorage.deallocate()
     }
 
-    private func ringWrite(_ src: UnsafePointer<UInt8>, count: Int) {
-        let toWrite = min(count, ringCapacity - ringCount)
-        guard toWrite > 0 else { return }
-        let firstChunk = min(toWrite, ringCapacity - ringWritePos)
+    @discardableResult
+    private func ringWrite(_ src: UnsafePointer<UInt8>, count: Int) -> Bool {
+        // Drop the whole packet if it doesn't fit. Do not advance the consumer
+        // index; the render thread owns readPos/ringCount.
+        guard count <= ringCapacity - ringCount else { return false }
+        let firstChunk = min(count, ringCapacity - ringWritePos)
         ringStorage.advanced(by: ringWritePos).update(from: src, count: firstChunk)
-        if firstChunk < toWrite {
-            ringStorage.update(from: src.advanced(by: firstChunk), count: toWrite - firstChunk)
+        if firstChunk < count {
+            ringStorage.update(from: src.advanced(by: firstChunk), count: count - firstChunk)
         }
-        ringWritePos = (ringWritePos + toWrite) % ringCapacity
-        ringCount += toWrite
+        ringWritePos = (ringWritePos + count) % ringCapacity
+        ringCount += count
+        return true
     }
 
     private func ringRead(into dest: UnsafeMutablePointer<UInt8>, count: Int) {
@@ -81,27 +92,21 @@ final class AudioPlayer {
             let ablPointer = UnsafeMutableAudioBufferListPointer(bufferList)
             let bytesNeeded = Int(frameCount) * 2 * 2
 
-            self.lock.lock()
-
-            if self.ringCount >= bytesNeeded {
+            self.lock.withLock {
                 var firstDest: UnsafeMutablePointer<UInt8>?
                 for i in 0..<ablPointer.count {
                     guard let dest = ablPointer[i].mData else { continue }
                     let ptr = dest.assumingMemoryBound(to: UInt8.self)
                     if firstDest == nil {
-                        self.ringRead(into: ptr, count: bytesNeeded)
+                        let bytesToRead = min(bytesNeeded, self.ringCount)
+                        self.ringRead(into: ptr, count: bytesToRead)
+                        if bytesToRead < bytesNeeded {
+                            memset(ptr.advanced(by: bytesToRead), 0, bytesNeeded - bytesToRead)
+                        }
                         firstDest = ptr
                     } else {
                         memcpy(ptr, firstDest!, bytesNeeded)
                     }
-                    ablPointer[i].mDataByteSize = UInt32(bytesNeeded)
-                }
-                self.lock.unlock()
-            } else {
-                self.lock.unlock()
-                for i in 0..<ablPointer.count {
-                    guard let dest = ablPointer[i].mData else { continue }
-                    memset(dest, 0, bytesNeeded)
                     ablPointer[i].mDataByteSize = UInt32(bytesNeeded)
                 }
             }
@@ -128,9 +133,9 @@ final class AudioPlayer {
     func stop() {
         guard engine.isRunning || ringCount > 0 else { return }
         engine.stop()
-        lock.lock()
-        ringClear()
-        lock.unlock()
+        lock.withLock {
+            ringClear()
+        }
         print("[audio] playback engine stopped")
     }
 
@@ -147,40 +152,42 @@ final class AudioPlayer {
     func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
         guard isOutputEnabled else { return }
         if avSync.consumeGapResume() {
-            lock.lock()
-            ringClear()
-            lock.unlock()
-        }
-
-        lock.lock()
-        data.withUnsafeBytes { raw in
-            guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            ringWrite(ptr, count: raw.count)
-        }
-
-        if avSync.isValid {
-            let expectedTs = avSync.expectedDaemonTimeNow()
-            let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
-
-            if drift < Self.driftDropThresholdMs {
-                let dropBytes = min(ringCount, Int(-drift) * Self.bytesPerMs)
-                let aligned = (dropBytes / 4) * 4
-                if aligned > 0 {
-                    ringDiscard(aligned)
-                }
-            } else if drift > Self.driftTrimThresholdMs {
-                let excess = ringCount - Self.targetBufferBytes
-                if excess > 0 {
-                    let aligned = (excess / 4) * 4
-                    ringDiscard(aligned)
-                }
+            lock.withLock {
+                ringClear()
             }
         }
 
-        if ringCount > Self.maxBufferSize {
-            let excess = ringCount - Self.maxBufferSize
-            ringDiscard(excess)
+        lock.withLock {
+            data.withUnsafeBytes { raw in
+                guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                if !ringWrite(ptr, count: raw.count) {
+                    droppedPacketCount += 1
+                }
+            }
+
+            if avSync.isValid {
+                let expectedTs = avSync.expectedDaemonTimeNow()
+                let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
+
+                if drift < Self.driftDropThresholdMs {
+                    let dropBytes = min(ringCount, Int(-drift) * Self.bytesPerMs)
+                    let aligned = (dropBytes / 4) * 4
+                    if aligned > 0 {
+                        ringDiscard(aligned)
+                    }
+                } else if drift > Self.driftTrimThresholdMs {
+                    let excess = ringCount - Self.targetBufferBytes
+                    if excess > 0 {
+                        let aligned = (excess / 4) * 4
+                        ringDiscard(aligned)
+                    }
+                }
+            }
+
+            if ringCount > Self.maxBufferSize {
+                let excess = ringCount - Self.maxBufferSize
+                ringDiscard(excess)
+            }
         }
-        lock.unlock()
     }
 }

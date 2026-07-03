@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,6 +76,31 @@ impl TcpFramedSender {
         })
     }
 
+    /// Write a header + payload pair with vectored I/O, looping on partial writes.
+    fn write_all_vectored(&mut self, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
+        let mut header_remaining = header;
+        let mut payload_remaining = payload;
+        while !header_remaining.is_empty() || !payload_remaining.is_empty() {
+            let bufs = [
+                IoSlice::new(header_remaining),
+                IoSlice::new(payload_remaining),
+            ];
+            let n = self.stream.write_vectored(&bufs)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write_vectored returned 0",
+                ));
+            }
+            let header_consumed = n.min(header_remaining.len());
+            header_remaining = &header_remaining[header_consumed..];
+            let remaining = n - header_consumed;
+            let payload_consumed = remaining.min(payload_remaining.len());
+            payload_remaining = &payload_remaining[payload_consumed..];
+        }
+        Ok(())
+    }
+
     pub fn send_video(
         &mut self,
         annex_b: &[u8],
@@ -84,31 +109,23 @@ impl TcpFramedSender {
         codec_id: u8,
     ) -> Result<()> {
         let payload_len = 1 + 1 + 1 + 4 + annex_b.len(); // type + is_idr + codec_id + ts + data
-        self.write_buf.clear();
-        self.write_buf
-            .extend_from_slice(&(payload_len as u32).to_be_bytes());
-        self.write_buf.push(MSG_VIDEO);
-        self.write_buf.push(if is_idr { 1 } else { 0 });
-        self.write_buf.push(codec_id);
-        self.write_buf
-            .extend_from_slice(&timestamp_ms.to_be_bytes());
-        self.write_buf.extend_from_slice(annex_b);
-        self.stream
-            .write_all(&self.write_buf)
+        let mut header = [0u8; 4 + 1 + 1 + 1 + 4];
+        header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        header[4] = MSG_VIDEO;
+        header[5] = if is_idr { 1 } else { 0 };
+        header[6] = codec_id;
+        header[7..11].copy_from_slice(&timestamp_ms.to_be_bytes());
+        self.write_all_vectored(&header, annex_b)
             .context("USB TCP write (video)")
     }
 
     pub fn send_audio(&mut self, pcm: &[u8], timestamp_ms: u32) -> Result<()> {
         let payload_len = 1 + 4 + pcm.len(); // type + ts + data
-        self.write_buf.clear();
-        self.write_buf
-            .extend_from_slice(&(payload_len as u32).to_be_bytes());
-        self.write_buf.push(MSG_AUDIO);
-        self.write_buf
-            .extend_from_slice(&timestamp_ms.to_be_bytes());
-        self.write_buf.extend_from_slice(pcm);
-        self.stream
-            .write_all(&self.write_buf)
+        let mut header = [0u8; 4 + 1 + 4];
+        header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        header[4] = MSG_AUDIO;
+        header[5..9].copy_from_slice(&timestamp_ms.to_be_bytes());
+        self.write_all_vectored(&header, pcm)
             .context("USB TCP write (audio)")
     }
 
@@ -303,6 +320,7 @@ fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender
             cb();
         }
     }
+    shared.audio_notify.notify_all();
 }
 
 fn local_hostname() -> Option<String> {
@@ -335,6 +353,7 @@ fn deactivate_usb_transport(shared: &Arc<SharedState>) {
             cb();
         }
     }
+    shared.audio_notify.notify_all();
 }
 
 fn read_control_loop(mut stream: TcpStream, shared: &Arc<SharedState>, stop: &Arc<AtomicBool>) {

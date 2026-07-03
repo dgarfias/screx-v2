@@ -16,7 +16,9 @@ struct ScrexCrypto {
         guard let nonce = try? AES.GCM.Nonce(data: nonceBytes) else { return nil }
         guard let sealed = try? AES.GCM.seal(plaintext, using: key, nonce: nonce, authenticating: aad) else { return nil }
         // Return ciphertext + tag (no nonce prefix — caller manages nonce)
-        var result = sealed.ciphertext
+        var result = Data()
+        result.reserveCapacity(sealed.ciphertext.count + tagLen)
+        result.append(sealed.ciphertext)
         result.append(sealed.tag)
         return result
     }
@@ -87,48 +89,52 @@ struct ScrexCrypto {
 
     /// Server→client nonce from packet header fields.
     static func nonceServer(frameId: UInt32, chunkIdx: UInt16, flags: UInt8) -> Data {
-        var n = Data(count: 12)
-        n[0] = 0x00
-        n[1] = UInt8(truncatingIfNeeded: frameId >> 24)
-        n[2] = UInt8(truncatingIfNeeded: frameId >> 16)
-        n[3] = UInt8(truncatingIfNeeded: frameId >> 8)
-        n[4] = UInt8(truncatingIfNeeded: frameId)
-        n[5] = UInt8(truncatingIfNeeded: chunkIdx >> 8)
-        n[6] = UInt8(truncatingIfNeeded: chunkIdx)
-        n[7] = flags
-        return n
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr[0] = 0x00
+            ptr[1] = UInt8(truncatingIfNeeded: frameId >> 24)
+            ptr[2] = UInt8(truncatingIfNeeded: frameId >> 16)
+            ptr[3] = UInt8(truncatingIfNeeded: frameId >> 8)
+            ptr[4] = UInt8(truncatingIfNeeded: frameId)
+            ptr[5] = UInt8(truncatingIfNeeded: chunkIdx >> 8)
+            ptr[6] = UInt8(truncatingIfNeeded: chunkIdx)
+            ptr[7] = flags
+            return Data(UnsafeBufferPointer(start: ptr.baseAddress!, count: 12))
+        }
     }
 
     /// Client→server nonce from sequence number.
     static func nonceClient(seqNum: UInt32) -> Data {
-        var n = Data(count: 12)
-        n[0] = 0xFF
-        n[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
-        n[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
-        n[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
-        n[4] = UInt8(truncatingIfNeeded: seqNum)
-        return n
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr[0] = 0xFF
+            ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
+            ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
+            ptr[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
+            ptr[4] = UInt8(truncatingIfNeeded: seqNum)
+            return Data(UnsafeBufferPointer(start: ptr.baseAddress!, count: 12))
+        }
     }
 
     /// Client→server TCP control nonce from sequence number.
     static func nonceControlClient(seqNum: UInt32) -> Data {
-        var n = Data(count: 12)
-        n[0] = 0x7F
-        n[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
-        n[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
-        n[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
-        n[4] = UInt8(truncatingIfNeeded: seqNum)
-        return n
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr[0] = 0x7F
+            ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
+            ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
+            ptr[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
+            ptr[4] = UInt8(truncatingIfNeeded: seqNum)
+            return Data(UnsafeBufferPointer(start: ptr.baseAddress!, count: 12))
+        }
     }
 
     /// Server→client TCP control nonce from sequence number.
     static func nonceControlServer(seqNum: UInt32) -> Data {
-        var n = Data(count: 12)
-        n[0] = 0x80
-        n[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
-        n[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
-        n[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
-        n[4] = UInt8(truncatingIfNeeded: seqNum)
-        return n
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr[0] = 0x80
+            ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
+            ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
+            ptr[3] = UInt8(truncatingIfNeeded: seqNum >> 8)
+            ptr[4] = UInt8(truncatingIfNeeded: seqNum)
+            return Data(UnsafeBufferPointer(start: ptr.baseAddress!, count: 12))
+        }
     }
 }

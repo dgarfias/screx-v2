@@ -51,6 +51,38 @@ const ADAPTIVE_ADJUST_INTERVAL: Duration = Duration::from_secs(1);
 const ADAPTIVE_SHORT_WINDOW: Duration = Duration::from_secs(2);
 const ADAPTIVE_LONG_WINDOW: Duration = Duration::from_secs(6);
 const SENDMMSG_BATCH_SIZE: usize = 32;
+const PKTINFO_CMSG_SPACE: usize = 64;
+
+/// Aligned storage for an IP_PKTINFO cmsg buffer.
+///
+/// `buf` is oversized and aligned so the cmsg is placed at a properly aligned
+/// address. `controllen` is the *actual* `CMSG_SPACE(...)` value that must be
+/// passed to `msg_controllen`; passing the full 64-byte buffer length causes
+/// `sendmsg`/`sendmmsg` to return `EINVAL` on some kernels.
+#[repr(C, align(8))]
+struct PktinfoCmsg {
+    buf: [u8; PKTINFO_CMSG_SPACE],
+    controllen: usize,
+}
+
+impl PktinfoCmsg {
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.controllen]
+    }
+
+    fn controllen(&self) -> usize {
+        self.controllen
+    }
+}
+
+impl Default for PktinfoCmsg {
+    fn default() -> Self {
+        Self {
+            buf: [0u8; PKTINFO_CMSG_SPACE],
+            controllen: 0,
+        }
+    }
+}
 
 fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -127,16 +159,20 @@ pub fn udp_source_for_local_ip(local_ip: Option<std::net::IpAddr>) -> Option<Udp
 }
 
 /// Build an IP_PKTINFO cmsg buffer that pins the IPv4 source address/interface.
-fn build_pktinfo_cmsg(source: UdpSource) -> Vec<u8> {
+fn build_pktinfo_cmsg(source: UdpSource) -> PktinfoCmsg {
     unsafe {
         let data_len = std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint;
         let space = libc::CMSG_SPACE(data_len) as usize;
-        let mut buf = vec![0u8; space];
-        let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(data_len) as _;
-        (*cmsg).cmsg_level = libc::IPPROTO_IP;
-        (*cmsg).cmsg_type = libc::IP_PKTINFO;
-        let pi = libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo;
+        assert!(
+            space <= PKTINFO_CMSG_SPACE,
+            "PKTINFO_CMSG_SPACE ({PKTINFO_CMSG_SPACE}) too small for CMSG_SPACE({data_len}) = {space}"
+        );
+        let mut cmsg = PktinfoCmsg::default();
+        let cmsg_hdr = cmsg.buf.as_mut_ptr() as *mut libc::cmsghdr;
+        (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(data_len) as _;
+        (*cmsg_hdr).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg_hdr).cmsg_type = libc::IP_PKTINFO;
+        let pi = libc::CMSG_DATA(cmsg_hdr) as *mut libc::in_pktinfo;
         std::ptr::write_unaligned(
             pi,
             libc::in_pktinfo {
@@ -147,25 +183,41 @@ fn build_pktinfo_cmsg(source: UdpSource) -> Vec<u8> {
                 ipi_addr: libc::in_addr { s_addr: 0 },
             },
         );
-        buf
+        cmsg.controllen = space;
+        cmsg
     }
 }
 
 /// `send_to` with an optional pinned IPv4 source address (IP_PKTINFO).
 /// Falls back to a plain `send_to` when no source is pinned or dst is IPv6.
+/// If `cmsg_buf` is provided it is used directly; otherwise a stack buffer is
+/// built from `source`.
 pub fn send_to_from(
     socket: &UdpSocket,
     buf: &[u8],
     dst: SocketAddr,
     source: Option<UdpSource>,
+    cmsg_buf: Option<&[u8]>,
 ) -> std::io::Result<usize> {
     let source = match (source, dst) {
         (Some(s), SocketAddr::V4(_)) => s,
         _ => return socket.send_to(buf, dst),
     };
 
+    // `controllen` must be exactly CMSG_SPACE(...); the buffer itself is only
+    // oversized for alignment. Passing the oversized buffer length causes
+    // `sendmsg` to return EINVAL on some kernels.
+    let (cmsg_ptr, controllen, _built) = match cmsg_buf {
+        Some(b) if !b.is_empty() => (b.as_ptr() as *mut libc::c_void, b.len(), None),
+        _ => {
+            let built = build_pktinfo_cmsg(source);
+            let ptr = built.buf.as_ptr() as *mut libc::c_void;
+            let len = built.controllen();
+            (ptr, len, Some(built))
+        }
+    };
+
     let (mut addr_storage, addr_len) = socket_addr_to_raw(dst);
-    let mut cmsg_buf = build_pktinfo_cmsg(source);
     let mut iov = libc::iovec {
         iov_base: buf.as_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -175,8 +227,8 @@ pub fn send_to_from(
         msg_namelen: addr_len,
         msg_iov: &mut iov,
         msg_iovlen: 1,
-        msg_control: cmsg_buf.as_mut_ptr().cast(),
-        msg_controllen: cmsg_buf.len() as _,
+        msg_control: cmsg_ptr,
+        msg_controllen: controllen as _,
         msg_flags: 0,
     };
     let ret = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
@@ -315,6 +367,8 @@ pub struct SharedState {
     pub usb_active: AtomicBool,
     pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
     pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
+    pub keyboard_worker: Mutex<Option<crate::uinput::KeyboardWorker>>,
+    pub audio_notify: Arc<Condvar>,
     pub virtual_mouse: Mutex<Option<crate::uinput::VirtualMouse>>,
     pub virtual_gamepads: Mutex<HashMap<u8, crate::uinput::VirtualGamepad>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
@@ -351,6 +405,8 @@ impl SharedState {
             usb_active: AtomicBool::new(false),
             virtual_touch: Mutex::new(None),
             virtual_keyboard: Mutex::new(None),
+            keyboard_worker: Mutex::new(None),
+            audio_notify: Arc::new(Condvar::new()),
             virtual_mouse: Mutex::new(None),
             virtual_gamepads: Mutex::new(HashMap::new()),
             cam_writer: Mutex::new(None),
@@ -560,6 +616,7 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
             shared.audio_output_enabled.store(false, Ordering::SeqCst);
             disable_virtual_sink(shared);
         }
+        shared.audio_notify.notify_all();
         return;
     }
 
@@ -606,11 +663,13 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
                 key_data
             );
         }
-        let mut kb = shared.virtual_keyboard.lock().unwrap();
-        if let Some(ref mut keyboard) = *kb {
-            crate::uinput::handle_key_packet(keyboard, key_data);
-        } else {
-            eprintln!("[control] KEY packet dropped: no virtual keyboard available");
+        if let Some(event) = crate::uinput::parse_key_event(key_data) {
+            let worker = shared.keyboard_worker.lock().unwrap();
+            if let Some(ref w) = *worker {
+                w.send(event);
+            } else {
+                eprintln!("[control] KEY packet dropped: no virtual keyboard available");
+            }
         }
         return;
     }
@@ -652,9 +711,13 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
                 rk_data.len()
             );
         }
-        let mut kb = shared.virtual_keyboard.lock().unwrap();
-        if let Some(ref mut keyboard) = *kb {
-            crate::uinput::handle_rawkey_packet(keyboard, rk_data);
+        if let Some(event) = crate::uinput::parse_rawkey_event(rk_data) {
+            let worker = shared.keyboard_worker.lock().unwrap();
+            if let Some(ref w) = *worker {
+                w.send(event);
+            } else {
+                eprintln!("[control] RAWKEY packet dropped: no virtual keyboard available");
+            }
         }
         return;
     }
@@ -692,6 +755,7 @@ pub fn disable_virtual_sink(shared: &Arc<SharedState>) {
         crate::audio::remove_virtual_sink(*module_id);
         *module_id = 0;
     }
+    shared.audio_notify.notify_all();
 }
 
 pub fn enable_virtual_mic(shared: &Arc<SharedState>) {
@@ -812,6 +876,7 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
     if !shared.usb_active.load(Ordering::Relaxed)
         && shared.has_active_client.swap(false, Ordering::SeqCst)
     {
+        shared.audio_notify.notify_all();
         shared.reset_stream_tuning();
         let shared_lc = Arc::clone(shared);
         std::thread::Builder::new()
@@ -1042,6 +1107,7 @@ pub fn run_client_manager(
                             fr.store(true, Ordering::Relaxed);
                         }
                         if !shared.has_active_client.swap(true, Ordering::SeqCst) {
+                            shared.audio_notify.notify_all();
                             drop(client);
                             let shared_lc = Arc::clone(&shared);
                             std::thread::Builder::new()
@@ -1088,6 +1154,7 @@ pub fn run_client_manager(
                                 &hb_buf[..HEADER_LEN + enc_len],
                                 addr,
                                 session_udp_source,
+                                None,
                             );
                         }
                         last_heartbeat = Instant::now();
@@ -1173,6 +1240,7 @@ pub fn run_client_manager(
                         &hb_buf[..HEADER_LEN + enc_len],
                         addr,
                         session_udp_source,
+                        None,
                     ) {
                         Ok(sent) => {
                             if should_log_debug(heartbeat_count) {
@@ -1209,6 +1277,8 @@ pub fn run_client_manager(
 // UDP sender — called synchronously from the capture thread
 // ---------------------------------------------------------------------------
 
+const MAX_RS_CACHE_ENTRIES: usize = 64;
+
 pub struct UdpSender {
     socket: UdpSocket,
     packet_pool: Vec<[u8; MAX_PACKET_LEN]>,
@@ -1221,6 +1291,8 @@ pub struct UdpSender {
     rs_cache: HashMap<(usize, usize), ReedSolomon>,
     cipher: Option<crate::crypto::SessionCipher>,
     source: Option<UdpSource>,
+    cmsg_buf: Option<PktinfoCmsg>,
+    log_sent_aus: bool,
 }
 
 impl UdpSender {
@@ -1237,6 +1309,8 @@ impl UdpSender {
             rs_cache: HashMap::new(),
             cipher: None,
             source: None,
+            cmsg_buf: None,
+            log_sent_aus: std::env::var_os("SCREX_LOG_SENT_AUS").is_some(),
         }
     }
 
@@ -1246,6 +1320,7 @@ impl UdpSender {
 
     pub fn set_source(&mut self, source: Option<UdpSource>) {
         self.source = source;
+        self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
     pub fn send_frame(
@@ -1256,9 +1331,9 @@ impl UdpSender {
         codec_id: u8,
         tuning: StreamTuning,
     ) -> Result<()> {
-        let payload = &au.annex_b;
+        let payload: &[u8] = &*au.annex_b;
         let is_idr = au.is_idr;
-        if std::env::var_os("SCREX_LOG_SENT_AUS").is_some() {
+        if self.log_sent_aus {
             let prefix_len = payload.len().min(24);
             println!(
                 "[stream/send] frame_id={} codec={} idr={} bytes={} fnv=0x{:016x} prefix={:02x?}",
@@ -1315,6 +1390,9 @@ impl UdpSender {
         if actual_parity > 0 {
             for i in data_count..total_shards {
                 self.shard_pool[i].fill(0);
+            }
+            if self.rs_cache.len() >= MAX_RS_CACHE_ENTRIES {
+                self.rs_cache.clear();
             }
             let rs = match self.rs_cache.entry((data_count, actual_parity)) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -1423,6 +1501,7 @@ impl UdpSender {
                             &self.packet_pool[idx][..self.packet_lens[idx]],
                             client_addr,
                             self.source,
+                            self.cmsg_buf.as_ref().map(|b| b.as_slice()),
                         )
                         .map_err(|e| anyhow::anyhow!("send error: {e}"))?;
                         frame_bytes += self.packet_lens[idx] as u64;
@@ -1449,17 +1528,15 @@ impl UdpSender {
         // Optional IP_PKTINFO cmsg shared by all messages in the batch
         // (sendmmsg only reads it). Pins the source IP/interface so
         // multi-homed hosts reply from the address the client dialed.
-        let mut cmsg_buf = match (self.source, client_addr) {
-            (Some(src), SocketAddr::V4(_)) => build_pktinfo_cmsg(src),
-            _ => Vec::new(),
-        };
-        let (cmsg_ptr, cmsg_len) = if cmsg_buf.is_empty() {
-            (ptr::null_mut(), 0)
-        } else {
-            (
-                cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-                cmsg_buf.len() as _,
-            )
+        let (cmsg_ptr, cmsg_len) = match (self.source, client_addr) {
+            (Some(_), SocketAddr::V4(_)) => match self.cmsg_buf.as_ref() {
+                Some(buf) => (
+                    buf.as_slice().as_ptr() as *mut libc::c_void,
+                    buf.controllen() as libc::size_t,
+                ),
+                None => (ptr::null_mut(), 0),
+            },
+            _ => (ptr::null_mut(), 0),
         };
 
         for idx in start..end {
@@ -1559,6 +1636,7 @@ pub struct AudioSender {
     send_buf: Vec<u8>,
     cipher: Option<crate::crypto::SessionCipher>,
     source: Option<UdpSource>,
+    cmsg_buf: Option<PktinfoCmsg>,
 }
 
 impl AudioSender {
@@ -1569,6 +1647,7 @@ impl AudioSender {
             send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN],
             cipher: None,
             source: None,
+            cmsg_buf: None,
         }
     }
 
@@ -1582,6 +1661,7 @@ impl AudioSender {
 
     pub fn set_source(&mut self, source: Option<UdpSource>) {
         self.source = source;
+        self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
     pub fn send_audio(
@@ -1631,6 +1711,7 @@ impl AudioSender {
                 &self.send_buf[..pkt_len],
                 client_addr,
                 self.source,
+                self.cmsg_buf.as_ref().map(|b| b.as_slice()),
             ) {
                 eprintln!("[audio] send error: {e}");
                 break;

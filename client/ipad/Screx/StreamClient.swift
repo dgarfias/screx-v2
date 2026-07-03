@@ -86,6 +86,7 @@ final class StreamClient {
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
                 self.startDataTimeout()
+                self.decoder.sendPliRequest = { [weak self] in self?.sendPli() }
                 self.receiveLoop(conn)
             case .failed(let error):
                 self.disconnect()

@@ -17,6 +17,8 @@ final class NetworkControlClient {
     private var sendSeq: UInt32 = 0
     private var isClosed = false
     private var recvBuffer = Data()
+    private var readOffset = 0
+    private static let recvBufferCompactThreshold = 64 * 1024
 
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
@@ -94,6 +96,7 @@ final class NetworkControlClient {
     private func protocolFailure(_ message: String) {
         log(message)
         recvBuffer.removeAll()
+        readOffset = 0
         connection.cancel()
         handleDisconnect()
     }
@@ -125,8 +128,8 @@ final class NetworkControlClient {
     }
 
     private func processReceiveBuffer() {
-        while recvBuffer.count >= 4 {
-            let bodyLen = recvBuffer.prefix(4).withUnsafeBytes { raw -> Int in
+        while readOffset + 4 <= recvBuffer.count {
+            let bodyLen = recvBuffer[readOffset..<readOffset + 4].withUnsafeBytes { raw -> Int in
                 let bytes = raw.bindMemory(to: UInt8.self)
                 return Int(bytes[0]) << 24
                     | Int(bytes[1]) << 16
@@ -140,10 +143,10 @@ final class NetworkControlClient {
             }
 
             let totalLen = 4 + bodyLen
-            guard recvBuffer.count >= totalLen else { return }
+            guard readOffset + totalLen <= recvBuffer.count else { return }
 
-            let frame = Data(recvBuffer.prefix(totalLen))
-            recvBuffer.removeFirst(totalLen)
+            let frame = recvBuffer.subdata(in: readOffset..<readOffset + totalLen)
+            readOffset += totalLen
 
             let body = frame.dropFirst(4)
             let seqNum = body.prefix(4).withUnsafeBytes { raw -> UInt32 in
@@ -167,6 +170,11 @@ final class NetworkControlClient {
             }
 
             handleInboundPayload(plaintext)
+        }
+
+        if readOffset > Self.recvBufferCompactThreshold {
+            recvBuffer.removeSubrange(0..<readOffset)
+            readOffset = 0
         }
     }
 

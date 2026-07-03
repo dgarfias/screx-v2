@@ -188,12 +188,17 @@ pub fn run_audio_capture(
         // Wait for a client to be active AND the virtual sink to actually exist.
         // The sink is created by the SPKR control handler; we must not spawn
         // parec until the PulseAudio module is loaded (audio_module_id > 0).
-        if !shared.has_active_client.load(Ordering::Relaxed)
-            || !shared.audio_output_enabled.load(Ordering::SeqCst)
-            || *shared.audio_module_id.lock().unwrap() == 0
         {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            continue;
+            let guard = shared.audio_module_id.lock().unwrap();
+            if !shared.has_active_client.load(Ordering::Relaxed)
+                || !shared.audio_output_enabled.load(Ordering::SeqCst)
+                || *guard == 0
+            {
+                let _ = shared
+                    .audio_notify
+                    .wait_timeout(guard, std::time::Duration::from_millis(200));
+                continue;
+            }
         }
 
         let mut parec = Command::new("parec");
@@ -299,11 +304,15 @@ pub fn run_audio_capture(
         }
 
         let _ = child.kill();
-        let _ = child.wait();
+        let exit_status = child.wait().ok();
+        let clean_stop = !shared.audio_output_enabled.load(Ordering::SeqCst);
         println!("[audio] capture session stopped, waiting for next client...");
-        // Brief backoff so we don't tight-loop if parec exits immediately
-        // (e.g. sink was removed between our check and parec connecting).
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Brief backoff so we don't tight-loop if parec exited with an error
+        // (crash-loop protection). On a clean, intentional stop we return to
+        // the condvar wait immediately.
+        if !clean_stop || exit_status.map_or(true, |s| !s.success()) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
 
     println!("[audio] capture thread exiting");

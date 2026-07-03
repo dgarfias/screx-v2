@@ -10,11 +10,26 @@ pub struct CaptureFrame<'a> {
     pub data: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackend {
+    Evdi,
+}
+
+impl CaptureBackend {
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "evdi" => Self::Evdi,
+            _ => Self::Evdi,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub backend: CaptureBackend,
 }
 
 mod evdi {
@@ -567,11 +582,13 @@ pub fn run_capture_loop(
     capture_start: Arc<AtomicBool>,
     mut on_frame: impl FnMut(CaptureFrame<'_>),
 ) -> Result<()> {
-    evdi::run_capture(
-        &config,
-        &stop,
-        &force_refresh,
-        &capture_start,
-        &mut on_frame,
-    )
+    match config.backend {
+        CaptureBackend::Evdi => evdi::run_capture(
+            &config,
+            &stop,
+            &force_refresh,
+            &capture_start,
+            &mut on_frame,
+        ),
+    }
 }

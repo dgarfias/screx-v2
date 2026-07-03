@@ -39,6 +39,8 @@ final class USBListener {
 
     private var hasReportedFirstFrame = false
     private var recvBuffer = Data()
+    private var readOffset = 0
+    private static let recvBufferCompactThreshold = 64 * 1024
 
     init(decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.decoder = decoder
@@ -90,6 +92,7 @@ final class USBListener {
         listener = nil
         hasReportedFirstFrame = false
         recvBuffer.removeAll()
+        readOffset = 0
         print("[usb] listener stopped")
     }
 
@@ -99,6 +102,7 @@ final class USBListener {
         connection = conn
         hasReportedFirstFrame = false
         recvBuffer.removeAll()
+        readOffset = 0
 
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
@@ -107,6 +111,7 @@ final class USBListener {
                 self?.sendReady(on: conn)
                 self?.onEvent?(.connected)
                 self?.onConnected?()
+                self?.decoder.sendPliRequest = { [weak self] in self?.sendPli() }
                 self?.readLoop(conn)
             case .waiting(let error):
                 print("[usb] connection waiting: \(error)")
@@ -146,6 +151,7 @@ final class USBListener {
         connection = nil
         hasReportedFirstFrame = false
         recvBuffer.removeAll()
+        readOffset = 0
         onDisconnected?()
     }
 
@@ -178,9 +184,9 @@ final class USBListener {
     }
 
     private func processBuffer() {
-        while recvBuffer.count >= 4 {
+        while readOffset + 4 <= recvBuffer.count {
             // Read 4-byte length header manually to avoid alignment issues
-            let b = recvBuffer.prefix(4)
+            let b = recvBuffer[readOffset..<readOffset + 4]
             let msgLen = Int(b[b.startIndex]) << 24
                        | Int(b[b.startIndex + 1]) << 16
                        | Int(b[b.startIndex + 2]) << 8
@@ -188,16 +194,17 @@ final class USBListener {
 
             guard msgLen > 0, msgLen < 10_000_000 else {
                 recvBuffer.removeAll()
+                readOffset = 0
                 print("[usb] invalid frame length \(msgLen), resetting buffer")
                 break
             }
 
             let totalNeeded = 4 + msgLen
-            guard recvBuffer.count >= totalNeeded else { break }
+            guard readOffset + totalNeeded <= recvBuffer.count else { break }
 
-            // Copy out the message bytes into a fresh contiguous Data
-            let msgData = Data(recvBuffer.prefix(totalNeeded).dropFirst(4))
-            recvBuffer = Data(recvBuffer.dropFirst(totalNeeded))
+            // Slice out the payload without reassigning the receive buffer.
+            let msgData = recvBuffer.subdata(in: readOffset + 4..<readOffset + totalNeeded)
+            readOffset += totalNeeded
             onTraffic?(totalNeeded, 0)
 
             guard msgData.count >= 1 else { continue }
@@ -250,6 +257,11 @@ final class USBListener {
             default:
                 break
             }
+        }
+
+        if readOffset > Self.recvBufferCompactThreshold {
+            recvBuffer.removeSubrange(0..<readOffset)
+            readOffset = 0
         }
     }
 

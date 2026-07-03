@@ -1,5 +1,8 @@
+use std::ops::Deref;
 use std::ptr;
 use std::time::{Duration, Instant};
+
+use libc;
 
 use anyhow::{bail, Context, Result};
 use ffmpeg_next as ffmpeg;
@@ -40,10 +43,74 @@ pub struct EncoderConfig {
     pub codec: VideoCodec,
 }
 
-#[derive(Debug, Clone)]
+/// Owned reference to an encoded packet's underlying AVBuffer.
+/// Avoids copying the encoded data when no extradata prefix is required.
+pub struct OwnedPacketBuf {
+    buf: *mut ffi::AVBufferRef,
+    data: *const u8,
+    len: usize,
+}
+
+unsafe impl Send for OwnedPacketBuf {}
+
+impl OwnedPacketBuf {
+    /// Create an owned buffer ref from a received AVPacket.
+    /// Returns `None` if the packet does not own a buffer.
+    unsafe fn from_packet(pkt: *const ffi::AVPacket) -> Option<Self> {
+        if pkt.is_null() || (*pkt).buf.is_null() {
+            return None;
+        }
+        let buf = ffi::av_buffer_ref((*pkt).buf);
+        if buf.is_null() {
+            return None;
+        }
+        Some(Self {
+            buf,
+            data: (*pkt).data,
+            len: (*pkt).size as usize,
+        })
+    }
+}
+
+impl Deref for OwnedPacketBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+impl Drop for OwnedPacketBuf {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.buf.is_null() {
+                ffi::av_buffer_unref(&mut self.buf);
+            }
+        }
+    }
+}
+
+/// Holds an Annex-B access unit, either as a zero-copy packet buffer or as a
+/// freshly allocated Vec when an IDR extradata prefix is prepended.
+pub enum AnnexB {
+    Packet(OwnedPacketBuf),
+    Vec(Vec<u8>),
+}
+
+impl Deref for AnnexB {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            AnnexB::Packet(p) => p,
+            AnnexB::Vec(v) => v,
+        }
+    }
+}
+
 pub struct EncodedAccessUnit {
     pub is_idr: bool,
-    pub annex_b: Vec<u8>,
+    pub annex_b: AnnexB,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +154,22 @@ impl Encoder {
 
     pub fn codec(&self) -> VideoCodec {
         self.config.codec
+    }
+
+    pub fn bitrate_bps(&self) -> u32 {
+        self.config.bitrate_bps
+    }
+
+    pub fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
+        if bps == self.config.bitrate_bps {
+            return Ok(());
+        }
+        match &mut self.inner {
+            ActiveEncoder::HwAccel(enc) => enc.reconfigure_bitrate(bps)?,
+            ActiveEncoder::Software(enc) => enc.reconfigure_bitrate(bps)?,
+        }
+        self.config.bitrate_bps = bps;
+        Ok(())
     }
 
     pub fn new(config: EncoderConfig) -> Result<Self> {
@@ -219,11 +302,13 @@ struct HwEncoder {
     sw_bgra: *mut ffi::AVFrame,
     sw_nv12: *mut ffi::AVFrame,
     hw_frame: *mut ffi::AVFrame,
+    mapped_frame: *mut ffi::AVFrame,
     pkt: *mut ffi::AVPacket,
     height: i32,
     frame_index: u64,
     fps: u32,
     extradata: Vec<u8>,
+    is_cqp: bool,
 }
 
 unsafe impl Send for HwEncoder {}
@@ -257,6 +342,24 @@ fn vaapi_hevc_qp(config: &EncoderConfig) -> i64 {
 }
 
 impl HwEncoder {
+    fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
+        unsafe {
+            let ctx = self.ctx;
+            if ctx.is_null() {
+                bail!("encoder context is null");
+            }
+            (*ctx).bit_rate = bps as i64;
+            (*ctx).rc_max_rate = bps as i64;
+            (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
+
+            if matches!(self.kind, HwKind::Vaapi) && !self.is_cqp {
+                let key = std::ffi::CString::new("b").unwrap();
+                ffi::av_opt_set_int((*ctx).priv_data, key.as_ptr(), bps as i64, 0);
+            }
+        }
+        Ok(())
+    }
+
     fn new_vaapi(config: &EncoderConfig) -> Result<Self> {
         if config.codec == VideoCodec::H265 {
             match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
@@ -394,10 +497,13 @@ impl HwEncoder {
                 (HwKind::Vaapi, VideoCodec::H265, VaapiHevcMode::Cqp(_))
             ) {
                 (*ctx).bit_rate = 0;
+                (*ctx).rc_max_rate = 0;
                 (*ctx).rc_buffer_size = 0;
             } else {
                 (*ctx).bit_rate = config.bitrate_bps as i64;
-                (*ctx).rc_buffer_size = (config.bitrate_bps / 2).max(1) as i32;
+                (*ctx).rc_max_rate = config.bitrate_bps as i64;
+                (*ctx).rc_buffer_size =
+                    (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
             }
 
             match kind {
@@ -475,27 +581,30 @@ impl HwEncoder {
             (*sw_bgra).height = height;
             (*sw_bgra).linesize[0] = width * 4;
 
-            let sw_nv12 = ffi::av_frame_alloc();
-            if sw_nv12.is_null() {
-                bail!("failed to allocate NV12 frame");
-            }
-            (*sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
-            (*sw_nv12).width = width;
-            (*sw_nv12).height = height;
-            let ret = ffi::av_frame_get_buffer(sw_nv12, 0);
-            if ret < 0 {
-                bail!("failed to allocate NV12 buffer (error {ret})");
-            }
+            // sw_nv12 is only allocated if av_hwframe_map fails on the first
+            // frame. Most drivers support mapping, so skipping the upfront
+            // allocation saves memory and startup cost on the common path.
+            let sw_nv12: *mut ffi::AVFrame = ptr::null_mut();
 
             let hw_frame = ffi::av_frame_alloc();
             if hw_frame.is_null() {
                 bail!("failed to allocate HW frame");
             }
 
+            let mapped_frame = ffi::av_frame_alloc();
+            if mapped_frame.is_null() {
+                bail!("failed to allocate mapped frame");
+            }
+
             let pkt = ffi::av_packet_alloc();
             if pkt.is_null() {
                 bail!("failed to allocate packet");
             }
+
+            let is_cqp = matches!(
+                (kind, config.codec, vaapi_hevc_mode),
+                (HwKind::Vaapi, VideoCodec::H265, VaapiHevcMode::Cqp(_))
+            );
 
             let codec_label = match config.codec {
                 VideoCodec::H264 => "H.264",
@@ -515,11 +624,13 @@ impl HwEncoder {
                 sw_bgra,
                 sw_nv12,
                 hw_frame,
+                mapped_frame,
                 pkt,
                 height,
                 frame_index: 0,
                 fps: config.fps.max(1),
                 extradata,
+                is_cqp,
             })
         }
     }
@@ -530,27 +641,76 @@ impl HwEncoder {
         is_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
         unsafe {
-            (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
-
-            ffi::sws_scale(
-                self.sws,
-                (*self.sw_bgra).data.as_ptr() as *const *const u8,
-                (*self.sw_bgra).linesize.as_ptr(),
-                0,
-                self.height,
-                (*self.sw_nv12).data.as_mut_ptr(),
-                (*self.sw_nv12).linesize.as_mut_ptr(),
-            );
-
             let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
             if ret < 0 {
                 bail!("failed to get hw frame buffer (error {ret})");
             }
 
-            let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
-            if ret < 0 {
+            let map_flags = (ffi::AV_HWFRAME_MAP_WRITE as libc::c_int)
+                | (ffi::AV_HWFRAME_MAP_OVERWRITE as libc::c_int);
+            let mapped = ffi::av_hwframe_map(self.mapped_frame, self.hw_frame, map_flags);
+
+            (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
+
+            if mapped >= 0 {
+                ffi::sws_scale(
+                    self.sws,
+                    (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                    (*self.sw_bgra).linesize.as_ptr(),
+                    0,
+                    self.height,
+                    (*self.mapped_frame).data.as_mut_ptr(),
+                    (*self.mapped_frame).linesize.as_mut_ptr(),
+                );
+                ffi::av_frame_unref(self.mapped_frame);
+            } else {
+                // Fallback for drivers that do not support direct mapping.
+                // Allocate the NV12 system buffer lazily on first use.
+                if self.sw_nv12.is_null() {
+                    eprintln!(
+                        "[encode] hwframe mapping unavailable, allocating sw_nv12 fallback"
+                    );
+                    self.sw_nv12 = ffi::av_frame_alloc();
+                    if self.sw_nv12.is_null() {
+                        ffi::av_frame_unref(self.mapped_frame);
+                        ffi::av_frame_unref(self.hw_frame);
+                        bail!("failed to allocate NV12 fallback frame");
+                    }
+                    (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                    (*self.sw_nv12).width = (*self.ctx).width;
+                    (*self.sw_nv12).height = (*self.ctx).height;
+                    let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
+                    if ret < 0 {
+                        ffi::av_frame_free(&mut self.sw_nv12);
+                        ffi::av_frame_unref(self.mapped_frame);
+                        ffi::av_frame_unref(self.hw_frame);
+                        bail!("failed to allocate NV12 fallback buffer (error {ret})");
+                    }
+                }
+
+                ffi::av_frame_unref(self.mapped_frame);
                 ffi::av_frame_unref(self.hw_frame);
-                bail!("failed to upload frame to hw surface (error {ret})");
+
+                ffi::sws_scale(
+                    self.sws,
+                    (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                    (*self.sw_bgra).linesize.as_ptr(),
+                    0,
+                    self.height,
+                    (*self.sw_nv12).data.as_mut_ptr(),
+                    (*self.sw_nv12).linesize.as_mut_ptr(),
+                );
+
+                let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
+                if ret < 0 {
+                    bail!("failed to get hw frame buffer (error {ret})");
+                }
+
+                let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
+                if ret < 0 {
+                    ffi::av_frame_unref(self.hw_frame);
+                    bail!("failed to upload frame to hw surface (error {ret})");
+                }
             }
 
             let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
@@ -585,17 +745,26 @@ impl HwEncoder {
                     bail!("avcodec_receive_packet failed (error {ret})");
                 }
 
-                let encoded =
-                    std::slice::from_raw_parts((*self.pkt).data, (*self.pkt).size as usize);
                 let is_key = ((*self.pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
 
                 let annex_b = if is_key && !self.extradata.is_empty() {
+                    let encoded =
+                        std::slice::from_raw_parts((*self.pkt).data, (*self.pkt).size as usize);
                     let mut buf = Vec::with_capacity(self.extradata.len() + encoded.len());
                     buf.extend_from_slice(&self.extradata);
                     buf.extend_from_slice(encoded);
-                    buf
+                    AnnexB::Vec(buf)
                 } else {
-                    encoded.to_vec()
+                    match OwnedPacketBuf::from_packet(self.pkt) {
+                        Some(pkt_buf) => AnnexB::Packet(pkt_buf),
+                        None => {
+                            let encoded = std::slice::from_raw_parts(
+                                (*self.pkt).data,
+                                (*self.pkt).size as usize,
+                            );
+                            AnnexB::Vec(encoded.to_vec())
+                        }
+                    }
                 };
 
                 output.push(EncodedAccessUnit {
@@ -617,6 +786,9 @@ impl Drop for HwEncoder {
             }
             if !self.hw_frame.is_null() {
                 ffi::av_frame_free(&mut self.hw_frame);
+            }
+            if !self.mapped_frame.is_null() {
+                ffi::av_frame_free(&mut self.mapped_frame);
             }
             if !self.sw_nv12.is_null() {
                 ffi::av_frame_free(&mut self.sw_nv12);
@@ -656,6 +828,19 @@ struct SwEncoder {
 unsafe impl Send for SwEncoder {}
 
 impl SwEncoder {
+    fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
+        unsafe {
+            let ctx = self.ctx;
+            if ctx.is_null() {
+                bail!("encoder context is null");
+            }
+            (*ctx).bit_rate = bps as i64;
+            (*ctx).rc_max_rate = bps as i64;
+            (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
+        }
+        Ok(())
+    }
+
     fn new(config: &EncoderConfig) -> Result<Self> {
         let width = config.width as i32;
         let height = config.height as i32;
@@ -703,7 +888,9 @@ impl SwEncoder {
                 den: 1,
             };
             (*ctx).bit_rate = config.bitrate_bps as i64;
-            (*ctx).rc_buffer_size = (config.bitrate_bps / 2).max(1) as i32;
+            (*ctx).rc_max_rate = config.bitrate_bps as i64;
+            (*ctx).rc_buffer_size =
+                (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
             (*ctx).gop_size = config.gop as i32;
             (*ctx).max_b_frames = 0;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
@@ -839,17 +1026,26 @@ impl SwEncoder {
                     bail!("avcodec_receive_packet failed (error {ret})");
                 }
 
-                let encoded =
-                    std::slice::from_raw_parts((*self.pkt).data, (*self.pkt).size as usize);
                 let is_key = ((*self.pkt).flags & ffi::AV_PKT_FLAG_KEY) != 0;
 
                 let annex_b = if is_key && !self.extradata.is_empty() {
+                    let encoded =
+                        std::slice::from_raw_parts((*self.pkt).data, (*self.pkt).size as usize);
                     let mut buf = Vec::with_capacity(self.extradata.len() + encoded.len());
                     buf.extend_from_slice(&self.extradata);
                     buf.extend_from_slice(encoded);
-                    buf
+                    AnnexB::Vec(buf)
                 } else {
-                    encoded.to_vec()
+                    match OwnedPacketBuf::from_packet(self.pkt) {
+                        Some(pkt_buf) => AnnexB::Packet(pkt_buf),
+                        None => {
+                            let encoded = std::slice::from_raw_parts(
+                                (*self.pkt).data,
+                                (*self.pkt).size as usize,
+                            );
+                            AnnexB::Vec(encoded.to_vec())
+                        }
+                    }
                 };
 
                 output.push(EncodedAccessUnit {

@@ -46,37 +46,54 @@ enum ReedSolomonDecoder {
             subMatrix[i] = codingMatrix[usedIndices[i]]
         }
 
-        // Invert the sub-matrix
-        guard var invMatrix = invertMatrix(subMatrix) else { return false }
+        // Look up or compute the inverse of the sub-matrix.
+        let cacheKey = InvertMatrixKey(
+            dataCount: dataCount,
+            parityCount: parityCount,
+            usedIndices: usedIndices
+        )
+        let invMatrix: [[UInt8]]
+        if let cached = invertMatrixCache[cacheKey] {
+            invMatrix = cached
+        } else {
+            guard let inverted = invertMatrix(subMatrix) else { return false }
+            invertMatrixCache[cacheKey] = inverted
+            // The key space is small but unbounded under pathological loss;
+            // reset if we ever grow too large. Recovery is bursty, so a reset
+            // only costs a few re-inversions.
+            if invertMatrixCache.count > invertMatrixCacheMaxEntries {
+                invertMatrixCache.removeAll(keepingCapacity: true)
+                invertMatrixCache[cacheKey] = inverted
+            }
+            invMatrix = inverted
+        }
 
         // Collect the data from present shards (in the order of usedIndices)
-        var presentData: [[UInt8]] = []
+        var presentData: [Data] = []
         for idx in usedIndices {
-            presentData.append([UInt8](shards[idx]!))
+            presentData.append(shards[idx]!)
         }
 
         // Recover missing data shards (indices < dataCount)
         for missingIdx in missingIndices where missingIdx < dataCount {
-            var recovered = [UInt8](repeating: 0, count: shardSize)
+            var recovered = Data(repeating: 0, count: shardSize)
             for j in 0..<dataCount {
                 let coeff = invMatrix[missingIdx][j]
                 if coeff == 0 { continue }
                 gf_mul_add(&recovered, presentData[j], coeff)
             }
-            shards[missingIdx] = Data(recovered)
+            shards[missingIdx] = recovered
         }
 
         // Recover missing parity shards (indices >= dataCount) — reconstruct from data
         for missingIdx in missingIndices where missingIdx >= dataCount {
-            var recovered = [UInt8](repeating: 0, count: shardSize)
-            // First, collect the (now-complete) data shards
+            var recovered = Data(repeating: 0, count: shardSize)
             for j in 0..<dataCount {
                 let coeff = codingMatrix[missingIdx][j]
                 if coeff == 0 { continue }
-                let dataShard = [UInt8](shards[j]!)
-                gf_mul_add(&recovered, dataShard, coeff)
+                gf_mul_add(&recovered, shards[j]!, coeff)
             }
-            shards[missingIdx] = Data(recovered)
+            shards[missingIdx] = recovered
         }
 
         return true
@@ -120,18 +137,33 @@ enum ReedSolomonDecoder {
     }
 
     /// dst[i] ^= src[i] * coeff (for all i)
-    private static func gf_mul_add(_ dst: inout [UInt8], _ src: [UInt8], _ coeff: UInt8) {
+    private static func gf_mul_add(_ dst: inout Data, _ src: Data, _ coeff: UInt8) {
         if coeff == 0 { return }
         if coeff == 1 {
-            for i in 0..<min(dst.count, src.count) {
-                dst[i] ^= src[i]
+            dst.withUnsafeMutableBytes { dstRaw in
+                src.withUnsafeBytes { srcRaw in
+                    guard let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    let count = min(dstRaw.count, srcRaw.count)
+                    for i in 0..<count {
+                        dstPtr[i] ^= srcPtr[i]
+                    }
+                }
             }
             return
         }
         let logCoeff = Int(gfLog[Int(coeff)])
-        for i in 0..<min(dst.count, src.count) {
-            if src[i] != 0 {
-                dst[i] ^= gfExp[Int(gfLog[Int(src[i])]) + logCoeff]
+        dst.withUnsafeMutableBytes { dstRaw in
+            src.withUnsafeBytes { srcRaw in
+                guard let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress,
+                      let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                let count = min(dstRaw.count, srcRaw.count)
+                for i in 0..<count {
+                    let v = srcPtr[i]
+                    if v != 0 {
+                        dstPtr[i] ^= gfExp[Int(gfLog[Int(v)]) + logCoeff]
+                    }
+                }
             }
         }
     }
@@ -139,6 +171,21 @@ enum ReedSolomonDecoder {
     // MARK: - Coding matrix (Vandermonde / Cauchy, compatible with reed-solomon-erasure)
 
     private static var matrixCache: [UInt64: [[UInt8]]] = [:]
+
+    /// Cache key for an inverted decode sub-matrix.
+    /// `usedIndices` is the ordered set of present data shards used to build the
+    /// sub-matrix. The same loss pattern then reuses the inverse.
+    private struct InvertMatrixKey: Hashable {
+        let dataCount: Int
+        let parityCount: Int
+        let usedIndices: [Int]
+    }
+
+    /// Inverted sub-matrices keyed by the loss pattern that produced them.
+    /// Recovery is driven from a single NWConnection receive queue, so no lock
+    /// is required; if that ever changes, wrap cache access in an NSLock.
+    private static var invertMatrixCache: [InvertMatrixKey: [[UInt8]]] = [:]
+    private static let invertMatrixCacheMaxEntries = 64
 
     private static func getCodingMatrix(dataCount: Int, parityCount: Int) -> [[UInt8]] {
         let key = UInt64(dataCount) << 32 | UInt64(parityCount)

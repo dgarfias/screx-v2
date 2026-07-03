@@ -109,6 +109,31 @@ fn ioctl_ui_dev_destroy() -> libc::c_ulong {
     ((UINPUT_IOCTL_BASE as libc::c_ulong) << 8) | 2
 }
 
+/// Build a single input event with the current time.
+fn input_event(type_: u16, code: u16, value: i32) -> InputEvent {
+    InputEvent {
+        time: current_timeval(),
+        type_,
+        code,
+        value,
+    }
+}
+
+/// Write multiple input events (including trailing SYN_REPORT) in a single
+/// `write_all` syscall. The uinput kernel driver accepts batches.
+fn emit_batch(file: &mut File, events: &[InputEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            events.as_ptr() as *const u8,
+            events.len() * mem::size_of::<InputEvent>(),
+        )
+    };
+    let _ = file.write_all(bytes);
+}
+
 pub struct VirtualTouchscreen {
     file: File,
     width: i32,
@@ -261,61 +286,48 @@ impl VirtualTouchscreen {
         }
     }
 
-    /// Process a touch contact from the iPad.
-    pub fn send_touch(&mut self, slot: u8, event_type: u8, x: u16, y: u16) {
+    /// Append the events for a touch contact to `events`.
+    fn send_touch(&mut self, events: &mut Vec<InputEvent>, slot: u8, event_type: u8, x: u16, y: u16) {
         let slot = (slot as i32).min(MAX_SLOTS - 1);
         let x = (x as i32).min(self.width - 1);
         let y = (y as i32).min(self.height - 1);
 
         // Switch slot if needed
         if self.current_slot != slot {
-            self.emit(EV_ABS, ABS_MT_SLOT, slot);
+            events.push(input_event(EV_ABS, ABS_MT_SLOT, slot));
             self.current_slot = slot;
         }
 
         match event_type {
             TOUCH_DOWN => {
-                self.emit(EV_ABS, ABS_MT_TRACKING_ID, slot);
-                self.emit(EV_ABS, ABS_MT_POSITION_X, x);
-                self.emit(EV_ABS, ABS_MT_POSITION_Y, y);
-                self.emit(EV_KEY, BTN_TOUCH, 1);
+                events.push(input_event(EV_ABS, ABS_MT_TRACKING_ID, slot));
+                events.push(input_event(EV_ABS, ABS_MT_POSITION_X, x));
+                events.push(input_event(EV_ABS, ABS_MT_POSITION_Y, y));
+                events.push(input_event(EV_KEY, BTN_TOUCH, 1));
                 // Also update single-touch axes
-                self.emit(EV_ABS, ABS_X, x);
-                self.emit(EV_ABS, ABS_Y, y);
+                events.push(input_event(EV_ABS, ABS_X, x));
+                events.push(input_event(EV_ABS, ABS_Y, y));
             }
             TOUCH_MOVE => {
-                self.emit(EV_ABS, ABS_MT_POSITION_X, x);
-                self.emit(EV_ABS, ABS_MT_POSITION_Y, y);
-                self.emit(EV_ABS, ABS_X, x);
-                self.emit(EV_ABS, ABS_Y, y);
+                events.push(input_event(EV_ABS, ABS_MT_POSITION_X, x));
+                events.push(input_event(EV_ABS, ABS_MT_POSITION_Y, y));
+                events.push(input_event(EV_ABS, ABS_X, x));
+                events.push(input_event(EV_ABS, ABS_Y, y));
             }
             TOUCH_UP => {
-                self.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+                events.push(input_event(EV_ABS, ABS_MT_TRACKING_ID, -1));
             }
             _ => {}
         }
     }
 
     /// Send a SYN_REPORT after all contacts in a batch have been processed.
-    pub fn sync(&mut self) {
-        self.emit(EV_SYN, SYN_REPORT, 0);
+    fn sync(&mut self, events: &mut Vec<InputEvent>) {
+        events.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, events);
+        events.clear();
     }
 
-    fn emit(&mut self, type_: u16, code: u16, value: i32) {
-        let ev = InputEvent {
-            time: current_timeval(),
-            type_,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = self.file.write_all(bytes);
-    }
 }
 
 impl Drop for VirtualTouchscreen {
@@ -447,25 +459,40 @@ impl VirtualMouse {
     }
 
     pub fn move_rel(&mut self, dx: i32, dy: i32) {
-        self.emit(EV_REL, REL_X, dx);
-        self.emit(EV_REL, REL_Y, dy);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_REL, REL_X, dx),
+                input_event(EV_REL, REL_Y, dy),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
     }
 
     pub fn move_abs(&mut self, x: u16, y: u16) {
-        self.emit(EV_ABS, ABS_X, x as i32);
-        self.emit(EV_ABS, ABS_Y, y as i32);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_ABS, ABS_X, x as i32),
+                input_event(EV_ABS, ABS_Y, y as i32),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
     }
 
     pub fn button(&mut self, btn: u8, state: i32) {
         if btn == 2 {
             if state != 0 {
                 crate::vlog!("[mouse] emit middle click pulse");
-                self.emit(EV_KEY, BTN_MIDDLE, 1);
-                self.emit(EV_SYN, SYN_REPORT, 0);
-                self.emit(EV_KEY, BTN_MIDDLE, 0);
-                self.emit(EV_SYN, SYN_REPORT, 0);
+                emit_batch(
+                    &mut self.file,
+                    &[
+                        input_event(EV_KEY, BTN_MIDDLE, 1),
+                        input_event(EV_SYN, SYN_REPORT, 0),
+                        input_event(EV_KEY, BTN_MIDDLE, 0),
+                        input_event(EV_SYN, SYN_REPORT, 0),
+                    ],
+                );
             }
             return;
         }
@@ -480,37 +507,37 @@ impl VirtualMouse {
             btn,
             code
         );
-        self.emit(EV_KEY, code, state);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_KEY, code, state),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
     }
 
     pub fn scroll(&mut self, dy: i32) {
-        self.emit(EV_REL, REL_WHEEL, dy);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_REL, REL_WHEEL, dy),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
     }
 
     pub fn release_all_buttons(&mut self) {
-        self.emit(EV_KEY, BTN_LEFT, 0);
-        self.emit(EV_KEY, BTN_RIGHT, 0);
-        self.emit(EV_KEY, BTN_MIDDLE, 0);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_KEY, BTN_LEFT, 0),
+                input_event(EV_KEY, BTN_RIGHT, 0),
+                input_event(EV_KEY, BTN_MIDDLE, 0),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
     }
 
-    fn emit(&mut self, type_: u16, code: u16, value: i32) {
-        let ev = InputEvent {
-            time: current_timeval(),
-            type_,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = self.file.write_all(bytes);
-    }
 }
 
 impl Drop for VirtualMouse {
@@ -626,57 +653,45 @@ impl VirtualGamepad {
             hat_x,
             hat_y
         );
-        self.sync_button(BTN_SOUTH, GPAD_BTN_SOUTH, buttons_mask);
-        self.sync_button(BTN_EAST, GPAD_BTN_EAST, buttons_mask);
-        self.sync_button(BTN_WEST, GPAD_BTN_WEST, buttons_mask);
-        self.sync_button(BTN_NORTH, GPAD_BTN_NORTH, buttons_mask);
-        self.sync_button(BTN_TL, GPAD_BTN_TL, buttons_mask);
-        self.sync_button(BTN_TR, GPAD_BTN_TR, buttons_mask);
-        self.sync_button(BTN_THUMBL, GPAD_BTN_THUMBL, buttons_mask);
-        self.sync_button(BTN_THUMBR, GPAD_BTN_THUMBR, buttons_mask);
-        self.sync_button(BTN_SELECT, GPAD_BTN_SELECT, buttons_mask);
-        self.sync_button(BTN_START, GPAD_BTN_START, buttons_mask);
-        self.sync_button(BTN_MODE, GPAD_BTN_MODE, buttons_mask);
+        // Max events: 10 button changes + 8 axis/SYN events.
+        let mut events = Vec::with_capacity(19);
+        self.sync_button(&mut events, BTN_SOUTH, GPAD_BTN_SOUTH, buttons_mask);
+        self.sync_button(&mut events, BTN_EAST, GPAD_BTN_EAST, buttons_mask);
+        self.sync_button(&mut events, BTN_WEST, GPAD_BTN_WEST, buttons_mask);
+        self.sync_button(&mut events, BTN_NORTH, GPAD_BTN_NORTH, buttons_mask);
+        self.sync_button(&mut events, BTN_TL, GPAD_BTN_TL, buttons_mask);
+        self.sync_button(&mut events, BTN_TR, GPAD_BTN_TR, buttons_mask);
+        self.sync_button(&mut events, BTN_THUMBL, GPAD_BTN_THUMBL, buttons_mask);
+        self.sync_button(&mut events, BTN_THUMBR, GPAD_BTN_THUMBR, buttons_mask);
+        self.sync_button(&mut events, BTN_SELECT, GPAD_BTN_SELECT, buttons_mask);
+        self.sync_button(&mut events, BTN_START, GPAD_BTN_START, buttons_mask);
+        self.sync_button(&mut events, BTN_MODE, GPAD_BTN_MODE, buttons_mask);
         self.buttons_mask = buttons_mask;
 
-        self.emit(EV_ABS, ABS_X, lx as i32);
-        self.emit(EV_ABS, ABS_Y, ly as i32);
-        self.emit(EV_ABS, ABS_RX, rx as i32);
-        self.emit(EV_ABS, ABS_RY, ry as i32);
-        self.emit(EV_ABS, ABS_Z, lt as i32);
-        self.emit(EV_ABS, ABS_RZ, rt as i32);
-        self.emit(EV_ABS, ABS_HAT0X, hat_x as i32);
-        self.emit(EV_ABS, ABS_HAT0Y, hat_y as i32);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        events.push(input_event(EV_ABS, ABS_X, lx as i32));
+        events.push(input_event(EV_ABS, ABS_Y, ly as i32));
+        events.push(input_event(EV_ABS, ABS_RX, rx as i32));
+        events.push(input_event(EV_ABS, ABS_RY, ry as i32));
+        events.push(input_event(EV_ABS, ABS_Z, lt as i32));
+        events.push(input_event(EV_ABS, ABS_RZ, rt as i32));
+        events.push(input_event(EV_ABS, ABS_HAT0X, hat_x as i32));
+        events.push(input_event(EV_ABS, ABS_HAT0Y, hat_y as i32));
+        events.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, &events);
     }
 
     pub fn release_all(&mut self) {
         self.set_state(0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
-    fn sync_button(&mut self, linux_code: u16, bit: u16, new_mask: u16) {
+    fn sync_button(&mut self, events: &mut Vec<InputEvent>, linux_code: u16, bit: u16, new_mask: u16) {
         let prev = (self.buttons_mask & bit) != 0;
         let next = (new_mask & bit) != 0;
         if prev != next {
-            self.emit(EV_KEY, linux_code, if next { 1 } else { 0 });
+            events.push(input_event(EV_KEY, linux_code, if next { 1 } else { 0 }));
         }
     }
 
-    fn emit(&mut self, type_: u16, code: u16, value: i32) {
-        let ev = InputEvent {
-            time: current_timeval(),
-            type_,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = self.file.write_all(bytes);
-    }
 }
 
 impl Drop for VirtualGamepad {
@@ -1015,16 +1030,19 @@ impl VirtualKeyboard {
     pub fn type_text(&mut self, text: &str) {
         for c in text.chars() {
             if let Some((keycode, shift)) = char_to_key(c) {
+                // press shift? -> press key -> syn -> release key -> release shift? -> syn
+                let mut ev = Vec::with_capacity(6);
                 if shift {
-                    self.key_event(KEY_LEFTSHIFT, 1);
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 1));
                 }
-                self.key_event(keycode, 1);
-                self.syn();
-                self.key_event(keycode, 0);
+                ev.push(input_event(EV_KEY, keycode, 1));
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+                ev.push(input_event(EV_KEY, keycode, 0));
                 if shift {
-                    self.key_event(KEY_LEFTSHIFT, 0);
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 0));
                 }
-                self.syn();
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+                emit_batch(&mut self.file, &ev);
             } else {
                 self.type_unicode(c);
             }
@@ -1034,17 +1052,24 @@ impl VirtualKeyboard {
     fn type_unicode(&mut self, c: char) {
         let hex = format!("{:x}", c as u32);
 
-        self.key_event(KEY_LEFTCTRL, 1);
-        self.key_event(KEY_LEFTSHIFT, 1);
-        self.key_event(KEY_U, 1);
-        self.syn();
-        self.key_event(KEY_U, 0);
-        self.key_event(KEY_LEFTSHIFT, 0);
-        self.key_event(KEY_LEFTCTRL, 0);
-        self.syn();
+        emit_batch(
+            &mut self.file,
+            &[
+                input_event(EV_KEY, KEY_LEFTCTRL, 1),
+                input_event(EV_KEY, KEY_LEFTSHIFT, 1),
+                input_event(EV_KEY, KEY_U, 1),
+                input_event(EV_SYN, SYN_REPORT, 0),
+                input_event(EV_KEY, KEY_U, 0),
+                input_event(EV_KEY, KEY_LEFTSHIFT, 0),
+                input_event(EV_KEY, KEY_LEFTCTRL, 0),
+                input_event(EV_SYN, SYN_REPORT, 0),
+            ],
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
+        // Hex digits: each is press + syn + release + syn = 4 events.
+        let mut ev = Vec::with_capacity(hex.len() * 4 + 4);
         for b in hex.bytes() {
             let key = match b {
                 b'0' => KEY_0,
@@ -1065,102 +1090,87 @@ impl VirtualKeyboard {
                 b'f' => KEY_F,
                 _ => continue,
             };
-            self.key_event(key, 1);
-            self.syn();
-            self.key_event(key, 0);
-            self.syn();
+            ev.push(input_event(EV_KEY, key, 1));
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            ev.push(input_event(EV_KEY, key, 0));
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
         }
-
-        self.key_event(KEY_ENTER, 1);
-        self.syn();
-        self.key_event(KEY_ENTER, 0);
-        self.syn();
+        ev.push(input_event(EV_KEY, KEY_ENTER, 1));
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+        ev.push(input_event(EV_KEY, KEY_ENTER, 0));
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, &ev);
     }
 
     pub fn press_special(&mut self, code: u8) {
         if let Some(keycode) = special_to_keycode(code) {
-            self.key_event(keycode, 1);
-            self.syn();
-            self.key_event(keycode, 0);
-            self.syn();
+            emit_batch(
+                &mut self.file,
+                &[
+                    input_event(EV_KEY, keycode, 1),
+                    input_event(EV_SYN, SYN_REPORT, 0),
+                    input_event(EV_KEY, keycode, 0),
+                    input_event(EV_SYN, SYN_REPORT, 0),
+                ],
+            );
         }
     }
 
     pub fn type_with_modifiers(&mut self, mods: u8, text: &str) {
-        self.press_mod_keys(mods, 1);
-        self.syn();
+        let mut ev = Vec::with_capacity(2 + text.chars().count() * 6 + 4);
+        self.push_mod_keys(&mut ev, mods, 1);
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
         for c in text.chars() {
             if let Some((keycode, shift)) = char_to_key(c) {
                 if shift {
-                    self.key_event(KEY_LEFTSHIFT, 1);
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 1));
                 }
-                self.key_event(keycode, 1);
-                self.syn();
-                self.key_event(keycode, 0);
+                ev.push(input_event(EV_KEY, keycode, 1));
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+                ev.push(input_event(EV_KEY, keycode, 0));
                 if shift {
-                    self.key_event(KEY_LEFTSHIFT, 0);
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 0));
                 }
-                self.syn();
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
             }
         }
-        self.press_mod_keys(mods, 0);
-        self.syn();
+        self.push_mod_keys(&mut ev, mods, 0);
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, &ev);
     }
 
     pub fn press_special_with_modifiers(&mut self, mods: u8, code: u8) {
         if let Some(keycode) = special_to_keycode(code) {
-            self.press_mod_keys(mods, 1);
-            self.syn();
-            self.key_event(keycode, 1);
-            self.syn();
-            self.key_event(keycode, 0);
-            self.press_mod_keys(mods, 0);
-            self.syn();
+            let mut ev = Vec::with_capacity(8);
+            self.push_mod_keys(&mut ev, mods, 1);
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            ev.push(input_event(EV_KEY, keycode, 1));
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            ev.push(input_event(EV_KEY, keycode, 0));
+            self.push_mod_keys(&mut ev, mods, 0);
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            emit_batch(&mut self.file, &ev);
         }
     }
 
-    fn press_mod_keys(&mut self, mods: u8, value: i32) {
+    fn push_mod_keys(&self, ev: &mut Vec<InputEvent>, mods: u8, value: i32) {
         if mods & 0x01 != 0 {
-            self.key_event(KEY_LEFTCTRL, value);
+            ev.push(input_event(EV_KEY, KEY_LEFTCTRL, value));
         }
         if mods & 0x02 != 0 {
-            self.key_event(KEY_LEFTALT, value);
+            ev.push(input_event(EV_KEY, KEY_LEFTALT, value));
         }
         if mods & 0x04 != 0 {
-            self.key_event(KEY_LEFTMETA, value);
+            ev.push(input_event(EV_KEY, KEY_LEFTMETA, value));
         }
     }
 
     fn key_event(&mut self, code: u16, value: i32) {
-        let ev = InputEvent {
-            time: current_timeval(),
-            type_: EV_KEY,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = self.file.write_all(bytes);
+        emit_batch(&mut self.file, &[input_event(EV_KEY, code, value)]);
     }
 
     fn syn(&mut self) {
-        let ev = InputEvent {
-            time: current_timeval(),
-            type_: EV_SYN,
-            code: SYN_REPORT,
-            value: 0,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const InputEvent as *const u8,
-                mem::size_of::<InputEvent>(),
-            )
-        };
-        let _ = self.file.write_all(bytes);
+        emit_batch(&mut self.file, &[input_event(EV_SYN, SYN_REPORT, 0)]);
     }
 }
 
@@ -1176,50 +1186,6 @@ impl Drop for VirtualKeyboard {
 pub const KEY_TYPE_TEXT: u8 = 0x01;
 pub const KEY_TYPE_SPECIAL: u8 = 0x02;
 pub const KEY_TYPE_COMBO: u8 = 0x04;
-
-/// Parse and handle a key packet from the iPad.
-/// Format: type(1) + payload(variable)
-pub fn handle_key_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    let key_type = data[0];
-    let payload = &data[1..];
-
-    match key_type {
-        KEY_TYPE_TEXT => {
-            if let Ok(text) = std::str::from_utf8(payload) {
-                kb.type_text(text);
-            }
-        }
-        KEY_TYPE_SPECIAL => {
-            if !payload.is_empty() {
-                kb.press_special(payload[0]);
-            }
-        }
-        KEY_TYPE_COMBO => {
-            if payload.len() >= 2 {
-                let mods = payload[0];
-                let inner_type = payload[1];
-                let inner_payload = &payload[2..];
-                match inner_type {
-                    KEY_TYPE_TEXT => {
-                        if let Ok(text) = std::str::from_utf8(inner_payload) {
-                            kb.type_with_modifiers(mods, text);
-                        }
-                    }
-                    KEY_TYPE_SPECIAL => {
-                        if !inner_payload.is_empty() {
-                            kb.press_special_with_modifiers(mods, inner_payload[0]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Touch packet parsing
@@ -1237,15 +1203,17 @@ pub fn handle_touch_packet(touch: &mut VirtualTouchscreen, data: &[u8]) {
         return;
     }
 
+    // Max events per contact: slot switch + 6 events (down) + syn at end.
+    let mut events = Vec::with_capacity(count * 8 + 1);
     for i in 0..count {
         let off = i * 8;
         let slot = contacts[off];
         let event_type = contacts[off + 1];
         let x = u16::from_be_bytes([contacts[off + 2], contacts[off + 3]]);
         let y = u16::from_be_bytes([contacts[off + 4], contacts[off + 5]]);
-        touch.send_touch(slot, event_type, x, y);
+        touch.send_touch(&mut events, slot, event_type, x, y);
     }
-    touch.sync();
+    touch.sync(&mut events);
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,17 +1261,113 @@ pub fn handle_mouse_packet(mouse: &mut VirtualMouse, data: &[u8]) {
 // Raw key packet parsing (physical keyboard HID usage → evdev)
 // ---------------------------------------------------------------------------
 
-/// Parse a raw key packet from a physical keyboard.
-/// Format: hid_usage(u16 BE) + state(1)
-pub fn handle_rawkey_packet(kb: &mut VirtualKeyboard, data: &[u8]) {
+// ---------------------------------------------------------------------------
+// Keyboard worker — moves slow unicode typing off the input-dispatch thread
+// ---------------------------------------------------------------------------
+
+/// Event types the keyboard worker can execute.
+#[derive(Debug, Clone)]
+pub enum KeyboardEvent {
+    /// Type a UTF-8 text string.
+    Text(String),
+    /// Press and release a special key by its Screx special code.
+    Special(u8),
+    /// Type text while holding modifier keys.
+    Combo { mods: u8, text: String },
+    /// Press and release a special key while holding modifier keys.
+    SpecialCombo { mods: u8, code: u8 },
+    /// Raw evdev key event (already resolved from HID usage).
+    Raw { code: u16, state: i32 },
+}
+
+impl VirtualKeyboard {
+    fn dispatch_event(&mut self, event: &KeyboardEvent) {
+        match event {
+            KeyboardEvent::Text(text) => self.type_text(text),
+            KeyboardEvent::Special(code) => self.press_special(*code),
+            KeyboardEvent::Combo { mods, text } => self.type_with_modifiers(*mods, text),
+            KeyboardEvent::SpecialCombo { mods, code } => {
+                self.press_special_with_modifiers(*mods, *code)
+            }
+            KeyboardEvent::Raw { code, state } => {
+                self.key_event(*code, *state);
+                self.syn();
+            }
+        }
+    }
+}
+
+/// Parse a KEY packet into a worker event.
+pub fn parse_key_event(data: &[u8]) -> Option<KeyboardEvent> {
+    if data.is_empty() {
+        return None;
+    }
+    let key_type = data[0];
+    let payload = &data[1..];
+    match key_type {
+        KEY_TYPE_TEXT => {
+            String::from_utf8(payload.to_vec()).ok().map(KeyboardEvent::Text)
+        }
+        KEY_TYPE_SPECIAL => {
+            payload.first().copied().map(KeyboardEvent::Special)
+        }
+        KEY_TYPE_COMBO if payload.len() >= 2 => {
+            let mods = payload[0];
+            let inner_type = payload[1];
+            let inner_payload = &payload[2..];
+            match inner_type {
+                KEY_TYPE_TEXT => String::from_utf8(inner_payload.to_vec())
+                    .ok()
+                    .map(|text| KeyboardEvent::Combo { mods, text }),
+                KEY_TYPE_SPECIAL => inner_payload
+                    .first()
+                    .copied()
+                    .map(|code| KeyboardEvent::SpecialCombo { mods, code }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse a RAWKEY packet into a worker event.
+pub fn parse_rawkey_event(data: &[u8]) -> Option<KeyboardEvent> {
     if data.len() < 3 {
-        return;
+        return None;
     }
     let hid = u16::from_be_bytes([data[0], data[1]]);
     let state = data[2] as i32;
-    if let Some(evdev) = hid_to_evdev(hid) {
-        kb.key_event(evdev, state);
-        kb.syn();
+    hid_to_evdev(hid).map(|code| KeyboardEvent::Raw { code, state })
+}
+
+/// Owned handle to a background thread that executes keyboard events.
+pub struct KeyboardWorker {
+    sender: std::sync::mpsc::SyncSender<KeyboardEvent>,
+}
+
+impl KeyboardWorker {
+    /// Spawn a thread that owns `keyboard` and executes events sequentially.
+    pub fn new(keyboard: VirtualKeyboard) -> Self {
+        // Small bounded queue: typing is bursty but the worker keeps up.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<KeyboardEvent>(32);
+        std::thread::Builder::new()
+            .name("keyboard-input".into())
+            .spawn(move || {
+                let mut kb = keyboard;
+                while let Ok(event) = receiver.recv() {
+                    kb.dispatch_event(&event);
+                }
+                // Channel closed — keyboard is dropped when kb goes out of scope.
+            })
+            .ok();
+        Self { sender }
+    }
+
+    /// Send an event to the keyboard worker. Non-blocking; drops on full/disconnect.
+    pub fn send(&self, event: KeyboardEvent) {
+        if self.sender.try_send(event).is_err() {
+            crate::vlog!("[keyboard] worker event dropped (backpressure or stopped)");
+        }
     }
 }
 

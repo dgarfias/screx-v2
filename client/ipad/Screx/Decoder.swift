@@ -30,6 +30,10 @@ final class VideoDecoder {
     private let renderQueue = DispatchQueue(label: "screx.render", qos: .userInteractive)
     private var naluBuf = [UInt8]()
 
+    var sendPliRequest: (() -> Void)?
+    private var lastBackpressureFlushTime: TimeInterval = 0
+    private static let backpressureFlushInterval: TimeInterval = 1.0
+
     init() {
         displayLayer.videoGravity = .resizeAspect
     }
@@ -315,6 +319,16 @@ final class VideoDecoder {
             if self.displayLayer.status == .failed {
                 self.displayLayer.flush()
             }
+
+            if !self.displayLayer.isReadyForMoreMediaData {
+                let now = CACurrentMediaTime()
+                if now - self.lastBackpressureFlushTime > Self.backpressureFlushInterval {
+                    self.lastBackpressureFlushTime = now
+                    self.displayLayer.flush()
+                    self.sendPliRequest?()
+                }
+            }
+
             self.displayLayer.enqueue(sampleBuffer)
             self.framesDisplayed += 1
 
