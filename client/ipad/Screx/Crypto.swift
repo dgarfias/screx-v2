@@ -90,6 +90,9 @@ struct ScrexCrypto {
     /// Server→client nonce from packet header fields.
     static func nonceServer(frameId: UInt32, chunkIdx: UInt16, flags: UInt8) -> Data {
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            // The daemon zero-pads unused nonce bytes; the temporary buffer is
+            // uninitialized stack memory, so it must be zeroed before use.
+            ptr.initialize(repeating: 0)
             ptr[0] = 0x00
             ptr[1] = UInt8(truncatingIfNeeded: frameId >> 24)
             ptr[2] = UInt8(truncatingIfNeeded: frameId >> 16)
@@ -105,6 +108,7 @@ struct ScrexCrypto {
     /// Client→server nonce from sequence number.
     static func nonceClient(seqNum: UInt32) -> Data {
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr.initialize(repeating: 0)
             ptr[0] = 0xFF
             ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
             ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
@@ -117,6 +121,7 @@ struct ScrexCrypto {
     /// Client→server TCP control nonce from sequence number.
     static func nonceControlClient(seqNum: UInt32) -> Data {
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr.initialize(repeating: 0)
             ptr[0] = 0x7F
             ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
             ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
@@ -129,6 +134,7 @@ struct ScrexCrypto {
     /// Server→client TCP control nonce from sequence number.
     static func nonceControlServer(seqNum: UInt32) -> Data {
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
+            ptr.initialize(repeating: 0)
             ptr[0] = 0x80
             ptr[1] = UInt8(truncatingIfNeeded: seqNum >> 24)
             ptr[2] = UInt8(truncatingIfNeeded: seqNum >> 16)
