@@ -34,6 +34,16 @@ final class AudioPlayer {
     private static let driftDropThresholdMs: Int32 = -40
     private static let driftTrimThresholdMs: Int32 = 60
 
+    // Standing-latency trim: underruns ratchet the ring depth up (silence is
+    // played, then the late audio arrives and queues behind), and timestamp
+    // drift stays ~0 so the drift logic above never corrects it. Track the
+    // minimum occupancy over a rolling window; if even the low point exceeds
+    // the threshold, that excess is standing latency — trim back to target.
+    private static let latencyTrimWindowFrames = 48000 * 3 // 3s at 48kHz
+    private static let latencyTrimThresholdBytes = (targetBufferMs + 30) * bytesPerMs
+    private var windowMinOccupancy = Int.max
+    private var windowFrames = 0
+
     deinit {
         ringStorage.deallocate()
     }
@@ -74,6 +84,8 @@ final class AudioPlayer {
         ringReadPos = 0
         ringWritePos = 0
         ringCount = 0
+        windowMinOccupancy = Int.max
+        windowFrames = 0
     }
 
     init(avSync: AVSyncState) {
@@ -93,6 +105,20 @@ final class AudioPlayer {
             let bytesNeeded = Int(frameCount) * 2 * 2
 
             self.lock.withLock {
+                // Occupancy right before a render pull is the standing latency.
+                if self.ringCount < self.windowMinOccupancy {
+                    self.windowMinOccupancy = self.ringCount
+                }
+                self.windowFrames += Int(frameCount)
+                if self.windowFrames >= Self.latencyTrimWindowFrames {
+                    if self.windowMinOccupancy > Self.latencyTrimThresholdBytes {
+                        let excess = self.windowMinOccupancy - Self.targetBufferBytes
+                        self.ringDiscard((excess / 4) * 4)
+                    }
+                    self.windowFrames = 0
+                    self.windowMinOccupancy = Int.max
+                }
+
                 var firstDest: UnsafeMutablePointer<UInt8>?
                 for i in 0..<ablPointer.count {
                     guard let dest = ablPointer[i].mData else { continue }
