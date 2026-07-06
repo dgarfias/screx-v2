@@ -21,17 +21,21 @@ extern "C" {
 
 pub struct V4l2Camera {
     file: Option<File>,
+    exclusive_caps: bool,
 }
 
 impl V4l2Camera {
-    pub fn new() -> Self {
-        Self { file: None }
+    pub fn new(exclusive_caps: bool) -> Self {
+        Self {
+            file: None,
+            exclusive_caps,
+        }
     }
 }
 
 impl CameraBackend for V4l2Camera {
     fn start(&mut self, w: u32, h: u32, fps: u32) -> Result<()> {
-        ensure_v4l2loopback(true)?;
+        ensure_v4l2loopback(self.exclusive_caps)?;
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();

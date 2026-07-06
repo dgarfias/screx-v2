@@ -9,8 +9,20 @@ use anyhow::{Context, Result};
 use crate::input::{
     GamepadState, InputBackend, KeyboardEvent, MouseEvent, TouchContact, GPAD_BTN_EAST,
     GPAD_BTN_MODE, GPAD_BTN_NORTH, GPAD_BTN_SELECT, GPAD_BTN_SOUTH, GPAD_BTN_START,
-    GPAD_BTN_THUMBL, GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, SPECIAL_BACKSPACE, TOUCH_DOWN,
-    TOUCH_MOVE, TOUCH_UP,
+    GPAD_BTN_THUMBL, GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, GPAD_BTN_WEST, SPECIAL_BACKSPACE,
+    TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
+};
+use crate::input::{
+    KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_A, KEY_APOSTROPHE,
+    KEY_B, KEY_BACKSLASH, KEY_BACKSPACE, KEY_C, KEY_CAPSLOCK, KEY_COMMA, KEY_D, KEY_DELETE,
+    KEY_DOT, KEY_DOWN, KEY_E, KEY_END, KEY_ENTER, KEY_EQUAL, KEY_ESC, KEY_F, KEY_F1, KEY_F10,
+    KEY_F11, KEY_F12, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_G,
+    KEY_GRAVE, KEY_H, KEY_HOME, KEY_I, KEY_INSERT, KEY_J, KEY_K, KEY_L, KEY_LEFT, KEY_LEFTALT,
+    KEY_LEFTBRACE, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_M, KEY_MINUS, KEY_N,
+    KEY_NUMLOCK, KEY_O, KEY_P, KEY_PAGEDOWN, KEY_PAGEUP, KEY_Q, KEY_R, KEY_RIGHT, KEY_RIGHTALT,
+    KEY_RIGHTBRACE, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_S, KEY_SCROLLLOCK,
+    KEY_SEMICOLON, KEY_SLASH, KEY_SPACE, KEY_SYSRQ, KEY_T, KEY_TAB, KEY_U, KEY_UP, KEY_V, KEY_W,
+    KEY_X, KEY_Y, KEY_Z,
 };
 
 // Linux input event constants
@@ -218,9 +230,13 @@ impl InputBackend for LinuxInput {
         Ok(())
     }
 
-    fn key_special(&mut self, code: u8, _modifiers: u8) -> Result<()> {
+    fn key_special(&mut self, code: u8, modifiers: u8) -> Result<()> {
         if let Some(ref mut kb) = self.keyboard {
-            kb.press_special(code);
+            if modifiers != 0 {
+                kb.press_special_with_modifiers(modifiers, code);
+            } else {
+                kb.press_special(code);
+            }
         }
         Ok(())
     }
@@ -243,26 +259,30 @@ impl InputBackend for LinuxInput {
     }
 
     fn mouse(&mut self, ev: MouseEvent) -> Result<()> {
+        // The virtual mouse device is created lazily on first use rather than
+        // eagerly in `LinuxInput::new`, mirroring the pre-refactor behavior
+        // where it was only instantiated once a physical mouse was actually
+        // reported as attached (or the first MOUSE packet arrived).
+        if self.mouse.is_none() {
+            self.mouse = Some(VirtualMouse::new()?);
+        }
+        let m = self.mouse.as_mut().unwrap();
         match ev {
             MouseEvent::MoveRelative { dx, dy } => {
-                if let Some(ref mut m) = self.mouse {
-                    m.move_rel(dx as i32, dy as i32);
-                }
+                crate::vlog!("[mouse] recv move: dx={dx} dy={dy}");
+                m.move_rel(dx as i32, dy as i32);
             }
             MouseEvent::MoveAbsolute { x, y } => {
-                if let Some(ref mut m) = self.mouse {
-                    m.move_abs(x, y);
-                }
+                crate::vlog!("[mouse] recv abs move: x={x} y={y}");
+                m.move_abs(x, y);
             }
             MouseEvent::Button { btn, state } => {
-                if let Some(ref mut m) = self.mouse {
-                    m.button(btn, state as i32);
-                }
+                crate::vlog!("[mouse] recv button: btn={btn} state={state}");
+                m.button(btn, state as i32);
             }
             MouseEvent::Scroll { dy } => {
-                if let Some(ref mut m) = self.mouse {
-                    m.scroll(dy as i32);
-                }
+                crate::vlog!("[mouse] recv scroll: dy={dy}");
+                m.scroll(dy as i32);
             }
         }
         Ok(())
@@ -857,6 +877,59 @@ impl VirtualKeyboard {
         }
     }
 
+    /// Types `text` while holding the given modifier combo (bit layout matches
+    /// the iPad wire protocol: ctrl=0x01, alt=0x02, meta/cmd=0x04).
+    pub fn type_with_modifiers(&mut self, mods: u8, text: &str) {
+        let mut ev = Vec::with_capacity(2 + text.chars().count() * 6 + 4);
+        self.push_mod_keys(&mut ev, mods, 1);
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+        for c in text.chars() {
+            if let Some((keycode, shift)) = char_to_key(c) {
+                if shift {
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 1));
+                }
+                ev.push(input_event(EV_KEY, keycode, 1));
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+                ev.push(input_event(EV_KEY, keycode, 0));
+                if shift {
+                    ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, 0));
+                }
+                ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            }
+        }
+        self.push_mod_keys(&mut ev, mods, 0);
+        ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, &ev);
+    }
+
+    /// Presses a special key while holding the given modifier combo (same
+    /// bit layout as `type_with_modifiers`).
+    pub fn press_special_with_modifiers(&mut self, mods: u8, code: u8) {
+        if let Some(keycode) = special_to_keycode(code) {
+            let mut ev = Vec::with_capacity(8);
+            self.push_mod_keys(&mut ev, mods, 1);
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            ev.push(input_event(EV_KEY, keycode, 1));
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            ev.push(input_event(EV_KEY, keycode, 0));
+            self.push_mod_keys(&mut ev, mods, 0);
+            ev.push(input_event(EV_SYN, SYN_REPORT, 0));
+            emit_batch(&mut self.file, &ev);
+        }
+    }
+
+    fn push_mod_keys(&self, ev: &mut Vec<InputEvent>, mods: u8, value: i32) {
+        if mods & 0x01 != 0 {
+            ev.push(input_event(EV_KEY, KEY_LEFTCTRL, value));
+        }
+        if mods & 0x02 != 0 {
+            ev.push(input_event(EV_KEY, KEY_LEFTALT, value));
+        }
+        if mods & 0x04 != 0 {
+            ev.push(input_event(EV_KEY, KEY_LEFTMETA, value));
+        }
+    }
+
     pub fn key_event(&mut self, code: u16, value: i32) {
         emit_batch(&mut self.file, &[input_event(EV_KEY, code, value)]);
     }
@@ -874,13 +947,6 @@ impl Drop for VirtualKeyboard {
         println!("[keyboard] virtual keyboard destroyed");
     }
 }
-
-const KEY_LEFTSHIFT: u16 = 42;
-const KEY_LEFTCTRL: u16 = 29;
-const KEY_LEFTALT: u16 = 56;
-const KEY_LEFTMETA: u16 = 125;
-const KEY_U: u16 = 22;
-const KEY_ENTER: u16 = 28;
 
 fn special_to_keycode(code: u8) -> Option<u16> {
     match code {

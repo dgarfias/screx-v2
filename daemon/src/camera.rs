@@ -15,13 +15,16 @@ pub trait CameraBackend: Send {
 }
 
 /// Create a platform camera backend.
-pub fn create_camera_backend() -> Box<dyn CameraBackend> {
+pub fn create_camera_backend(exclusive_caps: bool) -> Box<dyn CameraBackend> {
     #[cfg(target_os = "linux")]
     {
-        Box::new(crate::platform::linux::v4l2::V4l2Camera::new())
+        Box::new(crate::platform::linux::v4l2::V4l2Camera::new(
+            exclusive_caps,
+        ))
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = exclusive_caps;
         Box::new(crate::platform::windows::vcam::WindowsCamera::new())
     }
 }
@@ -32,8 +35,8 @@ pub struct CamWriter {
 }
 
 impl CamWriter {
-    pub fn new(config: CameraConfig) -> Result<Self> {
-        let mut backend = create_camera_backend();
+    pub fn new(config: CameraConfig, exclusive_caps: bool) -> Result<Self> {
+        let mut backend = create_camera_backend(exclusive_caps);
         backend.start(config.width, config.height, config.fps)?;
         Ok(Self { backend })
     }

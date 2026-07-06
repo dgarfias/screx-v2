@@ -331,7 +331,7 @@ pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
     };
 
     if needs_create {
-        match crate::camera::CamWriter::new(config) {
+        match crate::camera::CamWriter::new(config, shared.camera_exclusive_caps) {
             Ok(writer) => {
                 *shared.cam_writer.lock().unwrap() = Some(writer);
                 println!(
