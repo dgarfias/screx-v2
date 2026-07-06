@@ -1,19 +1,21 @@
-use std::io::{IoSlice, Read, Write};
-use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::platform::shim::hostname;
 use crate::stream_server::SharedState;
 
-const IPROXY_LOCAL_PORT: u16 = 9001;
-const DEVICE_PORT: u16 = 9000;
 const DETECT_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_RETRY: Duration = Duration::from_secs(1);
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Read poll interval for the USB read loop. Keeps `read_exact` from
+/// blocking forever so the global `stop` flag (Ctrl-C shutdown) is honored
+/// promptly and the mux socket is closed, letting the iPad detect loss of
+/// the daemon end of the pipe.
+const USB_READ_POLL: Duration = Duration::from_millis(250);
 
 const MSG_VIDEO: u8 = 0x01;
 const MSG_AUDIO: u8 = 0x02;
@@ -21,84 +23,61 @@ const MSG_CONTROL: u8 = 0x03;
 const READY_MAGIC: &[u8] = b"READY";
 const HOSTNAME_MAGIC: &[u8] = b"HOST";
 
-fn detect_device() -> bool {
-    Command::new("idevice_id")
-        .arg("-l")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            o.status.success() && out.lines().any(|l| !l.trim().is_empty())
-        })
-        .unwrap_or(false)
+/// A bidirectional byte stream to the iPad (TCP over USB mux).
+pub trait ReadWriteStream: Read + Write + Send {
+    fn try_clone_box(&self) -> Option<Box<dyn ReadWriteStream>>;
+    /// Forwarded to the underlying socket so the read loop can poll the
+    /// global `stop` flag instead of blocking forever (and so Ctrl-C on the
+    /// daemon unblocks the USB read loop, closing the mux socket so the iPad
+    /// detects the disconnect).
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
 }
 
-fn start_iproxy() -> Result<Child> {
-    let child = Command::new("iproxy")
-        .arg(format!("{IPROXY_LOCAL_PORT}:{DEVICE_PORT}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to start iproxy — is libimobiledevice-utils installed?")?;
-
-    println!(
-        "[usb] iproxy started (pid {}): localhost:{} -> device:{}",
-        child.id(),
-        IPROXY_LOCAL_PORT,
-        DEVICE_PORT
-    );
-
-    std::thread::sleep(Duration::from_millis(500));
-    Ok(child)
+impl ReadWriteStream for Box<dyn ReadWriteStream> {
+    fn try_clone_box(&self) -> Option<Box<dyn ReadWriteStream>> {
+        self.as_ref().try_clone_box()
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.as_ref().set_read_timeout(timeout)
+    }
 }
 
-fn stop_iproxy(child: &mut Child) {
-    let pid = child.id();
-    let _ = child.kill();
-    let _ = child.wait();
-    println!("[usb] iproxy stopped (pid {pid})");
+/// Platform-specific USB multiplexer client.
+pub trait MuxClient {
+    fn device_present(&mut self) -> bool;
+    fn connect(&mut self, device_port: u16) -> Result<Box<dyn ReadWriteStream>>;
+}
+
+fn create_mux_client() -> Box<dyn MuxClient> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::platform::linux::usbmux::LinuxMuxClient::new())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(crate::platform::windows::usbmux::WindowsMuxClient::new())
+    }
 }
 
 /// Thread-safe TCP sender for framed messages over USB.
-/// Stored in SharedState behind a Mutex.
 pub struct TcpFramedSender {
-    stream: TcpStream,
+    stream: Box<dyn ReadWriteStream>,
     write_buf: Vec<u8>,
 }
 
 impl TcpFramedSender {
-    fn new(stream: TcpStream) -> Result<Self> {
-        stream.set_nodelay(true).ok();
+    fn new(stream: Box<dyn ReadWriteStream>) -> Result<Self> {
         Ok(Self {
             stream,
             write_buf: Vec::with_capacity(256 * 1024),
         })
     }
 
-    /// Write a header + payload pair with vectored I/O, looping on partial writes.
     fn write_all_vectored(&mut self, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
-        let mut header_remaining = header;
-        let mut payload_remaining = payload;
-        while !header_remaining.is_empty() || !payload_remaining.is_empty() {
-            let bufs = [
-                IoSlice::new(header_remaining),
-                IoSlice::new(payload_remaining),
-            ];
-            let n = self.stream.write_vectored(&bufs)?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "write_vectored returned 0",
-                ));
-            }
-            let header_consumed = n.min(header_remaining.len());
-            header_remaining = &header_remaining[header_consumed..];
-            let remaining = n - header_consumed;
-            let payload_consumed = remaining.min(payload_remaining.len());
-            payload_remaining = &payload_remaining[payload_consumed..];
-        }
-        Ok(())
+        self.write_buf.clear();
+        self.write_buf.extend_from_slice(header);
+        self.write_buf.extend_from_slice(payload);
+        self.stream.write_all(&self.write_buf)
     }
 
     pub fn send_video(
@@ -108,7 +87,7 @@ impl TcpFramedSender {
         timestamp_ms: u32,
         codec_id: u8,
     ) -> Result<()> {
-        let payload_len = 1 + 1 + 1 + 4 + annex_b.len(); // type + is_idr + codec_id + ts + data
+        let payload_len = 1 + 1 + 1 + 4 + annex_b.len();
         let mut header = [0u8; 4 + 1 + 1 + 1 + 4];
         header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
         header[4] = MSG_VIDEO;
@@ -120,7 +99,7 @@ impl TcpFramedSender {
     }
 
     pub fn send_audio(&mut self, pcm: &[u8], timestamp_ms: u32) -> Result<()> {
-        let payload_len = 1 + 4 + pcm.len(); // type + ts + data
+        let payload_len = 1 + 4 + pcm.len();
         let mut header = [0u8; 4 + 1 + 4];
         header[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
         header[4] = MSG_AUDIO;
@@ -142,14 +121,24 @@ impl TcpFramedSender {
     }
 }
 
-/// Main USB transport loop. Runs on its own thread.
-/// Detects device, starts iproxy, connects TCP, reads control messages.
 pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
     println!("[usb] transport thread started (polling for device every {DETECT_INTERVAL:?})");
+    let mut mux = create_mux_client();
     let mut device_present = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if !detect_device() {
+        // Stay dormant while a network (non-USB) client session is alive:
+        // the iPad is reachable over Wi-Fi/Ethernet, so probing the USB mux
+        // every second is wasted work and spams the log. USB polling resumes
+        // automatically once the network session ends.
+        if shared.has_active_client.load(Ordering::SeqCst)
+            && !shared.usb_active.load(Ordering::SeqCst)
+        {
+            std::thread::sleep(DETECT_INTERVAL);
+            continue;
+        }
+
+        if !mux.device_present() {
             if device_present {
                 println!("[usb] iOS device disconnected from USB");
                 device_present = false;
@@ -163,90 +152,73 @@ pub fn run_usb_transport(shared: Arc<SharedState>, stop: Arc<AtomicBool>) {
             device_present = true;
         }
 
-        let mut iproxy_child = match start_iproxy() {
-            Ok(child) => child,
+        let stream = match mux.connect(9000) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("[usb] failed to start iproxy: {e:#}");
-                std::thread::sleep(DETECT_INTERVAL);
+                eprintln!("[usb] failed to connect USB mux: {e:#}");
+                std::thread::sleep(CONNECT_RETRY);
                 continue;
             }
         };
 
-        let addr = format!("127.0.0.1:{IPROXY_LOCAL_PORT}");
-        println!("[usb] waiting for Screx app USB listener");
-        while !stop.load(Ordering::Relaxed) && detect_device() {
-            let stream = match connect_to_iproxy(&addr, &stop) {
-                Some(stream) => stream,
-                None => break,
-            };
-
-            let mut read_stream = match stream.try_clone() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[usb] failed to clone TCP stream: {e}");
-                    std::thread::sleep(CONNECT_RETRY);
-                    continue;
-                }
-            };
-
-            let sender = match TcpFramedSender::new(stream) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[usb] failed to create TCP sender: {e}");
-                    std::thread::sleep(CONNECT_RETRY);
-                    continue;
-                }
-            };
-
-            if !wait_for_ready(&mut read_stream, &stop) {
+        let mut read_stream = match try_clone_stream(&*stream) {
+            Some(s) => s,
+            None => {
+                eprintln!("[usb] failed to clone USB stream");
                 std::thread::sleep(CONNECT_RETRY);
                 continue;
             }
+        };
+        // Poll the socket instead of blocking forever so Ctrl-C shutdown is
+        // honored promptly and the socket is dropped, letting the iPad see the
+        // disconnect. The WouldBlock/TimedOut branches in the loops below keep
+        // the read loops spinning until real data arrives or `stop` is set.
+        let _ = read_stream.set_read_timeout(Some(USB_READ_POLL));
 
-            activate_usb_transport(&shared, sender);
-            println!("[usb] transport ACTIVE — video/audio will prefer USB");
-
-            read_control_loop(read_stream, &shared, &stop);
-
-            deactivate_usb_transport(&shared);
-            println!("[usb] transport deactivated");
-
-            if !stop.load(Ordering::Relaxed) && detect_device() {
+        let sender = match TcpFramedSender::new(stream) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[usb] failed to create TCP sender: {e}");
                 std::thread::sleep(CONNECT_RETRY);
+                continue;
             }
+        };
+
+        if !wait_for_ready(&mut read_stream, &stop, &mut *mux) {
+            std::thread::sleep(CONNECT_RETRY);
+            continue;
         }
 
+        activate_usb_transport(&shared, sender);
+        println!("[usb] transport ACTIVE — video/audio will prefer USB");
+
+        read_control_loop(read_stream, &shared, &stop);
+
         deactivate_usb_transport(&shared);
-        stop_iproxy(&mut iproxy_child);
+        println!("[usb] transport deactivated");
+
+        if !stop.load(Ordering::Relaxed) && mux.device_present() {
+            std::thread::sleep(CONNECT_RETRY);
+        }
     }
 
     println!("[usb] transport thread stopped");
 }
 
-fn connect_to_iproxy(addr: &str, stop: &Arc<AtomicBool>) -> Option<TcpStream> {
-    while !stop.load(Ordering::Relaxed) && detect_device() {
-        match TcpStream::connect(addr) {
-            Ok(stream) => return Some(stream),
-            Err(e) => {
-                crate::vlog!("[usb] waiting for USB app listener at {addr}: {e}");
-                std::thread::sleep(CONNECT_RETRY);
-            }
-        }
-    }
-
-    None
+fn try_clone_stream(stream: &dyn ReadWriteStream) -> Option<Box<dyn ReadWriteStream>> {
+    stream.try_clone_box()
 }
 
-fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok();
-
+fn wait_for_ready(
+    stream: &mut dyn ReadWriteStream,
+    stop: &Arc<AtomicBool>,
+    mux: &mut dyn MuxClient,
+) -> bool {
     let started = Instant::now();
     let mut len_buf = [0u8; 4];
     let mut msg_buf = vec![0u8; 256];
 
-    while !stop.load(Ordering::Relaxed) && detect_device() {
+    while !stop.load(Ordering::Relaxed) && mux.device_present() {
         if started.elapsed() > READY_TIMEOUT {
             println!("[usb] READY timeout, waiting for a fresh USB app connection");
             return false;
@@ -296,7 +268,7 @@ fn wait_for_ready(stream: &mut TcpStream, stop: &Arc<AtomicBool>) -> bool {
 }
 
 fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender) {
-    if let Some(hostname) = local_hostname() {
+    if let Some(hostname) = hostname() {
         let mut payload = Vec::with_capacity(HOSTNAME_MAGIC.len() + hostname.len());
         payload.extend_from_slice(HOSTNAME_MAGIC);
         payload.extend_from_slice(hostname.as_bytes());
@@ -323,22 +295,6 @@ fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender
     shared.audio_notify.notify_all();
 }
 
-fn local_hostname() -> Option<String> {
-    let mut buf = [0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let hostname = String::from_utf8_lossy(&buf[..len]).trim().to_string();
-    if hostname.is_empty() {
-        None
-    } else {
-        Some(hostname)
-    }
-}
-
 fn deactivate_usb_transport(shared: &Arc<SharedState>) {
     shared.usb_active.store(false, Ordering::SeqCst);
     {
@@ -356,15 +312,20 @@ fn deactivate_usb_transport(shared: &Arc<SharedState>) {
     shared.audio_notify.notify_all();
 }
 
-fn read_control_loop(mut stream: TcpStream, shared: &Arc<SharedState>, stop: &Arc<AtomicBool>) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok();
-
+fn read_control_loop(
+    mut stream: Box<dyn ReadWriteStream>,
+    shared: &Arc<SharedState>,
+    stop: &Arc<AtomicBool>,
+) {
     let mut len_buf = [0u8; 4];
     let mut msg_buf = vec![0u8; 256];
     let mut cam_reassembler = crate::camera::CamReassembler::new();
+    let mut cam_chunks: u64 = 0;
+    let mut cam_frames: u64 = 0;
+    let mut cam_dropped_no_writer: u64 = 0;
+    let mut cam_last_report = std::time::Instant::now();
 
+    crate::vlog!("[usb] read loop started");
     while !stop.load(Ordering::Relaxed) {
         match stream.read_exact(&mut len_buf) {
             Ok(()) => {}
@@ -401,15 +362,30 @@ fn read_control_loop(mut stream: TcpStream, shared: &Arc<SharedState>, stop: &Ar
             let ctrl = &msg_buf[1..msg_len];
             if ctrl == READY_MAGIC {
                 crate::vlog!("[usb] ignoring duplicate READY on active transport");
+            } else if ctrl.starts_with(b"CAMCFG") || ctrl.starts_with(b"MICCFG") {
+                // CAMCFG/MICCFG config magics share the "CAM"/"MIC" prefix with the
+                // CAM/MIC data magics below, so they must be routed to the control
+                // handler here before the data branches would otherwise swallow them.
+                crate::stream_server::handle_control_message_data(shared, ctrl);
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
+                cam_chunks += 1;
                 if let Some(jpeg) = cam_reassembler.feed(&ctrl[3..]) {
+                    cam_frames += 1;
                     let mut cam = shared.cam_writer.lock().unwrap();
                     if let Some(ref mut cw) = *cam {
                         cw.write_frame(&jpeg);
+                    } else {
+                        cam_dropped_no_writer += 1;
                     }
                 }
+                if cam_chunks > 0 && cam_last_report.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    crate::vlog!(
+                        "[usb] cam: chunks={cam_chunks} frames={cam_frames} dropped_no_writer={cam_dropped_no_writer}"
+                    );
+                    cam_last_report = std::time::Instant::now();
+                }
             } else if ctrl.starts_with(b"MIC") && ctrl.len() > 7 {
-                // "MIC"(3) + seq(4) + opus_data
                 let opus_data = &ctrl[7..];
                 let mut mic = shared.mic_writer.lock().unwrap();
                 if let Some(ref mut mw) = *mic {

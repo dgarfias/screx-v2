@@ -13,6 +13,7 @@ use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
+use crate::platform::shim::{config_dir, hostname};
 
 // Wire protocol magic bytes
 const MAGIC_PAIR: &[u8] = b"SCREX_PAIR"; // 10 bytes
@@ -168,16 +169,6 @@ impl PairingState {
     }
 }
 
-fn config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("screx")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config").join("screx")
-    } else {
-        PathBuf::from("/tmp/screx")
-    }
-}
-
 fn load_or_create_daemon_id(path: &PathBuf) -> [u8; DEVICE_ID_LEN] {
     if let Ok(hex) = fs::read_to_string(path) {
         let hex = hex.trim();
@@ -233,6 +224,10 @@ pub fn run_pairing_server(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, addr)) => {
+                // On Windows, an accepted socket may inherit the listener's non-blocking
+                // flag. Handshake and control loops expect a blocking socket.
+                stream.set_nonblocking(false).ok();
+
                 // Reject if a session is already active (single-client mode)
                 if shared.has_active_client.load(Ordering::Relaxed) {
                     println!("[pairing] rejecting {addr} — session already active");
@@ -580,7 +575,7 @@ fn run_control_loop(
 
     println!("[control] network control channel active");
 
-    if let Some(hostname) = local_hostname() {
+    if let Some(hostname) = hostname() {
         let mut payload = Vec::with_capacity(CONTROL_HOSTNAME_MAGIC.len() + hostname.len());
         payload.extend_from_slice(CONTROL_HOSTNAME_MAGIC);
         payload.extend_from_slice(hostname.as_bytes());
@@ -682,22 +677,6 @@ fn send_control_frame(
     stream.write_all(&encrypted[..encrypted_len])?;
     stream.flush()?;
     Ok(())
-}
-
-fn local_hostname() -> Option<String> {
-    let mut buf = [0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc != 0 {
-        return None;
-    }
-
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let hostname = String::from_utf8_lossy(&buf[..len]).trim().to_string();
-    if hostname.is_empty() {
-        None
-    } else {
-        Some(hostname)
-    }
 }
 
 fn generate_pin(rng: &SystemRandom) -> String {

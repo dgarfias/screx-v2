@@ -1,13 +1,4 @@
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::io::FromRawFd;
-use std::process::Command;
-
-use anyhow::{Context, Result};
-
-const VIDEO_DEVICE: &str = "/dev/video10";
-const CARD_LABEL: &str = "Screx Camera";
-const MAX_CAM_CHUNKS: u16 = 4096;
+use anyhow::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CameraConfig {
@@ -16,102 +7,45 @@ pub struct CameraConfig {
     pub fps: u32,
 }
 
-extern "C" {
-    fn screx_v4l2_open_output(
-        device: *const libc::c_char,
-        width: libc::c_int,
-        height: libc::c_int,
-        fps: libc::c_int,
-    ) -> libc::c_int;
+/// Platform-specific virtual camera backend.
+pub trait CameraBackend: Send {
+    fn start(&mut self, w: u32, h: u32, fps: u32) -> Result<()>;
+    fn write_jpeg(&mut self, jpeg: &[u8]) -> Result<()>;
+    fn stop(&mut self);
 }
 
+/// Create a platform camera backend.
+pub fn create_camera_backend() -> Box<dyn CameraBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::platform::linux::v4l2::V4l2Camera::new())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(crate::platform::windows::vcam::WindowsCamera::new())
+    }
+}
+
+/// Convenience writer used by `stream_server`.
 pub struct CamWriter {
-    file: File,
+    backend: Box<dyn CameraBackend>,
 }
 
 impl CamWriter {
+    pub fn new(config: CameraConfig) -> Result<Self> {
+        let mut backend = create_camera_backend();
+        backend.start(config.width, config.height, config.fps)?;
+        Ok(Self { backend })
+    }
+
     pub fn write_frame(&mut self, jpeg: &[u8]) {
-        let _ = self.file.write_all(jpeg);
+        let _ = self.backend.write_jpeg(jpeg);
     }
 }
 
-pub fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
-    if std::path::Path::new(VIDEO_DEVICE).exists() {
-        return Ok(());
-    }
-
-    let exclusive_caps_arg = if exclusive_caps {
-        "exclusive_caps=1"
-    } else {
-        "exclusive_caps=0"
-    };
-    println!("[camera] loading v4l2loopback with {exclusive_caps_arg}");
-
-    let status = Command::new("modprobe")
-        .args([
-            "v4l2loopback",
-            "video_nr=10",
-            &format!("card_label={CARD_LABEL}"),
-            exclusive_caps_arg,
-            "max_buffers=2",
-        ])
-        .status()
-        .context("failed to run modprobe v4l2loopback")?;
-
-    if !status.success() {
-        anyhow::bail!("modprobe v4l2loopback failed — is v4l2loopback-dkms installed?");
-    }
-
-    for _ in 0..20 {
-        if std::path::Path::new(VIDEO_DEVICE).exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    if !std::path::Path::new(VIDEO_DEVICE).exists() {
-        anyhow::bail!("{VIDEO_DEVICE} did not appear after modprobe");
-    }
-
-    println!("[camera] v4l2loopback loaded, {VIDEO_DEVICE} ready");
-    Ok(())
-}
-
-pub fn create_cam_writer(config: CameraConfig) -> Result<CamWriter> {
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
-    let fd = unsafe {
-        screx_v4l2_open_output(
-            device.as_ptr(),
-            config.width as libc::c_int,
-            config.height as libc::c_int,
-            config.fps as libc::c_int,
-        )
-    };
-
-    match fd {
-        -1 => anyhow::bail!(
-            "failed to open {VIDEO_DEVICE}: {}",
-            std::io::Error::last_os_error()
-        ),
-        -2 => anyhow::bail!(
-            "VIDIOC_S_FMT failed on {VIDEO_DEVICE}: {}",
-            std::io::Error::last_os_error()
-        ),
-        -3 => anyhow::bail!(
-            "VIDIOC_S_PARM failed on {VIDEO_DEVICE}: {}",
-            std::io::Error::last_os_error()
-        ),
-        fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
-        fd => {
-            let file = unsafe { File::from_raw_fd(fd) };
-            println!(
-                "[camera] writer ready: {}x{} @ {}fps MJPEG -> {VIDEO_DEVICE}",
-                config.width, config.height, config.fps
-            );
-            Ok(CamWriter { file })
-        }
+impl Drop for CamWriter {
+    fn drop(&mut self) {
+        self.backend.stop();
     }
 }
 
@@ -123,6 +57,8 @@ pub struct CamReassembler {
     received: Vec<Option<Vec<u8>>>,
     received_count: u16,
 }
+
+const MAX_CAM_CHUNKS: u16 = 4096;
 
 impl CamReassembler {
     pub fn new() -> Self {

@@ -2,19 +2,18 @@ mod audio;
 mod camera;
 mod capture;
 mod crypto;
-mod doctor;
 mod encode;
+mod input;
 mod logging;
 mod pairing;
+mod platform;
 mod stream_server;
-mod uinput;
 mod usb;
 
 use std::fs;
 use std::net::UdpSocket;
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -63,7 +62,7 @@ struct Cli {
     keyframe: u32,
 
     /// Encoder bitrate (e.g. 8000000, 8M, 500K)
-    #[arg(short = 'r', long, default_value = "8M", value_parser = parse_bitrate)]
+    #[arg(short = 'b', long, default_value = "8M", value_parser = parse_bitrate)]
     bitrate: u32,
 
     /// UDP/TCP streaming port
@@ -71,16 +70,12 @@ struct Cli {
     port: u16,
 
     /// Encoder backend: auto, vaapi, nvenc, software
-    #[arg(short, long, default_value = "auto")]
+    #[arg(short = 'e', long, default_value = "auto")]
     backend: String,
 
     /// Video codec: h264, h265
     #[arg(short, long, default_value = "h264")]
     codec: String,
-
-    /// Capture backend: evdi, vkms
-    #[arg(long, default_value = "evdi")]
-    capture_backend: String,
 
     /// Enable detailed diagnostic logs
     #[arg(short, long, default_value_t = false)]
@@ -101,8 +96,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run host readiness checks
-    Doctor,
     /// List or remove paired devices
     Unpair {
         /// Device ID to unpair, or --all to remove all
@@ -128,7 +121,7 @@ impl AppConfig {
     fn from_cli(cli: &Cli) -> Self {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
-            capture_backend: capture::CaptureBackend::from_str(&cli.capture_backend),
+            capture_backend: capture::CaptureBackend::platform_default(),
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.width,
             height: cli.height,
@@ -147,7 +140,6 @@ async fn main() -> Result<()> {
     logging::set_verbose(cli.verbose);
 
     match &cli.command {
-        Some(Commands::Doctor) => return doctor::run_doctor(),
         Some(Commands::Unpair { device_id }) => {
             return pairing::run_unpair(device_id.as_deref());
         }
@@ -169,42 +161,46 @@ async fn main() -> Result<()> {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+
+    let input_backend: Arc<Mutex<dyn crate::input::InputBackend>> = {
+        #[cfg(target_os = "linux")]
+        {
+            let backend =
+                crate::platform::linux::uinput::LinuxInput::new(config.width, config.height)
+                    .map_err(|e| {
+                        eprintln!("[main] input backend failed (input disabled): {e:#}");
+                        e
+                    })?;
+            Arc::new(Mutex::new(backend))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let backend =
+                crate::platform::windows::input::WindowsInput::new(config.width, config.height)
+                    .map_err(|e| {
+                        eprintln!("[main] input backend failed (input disabled): {e:#}");
+                        e
+                    })?;
+            Arc::new(Mutex::new(backend))
+        }
+    };
+
     let shared = Arc::new(stream_server::SharedState::new(
         config.camera_exclusive_caps,
         config.bitrate_bps,
+        Arc::clone(&input_backend),
     ));
+
+    *shared.keyboard_worker.lock().unwrap() = Some(crate::input::KeyboardWorker::new(Arc::clone(
+        &input_backend,
+    )));
 
     // UDP socket for streaming
     let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
         .with_context(|| format!("failed to bind UDP port {}", config.stream_port))?;
 
-    unsafe {
-        let sndbuf: libc::c_int = 2 * 1024 * 1024;
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sndbuf as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-
-        let low_delay_tos: libc::c_int = 0x88;
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_TOS,
-            &low_delay_tos as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-
-        let priority: libc::c_int = 6;
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PRIORITY,
-            &priority as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+    if let Err(e) = crate::platform::net::tune_udp_socket(&socket) {
+        eprintln!("[main] failed to tune UDP socket: {e:#}");
     }
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
@@ -237,31 +233,10 @@ async fn main() -> Result<()> {
         println!("[main] USB-only mode — network pairing disabled");
     }
 
-    // Virtual touchscreen + keyboard (always running — needed for input even
-    // before video starts, and uinput devices are lightweight)
-    match uinput::VirtualTouchscreen::new(config.width, config.height) {
-        Ok(ts) => {
-            ts.map_to_output();
-            *shared.virtual_touch.lock().unwrap() = Some(ts);
-            println!("[main] virtual touchscreen ready");
-        }
-        Err(e) => {
-            eprintln!("[main] virtual touchscreen failed (touch disabled): {e:#}");
-        }
-    }
-    match uinput::VirtualKeyboard::new() {
-        Ok(kb) => {
-            *shared.virtual_keyboard.lock().unwrap() = None;
-            *shared.keyboard_worker.lock().unwrap() = Some(uinput::KeyboardWorker::new(kb));
-            println!("[main] virtual keyboard ready (worker thread)");
-        }
-        Err(e) => {
-            eprintln!("[main] virtual keyboard failed (keyboard disabled): {e:#}");
-        }
-    }
-
     // Clean up stale audio modules from a previous crash
     audio::cleanup_stale_modules();
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::vcam::cleanup_stale_registration();
 
     // -----------------------------------------------------------------------
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
@@ -292,17 +267,19 @@ async fn main() -> Result<()> {
             }
             *shared_d.mic_writer.lock().unwrap() = None;
 
-            // Virtual mouse (physical peripheral)
-            *shared_d.virtual_mouse.lock().unwrap() = None;
+            // Input backend cleanup (mouse, gamepads)
+            if let Ok(mut backend) = shared_d.input_backend.lock() {
+                for id in 0..4 {
+                    backend.gamepad_detach(id);
+                }
+            }
 
-            // Virtual gamepads
-            shared_d.virtual_gamepads.lock().unwrap().clear();
+            // Reset audio output flag first so the WASAPI loopback thread stops
+            // before the Steam Streaming Speakers devnode is disabled.
+            shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
 
             // Audio sink
             crate::stream_server::disable_virtual_sink(&shared_d);
-
-            // Reset audio output flag so next client starts with speakers off
-            shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
 
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
@@ -378,6 +355,13 @@ async fn main() -> Result<()> {
         .name("capture".into())
         .spawn(move || -> Result<()> {
             let mut sender = stream_server::UdpSender::new(send_socket);
+            let mut display = match capture::create_display_backend(&capture_config) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[capture] display backend init failed: {e:#}");
+                    return Err(e);
+                }
+            };
 
             loop {
                 if capture_stop.load(Ordering::Relaxed) {
@@ -391,7 +375,8 @@ async fn main() -> Result<()> {
                     }
                     let (lock, cvar) = &*capture_start_signal;
                     let guard = lock.lock().unwrap();
-                    if !capture_start.load(Ordering::Acquire) && !capture_stop.load(Ordering::Relaxed)
+                    if !capture_start.load(Ordering::Acquire)
+                        && !capture_stop.load(Ordering::Relaxed)
                     {
                         let _ = cvar
                             .wait_timeout(guard, std::time::Duration::from_millis(20))
@@ -421,7 +406,31 @@ async fn main() -> Result<()> {
                 // (multi-homed hosts may otherwise reply from another IP).
                 sender.set_source(*capture_shared.udp_source.lock().unwrap());
 
-                println!("[capture] starting EVDI capture session");
+                println!("[capture] attaching display backend");
+                if let Err(e) = display.attach(capture::DisplayMode {
+                    width: capture_config.width,
+                    height: capture_config.height,
+                    fps: capture_config.fps,
+                }) {
+                    eprintln!("[capture] display attach failed: {e:#}");
+                    capture_start.store(false, Ordering::Release);
+                    let (_, cvar) = &*capture_start_signal;
+                    cvar.notify_all();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+
+                // Backends that inject via absolute screen coordinates (Windows)
+                // need to know where the captured output actually sits on the
+                // desktop; wire touch/mouse coordinates only carry frame-local
+                // 0..width/0..height values. No-op on backends that don't need it.
+                if let Some((left, top, width, height)) = display.output_rect() {
+                    if let Ok(mut backend) = capture_shared.input_backend.lock() {
+                        backend.set_target_rect(left, top, width, height);
+                    }
+                }
+
+                println!("[capture] starting display capture session");
 
                 let session_shared = Arc::clone(&capture_shared);
                 let session_stop = Arc::clone(&capture_stop);
@@ -468,12 +477,10 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                if let Err(e) = capture::run_capture_loop(
-                    capture_config.clone(),
-                    cs2,
-                    Arc::clone(&session_refresh),
-                    Arc::new(AtomicBool::new(true)), // already started
-                    |frame| {
+                if let Err(e) = display.run_capture_loop(
+                    &*cs2,
+                    &*session_refresh,
+                    &mut |frame: capture::CaptureFrame<'_>| {
                         if dump_capture_remaining > 0 {
                             dump_capture_frame_ppm(dump_capture_remaining, &frame);
                             dump_capture_remaining -= 1;
@@ -495,7 +502,12 @@ async fn main() -> Result<()> {
                                         if dump_au_remaining == 0 {
                                             break;
                                         }
-                                        dump_sent_access_unit(dump_au_remaining, codec_id, au.is_idr, &*au.annex_b);
+                                        dump_sent_access_unit(
+                                            dump_au_remaining,
+                                            codec_id,
+                                            au.is_idr,
+                                            &*au.annex_b,
+                                        );
                                         dump_au_remaining -= 1;
                                     }
                                 }
@@ -510,9 +522,12 @@ async fn main() -> Result<()> {
                                     if use_usb {
                                         let mut usb = session_shared.usb_sender.lock().unwrap();
                                         if let Some(ref mut tcp) = *usb {
-                                            if let Err(e) =
-                                                tcp.send_video(&*au.annex_b, au.is_idr, ts, codec_id)
-                                            {
+                                            if let Err(e) = tcp.send_video(
+                                                &*au.annex_b,
+                                                au.is_idr,
+                                                ts,
+                                                codec_id,
+                                            ) {
                                                 eprintln!("[pipeline] USB send error: {e:#}");
                                                 drop(usb);
                                                 session_shared
@@ -523,7 +538,9 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     if let Some(addr) = udp_addr {
-                                        if let Err(e) = sender.send_frame(au, addr, ts, codec_id, tuning) {
+                                        if let Err(e) =
+                                            sender.send_frame(au, addr, ts, codec_id, tuning)
+                                        {
                                             eprintln!("[pipeline] send error: {e:#}");
                                         }
                                     }
@@ -538,9 +555,11 @@ async fn main() -> Result<()> {
                     eprintln!("[capture] session error: {e:#}");
                 }
 
+                display.detach();
+
                 let _ = watchdog.join();
 
-                println!("[capture] EVDI session ended, waiting for next client...");
+                println!("[capture] display session ended, waiting for next client...");
 
                 // Reset capture_start so we wait for the next client
                 capture_start.store(false, Ordering::Release);
@@ -602,10 +621,7 @@ async fn main() -> Result<()> {
     }
 
     // Cleanup remaining resources
-    *shared.virtual_keyboard.lock().unwrap() = None;
     *shared.keyboard_worker.lock().unwrap() = None;
-    *shared.virtual_touch.lock().unwrap() = None;
-    *shared.virtual_mouse.lock().unwrap() = None;
     *shared.cam_writer.lock().unwrap() = None;
     if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
         audio::remove_virtual_mic(mic);
@@ -632,7 +648,10 @@ async fn main() -> Result<()> {
 }
 
 fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
-    let path = format!("/tmp/screx-daemon-capture-{index:03}.ppm");
+    let path = std::env::temp_dir()
+        .join(format!("screx-daemon-capture-{index:03}.ppm"))
+        .to_string_lossy()
+        .to_string();
     let mut ppm = Vec::with_capacity(32 + frame.data.len() / 4 * 3);
     ppm.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width, frame.height).as_bytes());
     for px in frame.data.chunks_exact(4) {
@@ -646,7 +665,10 @@ fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
 
 fn dump_sent_access_unit(index: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
     let ext = if codec_id == 0x01 { "h265" } else { "h264" };
-    let path = format!("/tmp/screx-daemon-au-{index:03}.{ext}");
+    let path = std::env::temp_dir()
+        .join(format!("screx-daemon-au-{index:03}.{ext}"))
+        .to_string_lossy()
+        .to_string();
     match fs::write(&path, annex_b) {
         Ok(()) => println!(
             "[capture] dumped encoded access unit to {} codec={} idr={} bytes={}",

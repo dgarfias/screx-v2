@@ -58,6 +58,14 @@ sudo apt-get install -y \
   udev
 ```
 
+### Windows Host Notes
+
+Windows microphone forwarding requires VB-Audio VB-CABLE. Screx sends iPad mic
+audio into `CABLE Input`, and applications record it from `CABLE Output`.
+VB-CABLE is a global system audio device: if you already use VB-CABLE for other
+audio routing, avoid enabling Screx microphone forwarding or install a separate
+VB-Audio cable instance reserved for Screx.
+
 ## Build
 
 ### Linux daemon
@@ -125,9 +133,6 @@ sudo ./target/release/screx --usb-only
 
 # Try the virtual webcam without exclusive caps
 sudo ./target/release/screx --no-camera-exclusive-caps
-
-# Host readiness checks
-sudo ./target/release/screx doctor
 
 # List or remove pairings
 sudo ./target/release/screx unpair

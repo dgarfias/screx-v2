@@ -1,8 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +11,14 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter, CameraConfig};
 use crate::encode::EncodedAccessUnit;
-use crate::uinput::{VirtualKeyboard, VirtualTouchscreen};
+use crate::input::{
+    parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, GamepadState,
+    InputBackend, KeyboardWorker,
+};
+use crate::platform::net::{
+    build_pktinfo_cmsg, send_to_from, sendmmsg_batch, udp_source_for_local_ip, PktinfoCmsg,
+    UdpSource,
+};
 use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
@@ -32,9 +37,6 @@ const SPEAKER_MAGIC: &[u8] = b"SPKR";
 const MICCFG_MAGIC: &[u8] = b"MICCFG";
 const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
 
-static MOUSE_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
-static RAWKEY_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
-static KEY_CTRL_COUNT: AtomicU64 = AtomicU64::new(0);
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
@@ -51,38 +53,6 @@ const ADAPTIVE_ADJUST_INTERVAL: Duration = Duration::from_secs(1);
 const ADAPTIVE_SHORT_WINDOW: Duration = Duration::from_secs(2);
 const ADAPTIVE_LONG_WINDOW: Duration = Duration::from_secs(6);
 const SENDMMSG_BATCH_SIZE: usize = 32;
-const PKTINFO_CMSG_SPACE: usize = 64;
-
-/// Aligned storage for an IP_PKTINFO cmsg buffer.
-///
-/// `buf` is oversized and aligned so the cmsg is placed at a properly aligned
-/// address. `controllen` is the *actual* `CMSG_SPACE(...)` value that must be
-/// passed to `msg_controllen`; passing the full 64-byte buffer length causes
-/// `sendmsg`/`sendmmsg` to return `EINVAL` on some kernels.
-#[repr(C, align(8))]
-struct PktinfoCmsg {
-    buf: [u8; PKTINFO_CMSG_SPACE],
-    controllen: usize,
-}
-
-impl PktinfoCmsg {
-    fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.controllen]
-    }
-
-    fn controllen(&self) -> usize {
-        self.controllen
-    }
-}
-
-impl Default for PktinfoCmsg {
-    fn default() -> Self {
-        Self {
-            buf: [0u8; PKTINFO_CMSG_SPACE],
-            controllen: 0,
-        }
-    }
-}
 
 fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -103,141 +73,6 @@ fn seq_is_stale(seq_num: u32, expected_seq: u32) -> bool {
 }
 
 pub type LifecycleCallback = Box<dyn Fn() + Send + Sync>;
-
-/// Source address pinning for daemon→client UDP packets.
-///
-/// On multi-homed hosts (e.g. ethernet + wifi on the same subnet) the kernel
-/// may route UDP replies out a different interface — and with a different
-/// source IP — than the one the client connected to. iOS connected UDP
-/// sockets silently drop datagrams whose source doesn't match the address
-/// they connected to, so every video/audio/heartbeat packet is lost.
-/// We pin the source IP (and interface) to the local address of the TCP
-/// handshake using an IP_PKTINFO control message on each send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpSource {
-    pub ip: std::net::Ipv4Addr,
-    pub ifindex: u32,
-}
-
-/// Find the interface index owning a local IPv4 address (0 if unknown).
-pub fn ifindex_for_ipv4(ip: std::net::Ipv4Addr) -> u32 {
-    unsafe {
-        let mut ifap: *mut libc::ifaddrs = ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return 0;
-        }
-        let mut found = 0u32;
-        let mut cur = ifap;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_addr.is_null()
-                && (*ifa.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
-            {
-                let sin = ifa.ifa_addr as *const libc::sockaddr_in;
-                let addr = std::net::Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
-                if addr == ip {
-                    found = libc::if_nametoindex(ifa.ifa_name);
-                    break;
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-        found
-    }
-}
-
-/// Resolve a session's UDP source pinning from the TCP handshake local IP.
-pub fn udp_source_for_local_ip(local_ip: Option<std::net::IpAddr>) -> Option<UdpSource> {
-    match local_ip {
-        Some(std::net::IpAddr::V4(ip)) if !ip.is_unspecified() => Some(UdpSource {
-            ip,
-            ifindex: ifindex_for_ipv4(ip),
-        }),
-        _ => None,
-    }
-}
-
-/// Build an IP_PKTINFO cmsg buffer that pins the IPv4 source address/interface.
-fn build_pktinfo_cmsg(source: UdpSource) -> PktinfoCmsg {
-    unsafe {
-        let data_len = std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint;
-        let space = libc::CMSG_SPACE(data_len) as usize;
-        assert!(
-            space <= PKTINFO_CMSG_SPACE,
-            "PKTINFO_CMSG_SPACE ({PKTINFO_CMSG_SPACE}) too small for CMSG_SPACE({data_len}) = {space}"
-        );
-        let mut cmsg = PktinfoCmsg::default();
-        let cmsg_hdr = cmsg.buf.as_mut_ptr() as *mut libc::cmsghdr;
-        (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(data_len) as _;
-        (*cmsg_hdr).cmsg_level = libc::IPPROTO_IP;
-        (*cmsg_hdr).cmsg_type = libc::IP_PKTINFO;
-        let pi = libc::CMSG_DATA(cmsg_hdr) as *mut libc::in_pktinfo;
-        std::ptr::write_unaligned(
-            pi,
-            libc::in_pktinfo {
-                ipi_ifindex: source.ifindex as libc::c_int,
-                ipi_spec_dst: libc::in_addr {
-                    s_addr: u32::from(source.ip).to_be(),
-                },
-                ipi_addr: libc::in_addr { s_addr: 0 },
-            },
-        );
-        cmsg.controllen = space;
-        cmsg
-    }
-}
-
-/// `send_to` with an optional pinned IPv4 source address (IP_PKTINFO).
-/// Falls back to a plain `send_to` when no source is pinned or dst is IPv6.
-/// If `cmsg_buf` is provided it is used directly; otherwise a stack buffer is
-/// built from `source`.
-pub fn send_to_from(
-    socket: &UdpSocket,
-    buf: &[u8],
-    dst: SocketAddr,
-    source: Option<UdpSource>,
-    cmsg_buf: Option<&[u8]>,
-) -> std::io::Result<usize> {
-    let source = match (source, dst) {
-        (Some(s), SocketAddr::V4(_)) => s,
-        _ => return socket.send_to(buf, dst),
-    };
-
-    // `controllen` must be exactly CMSG_SPACE(...); the buffer itself is only
-    // oversized for alignment. Passing the oversized buffer length causes
-    // `sendmsg` to return EINVAL on some kernels.
-    let (cmsg_ptr, controllen, _built) = match cmsg_buf {
-        Some(b) if !b.is_empty() => (b.as_ptr() as *mut libc::c_void, b.len(), None),
-        _ => {
-            let built = build_pktinfo_cmsg(source);
-            let ptr = built.buf.as_ptr() as *mut libc::c_void;
-            let len = built.controllen();
-            (ptr, len, Some(built))
-        }
-    };
-
-    let (mut addr_storage, addr_len) = socket_addr_to_raw(dst);
-    let mut iov = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let msg = libc::msghdr {
-        msg_name: (&mut addr_storage as *mut libc::sockaddr_storage).cast(),
-        msg_namelen: addr_len,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: cmsg_ptr,
-        msg_controllen: controllen as _,
-        msg_flags: 0,
-    };
-    let ret = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(ret as usize)
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct StreamTuning {
@@ -365,12 +200,9 @@ pub struct SharedState {
     pub capture_stop_flag: Arc<AtomicBool>,
     pub usb_sender: Mutex<Option<TcpFramedSender>>,
     pub usb_active: AtomicBool,
-    pub virtual_touch: Mutex<Option<VirtualTouchscreen>>,
-    pub virtual_keyboard: Mutex<Option<VirtualKeyboard>>,
-    pub keyboard_worker: Mutex<Option<crate::uinput::KeyboardWorker>>,
+    pub input_backend: Arc<Mutex<dyn InputBackend>>,
+    pub keyboard_worker: Mutex<Option<KeyboardWorker>>,
     pub audio_notify: Arc<Condvar>,
-    pub virtual_mouse: Mutex<Option<crate::uinput::VirtualMouse>>,
-    pub virtual_gamepads: Mutex<HashMap<u8, crate::uinput::VirtualGamepad>>,
     pub cam_writer: Mutex<Option<CamWriter>>,
     pub camera_config: Mutex<CameraConfig>,
     pub camera_exclusive_caps: bool,
@@ -393,7 +225,11 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new(camera_exclusive_caps: bool, base_bitrate_bps: u32) -> Self {
+    pub fn new(
+        camera_exclusive_caps: bool,
+        base_bitrate_bps: u32,
+        input_backend: Arc<Mutex<dyn InputBackend>>,
+    ) -> Self {
         Self {
             client_addr: Mutex::new(None),
             force_idr: AtomicBool::new(false),
@@ -403,12 +239,9 @@ impl SharedState {
             capture_stop_flag: Arc::new(AtomicBool::new(false)),
             usb_sender: Mutex::new(None),
             usb_active: AtomicBool::new(false),
-            virtual_touch: Mutex::new(None),
-            virtual_keyboard: Mutex::new(None),
+            input_backend,
             keyboard_worker: Mutex::new(None),
             audio_notify: Arc::new(Condvar::new()),
-            virtual_mouse: Mutex::new(None),
-            virtual_gamepads: Mutex::new(HashMap::new()),
             cam_writer: Mutex::new(None),
             camera_config: Mutex::new(CameraConfig {
                 width: 0,
@@ -498,18 +331,15 @@ pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
     };
 
     if needs_create {
-        match crate::camera::ensure_v4l2loopback(shared.camera_exclusive_caps) {
-            Ok(()) => match crate::camera::create_cam_writer(config) {
-                Ok(writer) => {
-                    *shared.cam_writer.lock().unwrap() = Some(writer);
-                    println!(
-                        "[camera] virtual webcam ready ({}x{} @ {}fps)",
-                        config.width, config.height, config.fps
-                    );
-                }
-                Err(e) => eprintln!("[camera] {e:#}"),
-            },
-            Err(e) => eprintln!("[camera] v4l2loopback not available ({e:#})"),
+        match crate::camera::CamWriter::new(config) {
+            Ok(writer) => {
+                *shared.cam_writer.lock().unwrap() = Some(writer);
+                println!(
+                    "[camera] virtual webcam ready ({}x{} @ {}fps)",
+                    config.width, config.height, config.fps
+                );
+            }
+            Err(e) => eprintln!("[camera] {e:#}"),
         }
     }
 }
@@ -557,7 +387,7 @@ const PERIPH_KEYBOARD: u8 = 0x02;
 const PERIPH_ATTACHED: u8 = 0x01;
 const PERIPH_DETACHED: u8 = 0x00;
 
-pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
+pub fn handle_periph_packet_data(_shared: &Arc<SharedState>, data: &[u8]) {
     if data.len() < 2 {
         return;
     }
@@ -566,26 +396,15 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 
     match (device_type, state) {
         (PERIPH_MOUSE, PERIPH_ATTACHED) => {
-            let mut m = shared.virtual_mouse.lock().unwrap();
-            if m.is_none() {
-                match crate::uinput::VirtualMouse::new() {
-                    Ok(vm) => {
-                        *m = Some(vm);
-                        println!("[periph] physical mouse attached — virtual mouse created");
-                    }
-                    Err(e) => eprintln!("[periph] failed to create virtual mouse: {e}"),
-                }
-            }
+            crate::input::DIRECT_MOUSE_ENABLED.store(true, Ordering::SeqCst);
+            println!("[periph] physical mouse attached");
         }
         (PERIPH_MOUSE, PERIPH_DETACHED) => {
-            let mut m = shared.virtual_mouse.lock().unwrap();
-            if let Some(mut vm) = m.take() {
-                vm.release_all_buttons();
-                println!("[periph] physical mouse detached — virtual mouse destroyed");
-            }
+            crate::input::DIRECT_MOUSE_ENABLED.store(false, Ordering::SeqCst);
+            println!("[periph] physical mouse detached");
         }
         (PERIPH_KEYBOARD, PERIPH_ATTACHED) => {
-            println!("[periph] physical keyboard attached — using existing virtual keyboard");
+            println!("[periph] physical keyboard attached");
         }
         (PERIPH_KEYBOARD, PERIPH_DETACHED) => {
             println!("[periph] physical keyboard detached");
@@ -645,30 +464,21 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(TOUCH_MAGIC) && ctrl.len() > TOUCH_MAGIC.len() {
         let touch_data = &ctrl[TOUCH_MAGIC.len()..];
-        let mut touch = shared.virtual_touch.lock().unwrap();
-        if let Some(ref mut ts) = *touch {
-            crate::uinput::handle_touch_packet(ts, touch_data);
+        let contacts = parse_touch_packet(touch_data);
+        if let Ok(mut backend) = shared.input_backend.lock() {
+            let _ = backend.touch(&contacts);
         }
         return;
     }
 
     if ctrl.starts_with(KEY_MAGIC) && ctrl.len() > KEY_MAGIC.len() {
         let key_data = &ctrl[KEY_MAGIC.len()..];
-        let count = KEY_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let key_type = key_data.first().copied().unwrap_or(0);
-        if count == 1 || count % 50 == 0 || matches!(key_type, 0x02 | 0x04) {
-            println!(
-                "[control] parsed KEY packets={count} len={} type=0x{key_type:02x} bytes={:02x?}",
-                key_data.len(),
-                key_data
-            );
-        }
-        if let Some(event) = crate::uinput::parse_key_event(key_data) {
+        if let Some(event) = parse_key_event(key_data) {
             let worker = shared.keyboard_worker.lock().unwrap();
             if let Some(ref w) = *worker {
                 w.send(event);
             } else {
-                eprintln!("[control] KEY packet dropped: no virtual keyboard available");
+                eprintln!("[control] KEY packet dropped: no input backend available");
             }
         }
         return;
@@ -676,47 +486,23 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
 
     if ctrl.starts_with(MOUSE_MAGIC) && ctrl.len() > MOUSE_MAGIC.len() {
         let mouse_data = &ctrl[MOUSE_MAGIC.len()..];
-        let count = MOUSE_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % 100 == 0 {
-            println!(
-                "[control] parsed MOUSE packets={count} len={}",
-                mouse_data.len()
-            );
-        }
-        let mut m = shared.virtual_mouse.lock().unwrap();
-        if m.is_none() {
-            match crate::uinput::VirtualMouse::new() {
-                Ok(vm) => {
-                    println!("[mouse] direct control active - virtual mouse created");
-                    *m = Some(vm);
-                }
-                Err(e) => {
-                    eprintln!("[mouse] failed to create virtual mouse for direct control: {e}");
-                    return;
-                }
+        if let Some(ev) = parse_mouse_packet(mouse_data) {
+            crate::input::DIRECT_MOUSE_ENABLED.store(true, Ordering::SeqCst);
+            if let Ok(mut backend) = shared.input_backend.lock() {
+                let _ = backend.mouse(ev);
             }
-        }
-        if let Some(ref mut vm) = *m {
-            crate::uinput::handle_mouse_packet(vm, mouse_data);
         }
         return;
     }
 
     if ctrl.starts_with(RAWKEY_MAGIC) && ctrl.len() > RAWKEY_MAGIC.len() {
         let rk_data = &ctrl[RAWKEY_MAGIC.len()..];
-        let count = RAWKEY_CTRL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % 50 == 0 {
-            println!(
-                "[control] parsed RAWKEY packets={count} len={}",
-                rk_data.len()
-            );
-        }
-        if let Some(event) = crate::uinput::parse_rawkey_event(rk_data) {
+        if let Some(event) = parse_rawkey_event(rk_data) {
             let worker = shared.keyboard_worker.lock().unwrap();
             if let Some(ref w) = *worker {
                 w.send(event);
             } else {
-                eprintln!("[control] RAWKEY packet dropped: no virtual keyboard available");
+                eprintln!("[control] RAWKEY packet dropped: no input backend available");
             }
         }
         return;
@@ -750,6 +536,10 @@ pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
 }
 
 pub fn disable_virtual_sink(shared: &Arc<SharedState>) {
+    shared.audio_output_enabled.store(false, Ordering::SeqCst);
+    shared.audio_notify.notify_all();
+    std::thread::sleep(Duration::from_millis(200));
+
     let mut module_id = shared.audio_module_id.lock().unwrap();
     if *module_id > 0 {
         crate::audio::remove_virtual_sink(*module_id);
@@ -797,28 +587,23 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 
     match msg_type {
         GPAD_ATTACHED => {
-            let mut pads = shared.virtual_gamepads.lock().unwrap();
-            if pads.contains_key(&controller_id) {
-                return;
-            }
-            match crate::uinput::VirtualGamepad::new(controller_id) {
-                Ok(pad) => {
-                    pads.insert(controller_id, pad);
+            if let Ok(mut backend) = shared.input_backend.lock() {
+                if let Err(e) = backend.gamepad_attach(controller_id) {
+                    eprintln!(
+                        "[gamepad] failed to create virtual gamepad {}: {e}",
+                        controller_id + 1
+                    );
+                } else {
                     println!(
                         "[gamepad] controller {} attached — virtual gamepad created",
                         controller_id + 1
                     );
                 }
-                Err(e) => eprintln!(
-                    "[gamepad] failed to create virtual gamepad {}: {e}",
-                    controller_id + 1
-                ),
             }
         }
         GPAD_DETACHED => {
-            let mut pads = shared.virtual_gamepads.lock().unwrap();
-            if let Some(mut pad) = pads.remove(&controller_id) {
-                pad.release_all();
+            if let Ok(mut backend) = shared.input_backend.lock() {
+                backend.gamepad_detach(controller_id);
                 println!(
                     "[gamepad] controller {} detached — virtual gamepad destroyed",
                     controller_id + 1
@@ -850,9 +635,19 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
                 hat_y
             );
 
-            let mut pads = shared.virtual_gamepads.lock().unwrap();
-            if let Some(ref mut pad) = pads.get_mut(&controller_id) {
-                pad.set_state(buttons_mask, lx, ly, rx, ry, lt, rt, hat_x, hat_y);
+            if let Ok(mut backend) = shared.input_backend.lock() {
+                let state = GamepadState {
+                    buttons: buttons_mask,
+                    lx,
+                    ly,
+                    rx,
+                    ry,
+                    lt,
+                    rt,
+                    hat_x,
+                    hat_y,
+                };
+                let _ = backend.gamepad_state(controller_id, &state);
             }
         }
         _ => {}
@@ -1456,7 +1251,7 @@ impl UdpSender {
             let elapsed = self.stats_start.elapsed().as_secs_f64();
             let fps = self.stats_frames as f64 / elapsed;
             let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
-            println!(
+            crate::vlog!(
                 "[stream] fps={fps:.1} throughput={mbps:.2}Mbps chunks={data_count}+{actual_parity}fec",
             );
             self.stats_frames = 0;
@@ -1480,7 +1275,10 @@ impl UdpSender {
 
         while sent < total_shards {
             let end = (sent + SENDMMSG_BATCH_SIZE).min(total_shards);
-            match self.sendmmsg_batch(client_addr, sent, end) {
+            let batch: Vec<&[u8]> = (sent..end)
+                .map(|idx| &self.packet_pool[idx][..self.packet_lens[idx]])
+                .collect();
+            match sendmmsg_batch(&self.socket, &batch, client_addr, self.source) {
                 Ok(sent_now) if sent_now > 0 => {
                     frame_bytes += self.packet_lens[sent..sent + sent_now]
                         .iter()
@@ -1512,117 +1310,6 @@ impl UdpSender {
         }
 
         Ok(frame_bytes)
-    }
-
-    fn sendmmsg_batch(
-        &self,
-        client_addr: SocketAddr,
-        start: usize,
-        end: usize,
-    ) -> std::io::Result<usize> {
-        let batch_len = end - start;
-        let (mut addr_storage, addr_len) = socket_addr_to_raw(client_addr);
-        let mut iovecs = Vec::with_capacity(batch_len);
-        let mut msgs = Vec::with_capacity(batch_len);
-
-        // Optional IP_PKTINFO cmsg shared by all messages in the batch
-        // (sendmmsg only reads it). Pins the source IP/interface so
-        // multi-homed hosts reply from the address the client dialed.
-        let (cmsg_ptr, cmsg_len) = match (self.source, client_addr) {
-            (Some(_), SocketAddr::V4(_)) => match self.cmsg_buf.as_ref() {
-                Some(buf) => (
-                    buf.as_slice().as_ptr() as *mut libc::c_void,
-                    buf.controllen() as libc::size_t,
-                ),
-                None => (ptr::null_mut(), 0),
-            },
-            _ => (ptr::null_mut(), 0),
-        };
-
-        for idx in start..end {
-            iovecs.push(libc::iovec {
-                iov_base: self.packet_pool[idx].as_ptr() as *mut libc::c_void,
-                iov_len: self.packet_lens[idx],
-            });
-        }
-
-        for i in 0..batch_len {
-            msgs.push(libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: (&mut addr_storage as *mut libc::sockaddr_storage).cast(),
-                    msg_namelen: addr_len,
-                    msg_iov: &mut iovecs[i] as *mut libc::iovec,
-                    msg_iovlen: 1,
-                    msg_control: cmsg_ptr,
-                    msg_controllen: cmsg_len,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            });
-        }
-
-        let ret = unsafe {
-            libc::sendmmsg(
-                self.socket.as_raw_fd(),
-                msgs.as_mut_ptr(),
-                batch_len as u32,
-                0,
-            )
-        };
-
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(ret as usize)
-        }
-    }
-}
-
-fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    match addr {
-        SocketAddr::V4(addr) => {
-            let sockaddr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: addr.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_be_bytes(addr.ip().octets()).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-            unsafe {
-                ptr::write(
-                    (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
-                    sockaddr,
-                );
-            }
-            (
-                storage,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            )
-        }
-        SocketAddr::V6(addr) => {
-            let sockaddr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: addr.port().to_be(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: addr.ip().octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
-            unsafe {
-                ptr::write(
-                    (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
-                    sockaddr,
-                );
-            }
-            (
-                storage,
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-            )
-        }
     }
 }
 

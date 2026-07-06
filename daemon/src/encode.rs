@@ -116,16 +116,30 @@ pub struct EncodedAccessUnit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderBackend {
     Auto,
+    #[cfg(target_os = "linux")]
     Vaapi,
     Nvenc,
+    #[cfg(target_os = "windows")]
+    Amf,
+    #[cfg(target_os = "windows")]
+    Qsv,
+    #[cfg(target_os = "windows")]
+    Mf,
     Software,
 }
 
 impl EncoderBackend {
     pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            #[cfg(target_os = "linux")]
             "vaapi" => Self::Vaapi,
             "nvenc" | "nvidia" | "cuda" => Self::Nvenc,
+            #[cfg(target_os = "windows")]
+            "amf" => Self::Amf,
+            #[cfg(target_os = "windows")]
+            "qsv" => Self::Qsv,
+            #[cfg(target_os = "windows")]
+            "mf" => Self::Mf,
             "software" | "sw" | "x264" | "libx264" | "x265" | "libx265" => Self::Software,
             _ => Self::Auto,
         }
@@ -176,12 +190,28 @@ impl Encoder {
         ffmpeg::init().context("ffmpeg init")?;
 
         let inner = match config.backend {
+            #[cfg(target_os = "linux")]
             EncoderBackend::Vaapi => {
                 let enc = HwEncoder::new_vaapi(&config)?;
                 ActiveEncoder::HwAccel(enc)
             }
             EncoderBackend::Nvenc => {
                 let enc = HwEncoder::new_nvenc(&config)?;
+                ActiveEncoder::HwAccel(enc)
+            }
+            #[cfg(target_os = "windows")]
+            EncoderBackend::Amf => {
+                let enc = HwEncoder::new_amf(&config)?;
+                ActiveEncoder::HwAccel(enc)
+            }
+            #[cfg(target_os = "windows")]
+            EncoderBackend::Qsv => {
+                let enc = HwEncoder::new_qsv(&config)?;
+                ActiveEncoder::HwAccel(enc)
+            }
+            #[cfg(target_os = "windows")]
+            EncoderBackend::Mf => {
+                let enc = HwEncoder::new_mf(&config)?;
                 ActiveEncoder::HwAccel(enc)
             }
             EncoderBackend::Software => {
@@ -193,16 +223,36 @@ impl Encoder {
                     VideoCodec::H264 => "H.264",
                     VideoCodec::H265 => "H.265",
                 };
-                if let Ok(enc) = HwEncoder::new_vaapi(&config) {
-                    println!("[encode] auto-selected: vaapi ({codec_name})");
-                    ActiveEncoder::HwAccel(enc)
-                } else if let Ok(enc) = HwEncoder::new_nvenc(&config) {
-                    println!("[encode] auto-selected: nvenc ({codec_name})");
-                    ActiveEncoder::HwAccel(enc)
-                } else {
-                    println!("[encode] no hw encoder available, using software ({codec_name})");
-                    let enc = SwEncoder::new(&config)?;
-                    ActiveEncoder::Software(enc)
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(enc) = HwEncoder::new_vaapi(&config) {
+                        println!("[encode] auto-selected: vaapi ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else if let Ok(enc) = HwEncoder::new_nvenc(&config) {
+                        println!("[encode] auto-selected: nvenc ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else {
+                        println!("[encode] no hw encoder available, using software ({codec_name})");
+                        let enc = SwEncoder::new(&config)?;
+                        ActiveEncoder::Software(enc)
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if let Ok(enc) = HwEncoder::new_nvenc(&config) {
+                        println!("[encode] auto-selected: nvenc ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else if let Ok(enc) = HwEncoder::new_amf(&config) {
+                        println!("[encode] auto-selected: amf ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else if let Ok(enc) = HwEncoder::new_qsv(&config) {
+                        println!("[encode] auto-selected: qsv ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else {
+                        println!("[encode] no hw encoder available, using software ({codec_name})");
+                        let enc = SwEncoder::new(&config)?;
+                        ActiveEncoder::Software(enc)
+                    }
                 }
             }
         };
@@ -234,8 +284,15 @@ impl Encoder {
             self.config.height = frame.height.max(1);
             self.inner = match &self.inner {
                 ActiveEncoder::HwAccel(hw) => match hw.kind {
+                    #[cfg(target_os = "linux")]
                     HwKind::Vaapi => ActiveEncoder::HwAccel(HwEncoder::new_vaapi(&self.config)?),
                     HwKind::Nvenc => ActiveEncoder::HwAccel(HwEncoder::new_nvenc(&self.config)?),
+                    #[cfg(target_os = "windows")]
+                    HwKind::Amf => ActiveEncoder::HwAccel(HwEncoder::new_amf(&self.config)?),
+                    #[cfg(target_os = "windows")]
+                    HwKind::Qsv => ActiveEncoder::HwAccel(HwEncoder::new_qsv(&self.config)?),
+                    #[cfg(target_os = "windows")]
+                    HwKind::Mf => ActiveEncoder::HwAccel(HwEncoder::new_mf(&self.config)?),
                 },
                 ActiveEncoder::Software(_) => {
                     ActiveEncoder::Software(SwEncoder::new(&self.config)?)
@@ -270,7 +327,7 @@ impl Encoder {
             let elapsed = self.stats_start.elapsed().as_secs_f64();
             let fps = self.stats_encoded as f64 / elapsed;
             let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
-            println!(
+            crate::vlog!(
                 "[encode] fps={fps:.1} stream_mbps={mbps:.2} idr={}/{} bitrate={}",
                 self.stats_idr_count, self.stats_encoded, self.config.bitrate_bps
             );
@@ -290,8 +347,15 @@ impl Encoder {
 
 #[derive(Clone, Copy)]
 enum HwKind {
+    #[cfg(target_os = "linux")]
     Vaapi,
     Nvenc,
+    #[cfg(target_os = "windows")]
+    Amf,
+    #[cfg(target_os = "windows")]
+    Qsv,
+    #[cfg(target_os = "windows")]
+    Mf,
 }
 
 struct HwEncoder {
@@ -309,6 +373,11 @@ struct HwEncoder {
     fps: u32,
     extradata: Vec<u8>,
     is_cqp: bool,
+    // AMF/MF accept plain NV12 system-memory frames and do their own internal
+    // GPU upload — unlike VAAPI/NVENC they don't need (and on at least some
+    // AMD iGPU/driver combinations, don't work with) an explicit
+    // AVHWFramesContext. See push_frame() for the resulting split path.
+    uses_sw_frames: bool,
 }
 
 unsafe impl Send for HwEncoder {}
@@ -352,6 +421,7 @@ impl HwEncoder {
             (*ctx).rc_max_rate = bps as i64;
             (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
 
+            #[cfg(target_os = "linux")]
             if matches!(self.kind, HwKind::Vaapi) && !self.is_cqp {
                 let key = std::ffi::CString::new("b").unwrap();
                 ffi::av_opt_set_int((*ctx).priv_data, key.as_ptr(), bps as i64, 0);
@@ -360,6 +430,7 @@ impl HwEncoder {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn new_vaapi(config: &EncoderConfig) -> Result<Self> {
         if config.codec == VideoCodec::H265 {
             match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
@@ -389,21 +460,39 @@ impl HwEncoder {
         Self::new_with_vaapi_hevc_mode(config, HwKind::Nvenc, VaapiHevcMode::Bitrate)
     }
 
+    #[cfg(target_os = "windows")]
+    fn new_amf(config: &EncoderConfig) -> Result<Self> {
+        Self::new_with_vaapi_hevc_mode(config, HwKind::Amf, VaapiHevcMode::Bitrate)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn new_qsv(config: &EncoderConfig) -> Result<Self> {
+        Self::new_with_vaapi_hevc_mode(config, HwKind::Qsv, VaapiHevcMode::Bitrate)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn new_mf(config: &EncoderConfig) -> Result<Self> {
+        Self::new_with_vaapi_hevc_mode(config, HwKind::Mf, VaapiHevcMode::Bitrate)
+    }
+
     fn new_with_vaapi_hevc_mode(
         config: &EncoderConfig,
         kind: HwKind,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         vaapi_hevc_mode: VaapiHevcMode,
     ) -> Result<Self> {
         let width = config.width as i32;
         let height = config.height as i32;
 
         let (codec_name, hw_type, hw_pix_fmt, device_path) = match (kind, config.codec) {
+            #[cfg(target_os = "linux")]
             (HwKind::Vaapi, VideoCodec::H264) => (
                 "h264_vaapi",
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
                 ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
                 "/dev/dri/renderD128",
             ),
+            #[cfg(target_os = "linux")]
             (HwKind::Vaapi, VideoCodec::H265) => (
                 "hevc_vaapi",
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
@@ -422,12 +511,66 @@ impl HwEncoder {
                 ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
                 "0",
             ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Amf, VideoCodec::H264) => (
+                "h264_amf",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+                "0",
+            ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Amf, VideoCodec::H265) => (
+                "hevc_amf",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+                "0",
+            ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Qsv, VideoCodec::H264) => (
+                "h264_qsv",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
+                ffi::AVPixelFormat::AV_PIX_FMT_QSV,
+                "0",
+            ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Qsv, VideoCodec::H265) => (
+                "hevc_qsv",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
+                ffi::AVPixelFormat::AV_PIX_FMT_QSV,
+                "0",
+            ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Mf, VideoCodec::H264) => (
+                "h264_mf",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+                "0",
+            ),
+            #[cfg(target_os = "windows")]
+            (HwKind::Mf, VideoCodec::H265) => (
+                "hevc_mf",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
+                "0",
+            ),
         };
 
         let kind_name = match kind {
+            #[cfg(target_os = "linux")]
             HwKind::Vaapi => "VA-API",
             HwKind::Nvenc => "NVENC",
+            #[cfg(target_os = "windows")]
+            HwKind::Amf => "AMF",
+            #[cfg(target_os = "windows")]
+            HwKind::Qsv => "QSV",
+            #[cfg(target_os = "windows")]
+            HwKind::Mf => "MediaFoundation",
         };
+
+        #[cfg(target_os = "windows")]
+        let uses_sw_frames = matches!(kind, HwKind::Amf | HwKind::Mf);
+        #[cfg(not(target_os = "windows"))]
+        let uses_sw_frames = false;
 
         unsafe {
             let codec_cstr = std::ffi::CString::new(codec_name).unwrap();
@@ -442,42 +585,57 @@ impl HwEncoder {
             }
 
             let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-            let device_cstr = std::ffi::CString::new(device_path).unwrap();
-            let ret = ffi::av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                hw_type,
-                device_cstr.as_ptr(),
-                ptr::null_mut(),
-                0,
-            );
-            if ret < 0 {
-                ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to create {kind_name} device context (error {ret})");
+            let mut hw_frames_ref: *mut ffi::AVBufferRef = ptr::null_mut();
+
+            if !uses_sw_frames {
+                let device_cstr = std::ffi::CString::new(device_path).unwrap();
+                let ret = ffi::av_hwdevice_ctx_create(
+                    &mut hw_device_ctx,
+                    hw_type,
+                    device_cstr.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                );
+                if ret < 0 {
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to create {kind_name} device context (error {ret})");
+                }
+
+                hw_frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
+                if hw_frames_ref.is_null() {
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to allocate hw frames context");
+                }
+                let frames_ctx = (*hw_frames_ref).data as *mut ffi::AVHWFramesContext;
+                (*frames_ctx).format = hw_pix_fmt;
+                (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+                (*frames_ctx).width = width;
+                (*frames_ctx).height = height;
+                (*frames_ctx).initial_pool_size = 20;
+
+                let ret = ffi::av_hwframe_ctx_init(hw_frames_ref);
+                if ret < 0 {
+                    ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    ffi::avcodec_free_context(&mut (ctx as *mut _));
+                    bail!("failed to init hw frames context (error {ret})");
+                }
+
+                (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
+                (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ref);
+                (*ctx).pix_fmt = hw_pix_fmt;
+            } else {
+                // AMF/MF: feed plain NV12 system-memory frames and let the
+                // encoder do its own internal GPU upload (this matches how
+                // `ffmpeg -c:v h264_amf` behaves by default with no
+                // -init_hw_device/hwupload — no AVHWFramesContext involved).
+                // Building one explicitly, as the branch above does, fails
+                // with "Could not create the texture" (E_INVALIDARG) on at
+                // least some AMD iGPU/driver combinations.
+                (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
             }
 
-            let hw_frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
-            if hw_frames_ref.is_null() {
-                ffi::av_buffer_unref(&mut hw_device_ctx);
-                ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to allocate hw frames context");
-            }
-            let frames_ctx = (*hw_frames_ref).data as *mut ffi::AVHWFramesContext;
-            (*frames_ctx).format = hw_pix_fmt;
-            (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-            (*frames_ctx).width = width;
-            (*frames_ctx).height = height;
-            (*frames_ctx).initial_pool_size = 20;
-
-            let ret = ffi::av_hwframe_ctx_init(hw_frames_ref);
-            if ret < 0 {
-                ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
-                ffi::av_buffer_unref(&mut hw_device_ctx);
-                ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to init hw frames context (error {ret})");
-            }
-
-            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
-            (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ref);
             (*ctx).width = width;
             (*ctx).height = height;
             (*ctx).time_base = ffi::AVRational {
@@ -490,23 +648,27 @@ impl HwEncoder {
             };
             (*ctx).gop_size = config.gop as i32;
             (*ctx).max_b_frames = 0;
-            (*ctx).pix_fmt = hw_pix_fmt;
 
-            if matches!(
+            #[cfg(target_os = "linux")]
+            let is_vaapi_cqp = matches!(
                 (kind, config.codec, vaapi_hevc_mode),
                 (HwKind::Vaapi, VideoCodec::H265, VaapiHevcMode::Cqp(_))
-            ) {
+            );
+            #[cfg(not(target_os = "linux"))]
+            let is_vaapi_cqp = false;
+
+            if is_vaapi_cqp {
                 (*ctx).bit_rate = 0;
                 (*ctx).rc_max_rate = 0;
                 (*ctx).rc_buffer_size = 0;
             } else {
                 (*ctx).bit_rate = config.bitrate_bps as i64;
                 (*ctx).rc_max_rate = config.bitrate_bps as i64;
-                (*ctx).rc_buffer_size =
-                    (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
+                (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
             }
 
             match kind {
+                #[cfg(target_os = "linux")]
                 HwKind::Vaapi => {
                     let key = std::ffi::CString::new("async_depth").unwrap();
                     ffi::av_opt_set_int((*ctx).priv_data, key.as_ptr(), 1, 0);
@@ -534,6 +696,31 @@ impl HwEncoder {
                     let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
                     let one = std::ffi::CString::new("1").unwrap();
                     ffi::av_opt_set((*ctx).priv_data, zerolatency.as_ptr(), one.as_ptr(), 0);
+                }
+                #[cfg(target_os = "windows")]
+                HwKind::Amf => {
+                    let usage = std::ffi::CString::new("usage").unwrap();
+                    let ull = std::ffi::CString::new("ultralowlatency").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, usage.as_ptr(), ull.as_ptr(), 0);
+                    let rc = std::ffi::CString::new("rc").unwrap();
+                    let cbr = std::ffi::CString::new("cbr").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, rc.as_ptr(), cbr.as_ptr(), 0);
+                }
+                #[cfg(target_os = "windows")]
+                HwKind::Qsv => {
+                    let async_depth = std::ffi::CString::new("async_depth").unwrap();
+                    ffi::av_opt_set_int((*ctx).priv_data, async_depth.as_ptr(), 1, 0);
+                    let low_power = std::ffi::CString::new("low_power").unwrap();
+                    let one = std::ffi::CString::new("1").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, low_power.as_ptr(), one.as_ptr(), 0);
+                }
+                #[cfg(target_os = "windows")]
+                HwKind::Mf => {
+                    let hw_encoding = std::ffi::CString::new("hw_encoding").unwrap();
+                    let one = std::ffi::CString::new("1").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, hw_encoding.as_ptr(), one.as_ptr(), 0);
+                    let low_latency = std::ffi::CString::new("low_latency").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, low_latency.as_ptr(), one.as_ptr(), 0);
                 }
             }
 
@@ -601,10 +788,13 @@ impl HwEncoder {
                 bail!("failed to allocate packet");
             }
 
+            #[cfg(target_os = "linux")]
             let is_cqp = matches!(
                 (kind, config.codec, vaapi_hevc_mode),
                 (HwKind::Vaapi, VideoCodec::H265, VaapiHevcMode::Cqp(_))
             );
+            #[cfg(not(target_os = "linux"))]
+            let is_cqp = false;
 
             let codec_label = match config.codec {
                 VideoCodec::H264 => "H.264",
@@ -631,6 +821,7 @@ impl HwEncoder {
                 fps: config.fps.max(1),
                 extradata,
                 is_cqp,
+                uses_sw_frames,
             })
         }
     }
@@ -640,6 +831,9 @@ impl HwEncoder {
         frame: &CaptureFrame<'_>,
         is_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
+        if self.uses_sw_frames {
+            return self.push_frame_sw(frame, is_idr);
+        }
         unsafe {
             let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
             if ret < 0 {
@@ -667,9 +861,7 @@ impl HwEncoder {
                 // Fallback for drivers that do not support direct mapping.
                 // Allocate the NV12 system buffer lazily on first use.
                 if self.sw_nv12.is_null() {
-                    eprintln!(
-                        "[encode] hwframe mapping unavailable, allocating sw_nv12 fallback"
-                    );
+                    eprintln!("[encode] hwframe mapping unavailable, allocating sw_nv12 fallback");
                     self.sw_nv12 = ffi::av_frame_alloc();
                     if self.sw_nv12.is_null() {
                         ffi::av_frame_unref(self.mapped_frame);
@@ -723,6 +915,65 @@ impl HwEncoder {
 
             let ret = ffi::avcodec_send_frame(self.ctx, self.hw_frame);
             ffi::av_frame_unref(self.hw_frame);
+            if ret < 0 {
+                bail!("avcodec_send_frame failed (error {ret})");
+            }
+
+            let output = self.drain_packets()?;
+            self.frame_index += 1;
+            Ok(output)
+        }
+    }
+
+    /// push_frame() path for AMF/MF (uses_sw_frames): feed a plain NV12
+    /// system-memory frame directly, same as the software encoder does.
+    fn push_frame_sw(
+        &mut self,
+        frame: &CaptureFrame<'_>,
+        is_idr: bool,
+    ) -> Result<Vec<EncodedAccessUnit>> {
+        unsafe {
+            if self.sw_nv12.is_null() {
+                self.sw_nv12 = ffi::av_frame_alloc();
+                if self.sw_nv12.is_null() {
+                    bail!("failed to allocate NV12 frame");
+                }
+                (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                (*self.sw_nv12).width = (*self.ctx).width;
+                (*self.sw_nv12).height = (*self.ctx).height;
+                let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
+                if ret < 0 {
+                    ffi::av_frame_free(&mut self.sw_nv12);
+                    bail!("failed to allocate NV12 buffer (error {ret})");
+                }
+            } else {
+                let ret = ffi::av_frame_make_writable(self.sw_nv12);
+                if ret < 0 {
+                    bail!("av_frame_make_writable failed (error {ret})");
+                }
+            }
+
+            (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
+
+            ffi::sws_scale(
+                self.sws,
+                (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                (*self.sw_bgra).linesize.as_ptr(),
+                0,
+                self.height,
+                (*self.sw_nv12).data.as_mut_ptr(),
+                (*self.sw_nv12).linesize.as_mut_ptr(),
+            );
+
+            let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
+            (*self.sw_nv12).pts = pts;
+            (*self.sw_nv12).pict_type = if is_idr {
+                ffi::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                ffi::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+
+            let ret = ffi::avcodec_send_frame(self.ctx, self.sw_nv12);
             if ret < 0 {
                 bail!("avcodec_send_frame failed (error {ret})");
             }
@@ -889,8 +1140,7 @@ impl SwEncoder {
             };
             (*ctx).bit_rate = config.bitrate_bps as i64;
             (*ctx).rc_max_rate = config.bitrate_bps as i64;
-            (*ctx).rc_buffer_size =
-                (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
+            (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
             (*ctx).gop_size = config.gop as i32;
             (*ctx).max_b_frames = 0;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
