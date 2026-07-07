@@ -75,10 +75,16 @@ pub fn send_qt_key_action(
     modifiers: i32,
     pressed: bool,
 ) -> Result<()> {
-    // Modifier keys (Shift, Ctrl, Alt, Meta) should NOT be sent as RAWKEY
-    // because our KEY combo packets already encode modifier state.
-    // Sending RAWKEY for modifiers causes them to get "stuck" on the remote side.
+    // Modifier keys (Shift, Ctrl, Alt, Meta) are sent as RAWKEY so the daemon
+    // sees both press and release.  This matches the iPad, which sends ALL keys
+    // (including modifiers) via RAWKEY.  The combo path for non-modifier keys
+    // encodes modifier state via the `modifiers` field and the daemon's
+    // `key_special`/`key_text_with_modifiers` presses/releases its own modifier
+    // VKs, so the RAWKEY press/release here does not interfere with combos.
     if qt_key_is_modifier(qt_key) {
+        if let Some(hid_usage) = qt_key_to_hid(qt_key) {
+            return send_raw_key(control, hid_usage, pressed);
+        }
         return Ok(());
     }
 

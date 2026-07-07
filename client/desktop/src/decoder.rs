@@ -314,6 +314,60 @@ impl Drop for VideoDecoder {
     }
 }
 
+fn annex_b_units(data: &[u8]) -> Vec<&[u8]> {
+    fn start_code_len(data: &[u8], pos: usize) -> usize {
+        if pos + 3 < data.len()
+            && data[pos] == 0
+            && data[pos + 1] == 0
+            && data[pos + 2] == 0
+            && data[pos + 3] == 1
+        {
+            4
+        } else if pos + 2 < data.len()
+            && data[pos] == 0
+            && data[pos + 1] == 0
+            && data[pos + 2] == 1
+        {
+            3
+        } else {
+            0
+        }
+    }
+
+    let mut units = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let mut start = None;
+        while pos < data.len() {
+            if start_code_len(data, pos) != 0 {
+                start = Some(pos);
+                break;
+            }
+            pos += 1;
+        }
+        let Some(start) = start else { break };
+        pos = start + start_code_len(data, start);
+        let mut end = data.len();
+        let mut scan = pos;
+        while scan < data.len() {
+            if start_code_len(data, scan) != 0 {
+                end = scan;
+                break;
+            }
+            scan += 1;
+        }
+        if end > start {
+            units.push(&data[start..end]);
+        }
+        pos = end;
+    }
+
+    if units.is_empty() && !data.is_empty() {
+        units.push(data);
+    }
+    units
+}
+
 // ---------------------------------------------------------------------------
 // FFmpeg init (once)
 // ---------------------------------------------------------------------------
@@ -379,8 +433,7 @@ unsafe extern "C" fn get_hw_format(
 }
 
 unsafe fn apply_low_latency_decoder_flags(ctx: *mut ffi::AVCodecContext) {
-    (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-    (*ctx).flags2 |= (ffi::AV_CODEC_FLAG2_FAST | ffi::AV_CODEC_FLAG2_CHUNKS) as i32;
+    (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
     (*ctx).thread_count = 1;
     (*ctx).thread_type = 0;
 }
@@ -609,12 +662,14 @@ impl HwDecoder {
     ) -> Result<Vec<DecodedOutput>> {
         let mut frames = Vec::new();
         unsafe {
-            // Feed the complete access unit directly — no parser needed.
-            (*self.pkt).data = annex_b.as_ptr() as *mut u8;
-            (*self.pkt).size = annex_b.len() as i32;
+            ffi::av_packet_unref(self.pkt);
+            let ret = ffi::av_new_packet(self.pkt, annex_b.len() as i32);
+            if ret < 0 {
+                bail!("av_new_packet error {ret}");
+            }
+            ptr::copy_nonoverlapping(annex_b.as_ptr(), (*self.pkt).data, annex_b.len());
             self.send_and_receive(&mut frames, pool, zero_copy)?;
-            (*self.pkt).data = ptr::null_mut();
-            (*self.pkt).size = 0;
+            ffi::av_packet_unref(self.pkt);
         }
         Ok(frames)
     }
@@ -885,13 +940,14 @@ impl SwDecoder {
     fn decode(&mut self, annex_b: &[u8], pool: &mut FrameBufferPool) -> Result<Vec<DecodedOutput>> {
         let mut frames = Vec::new();
         unsafe {
-            // Feed the complete access unit directly without re-parsing.
-            (*self.pkt).data = annex_b.as_ptr() as *mut u8;
-            (*self.pkt).size = annex_b.len() as i32;
+            ffi::av_packet_unref(self.pkt);
+            let ret = ffi::av_new_packet(self.pkt, annex_b.len() as i32);
+            if ret < 0 {
+                bail!("sw av_new_packet error {ret}");
+            }
+            ptr::copy_nonoverlapping(annex_b.as_ptr(), (*self.pkt).data, annex_b.len());
             self.send_and_receive(&mut frames, pool)?;
-            // Do NOT call av_packet_unref here — we don't own the data pointer.
-            (*self.pkt).data = ptr::null_mut();
-            (*self.pkt).size = 0;
+            ffi::av_packet_unref(self.pkt);
         }
         Ok(frames)
     }

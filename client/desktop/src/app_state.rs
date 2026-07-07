@@ -278,6 +278,26 @@ pub struct AppState {
         }
     ),
 
+    /// Send a raw HID key event (press or release) directly, bypassing the
+    /// combo/text path.  Used by the keyboard-grab mode where every key —
+    /// including modifiers — is forwarded as RAWKEY so the remote sees exact
+    /// press/release state, exactly like a physical keyboard passthrough.
+    pub send_raw_key_event: qt_method!(
+        fn send_raw_key_event(&mut self, qt_key: i32, pressed: bool) {
+            self.ensure_backend();
+            if !self.keyboard_enabled || !self.connected {
+                return;
+            }
+            if let Some(hid_usage) = crate::input::qt_key_to_hid(qt_key) {
+                if let Some(ref control) = self.direct_control {
+                    let _ = crate::input::send_raw_key(control, hid_usage, pressed);
+                } else if let Some(backend) = self.backend.clone() {
+                    backend.send_key_action(qt_key, String::new(), 0, pressed);
+                }
+            }
+        }
+    ),
+
     pub send_mouse_move: qt_method!(
         fn send_mouse_move(&mut self, norm_x: f32, norm_y: f32) {
             if !self.connected {
@@ -607,6 +627,7 @@ impl Default for AppState {
             toggle_info: Default::default(),
             select_camera_mode: Default::default(),
             send_key_event: Default::default(),
+            send_raw_key_event: Default::default(),
             send_mouse_move: Default::default(),
             send_mouse_move_raw: Default::default(),
             send_mouse_button: Default::default(),

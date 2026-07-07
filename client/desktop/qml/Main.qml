@@ -409,6 +409,30 @@ ApplicationWindow {
                             anchors.fill: parent
                             focus: AppState.connected && AppState.keyboard_enabled
                             activeFocusOnTab: false
+
+                            Keys.onPressed: {
+                                if (!AppState.connected || !AppState.keyboard_enabled) {
+                                    event.accepted = false
+                                    return
+                                }
+                                if ((event.modifiers & Qt.ControlModifier) &&
+                                    (event.modifiers & Qt.AltModifier) &&
+                                    event.key === Qt.Key_G) {
+                                    AppState.toggle_keyboard()
+                                    event.accepted = true
+                                    return
+                                }
+                                AppState.send_raw_key_event(event.key, true)
+                                event.accepted = true
+                            }
+                            Keys.onReleased: {
+                                if (!AppState.connected || !AppState.keyboard_enabled) {
+                                    event.accepted = false
+                                    return
+                                }
+                                AppState.send_raw_key_event(event.key, false)
+                                event.accepted = true
+                            }
                         }
                     }
                 }
@@ -473,6 +497,23 @@ ApplicationWindow {
                         font.family: uiFont()
                         font.pixelSize: 11
                     }
+                }
+
+                Button {
+                    text: "\u2715"
+                    font.pixelSize: 16
+                    z: 1
+                    onClicked: AppState.delete_connection(modelData.host, modelData.port)
+                    background: Rectangle { color: "transparent" }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#ff3b30"
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    implicitWidth: 32
+                    implicitHeight: 32
                 }
 
                 Text {

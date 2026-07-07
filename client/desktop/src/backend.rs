@@ -35,6 +35,12 @@ const UDP_CHUNK_PAYLOAD: usize = 1400;
 const UDP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const UDP_DATA_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bound on how long we wait, while parsing a SCREX_OK handshake body, for the
+/// extra 16 bytes a post-`daemon_device_id` daemon appends. See
+/// `read_handshake_response` for the detection strategy.
+const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Length in bytes of the daemon_device_id prefix new daemons add to SCREX_OK bodies.
+const DEVICE_ID_LEN: usize = 16;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Message sent from the UDP receiver thread to the decoder thread.
@@ -298,6 +304,11 @@ struct BackendWorker {
     next_session_id: u64,
     frame_slot: FrameSlotRef,
     blank_stream_retry_attempted: bool,
+    /// The camera mode most recently picked by the user, kept up to date
+    /// regardless of whether the webcam is currently capturing so that
+    /// enabling the camera later uses the selected mode instead of a
+    /// hardcoded default.
+    selected_camera_mode: Option<CameraConfig>,
 }
 
 impl BackendWorker {
@@ -317,6 +328,7 @@ impl BackendWorker {
             next_session_id: 1,
             frame_slot,
             blank_stream_retry_attempted: false,
+            selected_camera_mode: None,
         }
     }
 
@@ -740,10 +752,15 @@ impl BackendWorker {
     }
 
     fn handle_set_camera_mode(&mut self, mode: String) {
-        if let Some(active) = &self.active {
-            match parse_camera_mode(&mode) {
-                Some(config) => {
-                    // Only send CAMCFG if camera is currently active.
+        match parse_camera_mode(&mode) {
+            Some(config) => {
+                // Always remember the selection, whether or not the webcam is
+                // currently capturing, so a later "enable camera" uses it
+                // instead of falling back to the hardcoded default.
+                self.selected_camera_mode = Some(config);
+
+                if let Some(active) = &self.active {
+                    // Only send CAMCFG immediately if camera is currently active.
                     // If camera is off, the new mode will be used when camera is next enabled.
                     if active.webcam_capture.is_some() {
                         if let Err(error) = active.control.send_camera_config(config) {
@@ -763,11 +780,11 @@ impl BackendWorker {
                         )));
                     }
                 }
-                None => {
-                    (self.ui)(UiEvent::SetStatus(
-                        "Could not parse the selected camera mode.".into(),
-                    ));
-                }
+            }
+            None => {
+                (self.ui)(UiEvent::SetStatus(
+                    "Could not parse the selected camera mode.".into(),
+                ));
             }
         }
     }
@@ -807,13 +824,13 @@ impl BackendWorker {
         if let Some(active) = &mut self.active {
             if enabled {
                 if active.webcam_capture.is_none() {
-                    // Parse the current camera mode for resolution/fps.
-                    // We'll use 1280x720@30 as a safe default if parsing fails.
-                    let config = CameraConfig {
+                    // Use the mode most recently picked by the user, if any.
+                    // Fall back to 1280x720@30 only when nothing was selected.
+                    let config = self.selected_camera_mode.unwrap_or(CameraConfig {
                         width: 1280,
                         height: 720,
                         fps: 30,
-                    };
+                    });
                     // Tell the daemon to create the virtual webcam with our config
                     if let Err(e) = active.control.send_camera_config(config) {
                         (self.ui)(UiEvent::SetStatus(format!(
@@ -938,7 +955,7 @@ fn pair_flow(endpoint: EndpointInfo, device_id: [u8; 16]) -> Result<ConnectResul
             }))
         }
         HandshakeKind::Ok => {
-            if body.len() != 64 {
+            if body.len() != 64 && body.len() != 64 + DEVICE_ID_LEN {
                 bail!("invalid reconnect payload from pair flow");
             }
             bail!("daemon recognized this device as already paired, but no local pairing key was available")
@@ -975,11 +992,8 @@ fn complete_pairing(
         HandshakeKind::Busy => bail!("daemon became busy during pairing"),
         HandshakeKind::Pin => bail!("daemon requested another PIN unexpectedly"),
         HandshakeKind::Ok => {
-            if body.len() != 64 {
-                bail!("invalid final pairing response");
-            }
-            let session_salt = &body[..32];
-            let server_hmac = &body[32..64];
+            let (session_salt, server_hmac) =
+                parse_ok_body(&body).context("invalid final pairing response")?;
 
             let mut ikm = pending.ecdh_secret.clone();
             ikm.extend_from_slice(pin.as_bytes());
@@ -1029,11 +1043,8 @@ fn hello_flow(
         HandshakeKind::Reject => bail!("daemon no longer recognizes this device; pair again"),
         HandshakeKind::Pin => bail!("daemon requested PIN during HELLO unexpectedly"),
         HandshakeKind::Ok => {
-            if body.len() != 64 {
-                bail!("invalid HELLO response payload");
-            }
-            let server_nonce = &body[..32];
-            let server_hmac = &body[32..64];
+            let (server_nonce, server_hmac) =
+                parse_ok_body(&body).context("invalid HELLO response payload")?;
             let mut salt = Vec::with_capacity(64);
             salt.extend_from_slice(&client_nonce);
             salt.extend_from_slice(server_nonce);
@@ -1089,10 +1100,48 @@ fn read_handshake_response(stream: &mut TcpStream) -> Result<(HandshakeKind, Vec
         stream
             .read_exact(&mut body[2..])
             .context("read OK handshake body")?;
+
+        // Daemons updated for `daemon_device_id` send a body of
+        // SCREX_OK(10) + daemon_device_id(16) + salt_or_nonce(32) + hmac(32) = 80 bytes.
+        // Older daemons send SCREX_OK(10) + salt_or_nonce(32) + hmac(32) = 64 bytes.
+        // We don't know ahead of time which layout this daemon speaks, so probe
+        // for the extra 16 bytes with a short read timeout: the daemon writes the
+        // whole handshake response in a single write_all + flush, so on an
+        // up-to-date daemon those bytes are already sitting in the kernel receive
+        // buffer by the time we get here and this returns almost instantly. On an
+        // old daemon nothing more is ever coming, so we bound the wait instead of
+        // blocking forever and fall back to the legacy 64-byte layout.
+        let prev_timeout = stream.read_timeout().ok().flatten();
+        stream.set_read_timeout(Some(HANDSHAKE_PROBE_TIMEOUT)).ok();
+        let mut extra = [0u8; DEVICE_ID_LEN];
+        let got_extra = stream.read_exact(&mut extra).is_ok();
+        stream.set_read_timeout(prev_timeout).ok();
+        if got_extra {
+            body.extend_from_slice(&extra);
+        }
+
         return Ok((HandshakeKind::Ok, body));
     }
 
     bail!("unexpected handshake response")
+}
+
+/// Splits a SCREX_OK handshake body into (salt_or_nonce, server_hmac),
+/// transparently handling both the legacy 64-byte layout
+/// (salt_or_nonce(32) + hmac(32)) and the newer 80-byte layout
+/// (daemon_device_id(16) + salt_or_nonce(32) + hmac(32)). The daemon_device_id
+/// is parsed and discarded; the client has no local use for it today.
+fn parse_ok_body(body: &[u8]) -> Result<(&[u8], &[u8])> {
+    let len = body.len();
+    if len == 64 {
+        Ok((&body[..32], &body[32..64]))
+    } else if len == 64 + DEVICE_ID_LEN {
+        Ok((&body[DEVICE_ID_LEN..DEVICE_ID_LEN + 32], &body[DEVICE_ID_LEN + 32..]))
+    } else if len < 64 {
+        bail!("handshake OK response too short ({len} bytes)")
+    } else {
+        bail!("handshake OK response has unexpected length ({len} bytes)")
+    }
 }
 
 fn spawn_control_receiver(
@@ -1622,8 +1671,9 @@ fn spawn_udp_runtime(
 
                 // Drop stale packets for already-completed frames
                 if has_received_first_frame
-                    && frame_id < last_completed_frame_id
-                    && (last_completed_frame_id - frame_id) < 0x8000_0000
+                    && (frame_id == last_completed_frame_id
+                        || (frame_id < last_completed_frame_id
+                            && (last_completed_frame_id - frame_id) < 0x8000_0000))
                 {
                     stale_drop_count += 1;
                     if stale_drop_count <= 5 || stale_drop_count % 200 == 0 {
@@ -1697,6 +1747,25 @@ fn spawn_udp_runtime(
                     if let Some(assembly) = video_frames.remove(&fid) {
                         if assembly.can_recover() {
                             if let Some(annex_b) = assembly.reassemble() {
+                                if has_received_first_frame && fid > last_completed_frame_id + 1 {
+                                    let gap = fid - last_completed_frame_id - 1;
+                                    if gap > 0 && gap < 0x8000_0000 {
+                                        if should_send_pli(&mut last_pli_at) {
+                                            println!(
+                                                "[desktop/video] frame gap: last={} current={} gap={} -> PLI",
+                                                last_completed_frame_id, fid, gap,
+                                            );
+                                            let _ = control.send_pli();
+                                        }
+                                    }
+                                }
+
+                                last_completed_frame_id = fid;
+                                has_received_first_frame = true;
+                                av_sync.update_video(assembly.timestamp_ms);
+                                stats.note_frame();
+                                completed_frame_count += 1;
+
                                 let job = DecodeJob {
                                     annex_b,
                                     frame_id: fid,
@@ -1715,13 +1784,17 @@ fn spawn_udp_runtime(
                             let is_idr = assembly.flags & 0x01 != 0;
                             let age_ms = now.duration_since(assembly.created_at).as_millis();
                             println!(
-                                    "[desktop/video] dropped frame {} ({}) got {}/{} shards (need {}) age={}ms",
+                                    "[desktop/video] dropped frame {} ({}) got {}/{} shards (need {}) parity={} age={}ms present=[{}] dup={} invalid={}",
                                     fid,
                                     if is_idr { "IDR" } else { "P" },
                                     got,
                                     total,
                                     needed,
+                                    assembly.total_parity,
                                     age_ms,
+                                    assembly.present_summary(),
+                                    assembly.duplicate_count,
+                                    assembly.invalid_count,
                                 );
                             had_unrecoverable = true;
                             dropped_frame_count += 1;
@@ -2220,6 +2293,8 @@ struct FrameAssembly {
     /// Actual (pre-padding) payload length for each shard.
     actual_lengths: Vec<usize>,
     received_count: usize,
+    duplicate_count: usize,
+    invalid_count: usize,
     codec_id: u8,
     flags: u8,
     timestamp_ms: u32,
@@ -2242,6 +2317,8 @@ impl FrameAssembly {
             present: vec![false; total_shards],
             actual_lengths: vec![0usize; total_shards],
             received_count: 0,
+            duplicate_count: 0,
+            invalid_count: 0,
             codec_id,
             flags,
             timestamp_ms,
@@ -2251,9 +2328,11 @@ impl FrameAssembly {
     fn add_chunk(&mut self, index: usize, payload: &[u8], actual_len: usize) {
         let total_shards = self.total_data + self.total_parity;
         if index >= total_shards {
+            self.invalid_count += 1;
             return;
         }
         if self.present[index] {
+            self.duplicate_count += 1;
             return; // duplicate
         }
         // Copy payload into the fixed-size slot (zero-padded by initialization).
@@ -2310,6 +2389,32 @@ impl FrameAssembly {
             out.extend_from_slice(&shard[..actual_len.min(shard.len())]);
         }
         Some(out)
+    }
+
+    fn present_summary(&self) -> String {
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i < self.present.len() {
+            if !self.present[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i + 1 < self.present.len() && self.present[i + 1] {
+                i += 1;
+            }
+            if start == i {
+                ranges.push(start.to_string());
+            } else {
+                ranges.push(format!("{start}-{i}"));
+            }
+            i += 1;
+        }
+        if ranges.is_empty() {
+            "none".into()
+        } else {
+            ranges.join(",")
+        }
     }
 
     fn assemble_present_data(&self) -> Vec<u8> {
@@ -2469,24 +2574,53 @@ fn non_black_pixel_percent_sampled(rgba: &[u8]) -> f64 {
 
 fn dump_access_unit(frame_id: u32, codec_id: u8, is_idr: bool, annex_b: &[u8]) {
     let ext = if codec_id == 0x01 { "h265" } else { "h264" };
-    let path = format!("/tmp/screx-au-{frame_id:06}.{ext}");
+    let path = std::env::temp_dir().join(format!("screx-au-{frame_id:06}.{ext}"));
+    let mut nals = Vec::new();
+    let mut pos = 0;
+    while pos + 3 < annex_b.len() && nals.len() < 16 {
+        let sc_len = if annex_b[pos] == 0
+            && annex_b[pos + 1] == 0
+            && annex_b[pos + 2] == 0
+            && annex_b[pos + 3] == 1
+        {
+            4
+        } else if annex_b[pos] == 0 && annex_b[pos + 1] == 0 && annex_b[pos + 2] == 1 {
+            3
+        } else {
+            pos += 1;
+            continue;
+        };
+        let nal_start = pos + sc_len;
+        if nal_start < annex_b.len() {
+            let nal_type = if codec_id == 0x01 {
+                (annex_b[nal_start] >> 1) & 0x3f
+            } else {
+                annex_b[nal_start] & 0x1f
+            };
+            nals.push(nal_type);
+        }
+        pos = nal_start + 1;
+    }
     match fs::write(&path, annex_b) {
         Ok(()) => {
             let prefix_len = annex_b.len().min(24);
             println!(
-                "[desktop/video] dumped access unit frame_id={} codec={} idr={} bytes={} path={} prefix={:02x?}",
+                "[desktop/video] dumped access unit frame_id={} codec={} idr={} bytes={} path={} nals={:?} prefix={:02x?}",
                 frame_id,
                 codec_id,
                 is_idr,
                 annex_b.len(),
-                path,
+                path.display(),
+                nals,
                 &annex_b[..prefix_len]
             );
         }
         Err(error) => {
             eprintln!(
                 "[desktop/video] failed to dump access unit frame_id={} to {}: {}",
-                frame_id, path, error
+                frame_id,
+                path.display(),
+                error
             );
         }
     }
@@ -2651,6 +2785,10 @@ impl AppStorage {
         self.state
             .recent_connections
             .retain(|c| c.host != host || c.port != port);
+        // Also forget the trust relationship (pairing key) for this endpoint,
+        // otherwise a "deleted" connection would silently reconnect via HELLO
+        // next time the same host:port is entered.
+        self.state.pairings.remove(&format!("{host}:{port}"));
         self.save().ok();
     }
 

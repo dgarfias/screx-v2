@@ -290,11 +290,32 @@ impl InputBackend for WindowsInput {
                 mi.dy = dy as i32;
             }
             MouseEvent::MoveAbsolute { x, y } => {
-                let (sw, sh) = self.screen_size();
-                if sw > 0 && sh > 0 {
-                    mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-                    mi.dx = ((x as i32 * 65535) / sw).clamp(0, 65535);
-                    mi.dy = ((y as i32 * 65535) / sh).clamp(0, 65535);
+                // The wire coordinate is normalized 0..65535 across the
+                // captured output's content area (matching the iPad and the
+                // desktop client's letterbox-aware `send_mouse_move_raw`).
+                // Map it onto the VDD's actual on-screen position, the same
+                // way touch coordinates are offset by `state.rect`.
+                let state = self.touch_state.lock().unwrap();
+                let (left, top, width, height) = state.rect;
+                drop(state);
+                if width > 0 && height > 0 {
+                    let fx = x as f32 / 65535.0;
+                    let fy = y as f32 / 65535.0;
+                    let abs_x = left + (fx * width as f32) as i32;
+                    let abs_y = top + (fy * height as f32) as i32;
+                    // MOUSEEVENTF_ABSOLUTE maps 0..65535 to the *entire* virtual
+                    // desktop, so first convert the absolute screen point to
+                    // the normalized range Windows expects.
+                    let (sw, sh) = self.screen_size();
+                    if sw > 0 && sh > 0 {
+                        mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+                        // Windows uses an exclusive range (0..65535 maps to
+                        // 0..sw-1), so multiply by 65535 and clamp.
+                        mi.dx = (((abs_x as i64) * 65535) / (sw as i64 - 1))
+                            .clamp(0, 65535) as i32;
+                        mi.dy = (((abs_y as i64) * 65535) / (sh as i64 - 1))
+                            .clamp(0, 65535) as i32;
+                    }
                 }
             }
             MouseEvent::Button { btn, state } => {
