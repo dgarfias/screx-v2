@@ -2,42 +2,50 @@
 
 ## Overview
 
-Screx is a Linux-to-iPad remote display system built around a virtual monitor on Linux and a custom low-latency client on iPad.
+Screx is a remote display system built around a virtual monitor on a host machine (Linux or
+Windows) and custom low-latency clients on iPad and desktop (macOS/Windows/Linux).
 
 At a high level:
 
-- the Linux daemon creates a virtual display via EVDI
-- the desktop compositor renders to that virtual display
-- the daemon captures, encodes, and streams video/audio to the iPad
-- the iPad sends back touch, keyboard, mouse, controller, microphone, camera, and session control messages
+- the daemon creates a virtual display (EVDI on Linux, a DXGI-duplicated virtual monitor via a
+  third-party driver on Windows)
+- the host compositor renders to that virtual display
+- the daemon captures, encodes, and streams video/audio to the client
+- the client sends back touch/mouse/keyboard, controller, microphone, camera, and session control
+  messages
+
+The daemon binary and wire protocol are the same across host platforms — see
+[DAEMON_LINUX.md](DAEMON_LINUX.md) and [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for platform-specific
+build/run/driver details. Either daemon works with either client — see
+[CLIENT_IPAD.md](CLIENT_IPAD.md) and [CLIENT_DESKTOP.md](CLIENT_DESKTOP.md).
 
 The system supports two transports:
 
 - **Network**
   - UDP for media
   - encrypted TCP for pairing and control
-- **USB**
-  - framed TCP over `iproxy`
+- **USB** (iPad client only)
+  - framed TCP over `iproxy` (Linux) / Apple Mobile Device Service (Windows)
 
 ## High-Level Data Flow
 
 ```text
-Linux desktop/compositor
-    -> EVDI virtual monitor
+Host desktop/compositor
+    -> virtual monitor (EVDI / DXGI duplication)
     -> capture
     -> encode
     -> transport
-    -> iPad decode/display
+    -> client decode/display
 
-iPad input/peripherals
+Client input/peripherals
     -> control transport
-    -> Linux daemon
-    -> uinput / PipeWire / v4l2loopback
+    -> daemon
+    -> uinput+PipeWire+v4l2loopback (Linux) / SendInput+WASAPI+DirectShow+ViGEmBus (Windows)
 ```
 
 ## Main Components
 
-### Linux daemon
+### Daemon (shared core)
 
 Key files:
 
@@ -49,34 +57,50 @@ Key files:
 - `daemon/src/usb.rs`
 - `daemon/src/audio.rs`
 - `daemon/src/camera.rs`
-- `daemon/src/uinput.rs`
+- `daemon/src/input.rs`
 
 Responsibilities:
 
 - create and manage the virtual display
-- capture EVDI frames
+- capture frames from it
 - encode H.264/H.265
 - stream media over network or USB
 - manage pairing and session keys
-- inject touch/keyboard/mouse/controller input
-- expose virtual microphone and virtual webcam devices
-- expose an audio sink for playback on the iPad
+- parse touch/keyboard/mouse/controller input messages
+- expose virtual microphone, webcam, and speaker devices
+
+### Daemon (platform backends)
+
+Platform-specific implementations live behind the `crate::platform` module
+(`daemon/src/platform/mod.rs`), selected at compile time:
+
+- `daemon/src/platform/linux/` — EVDI virtual display, `uinput` virtual input devices,
+  PipeWire/PulseAudio, `v4l2loopback` webcam, `idevice_id`/`iproxy` for USB
+- `daemon/src/platform/windows/` — DXGI Desktop Duplication + a third-party Indirect Display
+  Driver for the virtual monitor (`display.rs`), `SendInput`-based input (`input.rs`), WASAPI +
+  "Steam Streaming Speakers" for audio (`wasapi.rs`, `audio_driver.rs`), a DirectShow capture
+  filter DLL for the virtual webcam (`vcam.rs`, `vcam_filter/lib.rs`), ViGEmBus for virtual Xbox
+  360 gamepads (`vigem.rs`), and native usbmuxd-protocol speech to Apple Mobile Device Service for
+  USB detection (`usbmux.rs`)
+
+See [DAEMON_LINUX.md](DAEMON_LINUX.md) and [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for the
+dependencies and drivers each backend needs.
 
 ### iPad app
 
 Key files:
 
-- `app/Screx/ScrexApp.swift`
-- `app/Screx/PairingService.swift`
-- `app/Screx/NetworkControlClient.swift`
-- `app/Screx/StreamClient.swift`
-- `app/Screx/USBListener.swift`
-- `app/Screx/Decoder.swift`
-- `app/Screx/DisplayView.swift`
-- `app/Screx/AudioPlayer.swift`
-- `app/Screx/MicCapture.swift`
-- `app/Screx/CameraCapture.swift`
-- `app/Screx/Crypto.swift`
+- `client/ipad/Screx/ScrexApp.swift`
+- `client/ipad/Screx/PairingService.swift`
+- `client/ipad/Screx/NetworkControlClient.swift`
+- `client/ipad/Screx/StreamClient.swift`
+- `client/ipad/Screx/USBListener.swift`
+- `client/ipad/Screx/Decoder.swift`
+- `client/ipad/Screx/DisplayView.swift`
+- `client/ipad/Screx/AudioPlayer.swift`
+- `client/ipad/Screx/MicCapture.swift`
+- `client/ipad/Screx/CameraCapture.swift`
+- `client/ipad/Screx/Crypto.swift`
 
 Responsibilities:
 
@@ -89,6 +113,27 @@ Responsibilities:
 - input forwarding
 - microphone and camera forwarding
 - connection-health UI and session state
+
+### Desktop client
+
+Key files:
+
+- `client/desktop/src/main.rs`, `backend.rs`, `app_state.rs`
+- `client/desktop/src/decoder.rs`, `video_surface.rs`
+- `client/desktop/src/input.rs`, `keyboard_grab.rs`
+- `client/desktop/src/audio_player.rs`, `mic_capture.rs`
+- `client/desktop/src/webcam_capture.rs`
+- `client/desktop/qml/Main.qml`
+
+Responsibilities (network transport only — no USB support):
+
+- connection UI (Qt Quick/QML) driving a Rust backend
+- PIN pairing flow
+- network media receive path, with zero-copy hardware-accelerated decode/display where available
+  (VA-API on Linux, D3D11VA on Windows)
+- local audio playback and microphone capture
+- input forwarding, including OS-level keyboard grabbing
+- webcam forwarding via `nokhwa`
 
 ## Transport Model
 
@@ -344,22 +389,22 @@ External keyboard HID-like packets use `"RAWKEY"`.
 
 ### Speakers
 
-- Linux creates a virtual sink named `screx_ipad`
-- daemon captures from `screx_ipad.monitor`
-- audio is sent to the iPad
+- Linux creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`; Windows
+  installs/enables the "Steam Streaming Speakers" device and loopback-captures it via WASAPI
+- audio is sent to the client
 - the speaker toggle can hard-detach the sink using the `SPKR` control message
 
 ### Microphone
 
-- iPad captures microphone audio
-- encodes as Opus
-- daemon decodes and exposes a virtual microphone source
+- the client captures microphone audio and encodes it as Opus
+- on Linux the daemon decodes and exposes a virtual microphone source via PipeWire/PulseAudio; on
+  Windows it decodes into VB-Audio VB-CABLE's input
 
 ### Camera
 
-- iPad captures camera frames
-- frames are JPEG-compressed
-- daemon writes them into a `v4l2loopback` webcam device
+- the client captures camera frames as JPEG
+- on Linux the daemon writes them into a `v4l2loopback` webcam device; on Windows it writes them
+  into a shared-memory buffer read by a registered DirectShow capture filter (`screx_vcam.dll`)
 
 ## Connection Health Model
 
@@ -377,7 +422,9 @@ The iPad app uses explicit session-health states such as:
 
 These states are driven by transport events instead of only raw status strings.
 
-## Virtual Devices on Linux
+## Virtual Devices
+
+### Linux
 
 The daemon may create:
 
@@ -387,11 +434,26 @@ The daemon may create:
 - `uinput` virtual mouse
 - up to 4 `uinput` virtual gamepads
 - `v4l2loopback` virtual webcam
-- PipeWire / PulseAudio virtual sink for iPad speakers
-- PipeWire virtual source for iPad microphone
+- PipeWire / PulseAudio virtual sink for client speakers
+- PipeWire virtual source for client microphone
+
+### Windows
+
+The daemon may create/enable:
+
+- a virtual display devnode bound to a third-party Indirect Display Driver
+- a DirectShow virtual webcam filter (`screx_vcam.dll`, registered under
+  `CLSID_VideoInputDeviceCategory`)
+- up to 4 virtual Xbox 360 gamepads via ViGEmBus
+- a "Steam Streaming Speakers" devnode for client speaker output
+- input injection via `SendInput` (no persistent device object)
+
+Microphone forwarding on Windows relies on the separately-installed VB-Audio VB-CABLE rather than
+a daemon-managed device — see [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md).
 
 ## Notes on Compatibility
 
 - Network mode is the main path for pairing and remote use.
-- USB mode is lower-latency and more stable when tethered.
-- The virtual webcam uses `v4l2loopback`; some applications behave differently depending on `exclusive_caps` mode. See the v4l2loopback troubleshooting notes in the ArchWiki for compatibility context: [ArchWiki: v4l2loopback Troubleshooting](https://wiki.archlinux.org/title/V4l2loopback#Troubleshooting).
+- USB mode (iPad only) is lower-latency and more stable when tethered.
+- The Linux virtual webcam uses `v4l2loopback`; some applications behave differently depending on `exclusive_caps` mode. See the v4l2loopback troubleshooting notes in the ArchWiki for compatibility context: [ArchWiki: v4l2loopback Troubleshooting](https://wiki.archlinux.org/title/V4l2loopback#Troubleshooting).
+- See [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for the Windows-specific drivers required and their compatibility notes.
