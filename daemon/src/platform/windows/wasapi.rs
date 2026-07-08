@@ -149,6 +149,17 @@ impl AudioBackend for WasapiBackend {
     fn destroy_mic(&mut self) {}
 }
 
+/// Cheap capability probe: true if the Steam Streaming Speakers endpoint is
+/// currently enumerable. Mirrors the lookup `run_wasapi_loopback` performs
+/// before falling back to the plain default output device — does not open
+/// the endpoint, just checks it exists.
+pub fn probe_speaker_available() -> bool {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    policy_config::find_endpoint_by_friendly_name(audio_driver::STEAM_SPK_FRIENDLY_NAME).is_ok()
+}
+
 unsafe fn run_wasapi_loopback(stop: &AtomicBool, on_chunk: &mut dyn FnMut(&[u8])) -> Result<()> {
     // COM may already be initialized on this thread; ignore that error.
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -341,6 +352,16 @@ impl MicSink for VbCableMicSink {
             }
         }
     }
+}
+
+/// Cheap capability probe: true if a VB-CABLE capture endpoint is currently
+/// enumerable. Mirrors the lookup `create_vbcable_mic` performs before it
+/// actually activates the endpoint — does not open the device.
+pub fn probe_mic_available() -> bool {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    find_vbcable_endpoint(eCapture, VB_CABLE_CAPTURE_NAMES, DEVICE_STATE_ACTIVE).is_ok()
 }
 
 unsafe fn create_vbcable_mic() -> Result<Box<dyn MicSink>> {

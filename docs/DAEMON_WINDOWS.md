@@ -104,9 +104,13 @@ cd daemon
 .\target\release\screx.exe unpair --all
 ```
 
-Same CLI flags as the [Linux daemon](DAEMON_LINUX.md#run) — see that page's flag table (`-w`,
-`-H`, `-f`, `-k`, `-b`, `-p`, `-e`, `-c`, `-v`, `--network-only`, `--usb-only`); `-e/--backend
-vaapi` and `--no-camera-exclusive-caps` are Linux-only and have no effect on Windows.
+Same CLI flags as the [Linux daemon](DAEMON_LINUX.md#run) — see that page's flag table (`-w,
+--max-width`, `-H, --max-height`, `-f, --max-framerate`, `-k, --keyframe`, `-b, --max-bitrate`,
+`-p, --port`, `-e, --backend`, `-c, --codec`, `-v, --verbose`, `--network-only`, `--usb-only`);
+`-w`/`-H`/`-f`/`-b` are per-daemon ceilings and defaults, not fixed values — connecting clients may
+request lower values during connection (see
+[ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation)). `-e/--backend vaapi` and
+`--no-camera-exclusive-caps` are Linux-only and have no effect on Windows.
 
 ## Use
 

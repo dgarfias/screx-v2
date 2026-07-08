@@ -72,11 +72,11 @@ cd daemon
 # Basic
 sudo ./target/release/screx
 
-# 1080p, 60 fps, H.264 via VA-API
-sudo ./target/release/screx -w 1920 -H 1080 -f 60 -b vaapi -c h264
+# Cap sessions at 1080p/60fps, H.264 via VA-API
+sudo ./target/release/screx -w 1920 -H 1080 -f 60 -e vaapi -c h264
 
-# H.265 with NVENC
-sudo ./target/release/screx --codec h265 --backend nvenc --bitrate 10M
+# H.265 with NVENC, 10 Mbps bitrate ceiling
+sudo ./target/release/screx --codec h265 --backend nvenc --max-bitrate 10M
 
 # Network only
 sudo ./target/release/screx --network-only
@@ -98,18 +98,24 @@ sudo ./target/release/screx unpair --all
 
 | Flag | Default | Description |
 |---|---|---|
-| `-w, --width` | `2160` | Virtual display width |
-| `-H, --height` | `1620` | Virtual display height |
-| `-f, --framerate` | `30` | Target framerate |
+| `-w, --max-width` | `3840` | Maximum display width clients may request (also the default when a client doesn't ask) |
+| `-H, --max-height` | `2160` | Maximum display height clients may request (also the default when a client doesn't ask) |
+| `-f, --max-framerate` | `60` | Maximum framerate clients may request (also the default when a client doesn't ask) |
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
-| `-b, --bitrate` | `8M` | Encoder bitrate (e.g. `8000000`, `8M`, `500K`) |
+| `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
 | `-p, --port` | `9000` | UDP/TCP streaming port |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
-| `-c, --codec` | `h264` | Video codec: `h264`, `h265` |
+| `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
 | `-v, --verbose` | off | Detailed diagnostic logs |
 | `--network-only` | off | Disable USB transport |
 | `--usb-only` | off | Disable network pairing and UDP streaming |
 | `--no-camera-exclusive-caps` | off | Disable v4l2loopback exclusive capture caps for better app compatibility |
+
+`--max-width`/`--max-height`/`--max-framerate`/`--max-bitrate` are per-daemon ceilings and defaults,
+not fixed values every session gets: connecting clients may propose any resolution, framerate,
+codec, or bitrate at or below these bounds during connection, and the daemon starts that session
+with the negotiated values. See [ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation) for the
+negotiation protocol.
 
 ## Use
 

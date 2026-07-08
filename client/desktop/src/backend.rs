@@ -23,6 +23,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::audio_player::AudioPlayer;
+use crate::capabilities::{self, DaemonCapabilities, StreamSettingsChoice};
 use crate::decoder::{CodecId, DecodedOutput, FrameBufferPool, VideoDecoder};
 use crate::mic_capture::MicCapture;
 use crate::video_surface::{DisplayFrame, FrameSlotRef, RawFrame};
@@ -43,6 +44,9 @@ const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const DEVICE_ID_LEN: usize = 16;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const PLI_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// How long to wait for a `CAPS` frame after session establishment before
+/// assuming a legacy daemon (see the backward-compatibility matrix).
+const CAPS_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Message sent from the UDP receiver thread to the decoder thread.
 struct DecodeJob {
     annex_b: Vec<u8>,
@@ -61,6 +65,13 @@ const MAGIC_REJECT: &[u8] = b"SCREX_REJECT";
 const MAGIC_REGISTER: &[u8] = b"SCREX";
 const MAGIC_PLI: &[u8] = b"PLI";
 const MAGIC_HOST: &[u8] = b"HOST";
+/// Capability-negotiation TLV messages — see `crate::capabilities` for the
+/// wire format. Defined here alongside the other magic constants per this
+/// file's convention; the actual byte values live in `capabilities` so the
+/// TLV module is self-contained.
+const MAGIC_CAPS: &[u8] = capabilities::MAGIC_CAPS;
+#[allow(dead_code)] // referenced via capabilities::build_stng, not by literal here
+const MAGIC_STNG: &[u8] = capabilities::MAGIC_STNG;
 const MAGIC_DISCONNECT: &[u8] = b"DISCONNECT";
 const MAGIC_SPEAKER: &[u8] = b"SPKR";
 const MAGIC_MICCFG: &[u8] = b"MICCFG";
@@ -123,6 +134,16 @@ impl BackendHandle {
 
     pub fn load_connections(&self) {
         let _ = self.tx.send(BackendCommand::LoadConnections);
+    }
+
+    /// Persist the user's stream-settings picks (resolution/framerate/codec/
+    /// bitrate presets from the settings dialog). Applied — clamped against
+    /// the daemon's advertised `CAPS` — the next time a session is
+    /// established; see `BackendWorker::handle_caps_received`.
+    pub fn set_stream_settings(&self, choice: StreamSettingsChoice) {
+        let _ = self
+            .tx
+            .send(BackendCommand::SetStreamSettings { choice });
     }
 
     pub fn toggle_pinned(&self, host: String, port: u16) {
@@ -225,6 +246,20 @@ enum BackendCommand {
         session_id: u64,
         hostname: String,
     },
+    /// Parsed from an inbound `CAPS` control frame by `spawn_control_receiver`.
+    CapsReceived {
+        session_id: u64,
+        caps: DaemonCapabilities,
+    },
+    /// Fired ~2s after session establishment if `CapsReceived` never arrived
+    /// — see the Backward Compatibility matrix in the plan: treat this as a
+    /// legacy daemon, assume everything is available, and never send `STNG`.
+    CapsTimeout {
+        session_id: u64,
+    },
+    SetStreamSettings {
+        choice: StreamSettingsChoice,
+    },
 }
 
 #[derive(Clone)]
@@ -246,6 +281,9 @@ pub enum UiEvent {
     ClearPinPrompt,
     SetConnections(Vec<RecentConnection>),
     SetCameraEnabled(bool),
+    /// Daemon-advertised capabilities, either parsed from `CAPS` or the
+    /// permissive default (all-true) used for legacy daemons / on disconnect.
+    SetCapabilities(DaemonCapabilities),
     /// Give the UI thread a direct handle to the TCP control sender
     /// so mouse/key events bypass the mpsc channel entirely.
     SetDirectControl(Option<Arc<ControlSender>>),
@@ -276,6 +314,16 @@ pub fn load_connections_json() -> String {
         }
         Err(_) => "[]".into(),
     }
+}
+
+/// Load the user's persisted stream-settings picks for eager UI
+/// initialization (`AppState::default`), so the settings dialog opens
+/// showing the last-used choices instead of resetting to "default" every
+/// app launch.
+pub fn load_stream_settings() -> StreamSettingsChoice {
+    AppStorage::load()
+        .map(|storage| storage.get_stream_settings_choice())
+        .unwrap_or_default()
 }
 
 pub fn spawn_backend<F>(ui: F, frame_slot: FrameSlotRef) -> BackendHandle
@@ -439,6 +487,7 @@ impl BackendWorker {
                         latency_ms: 0,
                         dropped_frames: 0,
                     });
+                    (self.ui)(UiEvent::SetCapabilities(DaemonCapabilities::default()));
                 }
             }
             BackendCommand::LoadConnections => {
@@ -468,6 +517,13 @@ impl BackendWorker {
                         self.push_connections_to_ui();
                     }
                 }
+            }
+            BackendCommand::CapsReceived { session_id, caps } => {
+                self.handle_caps_received(session_id, caps)
+            }
+            BackendCommand::CapsTimeout { session_id } => self.handle_caps_timeout(session_id),
+            BackendCommand::SetStreamSettings { choice } => {
+                self.storage.set_stream_settings_choice(choice);
             }
         }
     }
@@ -641,6 +697,23 @@ impl BackendWorker {
             Arc::clone(&av_sync),
         );
 
+        // Wait (in a dedicated thread, so the worker loop stays responsive)
+        // for either a CAPS frame to arrive on the control receiver thread or
+        // a ~2s timeout. Whichever happens first resolves capability
+        // negotiation for this session — see handle_caps_received /
+        // handle_caps_timeout. This mirrors the "assume legacy daemon after
+        // 2s" rule from the backward-compatibility matrix.
+        {
+            let timeout_tx = self.tx.clone();
+            let timeout_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                thread::sleep(CAPS_TIMEOUT);
+                if !timeout_stop.load(Ordering::Relaxed) {
+                    let _ = timeout_tx.send(BackendCommand::CapsTimeout { session_id });
+                }
+            });
+        }
+
         self.active = Some(ActiveSession {
             session_id,
             control,
@@ -653,7 +726,49 @@ impl BackendWorker {
             reconnect_host,
             server_port: bootstrap.server_addr.port(),
             speaker_enabled,
+            caps_resolved: false,
         });
+    }
+
+    /// Called when a `CAPS` frame has been parsed off the wire for the given
+    /// session. Clamps the user's persisted stream-settings choice against
+    /// what the daemon actually advertised and sends exactly one `STNG`
+    /// frame. A no-op if this session already resolved capabilities (e.g.
+    /// the 2s timeout already fired, or a duplicate CAPS arrived).
+    fn handle_caps_received(&mut self, session_id: u64, caps: DaemonCapabilities) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.session_id != session_id || active.caps_resolved {
+            return;
+        }
+        active.caps_resolved = true;
+        (self.ui)(UiEvent::SetCapabilities(caps.clone()));
+
+        let choice = self.storage.get_stream_settings_choice();
+        let requested = choice.to_requested();
+        let clamped = capabilities::clamp_settings(&requested, &caps);
+        let stng = capabilities::build_stng(&clamped);
+        if let Err(error) = active.control.send_payload(&stng) {
+            (self.ui)(UiEvent::SetStatus(format!(
+                "Failed to send stream settings: {error:#}"
+            )));
+        }
+    }
+
+    /// Called ~2s after session establishment if no CAPS frame ever arrived.
+    /// Per the backward-compatibility matrix, this means "legacy daemon":
+    /// assume every feature is available and send nothing — an old daemon
+    /// may not tolerate an unrecognized `STNG` prefix.
+    fn handle_caps_timeout(&mut self, session_id: u64) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.session_id != session_id || active.caps_resolved {
+            return;
+        }
+        active.caps_resolved = true;
+        (self.ui)(UiEvent::SetCapabilities(DaemonCapabilities::default()));
     }
 
     fn handle_retry_blank_stream(&mut self, session_id: u64) {
@@ -712,6 +827,7 @@ impl BackendWorker {
                     latency_ms: 0,
                     dropped_frames: 0,
                 });
+                (self.ui)(UiEvent::SetCapabilities(DaemonCapabilities::default()));
             }
         } else if !quiet {
             (self.ui)(UiEvent::SetConnecting(false));
@@ -719,6 +835,7 @@ impl BackendWorker {
             (self.ui)(UiEvent::SetDirectControl(None));
             (self.ui)(UiEvent::SetConnected(false));
             (self.ui)(UiEvent::SetStatus("No active session.".into()));
+            (self.ui)(UiEvent::SetCapabilities(DaemonCapabilities::default()));
         }
     }
 
@@ -877,6 +994,10 @@ struct ActiveSession {
     reconnect_host: String,
     server_port: u16,
     speaker_enabled: bool,
+    /// Set once this session's capability negotiation has resolved, either
+    /// via a received `CAPS` frame or the timeout fallback. Guards against
+    /// double-handling (e.g. a late CAPS after the timeout already fired).
+    caps_resolved: bool,
 }
 
 const PERIPH_MOUSE: u8 = 0x01;
@@ -1225,6 +1346,10 @@ fn spawn_control_receiver(
                         hostname,
                     });
                 }
+            } else if payload.starts_with(MAGIC_CAPS) {
+                if let Some(caps) = capabilities::parse_caps(payload) {
+                    let _ = tx.send(BackendCommand::CapsReceived { session_id, caps });
+                }
             }
         }
     });
@@ -1261,7 +1386,7 @@ fn spawn_udp_runtime(
 
     // --- Decoder thread ---
     let decode_stop = Arc::clone(&stop);
-    let _decode_ui = Arc::clone(&ui);
+    let decode_ui = Arc::clone(&ui);
     let decode_tx_cmd = tx.clone();
     let decode_control = Arc::clone(&control);
     thread::spawn(move || {
@@ -1272,6 +1397,10 @@ fn spawn_udp_runtime(
         let mut mostly_black_frame_count: u32 = 0;
         let mut blank_stream_retry_queued = false;
         let mut last_pli_at: Option<Instant> = None;
+        // Drives the toolbar's codec/resolution labels — replaces the
+        // "Negotiating stream"/"Receiving stream" placeholders once the
+        // decoder actually knows the active codec and frame size.
+        let mut last_reported_dims: Option<(u32, u32)> = None;
 
         let mut debug_dump_au_remaining = std::env::var("SCREX_DUMP_ACCESS_UNITS")
             .ok()
@@ -1307,6 +1436,8 @@ fn spawn_udp_runtime(
                     Ok(dec) => {
                         decoder = Some(dec);
                         current_codec_id = Some(job.codec_id);
+                        let codec_label = if job.codec_id == 0x01 { "H.265" } else { "H.264" };
+                        decode_ui(UiEvent::SetCodecLabel(codec_label.to_string()));
                     }
                     Err(e) => {
                         eprintln!("[decoder-thread] decoder init failed: {e:#}");
@@ -1321,6 +1452,7 @@ fn spawn_udp_runtime(
                 match dec.decode(&job.annex_b, &mut pool) {
                     Ok(decoded_frames) => {
                         let decode_us = t0.elapsed().as_micros();
+                        let had_frames = !decoded_frames.is_empty();
                         for output in decoded_frames {
                             decoded_frame_count = decoded_frame_count.wrapping_add(1);
                             let au_len = job.annex_b.len();
@@ -1400,6 +1532,16 @@ fn spawn_udp_runtime(
                                         );
                                     }
                                 }
+                            }
+                        }
+                        if had_frames {
+                            let dims = (dec.last_width, dec.last_height);
+                            if dims.0 > 0 && dims.1 > 0 && last_reported_dims != Some(dims) {
+                                last_reported_dims = Some(dims);
+                                decode_ui(UiEvent::SetResolutionLabel(format!(
+                                    "{}x{}",
+                                    dims.0, dims.1
+                                )));
                             }
                         }
                     }
@@ -2676,6 +2818,11 @@ struct StoredState {
     pairings: HashMap<String, String>,
     #[serde(default)]
     recent_connections: Vec<RecentConnection>,
+    /// The user's stream-settings picks from the desktop settings dialog
+    /// (resolution/framerate/codec/bitrate presets). Applied — clamped
+    /// against the daemon's advertised CAPS — on the next connection.
+    #[serde(default)]
+    stream_settings: StreamSettingsChoice,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2829,6 +2976,15 @@ impl AppStorage {
 
     fn get_connections(&self) -> &[RecentConnection] {
         &self.state.recent_connections
+    }
+
+    fn get_stream_settings_choice(&self) -> StreamSettingsChoice {
+        self.state.stream_settings.clone()
+    }
+
+    fn set_stream_settings_choice(&mut self, choice: StreamSettingsChoice) {
+        self.state.stream_settings = choice;
+        self.save().ok();
     }
 
     fn save(&self) -> Result<()> {

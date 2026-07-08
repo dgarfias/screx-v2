@@ -13,6 +13,15 @@ use crate::input::{
     GPAD_BTN_START, GPAD_BTN_THUMBL, GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, GPAD_BTN_WEST,
 };
 
+/// Cheap capability probe: true if the ViGEmBus driver is installed and
+/// loadable right now. Reuses the exact `Client::connect()` check that
+/// `VirtualGamepads::client()` performs lazily on first attach, so this
+/// probe fails for the same reason ("ViGEmBus driver not installed") that
+/// a real attach would.
+pub fn probe_available() -> bool {
+    Client::connect().is_ok()
+}
+
 /// A pad's target plus whether its current run of update() failures has
 /// already been logged (reset on re-attach).
 struct Pad {

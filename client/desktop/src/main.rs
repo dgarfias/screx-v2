@@ -4,6 +4,7 @@
 mod app_state;
 mod audio_player;
 mod backend;
+mod capabilities;
 mod decoder;
 mod input;
 mod mic_capture;

@@ -12,6 +12,7 @@ final class NetworkControlClient {
     private static let micCfgMagic = Data("MICCFG".utf8)
     private static let cameraCfgMagic = Data("CAMCFG".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
+    private static let capsMagic = Data("CAPS".utf8)
     private static let maxControlFrame = 65536
 
     private var sendSeq: UInt32 = 0
@@ -23,6 +24,7 @@ final class NetworkControlClient {
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var onHostname: ((String) -> Void)?
+    var onCapabilities: ((DaemonCapabilities) -> Void)?
 
     init(connection: NWConnection, sessionKey: SymmetricKey) {
         self.connection = connection
@@ -184,6 +186,12 @@ final class NetworkControlClient {
             let hostname = String(decoding: hostData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !hostname.isEmpty else { return }
             onHostname?(hostname)
+        } else if payload.starts(with: Self.capsMagic) {
+            guard let capabilities = DaemonCapabilities.parse(payload) else {
+                log("failed to parse CAPS payload: \(payload.count) bytes")
+                return
+            }
+            onCapabilities?(capabilities)
         } else {
             log("unexpected inbound tcp control payload: \(payload.count) bytes")
         }
@@ -294,5 +302,11 @@ final class NetworkControlClient {
         var payload = Data("GPAD".utf8)
         payload.append(gamepadData)
         sendFrame(payload, label: "gpad")
+    }
+
+    /// Sends client-proposed stream settings (resolution/fps/codec/bitrate) to the
+    /// daemon in response to a `CAPS` message, per the capability-negotiation protocol.
+    func sendStreamSettings(_ settings: StreamSettings) {
+        sendFrame(settings.encode(), label: "stng")
     }
 }

@@ -10,7 +10,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter, CameraConfig};
-use crate::encode::EncodedAccessUnit;
+use crate::encode::{EncodedAccessUnit, EncoderBackend, VideoCodec};
 use crate::input::{
     parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, GamepadState,
     InputBackend, KeyboardWorker,
@@ -36,6 +36,36 @@ const GPAD_MAGIC: &[u8] = b"GPAD";
 const SPEAKER_MAGIC: &[u8] = b"SPKR";
 const MICCFG_MAGIC: &[u8] = b"MICCFG";
 const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
+const STNG_MAGIC: &[u8] = b"STNG";
+
+// Capability-negotiation wire format (daemon -> client `CAPS`, client ->
+// daemon `STNG`). See docs/ARCHITECTURE.md "Capability Negotiation" for the
+// canonical spec both clients implement independently.
+const CAPS_MAGIC: &[u8] = b"CAPS";
+const CAPS_VERSION: u8 = 1;
+const CAPS_TAG_CAMERA: u8 = 0x01;
+const CAPS_TAG_MICROPHONE: u8 = 0x02;
+const CAPS_TAG_SPEAKER: u8 = 0x03;
+const CAPS_TAG_GAMEPAD: u8 = 0x04;
+const CAPS_TAG_CODECS: u8 = 0x05;
+const CAPS_TAG_MAX_RESOLUTION: u8 = 0x06;
+const CAPS_TAG_MAX_FRAMERATE: u8 = 0x07;
+const CAPS_TAG_BITRATE_RANGE: u8 = 0x08;
+const CAPS_ENTRY_COUNT: u8 = 8;
+
+const STNG_TAG_RESOLUTION: u8 = 0x01;
+const STNG_TAG_FRAMERATE: u8 = 0x02;
+const STNG_TAG_CODEC: u8 = 0x03;
+const STNG_TAG_BITRATE: u8 = 0x04;
+
+/// Validation/clamping bounds for client-proposed `STNG` settings (see the
+/// plan's "Validation/clamping bounds" section). The bitrate floor is fixed,
+/// not operator-configurable; the ceilings come from the daemon's
+/// `--max-*` CLI flags, stored on `SharedState`.
+const STNG_RESOLUTION_FLOOR_W: u32 = 640;
+const STNG_RESOLUTION_FLOOR_H: u32 = 360;
+const STNG_FPS_FLOOR: u32 = 15;
+const STNG_BITRATE_FLOOR_BPS: u32 = 500_000;
 
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -109,6 +139,16 @@ impl AdaptiveStreamState {
         self.pframe_fec_percent = PFRAME_FEC_PERCENT;
         self.pli_events.clear();
         self.last_adjust_at = Instant::now();
+    }
+
+    /// Rebaseline the adaptive bitrate loop around a new base (e.g. a
+    /// client-negotiated `STNG` bitrate, or the CLI default restored when a
+    /// session ends). The adaptive loop in `adjust()` throttles up/down from
+    /// `base_bitrate_bps`, so changing it without also resetting the current
+    /// value would leave the stream ramping from the old client's bitrate.
+    fn set_base(&mut self, base_bitrate_bps: u32) {
+        self.base_bitrate_bps = base_bitrate_bps;
+        self.reset();
     }
 
     fn note_pli(&mut self, now: Instant) {
@@ -222,6 +262,23 @@ pub struct SharedState {
     pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
     /// Local source IP/interface pinned for daemon→client UDP (from TCP handshake)
     pub udp_source: Mutex<Option<UdpSource>>,
+    /// Ceilings advertised in `CAPS` and enforced when clamping `STNG`
+    /// requests — 1:1 with the daemon operator's `--max-width`/
+    /// `--max-height`/`--max-framerate`/`--max-bitrate` CLI flags. These
+    /// double as the session defaults used when a client never sends
+    /// `STNG` (or a tag within it), matching today's "one fixed config for
+    /// every session" behavior for old clients.
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_fps: u32,
+    pub bitrate_max_bps: u32,
+    pub encoder_backend: EncoderBackend,
+    /// Settings parsed out of a client's `STNG` control message, consumed
+    /// once by the capture thread at the start of the next session (see
+    /// `main.rs`'s capture loop). `None` means "no STNG received yet for
+    /// the pending session" — the capture thread waits briefly on the
+    /// condvar before falling back to the CLI/max defaults.
+    pub pending_settings: Arc<(Mutex<Option<RequestedSettings>>, Condvar)>,
 }
 
 impl SharedState {
@@ -229,6 +286,11 @@ impl SharedState {
         camera_exclusive_caps: bool,
         base_bitrate_bps: u32,
         input_backend: Arc<Mutex<dyn InputBackend>>,
+        max_width: u32,
+        max_height: u32,
+        max_fps: u32,
+        bitrate_max_bps: u32,
+        encoder_backend: EncoderBackend,
     ) -> Self {
         Self {
             client_addr: Mutex::new(None),
@@ -262,6 +324,12 @@ impl SharedState {
             adaptive_stream: Mutex::new(AdaptiveStreamState::new(base_bitrate_bps)),
             expected_client_ip: Mutex::new(None),
             udp_source: Mutex::new(None),
+            max_width,
+            max_height,
+            max_fps,
+            bitrate_max_bps,
+            encoder_backend,
+            pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
             start_time: Instant::now(),
         }
     }
@@ -306,6 +374,268 @@ impl SharedState {
     pub fn reset_stream_tuning(&self) {
         self.adaptive_stream.lock().unwrap().reset();
     }
+
+    /// Rebaseline the adaptive bitrate loop, e.g. to a client-negotiated
+    /// `STNG` bitrate at session start, or back to the CLI default when a
+    /// session ends so the next (possibly old-client) session isn't stuck
+    /// on the previous client's negotiated bitrate.
+    pub fn set_base_bitrate(&self, base_bitrate_bps: u32) {
+        self.adaptive_stream.lock().unwrap().set_base(base_bitrate_bps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability negotiation — `CAPS` (daemon -> client) and `STNG` (client ->
+// daemon). See docs/ARCHITECTURE.md "Capability Negotiation" for the wire
+// format; both clients implement it independently from scratch.
+// ---------------------------------------------------------------------------
+
+/// What this daemon can actually do right now, not just "compiled in."
+/// Rebuilt fresh for every `CAPS` message (see `build_caps_message`) rather
+/// than cached, since e.g. plugging in a driver after the daemon started
+/// should show up in the next connection's advertised capabilities.
+#[derive(Debug, Clone)]
+pub struct DaemonCapabilities {
+    pub camera: bool,
+    pub microphone: bool,
+    pub speaker: bool,
+    /// `None` = unsupported, `Some(n)` = max simultaneous controllers.
+    pub gamepad: Option<u8>,
+    pub codecs: Vec<VideoCodec>,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_fps: u32,
+    pub bitrate_min_bps: u32,
+    pub bitrate_max_bps: u32,
+}
+
+/// Client-proposed stream settings parsed out of `STNG`, already clamped
+/// against `DaemonCapabilities`. `None` fields mean "use the daemon's own
+/// default for that field" — either because the client omitted the tag, or
+/// because what it asked for wasn't usable (unsupported codec, etc).
+#[derive(Debug, Clone, Default)]
+pub struct RequestedSettings {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+    pub codec: Option<VideoCodec>,
+    pub bitrate_bps: Option<u32>,
+}
+
+/// Cheap, real probes (not just "compiled in") for what this daemon can
+/// actually do right now. Called both at startup (for an operator-visible
+/// log line) and fresh on every `CAPS` message — see `build_caps_message`.
+pub fn probe_capabilities(
+    max_width: u32,
+    max_height: u32,
+    max_fps: u32,
+    bitrate_max_bps: u32,
+    encoder_backend: EncoderBackend,
+) -> DaemonCapabilities {
+    DaemonCapabilities {
+        camera: crate::camera::probe_camera_available(),
+        microphone: crate::audio::probe_mic_available(),
+        speaker: crate::audio::probe_speaker_available(),
+        gamepad: crate::input::probe_gamepad_max_controllers(),
+        codecs: crate::encode::probe_available_codecs(encoder_backend),
+        max_width,
+        max_height,
+        max_fps,
+        bitrate_min_bps: STNG_BITRATE_FLOOR_BPS,
+        bitrate_max_bps,
+    }
+}
+
+fn push_tlv_entry(msg: &mut Vec<u8>, tag: u8, value: &[u8]) {
+    msg.push(tag);
+    msg.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    msg.extend_from_slice(value);
+}
+
+/// Build a `CAPS` control message frame body advertising what this daemon
+/// can do right now. Re-probes capabilities on every call (see
+/// `probe_capabilities`) rather than reading a cached value, so it's cheap
+/// by design — callers (pairing.rs, usb.rs) call this once per connection.
+pub fn build_caps_message(shared: &SharedState) -> Vec<u8> {
+    let caps = probe_capabilities(
+        shared.max_width,
+        shared.max_height,
+        shared.max_fps,
+        shared.bitrate_max_bps,
+        shared.encoder_backend,
+    );
+
+    let mut msg = Vec::with_capacity(64);
+    msg.extend_from_slice(CAPS_MAGIC);
+    msg.push(CAPS_VERSION);
+    msg.push(CAPS_ENTRY_COUNT);
+
+    push_tlv_entry(&mut msg, CAPS_TAG_CAMERA, &[caps.camera as u8]);
+    push_tlv_entry(&mut msg, CAPS_TAG_MICROPHONE, &[caps.microphone as u8]);
+    push_tlv_entry(&mut msg, CAPS_TAG_SPEAKER, &[caps.speaker as u8]);
+
+    let (gamepad_available, gamepad_max) = match caps.gamepad {
+        Some(max) => (1u8, max),
+        None => (0u8, 0u8),
+    };
+    push_tlv_entry(
+        &mut msg,
+        CAPS_TAG_GAMEPAD,
+        &[gamepad_available, gamepad_max],
+    );
+
+    let mut codecs_value = Vec::with_capacity(1 + caps.codecs.len());
+    codecs_value.push(caps.codecs.len() as u8);
+    codecs_value.extend(caps.codecs.iter().map(|c| c.transport_id()));
+    push_tlv_entry(&mut msg, CAPS_TAG_CODECS, &codecs_value);
+
+    let mut resolution_value = Vec::with_capacity(4);
+    resolution_value
+        .extend_from_slice(&(caps.max_width.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+    resolution_value
+        .extend_from_slice(&(caps.max_height.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+    push_tlv_entry(&mut msg, CAPS_TAG_MAX_RESOLUTION, &resolution_value);
+
+    push_tlv_entry(&mut msg, CAPS_TAG_MAX_FRAMERATE, &[caps.max_fps.min(255) as u8]);
+
+    let mut bitrate_value = Vec::with_capacity(8);
+    bitrate_value.extend_from_slice(&caps.bitrate_min_bps.to_be_bytes());
+    bitrate_value.extend_from_slice(&caps.bitrate_max_bps.to_be_bytes());
+    push_tlv_entry(&mut msg, CAPS_TAG_BITRATE_RANGE, &bitrate_value);
+
+    msg
+}
+
+/// Clamp `value` into `[floor, ceiling]`, tolerating a misconfigured
+/// operator ceiling below the fixed floor (e.g. `--max-width` set below 640)
+/// rather than panicking — `u32::clamp` requires `floor <= ceiling`.
+fn clamp_u32(value: u32, floor: u32, ceiling: u32) -> u32 {
+    value.clamp(floor, ceiling.max(floor))
+}
+
+/// Parse an `STNG` message body (everything after the `"STNG"` magic:
+/// version + entry_count + entries) into a `RequestedSettings`. Unknown tags
+/// — or a known tag with an unexpected length — are skipped via their
+/// declared length rather than treated as a parse failure, so a future v2
+/// tag doesn't break this parser. Returns `None` only if the body is too
+/// short to contain a header at all (malformed message, not just unknown
+/// tags).
+fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
+    if body.len() < 2 {
+        return None;
+    }
+    let _version = body[0];
+    let entry_count = body[1] as usize;
+    let mut offset = 2usize;
+    let mut settings = RequestedSettings::default();
+
+    for _ in 0..entry_count {
+        if offset + 3 > body.len() {
+            break; // truncated entry header; stop parsing what we have
+        }
+        let tag = body[offset];
+        let len = u16::from_be_bytes([body[offset + 1], body[offset + 2]]) as usize;
+        offset += 3;
+        if offset + len > body.len() {
+            break; // truncated value; stop parsing what we have
+        }
+        let value = &body[offset..offset + len];
+        offset += len;
+
+        match tag {
+            STNG_TAG_RESOLUTION if len == 4 => {
+                settings.width = Some(u16::from_be_bytes([value[0], value[1]]) as u32);
+                settings.height = Some(u16::from_be_bytes([value[2], value[3]]) as u32);
+            }
+            STNG_TAG_FRAMERATE if len == 1 => {
+                settings.fps = Some(value[0] as u32);
+            }
+            STNG_TAG_CODEC if len == 1 => {
+                settings.codec = match value[0] {
+                    0x00 => Some(VideoCodec::H264),
+                    0x01 => Some(VideoCodec::H265),
+                    _ => None, // invalid codec id -> daemon default
+                };
+            }
+            STNG_TAG_BITRATE if len == 4 => {
+                settings.bitrate_bps = Some(u32::from_be_bytes([
+                    value[0], value[1], value[2], value[3],
+                ]));
+            }
+            // Unknown tag, or a known tag with an unexpected length: `offset`
+            // has already advanced past the value, so parsing just continues
+            // with the next entry.
+            _ => {}
+        }
+    }
+
+    Some(settings)
+}
+
+/// Clamp everything the client asked for against `DaemonCapabilities` —
+/// never trust the client's numbers directly. Logs a warning whenever a
+/// clamp changes what was requested, so operators can debug "why did my
+/// requested 4K60 get downgraded."
+fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) -> RequestedSettings {
+    if let (Some(w), Some(h)) = (req.width, req.height) {
+        let clamped_w = clamp_u32(w, STNG_RESOLUTION_FLOOR_W, shared.max_width);
+        let clamped_h = clamp_u32(h, STNG_RESOLUTION_FLOOR_H, shared.max_height);
+        if clamped_w != w || clamped_h != h {
+            println!(
+                "[control] STNG requested resolution {w}x{h} clamped to {clamped_w}x{clamped_h}"
+            );
+        }
+        req.width = Some(clamped_w);
+        req.height = Some(clamped_h);
+    }
+
+    if let Some(fps) = req.fps {
+        let clamped = clamp_u32(fps, STNG_FPS_FLOOR, shared.max_fps);
+        if clamped != fps {
+            println!("[control] STNG requested framerate {fps} clamped to {clamped}");
+        }
+        req.fps = Some(clamped);
+    }
+
+    if let Some(codec) = req.codec {
+        let available = crate::encode::probe_available_codecs(shared.encoder_backend);
+        if !available.contains(&codec) {
+            println!(
+                "[control] STNG requested codec {codec:?} not available on this daemon, falling back to default"
+            );
+            req.codec = None;
+        }
+    }
+
+    if let Some(bitrate) = req.bitrate_bps {
+        let clamped = clamp_u32(bitrate, STNG_BITRATE_FLOOR_BPS, shared.bitrate_max_bps);
+        if clamped != bitrate {
+            println!("[control] STNG requested bitrate {bitrate} clamped to {clamped}");
+        }
+        req.bitrate_bps = Some(clamped);
+    }
+
+    req
+}
+
+/// Handle an inbound `STNG` control message: parse, clamp, and hand off to
+/// the capture thread via the `pending_settings` condvar for the *next*
+/// session it starts (see main.rs's capture loop).
+fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
+    let Some(parsed) = parse_stng_body(body) else {
+        eprintln!(
+            "[control] malformed STNG message ({} bytes), ignoring",
+            body.len()
+        );
+        return;
+    };
+
+    let clamped = clamp_requested_settings(shared, parsed);
+    println!("[control] received STNG, will apply to next session: {clamped:?}");
+
+    let (lock, cvar) = &*shared.pending_settings;
+    *lock.lock().unwrap() = Some(clamped);
+    cvar.notify_all();
 }
 
 pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
@@ -417,6 +747,11 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     if ctrl.starts_with(PLI_MAGIC) {
         shared.note_pli();
         shared.force_idr.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    if ctrl.starts_with(STNG_MAGIC) {
+        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..]);
         return;
     }
 

@@ -5,6 +5,7 @@ use qmetaobject::prelude::*;
 use qmetaobject::{queued_callback, QPointer};
 
 use crate::backend::{BackendHandle, ControlSender, UiEvent};
+use crate::capabilities::{DaemonCapabilities, StreamSettingsChoice};
 
 const GLOBAL_KEY_SHORTCUT_OVERRIDE: i32 = 0;
 const GLOBAL_KEY_PRESS: i32 = 1;
@@ -64,6 +65,52 @@ pub struct AppState {
     pub keyboard_enabled_changed: qt_signal!(),
     pub mouse_grabbed: qt_property!(bool; NOTIFY mouse_grabbed_changed),
     pub mouse_grabbed_changed: qt_signal!(),
+
+    // ── Daemon-advertised capabilities (CAPS) ──
+    // Default to true so the UI is unchanged until a CAPS frame (or the 2s
+    // legacy-daemon timeout) says otherwise. Reset to these defaults on
+    // disconnect. No gamepad_available: this client has no gamepad UI.
+    pub camera_available: qt_property!(bool; NOTIFY camera_available_changed),
+    pub camera_available_changed: qt_signal!(),
+
+    pub mic_available: qt_property!(bool; NOTIFY mic_available_changed),
+    pub mic_available_changed: qt_signal!(),
+
+    pub speaker_available: qt_property!(bool; NOTIFY speaker_available_changed),
+    pub speaker_available_changed: qt_signal!(),
+
+    /// Upper bounds advertised by the daemon, for the settings dialog.
+    pub caps_max_width: qt_property!(u32; NOTIFY caps_max_width_changed),
+    pub caps_max_width_changed: qt_signal!(),
+
+    pub caps_max_height: qt_property!(u32; NOTIFY caps_max_height_changed),
+    pub caps_max_height_changed: qt_signal!(),
+
+    pub caps_max_fps: qt_property!(u32; NOTIFY caps_max_fps_changed),
+    pub caps_max_fps_changed: qt_signal!(),
+
+    pub caps_codec_h264: qt_property!(bool; NOTIFY caps_codec_h264_changed),
+    pub caps_codec_h264_changed: qt_signal!(),
+
+    pub caps_codec_h265: qt_property!(bool; NOTIFY caps_codec_h265_changed),
+    pub caps_codec_h265_changed: qt_signal!(),
+
+    pub caps_bitrate_min_bps: qt_property!(u32; NOTIFY caps_bitrate_min_bps_changed),
+    pub caps_bitrate_min_bps_changed: qt_signal!(),
+
+    pub caps_bitrate_max_bps: qt_property!(u32; NOTIFY caps_bitrate_max_bps_changed),
+    pub caps_bitrate_max_bps_changed: qt_signal!(),
+
+    // ── Persisted stream-settings picks (resolution/framerate/codec/bitrate
+    // presets), set via the settings dialog before connecting. Each is one
+    // of the curated preset strings understood by
+    // `capabilities::StreamSettingsChoice::to_requested` — "default" means
+    // "omit this field, let the daemon choose."
+    pub stream_resolution_choice: qt_property!(QString; NOTIFY stream_settings_changed),
+    pub stream_framerate_choice: qt_property!(QString; NOTIFY stream_settings_changed),
+    pub stream_codec_choice: qt_property!(QString; NOTIFY stream_settings_changed),
+    pub stream_bitrate_choice: qt_property!(QString; NOTIFY stream_settings_changed),
+    pub stream_settings_changed: qt_signal!(),
 
     pub info_visible: qt_property!(bool; NOTIFY info_visible_changed),
     pub info_visible_changed: qt_signal!(),
@@ -198,6 +245,11 @@ pub struct AppState {
 
     pub toggle_speaker: qt_method!(
         fn toggle_speaker(&mut self) {
+            // Guard against the daemon having reported speaker forwarding
+            // unavailable — backstop for the toolbar's visibility gating.
+            if !self.speaker_available {
+                return;
+            }
             self.ensure_backend();
             self.speaker_enabled = !self.speaker_enabled;
             self.speaker_enabled_changed();
@@ -209,6 +261,9 @@ pub struct AppState {
 
     pub toggle_mic: qt_method!(
         fn toggle_mic(&mut self) {
+            if !self.mic_available {
+                return;
+            }
             self.ensure_backend();
             self.mic_enabled = !self.mic_enabled;
             self.mic_enabled_changed();
@@ -220,6 +275,9 @@ pub struct AppState {
 
     pub toggle_camera: qt_method!(
         fn toggle_camera(&mut self) {
+            if !self.camera_available {
+                return;
+            }
             self.ensure_backend();
             self.camera_enabled = !self.camera_enabled;
             self.camera_enabled_changed();
@@ -254,6 +312,37 @@ pub struct AppState {
             self.selected_camera_mode_changed();
             if let Some(backend) = self.backend.clone() {
                 backend.set_camera_mode(self.selected_camera_mode.to_string());
+            }
+        }
+    ),
+
+    /// Called by the stream-settings dialog (opened from the connection
+    /// card, before connecting). Each argument is one of the curated preset
+    /// strings ("default", "1920x1080", "30", "h264", "8000000", etc — see
+    /// `capabilities::StreamSettingsChoice`). Persisted immediately so the
+    /// choice survives app restarts; applied (clamped against the daemon's
+    /// advertised CAPS) the next time a session is established.
+    pub set_stream_settings: qt_method!(
+        fn set_stream_settings(
+            &mut self,
+            resolution: QString,
+            framerate: QString,
+            codec: QString,
+            bitrate: QString,
+        ) {
+            self.ensure_backend();
+            self.stream_resolution_choice = resolution.clone();
+            self.stream_framerate_choice = framerate.clone();
+            self.stream_codec_choice = codec.clone();
+            self.stream_bitrate_choice = bitrate.clone();
+            self.stream_settings_changed();
+            if let Some(backend) = self.backend.clone() {
+                backend.set_stream_settings(StreamSettingsChoice {
+                    resolution: resolution.to_string(),
+                    framerate: framerate.to_string(),
+                    codec: codec.to_string(),
+                    bitrate: bitrate.to_string(),
+                });
             }
         }
     ),
@@ -521,6 +610,7 @@ impl AppState {
             UiEvent::SetDirectControl(ctrl) => {
                 self.direct_control = ctrl;
             }
+            UiEvent::SetCapabilities(caps) => self.set_capabilities(&caps),
         }
     }
 
@@ -565,10 +655,44 @@ impl AppState {
         self.pin_prompt_visible = !value.is_empty();
         self.pin_prompt_visible_changed();
     }
+
+    /// Applies a `DaemonCapabilities` snapshot to the UI-facing properties —
+    /// called both when a real `CAPS` frame arrives and (with
+    /// `DaemonCapabilities::default()`) on the legacy-daemon timeout and on
+    /// disconnect, so the toolbar always reflects "what this connection
+    /// actually supports."
+    fn set_capabilities(&mut self, caps: &DaemonCapabilities) {
+        self.camera_available = caps.camera;
+        self.camera_available_changed();
+        self.mic_available = caps.microphone;
+        self.mic_available_changed();
+        self.speaker_available = caps.speaker;
+        self.speaker_available_changed();
+
+        self.caps_max_width = caps.max_width;
+        self.caps_max_width_changed();
+        self.caps_max_height = caps.max_height;
+        self.caps_max_height_changed();
+        self.caps_max_fps = caps.max_fps;
+        self.caps_max_fps_changed();
+        self.caps_codec_h264 = caps.codecs.contains(&crate::capabilities::CODEC_H264);
+        self.caps_codec_h264_changed();
+        self.caps_codec_h265 = caps.codecs.contains(&crate::capabilities::CODEC_H265);
+        self.caps_codec_h265_changed();
+        self.caps_bitrate_min_bps = caps.bitrate_min_bps;
+        self.caps_bitrate_min_bps_changed();
+        self.caps_bitrate_max_bps = caps.bitrate_max_bps;
+        self.caps_bitrate_max_bps_changed();
+    }
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        // Permissive defaults — unchanged UI behavior until a real CAPS
+        // frame (or the legacy-daemon timeout) says otherwise.
+        let default_caps = DaemonCapabilities::default();
+        let stream_settings = crate::backend::load_stream_settings();
+
         Self {
             base: Default::default(),
             connected: false,
@@ -585,6 +709,32 @@ impl Default for AppState {
             mouse_grabbed: false,
             mouse_grabbed_changed: Default::default(),
             keyboard_enabled_changed: Default::default(),
+            camera_available: default_caps.camera,
+            camera_available_changed: Default::default(),
+            mic_available: default_caps.microphone,
+            mic_available_changed: Default::default(),
+            speaker_available: default_caps.speaker,
+            speaker_available_changed: Default::default(),
+            caps_max_width: default_caps.max_width,
+            caps_max_width_changed: Default::default(),
+            caps_max_height: default_caps.max_height,
+            caps_max_height_changed: Default::default(),
+            caps_max_fps: default_caps.max_fps,
+            caps_max_fps_changed: Default::default(),
+            caps_codec_h264: default_caps.codecs.contains(&crate::capabilities::CODEC_H264),
+            caps_codec_h264_changed: Default::default(),
+            caps_codec_h265: default_caps.codecs.contains(&crate::capabilities::CODEC_H265),
+            caps_codec_h265_changed: Default::default(),
+            caps_bitrate_min_bps: default_caps.bitrate_min_bps,
+            caps_bitrate_min_bps_changed: Default::default(),
+            caps_bitrate_max_bps: default_caps.bitrate_max_bps,
+            caps_bitrate_max_bps_changed: Default::default(),
+            stream_resolution_choice: QString::from(stream_settings.resolution.as_str()),
+            stream_framerate_choice: QString::from(stream_settings.framerate.as_str()),
+            stream_codec_choice: QString::from(stream_settings.codec.as_str()),
+            stream_bitrate_choice: QString::from(stream_settings.bitrate.as_str()),
+            stream_settings_changed: Default::default(),
+            set_stream_settings: Default::default(),
             info_visible: true,
             info_visible_changed: Default::default(),
             session_title: QString::from("No active session"),

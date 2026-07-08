@@ -584,6 +584,11 @@ fn run_control_loop(
         }
     }
 
+    let caps_payload = crate::stream_server::build_caps_message(shared);
+    if let Err(e) = send_control_frame(&mut stream, &cipher, &mut send_seq, &caps_payload) {
+        eprintln!("[control] failed to send capabilities: {e:#}");
+    }
+
     while !stop.load(Ordering::Relaxed) {
         if !shared.is_current_network_session(session_id) {
             println!("[control] network control loop exiting for stale session {session_id}");

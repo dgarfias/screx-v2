@@ -14,6 +14,32 @@ pub trait CameraBackend: Send {
     fn stop(&mut self);
 }
 
+/// Cheap capability probe: is virtual webcam forwarding likely to work right
+/// now? Necessary but not sufficient for an actually-working camera (a
+/// not-yet-approved OS permission, or a busy device, can still make the real
+/// `CamWriter::new` fail later) — this is just "the underlying driver is
+/// present," not a guarantee.
+pub fn probe_camera_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Mirrors the modprobe check in `platform::linux::v4l2::ensure_v4l2loopback`
+        // without actually loading the module: available if it's already
+        // loaded, or if modprobe could load it on demand.
+        if std::path::Path::new("/sys/module/v4l2loopback").exists() {
+            return true;
+        }
+        std::process::Command::new("modinfo")
+            .arg("v4l2loopback")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::vcam::probe_camera_available()
+    }
+}
+
 /// Create a platform camera backend.
 pub fn create_camera_backend(exclusive_caps: bool) -> Box<dyn CameraBackend> {
     #[cfg(target_os = "linux")]

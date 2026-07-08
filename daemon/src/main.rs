@@ -45,25 +45,32 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Virtual display width
-    #[arg(short, long, default_value_t = 2160)]
-    width: u32,
+    /// Maximum virtual display width a session may negotiate (ceiling, not a
+    /// fixed value — connecting clients may request anything at or below it
+    /// via `STNG`; old clients that never negotiate get this as their
+    /// session default)
+    #[arg(short = 'w', long = "max-width", default_value_t = 3840)]
+    max_width: u32,
 
-    /// Virtual display height (uses -H to avoid conflict with --help)
-    #[arg(short = 'H', long, default_value_t = 1620)]
-    height: u32,
+    /// Maximum virtual display height a session may negotiate (uses -H to
+    /// avoid conflict with --help; ceiling, not a fixed value — see
+    /// --max-width)
+    #[arg(short = 'H', long = "max-height", default_value_t = 2160)]
+    max_height: u32,
 
-    /// Target framerate
-    #[arg(short, long, default_value_t = 30)]
-    framerate: u32,
+    /// Maximum target framerate a session may negotiate (ceiling, not a
+    /// fixed value — see --max-width)
+    #[arg(short = 'f', long = "max-framerate", default_value_t = 60)]
+    max_framerate: u32,
 
     /// Keyframe interval (in frames)
     #[arg(short, long, default_value_t = 90)]
     keyframe: u32,
 
-    /// Encoder bitrate (e.g. 8000000, 8M, 500K)
-    #[arg(short = 'b', long, default_value = "8M", value_parser = parse_bitrate)]
-    bitrate: u32,
+    /// Maximum encoder bitrate a session may negotiate (e.g. 20000000, 20M,
+    /// 500K; ceiling, not a fixed value — see --max-width)
+    #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
+    max_bitrate: u32,
 
     /// UDP/TCP streaming port
     #[arg(short, long, default_value_t = 9000)]
@@ -118,16 +125,21 @@ struct AppConfig {
 }
 
 impl AppConfig {
+    // `width`/`height`/`fps`/`bitrate_bps` here are sourced 1:1 from the
+    // renamed `--max-*` CLI flags. They now mean "session ceiling" (per
+    // `DaemonCapabilities`) *and* "session default when a client never
+    // negotiates via STNG" — the same field does both jobs, since an
+    // un-negotiated session is defined as "get the daemon's max."
     fn from_cli(cli: &Cli) -> Self {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
             capture_backend: capture::CaptureBackend::platform_default(),
             codec: encode::VideoCodec::from_str(&cli.codec),
-            width: cli.width,
-            height: cli.height,
-            fps: cli.framerate,
+            width: cli.max_width,
+            height: cli.max_height,
+            fps: cli.max_framerate,
             gop: cli.keyframe.max(10),
-            bitrate_bps: cli.bitrate,
+            bitrate_bps: cli.max_bitrate,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
@@ -160,6 +172,19 @@ async fn main() -> Result<()> {
         println!("[main] verbose logging enabled");
     }
 
+    // One-time startup probe, just for an operator-visible log line — the
+    // real per-connection `CAPS` message re-probes fresh every time (see
+    // `stream_server::build_caps_message`), since a driver installed after
+    // the daemon started should be reflected in the next connection.
+    let startup_capabilities = stream_server::probe_capabilities(
+        config.width,
+        config.height,
+        config.fps,
+        config.bitrate_bps,
+        config.encoder_backend,
+    );
+    println!("[main] daemon capabilities: {startup_capabilities:?}");
+
     let stop = Arc::new(AtomicBool::new(false));
 
     let input_backend: Arc<Mutex<dyn crate::input::InputBackend>> = {
@@ -189,6 +214,11 @@ async fn main() -> Result<()> {
         config.camera_exclusive_caps,
         config.bitrate_bps,
         Arc::clone(&input_backend),
+        config.width,
+        config.height,
+        config.fps,
+        config.bitrate_bps,
+        config.encoder_backend,
     ));
 
     *shared.keyboard_worker.lock().unwrap() = Some(crate::input::KeyboardWorker::new(Arc::clone(
@@ -281,6 +311,14 @@ async fn main() -> Result<()> {
             // Audio sink
             crate::stream_server::disable_virtual_sink(&shared_d);
 
+            // Discard any STNG left over from this connection so it can't
+            // leak into the next session (e.g. a client that sent STNG then
+            // aborted before ever starting to stream).
+            {
+                let (lock, _) = &*shared_d.pending_settings;
+                *lock.lock().unwrap() = None;
+            }
+
             // Signal capture thread to stop (EVDI will be torn down)
             shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
             shared_d.capture_start.store(false, Ordering::Release);
@@ -323,20 +361,16 @@ async fn main() -> Result<()> {
     let send_socket = socket.try_clone().context("clone socket for sender")?;
     let capture_shared = Arc::clone(&shared);
     let capture_stop = Arc::clone(&stop);
+    // Used once, below, to construct the display backend before the
+    // per-session loop starts (see the "do NOT reconstruct it per session"
+    // note on `capture_config` inside the loop). `config` itself is moved
+    // into the capture thread closure so each session can merge in
+    // client-requested (STNG) settings over these CLI/max defaults.
     let capture_config = capture::CaptureConfig {
         width: config.width,
         height: config.height,
         fps: config.fps,
         backend: config.capture_backend,
-    };
-    let enc_config = encode::EncoderConfig {
-        bitrate_bps: config.bitrate_bps,
-        gop: config.gop,
-        fps: config.fps,
-        width: config.width,
-        height: config.height,
-        backend: config.encoder_backend,
-        codec: config.codec,
     };
 
     let force_refresh = Arc::new(AtomicBool::new(false));
@@ -355,6 +389,11 @@ async fn main() -> Result<()> {
         .name("capture".into())
         .spawn(move || -> Result<()> {
             let mut sender = stream_server::UdpSender::new(send_socket);
+            // Backend is constructed ONCE for the life of the process, from
+            // the CLI/max-derived `capture_config` above — NOT per session.
+            // Per-session resolution/fps changes are applied below via
+            // `display.attach(mode)`, which this backend already supports
+            // being called with fresh each session.
             let mut display = match capture::create_display_backend(&capture_config) {
                 Ok(d) => d,
                 Err(e) => {
@@ -387,6 +426,74 @@ async fn main() -> Result<()> {
                 // Reset the stop flag for this capture session
                 capture_stop_flag.store(false, Ordering::SeqCst);
 
+                // Give a client that just received CAPS a short window to
+                // send STNG before this session's config is locked in. On
+                // the network path STNG normally arrives over the TCP
+                // control channel before the first authenticated UDP packet
+                // flips capture_start (stream_server.rs), so this usually
+                // returns instantly; the timeout is the compatibility path
+                // for old clients that never send STNG at all.
+                let requested = {
+                    let (lock, cvar) = &*capture_shared.pending_settings;
+                    let guard = lock.lock().unwrap();
+                    let (mut guard, _timeout) = cvar
+                        .wait_timeout_while(
+                            guard,
+                            std::time::Duration::from_millis(2000),
+                            |settings| settings.is_none(),
+                        )
+                        .unwrap();
+                    guard.take()
+                };
+
+                // Merge the (already-clamped) requested settings over the
+                // CLI/max defaults to get this session's actual config.
+                // Bitrate/resolution/fps/codec are the "full rebuild" case,
+                // but that's fine — Encoder::new and display.attach() are
+                // already fresh per session below.
+                let session_width = requested.as_ref().and_then(|r| r.width).unwrap_or(config.width);
+                let session_height = requested
+                    .as_ref()
+                    .and_then(|r| r.height)
+                    .unwrap_or(config.height);
+                let session_fps = requested.as_ref().and_then(|r| r.fps).unwrap_or(config.fps);
+                let session_codec = requested
+                    .as_ref()
+                    .and_then(|r| r.codec)
+                    .unwrap_or(config.codec);
+                let session_bitrate_bps = requested
+                    .as_ref()
+                    .and_then(|r| r.bitrate_bps)
+                    .unwrap_or(config.bitrate_bps);
+
+                if let Some(ref r) = requested {
+                    println!(
+                        "[capture] starting session with negotiated settings: {r:?} -> {session_width}x{session_height}@{session_fps} codec={session_codec:?} bitrate={session_bitrate_bps}"
+                    );
+                }
+
+                // Rebaseline the adaptive bitrate loop around this session's
+                // bitrate so it throttles up/down from the negotiated value
+                // instead of the CLI default. Restored on session teardown
+                // below.
+                capture_shared.set_base_bitrate(session_bitrate_bps);
+
+                let capture_config = capture::CaptureConfig {
+                    width: session_width,
+                    height: session_height,
+                    fps: session_fps,
+                    backend: config.capture_backend,
+                };
+                let enc_config = encode::EncoderConfig {
+                    bitrate_bps: session_bitrate_bps,
+                    gop: config.gop,
+                    fps: session_fps,
+                    width: session_width,
+                    height: session_height,
+                    backend: config.encoder_backend,
+                    codec: session_codec,
+                };
+
                 // Create encoder fresh for each session
                 let mut encoder = match encode::Encoder::new(enc_config.clone()) {
                     Ok(e) => e,
@@ -413,6 +520,7 @@ async fn main() -> Result<()> {
                     fps: capture_config.fps,
                 }) {
                     eprintln!("[capture] display attach failed: {e:#}");
+                    capture_shared.set_base_bitrate(config.bitrate_bps);
                     capture_start.store(false, Ordering::Release);
                     let (_, cvar) = &*capture_start_signal;
                     cvar.notify_all();
@@ -558,6 +666,12 @@ async fn main() -> Result<()> {
                 display.detach();
 
                 let _ = watchdog.join();
+
+                // Restore the CLI/max default bitrate baseline so the next
+                // session — which may be an old client that never sends
+                // STNG — isn't stuck ramping from this session's negotiated
+                // bitrate.
+                capture_shared.set_base_bitrate(config.bitrate_bps);
 
                 println!("[capture] display session ended, waiting for next client...");
 

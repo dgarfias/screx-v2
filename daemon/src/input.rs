@@ -57,6 +57,34 @@ pub struct GamepadState {
     pub hat_y: i8,
 }
 
+/// Cheap capability probe for virtual gamepad passthrough. Returns the max
+/// number of simultaneous controllers supported, or `None` if this daemon
+/// can't do gamepad passthrough at all right now.
+pub fn probe_gamepad_max_controllers() -> Option<u8> {
+    #[cfg(target_os = "linux")]
+    {
+        // uinput gamepad creation only fails if /dev/uinput isn't openable;
+        // treat presence of the device node as the probe (mirrors
+        // `VirtualGamepad::new` in platform::linux::uinput). The Linux
+        // backend keys pads in a HashMap with no fixed cap; 4 matches the
+        // controller_id range (0..4) the rest of the protocol assumes (see
+        // the disconnect cleanup loop in main.rs).
+        if std::path::Path::new("/dev/uinput").exists() {
+            Some(4)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if crate::platform::windows::vigem::probe_available() {
+            Some(4)
+        } else {
+            None
+        }
+    }
+}
+
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
     /// Tells the backend where the captured output actually sits on screen —

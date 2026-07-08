@@ -191,6 +191,13 @@ impl CameraBackend for WindowsCamera {
     }
 }
 
+/// Cheap capability probe: true if `screx_vcam.dll` is present next to the
+/// exe (or via `SCREX_VCAM_DLL_PATH`). Necessary but not sufficient for a
+/// working camera — DirectShow filter registration can still fail later.
+pub fn probe_camera_available() -> bool {
+    find_vcam_dll_path().is_some()
+}
+
 fn find_vcam_dll_path() -> Option<std::path::PathBuf> {
     if let Ok(env) = std::env::var("SCREX_VCAM_DLL_PATH") {
         let p: std::path::PathBuf = env.into();

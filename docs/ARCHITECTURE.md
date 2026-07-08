@@ -282,6 +282,8 @@ Control payloads include messages such as:
 - `GPAD`
 - `SPKR`
 - `HOST<hostname>`
+- `CAPS` (daemon -> client, capability negotiation)
+- `STNG` (client -> daemon, capability negotiation)
 - `DISCONNECT`
 
 ### USB Transport (TCP)
@@ -310,6 +312,8 @@ ASCII prefix plus message body, for example:
 - `PLI`
 - `SPKR<1-byte-flag>`
 - `HOST<hostname>`
+- `CAPS...` (daemon -> client, capability negotiation)
+- `STNG...` (client -> daemon, capability negotiation)
 - `TOUCH...`
 - `KEY...`
 - `MOUSE...`
@@ -318,6 +322,80 @@ ASCII prefix plus message body, for example:
 - `GPAD...`
 - `CAM...`
 - `MIC...`
+
+## Capability Negotiation
+
+Right after the daemon sends `HOST<hostname>` on the control channel — network TCP control and USB
+control alike — it sends `CAPS`, telling the client what it can actually do. The client replies with
+`STNG`, proposing session settings within the bounds `CAPS` advertised. Both messages travel inside
+the same control framing already used for `HOST` (network: AES-GCM control frame via
+`send_control_frame`; USB: `type = 0x03` control payload) — there is no new transport, socket, or
+crypto involved.
+
+Both messages share one TLV envelope: a 4-byte ASCII magic, a version byte, an entry count, then that
+many `tag(u8) + length(u16 BE) + value` entries. **A parser that doesn't recognize a tag reads the
+`u16` length and skips that many bytes, then continues to the next entry** — unknown tags are never
+treated as an error. This is how future protocol versions add tags without breaking older parsers.
+
+### `CAPS` (daemon -> client)
+
+```
+"CAPS"(4 bytes ASCII) + version(u8, currently 1) + entry_count(u8) + entries...
+
+each entry: tag(u8) + length(u16 BE) + value(length bytes)
+```
+
+v1 tags:
+
+| Tag | Name | Value layout | Meaning |
+|---|---|---|---|
+| `0x01` | CAMERA | `available(u8 0/1)` | Virtual webcam forwarding works right now |
+| `0x02` | MICROPHONE | `available(u8 0/1)` | Virtual microphone forwarding works right now |
+| `0x03` | SPEAKER | `available(u8 0/1)` | Speaker/system-audio forwarding works right now |
+| `0x04` | GAMEPAD | `available(u8 0/1)` + `max_controllers(u8)` | Gamepad passthrough works, and how many simultaneous controllers |
+| `0x05` | CODECS | `count(u8)` + `count` bytes of codec id (`0x00`=H.264, `0x01`=H.265) | Which codecs this daemon can actually encode right now |
+| `0x06` | MAX_RESOLUTION | `width(u16 BE)` + `height(u16 BE)` | Upper bound the client may request |
+| `0x07` | MAX_FRAMERATE | `fps(u8)` | Upper bound the client may request |
+| `0x08` | BITRATE_RANGE | `min_bps(u32 BE)` + `max_bps(u32 BE)` | Bounds the client may request |
+
+### `STNG` (client -> daemon)
+
+```
+"STNG"(4 bytes ASCII) + version(u8, currently 1) + entry_count(u8) + entries...
+
+each entry: tag(u8) + length(u16 BE) + value(length bytes)
+```
+
+v1 tags:
+
+| Tag | Name | Value layout |
+|---|---|---|
+| `0x01` | RESOLUTION | `width(u16 BE)` + `height(u16 BE)` |
+| `0x02` | FRAMERATE | `fps(u8)` |
+| `0x03` | CODEC | `codec_id(u8)` (`0x00`=H.264, `0x01`=H.265) |
+| `0x04` | BITRATE | `bps(u32 BE)` |
+
+An omitted tag means "use the daemon's default for that field." `entry_count = 0` is valid and means
+"everything default, just connect" — the client should still send the message in that case rather
+than skipping it, since the daemon is waiting for it (see Backward compatibility below).
+
+### Clamping
+
+The daemon never applies `STNG` values as-is — it clamps against its own configured bounds before
+starting the session's capture/encode pipeline:
+
+- resolution clamps to `[640x360, --max-width x --max-height]`
+- framerate clamps to `[15, --max-framerate]`
+- bitrate clamps to `[500 Kbps, --max-bitrate]`
+- a requested codec not in the daemon's advertised `CODECS` falls back to the daemon's default codec
+
+### Backward compatibility
+
+| Scenario | Behavior |
+|---|---|
+| Old client, new daemon | Client doesn't recognize `CAPS` and drops it, never sends `STNG`. Daemon waits ~2s for `STNG`, then proceeds with its CLI-configured defaults — identical to pre-negotiation behavior. |
+| New client, old daemon | Client waits ~2s for `CAPS` after the control channel comes up; if it never arrives, the client assumes a legacy daemon with every feature available, sends no `STNG` at all, and connects exactly as before. Clients only ever send `STNG` in response to a received `CAPS`. |
+| New client, new daemon | Full negotiation: `CAPS` then `STNG`, clamped as above. |
 
 ## Media Subprotocols
 

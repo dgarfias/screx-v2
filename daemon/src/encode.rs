@@ -146,6 +146,90 @@ impl EncoderBackend {
     }
 }
 
+/// Resolve the ffmpeg encoder name that would be used for a concrete
+/// (non-`Auto`) backend + codec pair. Mirrors the name tables in
+/// `HwEncoder::new_with_vaapi_hevc_mode` and `SwEncoder::new` below — kept
+/// separate so `probe_available_codecs` can check availability without
+/// opening any hardware device.
+fn resolved_codec_name(backend: EncoderBackend, codec: VideoCodec) -> Option<&'static str> {
+    Some(match (backend, codec) {
+        #[cfg(target_os = "linux")]
+        (EncoderBackend::Vaapi, VideoCodec::H264) => "h264_vaapi",
+        #[cfg(target_os = "linux")]
+        (EncoderBackend::Vaapi, VideoCodec::H265) => "hevc_vaapi",
+        (EncoderBackend::Nvenc, VideoCodec::H264) => "h264_nvenc",
+        (EncoderBackend::Nvenc, VideoCodec::H265) => "hevc_nvenc",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Amf, VideoCodec::H264) => "h264_amf",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Amf, VideoCodec::H265) => "hevc_amf",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Qsv, VideoCodec::H264) => "h264_qsv",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Qsv, VideoCodec::H265) => "hevc_qsv",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Mf, VideoCodec::H264) => "h264_mf",
+        #[cfg(target_os = "windows")]
+        (EncoderBackend::Mf, VideoCodec::H265) => "hevc_mf",
+        (EncoderBackend::Software, VideoCodec::H264) => "libx264",
+        (EncoderBackend::Software, VideoCodec::H265) => "libx265",
+        (EncoderBackend::Auto, _) => return None,
+    })
+}
+
+/// True if ffmpeg has an encoder registered under this name. Cheap — a
+/// symbol table lookup, no device is opened (same call used at encoder
+/// construction time, `avcodec_find_encoder_by_name`).
+fn encoder_name_resolves(name: &str) -> bool {
+    match std::ffi::CString::new(name) {
+        Ok(cstr) => unsafe { !ffi::avcodec_find_encoder_by_name(cstr.as_ptr()).is_null() },
+        Err(_) => false,
+    }
+}
+
+/// Which codecs this daemon can actually encode right now for `backend`
+/// (which may be `Auto`). Does not just parrot the operator's `--codec`
+/// flag — actually resolves an encoder name and checks ffmpeg has it.
+/// `Auto` reports the union of what any backend it would consider at
+/// encoder-construction time supports, since the one that actually wins is
+/// only known once real hardware probing happens in `Encoder::new`.
+pub fn probe_available_codecs(backend: EncoderBackend) -> Vec<VideoCodec> {
+    let _ = ffmpeg::init();
+
+    let candidates: Vec<EncoderBackend> = match backend {
+        EncoderBackend::Auto => {
+            #[cfg(target_os = "linux")]
+            {
+                vec![
+                    EncoderBackend::Vaapi,
+                    EncoderBackend::Nvenc,
+                    EncoderBackend::Software,
+                ]
+            }
+            #[cfg(target_os = "windows")]
+            {
+                vec![
+                    EncoderBackend::Nvenc,
+                    EncoderBackend::Amf,
+                    EncoderBackend::Qsv,
+                    EncoderBackend::Mf,
+                    EncoderBackend::Software,
+                ]
+            }
+        }
+        other => vec![other],
+    };
+
+    [VideoCodec::H264, VideoCodec::H265]
+        .into_iter()
+        .filter(|codec| {
+            candidates
+                .iter()
+                .any(|b| resolved_codec_name(*b, *codec).is_some_and(encoder_name_resolves))
+        })
+        .collect()
+}
+
 enum ActiveEncoder {
     HwAccel(HwEncoder),
     Software(SwEncoder),

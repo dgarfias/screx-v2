@@ -277,6 +277,11 @@ fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender
         }
     }
 
+    let caps_payload = crate::stream_server::build_caps_message(shared);
+    if let Err(e) = sender.send_control(&caps_payload) {
+        eprintln!("[usb] failed to send capabilities: {e:#}");
+    }
+
     {
         let mut usb = shared.usb_sender.lock().unwrap();
         *usb = Some(sender);
