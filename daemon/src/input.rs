@@ -87,13 +87,20 @@ pub fn probe_gamepad_max_controllers() -> Option<u8> {
 
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
-    /// Tells the backend where the captured output actually sits on screen —
-    /// (left, top, width, height) in absolute virtual-desktop coordinates.
-    /// Wire touch/mouse coordinates are 0..width/0..height relative to the
-    /// captured frame; backends that inject via absolute screen coordinates
-    /// (Windows) need this offset. No-op where it doesn't apply (Linux
-    /// injects into a dedicated virtual input device sized to match, so no
-    /// translation is needed).
+    /// Tells the backend the current session's stream resolution and, where
+    /// meaningful, where the captured output sits on screen — (left, top,
+    /// width, height). Wire touch/mouse coordinates are always 0..width/
+    /// 0..height in *negotiated session stream* space, which can differ from
+    /// the backend's underlying input device geometry (e.g. a client
+    /// requesting 1920x1080 while the daemon's virtual devices are sized to
+    /// a larger startup ceiling). Windows injects via absolute
+    /// virtual-desktop coordinates, so it uses (left, top, width, height) to
+    /// translate frame-local coordinates onto the desktop. Linux ignores
+    /// left/top (its virtual touchscreen is a fixed-size device that
+    /// gsettings maps directly onto the captured EVDI output, so there is no
+    /// desktop-absolute translation to do) and instead scales incoming
+    /// coordinates from session-resolution space onto its fixed-size virtual
+    /// touchscreen's ABS range.
     fn set_target_rect(&mut self, _left: i32, _top: i32, _width: u32, _height: u32) {}
 
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;

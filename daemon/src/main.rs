@@ -531,11 +531,17 @@ async fn main() -> Result<()> {
                 // Backends that inject via absolute screen coordinates (Windows)
                 // need to know where the captured output actually sits on the
                 // desktop; wire touch/mouse coordinates only carry frame-local
-                // 0..width/0..height values. No-op on backends that don't need it.
-                if let Some((left, top, width, height)) = display.output_rect() {
-                    if let Ok(mut backend) = capture_shared.input_backend.lock() {
-                        backend.set_target_rect(left, top, width, height);
-                    }
+                // 0..width/0..height values in the negotiated session
+                // resolution. Prefer the backend's own notion of output
+                // placement (Windows); fall back to the session resolution at
+                // the origin otherwise — Linux ignores left/top and instead
+                // scales incoming coordinates onto its fixed-size virtual
+                // touchscreen, but still needs the session dims to do that.
+                let (left, top, width, height) = display
+                    .output_rect()
+                    .unwrap_or((0, 0, capture_config.width, capture_config.height));
+                if let Ok(mut backend) = capture_shared.input_backend.lock() {
+                    backend.set_target_rect(left, top, width, height);
                 }
 
                 println!("[capture] starting display capture session");

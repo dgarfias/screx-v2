@@ -299,24 +299,9 @@ impl StreamSettingsChoice {
     pub fn to_requested(&self) -> RequestedSettings {
         let mut out = RequestedSettings::default();
 
-        match self.resolution.as_str() {
-            "1280x720" => {
-                out.width = Some(1280);
-                out.height = Some(720);
-            }
-            "1920x1080" => {
-                out.width = Some(1920);
-                out.height = Some(1080);
-            }
-            "2560x1440" => {
-                out.width = Some(2560);
-                out.height = Some(1440);
-            }
-            "3840x2160" => {
-                out.width = Some(3840);
-                out.height = Some(2160);
-            }
-            _ => {}
+        if let Some((w, h)) = parse_resolution(&self.resolution) {
+            out.width = Some(w);
+            out.height = Some(h);
         }
 
         out.fps = match self.framerate.as_str() {
@@ -331,15 +316,22 @@ impl StreamSettingsChoice {
             _ => None,
         };
 
-        out.bitrate_bps = match self.bitrate.as_str() {
-            "3000000" => Some(3_000_000),
-            "8000000" => Some(8_000_000),
-            "15000000" => Some(15_000_000),
-            _ => None,
-        };
+        out.bitrate_bps = self.bitrate.parse::<u32>().ok().filter(|b| *b > 0);
 
         out
     }
+}
+
+/// Parse a "WxH" resolution string (e.g. "1920x1080") into `(width, height)`.
+/// Both dimensions must be positive integers that fit in `u16` (plenty for
+/// any real resolution). Anything else (missing 'x', non-numeric parts,
+/// zero, out-of-range) yields `None`, which `to_requested` treats as "omit
+/// this field."
+fn parse_resolution(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.split_once('x')?;
+    let w: u16 = w.parse().ok().filter(|v| *v > 0)?;
+    let h: u16 = h.parse().ok().filter(|v| *v > 0)?;
+    Some((w as u32, h as u32))
 }
 
 #[cfg(test)]
@@ -407,5 +399,54 @@ mod tests {
         assert_eq!(clamped.fps, Some(30));
         assert_eq!(clamped.codec, None); // H.265 not advertised -> omitted
         assert_eq!(clamped.bitrate_bps, Some(5_000_000));
+    }
+
+    #[test]
+    fn to_requested_accepts_non_preset_bitrate() {
+        let choice = StreamSettingsChoice {
+            bitrate: "12500000".to_string(),
+            ..StreamSettingsChoice::default()
+        };
+        assert_eq!(choice.to_requested().bitrate_bps, Some(12_500_000));
+    }
+
+    #[test]
+    fn to_requested_accepts_non_preset_resolution() {
+        let choice = StreamSettingsChoice {
+            resolution: "2360x1640".to_string(),
+            ..StreamSettingsChoice::default()
+        };
+        let requested = choice.to_requested();
+        assert_eq!(requested.width, Some(2360));
+        assert_eq!(requested.height, Some(1640));
+    }
+
+    #[test]
+    fn to_requested_rejects_malformed_resolution() {
+        let choice = StreamSettingsChoice {
+            resolution: "abcxdef".to_string(),
+            ..StreamSettingsChoice::default()
+        };
+        let requested = choice.to_requested();
+        assert_eq!(requested.width, None);
+        assert_eq!(requested.height, None);
+    }
+
+    #[test]
+    fn to_requested_rejects_non_numeric_bitrate() {
+        let choice = StreamSettingsChoice {
+            bitrate: "default".to_string(),
+            ..StreamSettingsChoice::default()
+        };
+        assert_eq!(choice.to_requested().bitrate_bps, None);
+    }
+
+    #[test]
+    fn to_requested_rejects_zero_bitrate() {
+        let choice = StreamSettingsChoice {
+            bitrate: "0".to_string(),
+            ..StreamSettingsChoice::default()
+        };
+        assert_eq!(choice.to_requested().bitrate_bps, None);
     }
 }

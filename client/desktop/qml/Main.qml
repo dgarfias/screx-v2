@@ -689,6 +689,24 @@ ApplicationWindow {
         property string selFramerate: AppState.stream_framerate_choice
         property string selCodec: AppState.stream_codec_choice
         property string selBitrate: AppState.stream_bitrate_choice
+        property bool customBitrateActive: false
+        property string customBitrateMbpsText: ""
+
+        // True for "default" or one of the curated preset bps strings.
+        // Anything else is a user-typed custom bitrate.
+        function isPresetBitrate(v) {
+            return v === "default" || v === "3000000" || v === "8000000"
+                || v === "15000000" || v === "20000000"
+        }
+
+        // Format a bps string as a trimmed Mbps string ("12500000" -> "12.5",
+        // "20000000" -> "20"). Returns "" if not a positive number.
+        function formatMbps(bpsStr) {
+            var n = parseInt(bpsStr, 10)
+            if (isNaN(n) || n <= 0) return ""
+            var mbps = Math.round(n / 100000) / 10
+            return (mbps % 1 === 0) ? mbps.toFixed(0) : mbps.toFixed(1)
+        }
 
         function summaryText() {
             var res = selResolution === "default" ? "Auto res" : selResolution
@@ -701,6 +719,15 @@ ApplicationWindow {
             selFramerate = AppState.stream_framerate_choice
             selCodec = AppState.stream_codec_choice
             selBitrate = AppState.stream_bitrate_choice
+
+            if (isPresetBitrate(selBitrate)) {
+                customBitrateActive = false
+                customBitrateMbpsText = ""
+            } else {
+                var mbpsLabel = formatMbps(selBitrate)
+                customBitrateActive = mbpsLabel !== ""
+                customBitrateMbpsText = mbpsLabel
+            }
         }
 
         background: Rectangle {
@@ -843,19 +870,23 @@ ApplicationWindow {
                 spacing: 6
                 Repeater {
                     model: [
-                        { label: "Daemon default", value: "default" },
-                        { label: "Data saver (3 Mbps)", value: "3000000" },
-                        { label: "Balanced (8 Mbps)", value: "8000000" },
-                        { label: "High quality (15 Mbps)", value: "15000000" }
+                        { label: "Default", value: "default" },
+                        { label: "Low (3 Mbps)", value: "3000000" },
+                        { label: "Medium (8 Mbps)", value: "8000000" },
+                        { label: "High (15 Mbps)", value: "15000000" },
+                        { label: "Very high (20 Mbps)", value: "20000000" }
                     ]
                     delegate: Button {
                         text: modelData.label
                         font.family: uiFont()
                         font.pixelSize: 12
-                        onClicked: streamSettingsPopup.selBitrate = modelData.value
+                        onClicked: {
+                            streamSettingsPopup.selBitrate = modelData.value
+                            streamSettingsPopup.customBitrateActive = false
+                        }
                         background: Rectangle {
                             radius: 6
-                            color: streamSettingsPopup.selBitrate === modelData.value ? "#007aff" : "#2c2c2e"
+                            color: (!streamSettingsPopup.customBitrateActive && streamSettingsPopup.selBitrate === modelData.value) ? "#007aff" : "#2c2c2e"
                         }
                         contentItem: Text {
                             text: parent.text
@@ -867,6 +898,47 @@ ApplicationWindow {
                         leftPadding: 8; rightPadding: 8
                         topPadding: 6; bottomPadding: 6
                     }
+                }
+                Button {
+                    text: "Custom"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                    onClicked: streamSettingsPopup.customBitrateActive = true
+                    background: Rectangle {
+                        radius: 6
+                        color: streamSettingsPopup.customBitrateActive ? "#007aff" : "#2c2c2e"
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#ffffff"
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    leftPadding: 8; rightPadding: 8
+                    topPadding: 6; bottomPadding: 6
+                }
+            }
+
+            TextField {
+                id: customBitrateField
+                visible: streamSettingsPopup.customBitrateActive
+                Layout.fillWidth: true
+                placeholderText: "Custom Mbps (e.g. 12.5)"
+                text: streamSettingsPopup.customBitrateMbpsText
+                font.family: uiFont()
+                font.pixelSize: 13
+                padding: 8
+                color: "#ffffff"
+                placeholderTextColor: "#8e8e93"
+                inputMethodHints: Qt.ImhFormattedNumbersOnly
+                validator: DoubleValidator { bottom: 0; decimals: 1; notation: DoubleValidator.StandardNotation }
+                onTextChanged: streamSettingsPopup.customBitrateMbpsText = text
+                background: Rectangle {
+                    radius: 8
+                    color: "#2c2c2e"
+                    border.color: customBitrateField.activeFocus ? "#007aff" : "#3a3a3c"
+                    border.width: customBitrateField.activeFocus ? 2 : 1
                 }
             }
 
@@ -905,11 +977,18 @@ ApplicationWindow {
                     font.pixelSize: 13
                     font.weight: 700
                     onClicked: {
+                        var bitrateValue = streamSettingsPopup.selBitrate
+                        if (streamSettingsPopup.customBitrateActive) {
+                            var mbps = parseFloat(streamSettingsPopup.customBitrateMbpsText)
+                            bitrateValue = (!isNaN(mbps) && mbps > 0)
+                                ? Math.round(mbps * 1000000).toString()
+                                : "default"
+                        }
                         AppState.set_stream_settings(
                             streamSettingsPopup.selResolution,
                             streamSettingsPopup.selFramerate,
                             streamSettingsPopup.selCodec,
-                            streamSettingsPopup.selBitrate
+                            bitrateValue
                         )
                         streamSettingsPopup.close()
                     }

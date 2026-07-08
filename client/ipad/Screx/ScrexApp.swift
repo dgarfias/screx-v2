@@ -177,6 +177,13 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     case p1080 = "1080p"
     case p1440 = "1440p"
     case uhd4k = "4k"
+    case ipadMini = "2266x1488"
+    case ipadBase = "2160x1620"
+    case ipadA16 = "2360x1640"
+    case ipadPro11 = "2388x1668"
+    case ipadPro11M4 = "2420x1668"
+    case ipadPro129 = "2732x2048"
+    case ipadPro13M4 = "2752x2064"
 
     var id: String { rawValue }
 
@@ -187,6 +194,13 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
         case .p1080: return "1080p (1920×1080)"
         case .p1440: return "1440p (2560×1440)"
         case .uhd4k: return "4K (3840×2160)"
+        case .ipadMini: return "2266×1488 (iPad mini)"
+        case .ipadBase: return "2160×1620 (iPad 7th–9th gen)"
+        case .ipadA16: return "2360×1640 (iPad 10th/11th gen, Air 11″)"
+        case .ipadPro11: return "2388×1668 (iPad Pro 11″)"
+        case .ipadPro11M4: return "2420×1668 (iPad Pro 11″ M4)"
+        case .ipadPro129: return "2732×2048 (iPad Pro 12.9″, Air 13″)"
+        case .ipadPro13M4: return "2752×2064 (iPad Pro 13″ M4)"
         }
     }
 
@@ -197,6 +211,13 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
         case .p1080: return (1920, 1080)
         case .p1440: return (2560, 1440)
         case .uhd4k: return (3840, 2160)
+        case .ipadMini: return (2266, 1488)
+        case .ipadBase: return (2160, 1620)
+        case .ipadA16: return (2360, 1640)
+        case .ipadPro11: return (2388, 1668)
+        case .ipadPro11M4: return (2420, 1668)
+        case .ipadPro129: return (2732, 2048)
+        case .ipadPro13M4: return (2752, 2064)
         }
     }
 }
@@ -251,30 +272,38 @@ enum StreamCodecPreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// User-facing bitrate presets offered in the Stream Settings sheet.
+/// User-facing bitrate presets offered in the Stream Settings sheet. `.custom` has no
+/// fixed `bitrateBps` of its own — its effective value comes from
+/// `StreamViewModel.customBitrateMbps` instead (see `resolvedBitrateBps(clampingTo:)`).
 enum StreamBitratePreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
-    case dataSaver = "saver"
-    case balanced = "balanced"
-    case highQuality = "high"
+    case low = "low"
+    case medium = "medium"
+    case high = "high"
+    case veryHigh = "veryhigh"
+    case custom = "custom"
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .daemonDefault: return "Daemon default"
-        case .dataSaver: return "Data saver (3 Mbps)"
-        case .balanced: return "Balanced (8 Mbps)"
-        case .highQuality: return "High quality (15 Mbps)"
+        case .low: return "Low (3 Mbps)"
+        case .medium: return "Medium (8 Mbps)"
+        case .high: return "High (15 Mbps)"
+        case .veryHigh: return "Very high (20 Mbps)"
+        case .custom: return "Custom…"
         }
     }
 
     var bitrateBps: UInt32? {
         switch self {
         case .daemonDefault: return nil
-        case .dataSaver: return 3_000_000
-        case .balanced: return 8_000_000
-        case .highQuality: return 15_000_000
+        case .low: return 3_000_000
+        case .medium: return 8_000_000
+        case .high: return 15_000_000
+        case .veryHigh: return 20_000_000
+        case .custom: return nil
         }
     }
 }
@@ -428,6 +457,8 @@ final class StreamViewModel: ObservableObject {
     @Published var preferredFramerate: StreamFrameratePreset = StreamViewModel.loadPreferredFramerate()
     @Published var preferredCodec: StreamCodecPreset = StreamViewModel.loadPreferredCodec()
     @Published var preferredBitrate: StreamBitratePreset = StreamViewModel.loadPreferredBitrate()
+    /// Effective bitrate (in Mbps) when `preferredBitrate == .custom`. Ignored otherwise.
+    @Published var customBitrateMbps: Double = StreamViewModel.loadCustomBitrateMbps()
 
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
@@ -559,6 +590,8 @@ final class StreamViewModel: ObservableObject {
     private static let preferredFramerateKey = "screx_pref_framerate"
     private static let preferredCodecKey = "screx_pref_codec"
     private static let preferredBitrateKey = "screx_pref_bitrate"
+    private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
+    private static let defaultCustomBitrateMbps: Double = 10.0
 
     private static func loadPreferredResolution() -> StreamResolutionPreset {
         let raw = UserDefaults.standard.string(forKey: preferredResolutionKey) ?? StreamResolutionPreset.daemonDefault.rawValue
@@ -575,9 +608,26 @@ final class StreamViewModel: ObservableObject {
         return StreamCodecPreset(rawValue: raw) ?? .daemonDefault
     }
 
+    /// Loads the persisted bitrate preset, migrating raw values from before the
+    /// Low/Medium/High/Very high/Custom rename (`"saver"` → `.low`, `"balanced"` →
+    /// `.medium`; the old `"high"` rawValue is unchanged and matches `.high` directly).
     private static func loadPreferredBitrate() -> StreamBitratePreset {
         let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) ?? StreamBitratePreset.daemonDefault.rawValue
-        return StreamBitratePreset(rawValue: raw) ?? .daemonDefault
+        if let preset = StreamBitratePreset(rawValue: raw) {
+            return preset
+        }
+        switch raw {
+        case "saver": return .low
+        case "balanced": return .medium
+        default: return .daemonDefault
+        }
+    }
+
+    private static func loadCustomBitrateMbps() -> Double {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: customBitrateMbpsKey) != nil else { return defaultCustomBitrateMbps }
+        let value = defaults.double(forKey: customBitrateMbpsKey)
+        return value.isFinite && value > 0 ? value : defaultCustomBitrateMbps
     }
 
     /// Called when the Stream Settings sheet is dismissed to persist whatever the user
@@ -589,17 +639,39 @@ final class StreamViewModel: ObservableObject {
         defaults.set(preferredFramerate.rawValue, forKey: Self.preferredFramerateKey)
         defaults.set(preferredCodec.rawValue, forKey: Self.preferredCodecKey)
         defaults.set(preferredBitrate.rawValue, forKey: Self.preferredBitrateKey)
+        defaults.set(customBitrateMbps, forKey: Self.customBitrateMbpsKey)
     }
 
-    private var preferredStreamSettings: StreamSettings {
+    private func preferredStreamSettings(for capabilities: DaemonCapabilities) -> StreamSettings {
         let resolution = preferredResolution.resolution
         return StreamSettings(
             width: resolution?.width,
             height: resolution?.height,
             fps: preferredFramerate.fps,
             codecId: preferredCodec.codecId,
-            bitrateBps: preferredBitrate.bitrateBps
+            bitrateBps: resolvedBitrateBps(clampingTo: capabilities)
         )
+    }
+
+    /// Resolves `preferredBitrate` (and, for `.custom`, `customBitrateMbps`) to a concrete
+    /// bps value to put on the wire. For `.custom` the raw Mbps input is snapped into
+    /// `capabilities.bitrateMinBps...bitrateMaxBps` client-side, because
+    /// `DaemonCapabilities.clamp` *drops* out-of-range values to nil rather than snapping
+    /// them — without this, a custom value slightly outside the daemon's advertised range
+    /// would silently fall back to "daemon default" instead of clamping to the nearest
+    /// supported bound. Non-finite or non-positive input is treated as "no preference"
+    /// (nil), same as daemon default.
+    private func resolvedBitrateBps(clampingTo capabilities: DaemonCapabilities) -> UInt32? {
+        guard preferredBitrate == .custom else {
+            return preferredBitrate.bitrateBps
+        }
+        guard customBitrateMbps.isFinite, customBitrateMbps > 0 else { return nil }
+        let rawBps = (customBitrateMbps * 1_000_000).rounded()
+        guard rawBps.isFinite, rawBps > 0 else { return nil }
+        let minBps = Double(capabilities.bitrateMinBps)
+        let maxBps = Double(capabilities.bitrateMaxBps)
+        let snapped = min(max(rawBps, minBps), maxBps)
+        return UInt32(snapped)
     }
 
     private func rememberRecentConnection(name: String, host: String, port: UInt16) {
@@ -816,7 +888,7 @@ final class StreamViewModel: ObservableObject {
         capsTimeoutWorkItem = nil
         daemonCapabilities = capabilities
 
-        let clamped = capabilities.clamp(preferredStreamSettings)
+        let clamped = capabilities.clamp(preferredStreamSettings(for: capabilities))
         log("CAPS received: \(capabilities); sending STNG: \(clamped)")
         sendStreamSettingsTransportState(clamped)
     }
@@ -1977,6 +2049,7 @@ struct ContentView: View {
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
     @State private var showStreamSettings = false
+    @State private var customBitrateText: String = ""
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -2315,13 +2388,33 @@ struct ContentView: View {
                     }
 
                     streamSettingRow(title: "Bitrate") {
-                        Picker("Bitrate", selection: $model.preferredBitrate) {
-                            ForEach(StreamBitratePreset.allCases) { preset in
-                                Text(preset.label).tag(preset)
+                        HStack(spacing: 8) {
+                            Picker("Bitrate", selection: $model.preferredBitrate) {
+                                ForEach(StreamBitratePreset.allCases) { preset in
+                                    Text(preset.label).tag(preset)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+
+                            if model.preferredBitrate == .custom {
+                                HStack(spacing: 4) {
+                                    TextField("Mbps", text: $customBitrateText)
+                                        .keyboardType(.decimalPad)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(width: 64)
+                                        .textFieldStyle(.roundedBorder)
+                                        .onChange(of: customBitrateText) { newValue in
+                                            if let parsed = Double(newValue), parsed.isFinite, parsed > 0 {
+                                                model.customBitrateMbps = parsed
+                                            }
+                                        }
+                                    Text("Mbps")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
                     }
                 }
 
@@ -2330,6 +2423,9 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .padding(32)
+            .onAppear {
+                customBitrateText = String(format: "%.1f", model.customBitrateMbps)
+            }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
