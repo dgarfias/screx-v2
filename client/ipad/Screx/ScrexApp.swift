@@ -2460,6 +2460,12 @@ struct ContentView: View {
                     model.persistStreamSettingsPreferences()
                 }
             )
+            // The parent ContentView re-renders ~every second from chatty model
+            // traffic/health updates. Wrapping the sheet in .equatable() and
+            // comparing only the seeded initial values lets SwiftUI skip those
+            // identical parent-driven re-renders while @State-driven user edits
+            // still invalidate the view normally.
+            .equatable()
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -2805,8 +2811,17 @@ struct ContentView: View {
 /// snap its scroll position back to the top. This view only depends on local `@State`
 /// seeded once from the model when the sheet is presented, so it never re-renders because
 /// of model changes.
-private struct StreamSettingsSheet: View {
+private struct StreamSettingsSheet: View, Equatable {
     @Environment(\.dismiss) private var dismiss
+
+    // Seeded values passed by the parent. These never change during the lifetime
+    // of the sheet, so they are used only for Equatable comparison to skip
+    // parent-driven re-renders caused by the chatty StreamViewModel.
+    private let initialResolution: StreamResolutionPreset
+    private let initialFramerate: StreamFrameratePreset
+    private let initialCodec: StreamCodecPreset
+    private let initialBitrate: StreamBitratePreset
+    private let initialCustomBitrateMbps: Double
 
     @State private var resolution: StreamResolutionPreset
     @State private var framerate: StreamFrameratePreset
@@ -2816,6 +2831,14 @@ private struct StreamSettingsSheet: View {
 
     let onSave: (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
 
+    static func == (lhs: StreamSettingsSheet, rhs: StreamSettingsSheet) -> Bool {
+        lhs.initialResolution == rhs.initialResolution
+            && lhs.initialFramerate == rhs.initialFramerate
+            && lhs.initialCodec == rhs.initialCodec
+            && lhs.initialBitrate == rhs.initialBitrate
+            && lhs.initialCustomBitrateMbps == rhs.initialCustomBitrateMbps
+    }
+
     init(
         resolution: StreamResolutionPreset,
         framerate: StreamFrameratePreset,
@@ -2824,6 +2847,11 @@ private struct StreamSettingsSheet: View {
         customBitrateMbps: Double,
         onSave: @escaping (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
     ) {
+        self.initialResolution = resolution
+        self.initialFramerate = framerate
+        self.initialCodec = codec
+        self.initialBitrate = bitrate
+        self.initialCustomBitrateMbps = customBitrateMbps
         _resolution = State(initialValue: resolution)
         _framerate = State(initialValue: framerate)
         _codec = State(initialValue: codec)
