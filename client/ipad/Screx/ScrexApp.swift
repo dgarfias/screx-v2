@@ -632,10 +632,10 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Stream settings preferences
 
-    private static let preferredResolutionKey = "screx_pref_resolution"
-    private static let preferredFramerateKey = "screx_pref_framerate"
+    private static let preferredResolutionKey = "screx_pref_resolution_v2"
+    private static let preferredFramerateKey = "screx_pref_framerate_v2"
     private static let preferredCodecKey = "screx_pref_codec"
-    private static let preferredBitrateKey = "screx_pref_bitrate"
+    private static let preferredBitrateKey = "screx_pref_bitrate_v2"
     private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
     private static let defaultCustomBitrateMbps: Double = 10.0
 
@@ -668,23 +668,13 @@ final class StreamViewModel: ObservableObject {
         return StreamCodecPreset(rawValue: raw) ?? .daemonDefault
     }
 
-    /// Loads the persisted bitrate preset, migrating raw values from before the
-    /// Low/Medium/High/Very high/Custom rename (`"saver"` → `.low`, `"balanced"` →
-    /// `.medium`; the old `"high"` rawValue is unchanged and matches `.high` directly).
     /// Falls back to `.medium` (8 Mbps) both when no preference has ever been stored and
-    /// when a stored rawValue is unrecognized and doesn't match a legacy migration.
+    /// when a stored rawValue is unrecognized (e.g. a preset removed in a later version).
     private static func loadPreferredBitrate() -> StreamBitratePreset {
         guard let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) else {
             return .medium
         }
-        if let preset = StreamBitratePreset(rawValue: raw) {
-            return preset
-        }
-        switch raw {
-        case "saver": return .low
-        case "balanced": return .medium
-        default: return .medium
-        }
+        return StreamBitratePreset(rawValue: raw) ?? .medium
     }
 
     private static func loadCustomBitrateMbps() -> Double {
@@ -2155,7 +2145,6 @@ struct ContentView: View {
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
     @State private var showStreamSettings = false
-    @State private var customBitrateText: String = ""
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -2453,85 +2442,24 @@ struct ContentView: View {
             .padding(32)
             .interactiveDismissDisabled()
         }
-        .sheet(isPresented: $showStreamSettings, onDismiss: { model.persistStreamSettingsPreferences() }) {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("Stream Settings")
-                    .font(.title2.bold())
-
-                Text("Applied on your next connection. If a setting is beyond what the daemon supports, the connection will fail instead of being adjusted automatically.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-
-                VStack(alignment: .leading, spacing: 14) {
-                    streamSettingRow(title: "Resolution") {
-                        Picker("Resolution", selection: $model.preferredResolution) {
-                            ForEach(StreamResolutionPreset.pickerCases) { preset in
-                                Text(preset.label).tag(preset)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
+        .sheet(isPresented: $showStreamSettings) {
+            StreamSettingsSheet(
+                resolution: model.preferredResolution,
+                framerate: model.preferredFramerate,
+                codec: model.preferredCodec,
+                bitrate: model.preferredBitrate,
+                customBitrateMbps: model.customBitrateMbps,
+                onSave: { resolution, framerate, codec, bitrate, customBitrateMbps in
+                    model.preferredResolution = resolution
+                    model.preferredFramerate = framerate
+                    model.preferredCodec = codec
+                    model.preferredBitrate = bitrate
+                    if let customBitrateMbps {
+                        model.customBitrateMbps = customBitrateMbps
                     }
-
-                    streamSettingRow(title: "Framerate") {
-                        Picker("Framerate", selection: $model.preferredFramerate) {
-                            ForEach(StreamFrameratePreset.allCases) { preset in
-                                Text(preset.label).tag(preset)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
-
-                    streamSettingRow(title: "Codec") {
-                        Picker("Codec", selection: $model.preferredCodec) {
-                            ForEach(StreamCodecPreset.allCases) { preset in
-                                Text(preset.label).tag(preset)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                    }
-
-                    streamSettingRow(title: "Bitrate") {
-                        HStack(spacing: 8) {
-                            Picker("Bitrate", selection: $model.preferredBitrate) {
-                                ForEach(StreamBitratePreset.allCases) { preset in
-                                    Text(preset.label).tag(preset)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-
-                            if model.preferredBitrate == .custom {
-                                HStack(spacing: 4) {
-                                    TextField("Mbps", text: $customBitrateText)
-                                        .keyboardType(.decimalPad)
-                                        .multilineTextAlignment(.trailing)
-                                        .frame(width: 64)
-                                        .textFieldStyle(.roundedBorder)
-                                        .onChange(of: customBitrateText) { newValue in
-                                            if let parsed = Double(newValue), parsed.isFinite, parsed > 0 {
-                                                model.customBitrateMbps = parsed
-                                            }
-                                        }
-                                    Text("Mbps")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
+                    model.persistStreamSettingsPreferences()
                 }
-
-                Button("Done") { showStreamSettings = false }
-                    .buttonStyle(.borderedProminent)
-                    .frame(maxWidth: .infinity)
-            }
-            .padding(32)
-            .onAppear {
-                customBitrateText = String(format: "%.1f", model.customBitrateMbps)
-            }
+            )
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -2740,16 +2668,6 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func streamSettingRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        HStack {
-            Text(title)
-                .font(.subheadline.weight(.medium))
-            Spacer()
-            content()
-        }
-    }
-
     private func showToolbarMessage(_ message: String) {
         withAnimation(.easeInOut(duration: 0.2)) {
             toolbarMessage = message
@@ -2877,5 +2795,132 @@ struct ContentView: View {
 
     private static func saveToolbarExpanded(_ expanded: Bool) {
         UserDefaults.standard.set(expanded, forKey: expandedKey)
+    }
+}
+
+/// Stream Settings sheet content, extracted out of `ContentView` so it does not observe
+/// `StreamViewModel` at all. `ContentView` re-renders roughly every second from the
+/// model's chatty `@Published` properties (connection health, discovery, stats); while a
+/// `.pickerStyle(.menu)` menu is open, each re-render used to rebuild the menu content and
+/// snap its scroll position back to the top. This view only depends on local `@State`
+/// seeded once from the model when the sheet is presented, so it never re-renders because
+/// of model changes.
+private struct StreamSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var resolution: StreamResolutionPreset
+    @State private var framerate: StreamFrameratePreset
+    @State private var codec: StreamCodecPreset
+    @State private var bitrate: StreamBitratePreset
+    @State private var customBitrateText: String
+
+    let onSave: (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
+
+    init(
+        resolution: StreamResolutionPreset,
+        framerate: StreamFrameratePreset,
+        codec: StreamCodecPreset,
+        bitrate: StreamBitratePreset,
+        customBitrateMbps: Double,
+        onSave: @escaping (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
+    ) {
+        _resolution = State(initialValue: resolution)
+        _framerate = State(initialValue: framerate)
+        _codec = State(initialValue: codec)
+        _bitrate = State(initialValue: bitrate)
+        _customBitrateText = State(initialValue: String(format: "%.1f", customBitrateMbps))
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Stream Settings")
+                .font(.title2.bold())
+
+            Text("Applied on your next connection. If a setting is beyond what the daemon supports, the connection will fail instead of being adjusted automatically.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 14) {
+                streamSettingRow(title: "Resolution") {
+                    Picker("Resolution", selection: $resolution) {
+                        ForEach(StreamResolutionPreset.pickerCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Framerate") {
+                    Picker("Framerate", selection: $framerate) {
+                        ForEach(StreamFrameratePreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Codec") {
+                    Picker("Codec", selection: $codec) {
+                        ForEach(StreamCodecPreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Bitrate") {
+                    HStack(spacing: 8) {
+                        Picker("Bitrate", selection: $bitrate) {
+                            ForEach(StreamBitratePreset.allCases) { preset in
+                                Text(preset.label).tag(preset)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+
+                        if bitrate == .custom {
+                            HStack(spacing: 4) {
+                                TextField("Mbps", text: $customBitrateText)
+                                    .keyboardType(.decimalPad)
+                                    .multilineTextAlignment(.trailing)
+                                    .frame(width: 64)
+                                    .textFieldStyle(.roundedBorder)
+                                Text("Mbps")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button("Done") { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(32)
+        .onDisappear {
+            let parsedCustomBitrate: Double? = {
+                guard bitrate == .custom, let parsed = Double(customBitrateText), parsed.isFinite, parsed > 0 else {
+                    return nil
+                }
+                return parsed
+            }()
+            onSave(resolution, framerate, codec, bitrate, parsedCustomBitrate)
+        }
+    }
+
+    @ViewBuilder
+    private func streamSettingRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack {
+            Text(title)
+                .font(.subheadline.weight(.medium))
+            Spacer()
+            content()
+        }
     }
 }
