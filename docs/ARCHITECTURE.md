@@ -358,6 +358,12 @@ v1 tags:
 | `0x07` | MAX_FRAMERATE | `fps(u8)` | Upper bound the client may request |
 | `0x08` | BITRATE_RANGE | `min_bps(u32 BE)` + `max_bps(u32 BE)` | Bounds the client may request |
 
+`BITRATE_RANGE`'s `max_bps` reflects the ceiling for whichever transport `CAPS` was sent over —
+the daemon advertises a higher value on USB (`--max-bitrate-usb`, default `100M`) than on network
+(`--max-bitrate`, default `20M`), since USB links have far more headroom than typical networks. A
+client that reconnects over a different transport should expect a different `BITRATE_RANGE` and
+re-validate against it. `MAX_RESOLUTION`/`MAX_FRAMERATE` ceilings are shared across transports.
+
 ### `STNG` (client -> daemon)
 
 ```
@@ -379,14 +385,26 @@ An omitted tag means "use the daemon's default for that field." `entry_count = 0
 "everything default, just connect" — the client should still send the message in that case rather
 than skipping it, since the daemon is waiting for it (see Backward compatibility below).
 
-### Clamping
+### Client-side validation
 
-The daemon never applies `STNG` values as-is — it clamps against its own configured bounds before
-starting the session's capture/encode pipeline:
+Clients do not clamp or silently drop out-of-range settings. Before sending `STNG`, a client
+validates its own configured settings (resolution, framerate, codec, bitrate) against the bounds
+just advertised in `CAPS`; if anything the user has configured falls outside those bounds, the
+client refuses to proceed with the connection and shows the user an error naming the offending
+setting, rather than degrading silently to some other value.
+
+### Clamping (daemon-side safety net)
+
+Even though a conforming client is expected to refuse to connect rather than send an out-of-range
+`STNG`, the daemon never applies `STNG` values as-is — it clamps against its own configured bounds
+before starting the session's capture/encode pipeline, as a safety net for non-conforming or buggy
+clients:
 
 - resolution clamps to `[640x360, --max-width x --max-height]`
 - framerate clamps to `[15, --max-framerate]`
-- bitrate clamps to `[500 Kbps, --max-bitrate]`
+- bitrate clamps to `[500 Kbps, --max-bitrate]` for sessions negotiated over the network transport,
+  or `[500 Kbps, --max-bitrate-usb]` for sessions negotiated over USB — whichever ceiling matches
+  the transport the `STNG` message arrived on
 - a requested codec not in the daemon's advertised `CODECS` falls back to the daemon's default codec
 
 ### Backward compatibility

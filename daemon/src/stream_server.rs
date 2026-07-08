@@ -272,6 +272,11 @@ pub struct SharedState {
     pub max_height: u32,
     pub max_fps: u32,
     pub bitrate_max_bps: u32,
+    /// USB-transport bitrate ceiling (`--max-bitrate-usb`), advertised in
+    /// `CAPS` and enforced when clamping `STNG` instead of `bitrate_max_bps`
+    /// for sessions negotiated over USB — USB links have far more headroom
+    /// than typical networks (see `ControlTransport`).
+    pub bitrate_max_usb_bps: u32,
     pub encoder_backend: EncoderBackend,
     /// Settings parsed out of a client's `STNG` control message, consumed
     /// once by the capture thread at the start of the next session (see
@@ -290,6 +295,7 @@ impl SharedState {
         max_height: u32,
         max_fps: u32,
         bitrate_max_bps: u32,
+        bitrate_max_usb_bps: u32,
         encoder_backend: EncoderBackend,
     ) -> Self {
         Self {
@@ -328,6 +334,7 @@ impl SharedState {
             max_height,
             max_fps,
             bitrate_max_bps,
+            bitrate_max_usb_bps,
             encoder_backend,
             pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
             start_time: Instant::now(),
@@ -389,6 +396,34 @@ impl SharedState {
 // daemon). See docs/ARCHITECTURE.md "Capability Negotiation" for the wire
 // format; both clients implement it independently from scratch.
 // ---------------------------------------------------------------------------
+
+/// Which control channel a `CAPS`/`STNG` exchange is happening over. USB has
+/// far more bitrate headroom than a typical network link (even the slowest
+/// iPads' USB 2.0 connection is ~480 Mbps line rate), so the daemon
+/// advertises — and enforces — a different bitrate ceiling per transport.
+/// Resolution/fps ceilings are shared across both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlTransport {
+    Network,
+    Usb,
+}
+
+impl ControlTransport {
+    /// The bitrate ceiling that applies to this transport, per `SharedState`.
+    fn bitrate_ceiling(self, shared: &SharedState) -> u32 {
+        match self {
+            ControlTransport::Network => shared.bitrate_max_bps,
+            ControlTransport::Usb => shared.bitrate_max_usb_bps,
+        }
+    }
+
+    fn log_label(self) -> &'static str {
+        match self {
+            ControlTransport::Network => "network",
+            ControlTransport::Usb => "usb",
+        }
+    }
+}
 
 /// What this daemon can actually do right now, not just "compiled in."
 /// Rebuilt fresh for every `CAPS` message (see `build_caps_message`) rather
@@ -455,13 +490,16 @@ fn push_tlv_entry(msg: &mut Vec<u8>, tag: u8, value: &[u8]) {
 /// Build a `CAPS` control message frame body advertising what this daemon
 /// can do right now. Re-probes capabilities on every call (see
 /// `probe_capabilities`) rather than reading a cached value, so it's cheap
-/// by design — callers (pairing.rs, usb.rs) call this once per connection.
-pub fn build_caps_message(shared: &SharedState) -> Vec<u8> {
+/// by design — callers (pairing.rs, usb.rs) call this once per connection,
+/// passing the `ControlTransport` the connection arrived on so the
+/// advertised BITRATE_RANGE matches the ceiling that will actually be
+/// enforced for that transport.
+pub fn build_caps_message(shared: &SharedState, transport: ControlTransport) -> Vec<u8> {
     let caps = probe_capabilities(
         shared.max_width,
         shared.max_height,
         shared.max_fps,
-        shared.bitrate_max_bps,
+        transport.bitrate_ceiling(shared),
         shared.encoder_backend,
     );
 
@@ -575,8 +613,14 @@ fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
 /// Clamp everything the client asked for against `DaemonCapabilities` —
 /// never trust the client's numbers directly. Logs a warning whenever a
 /// clamp changes what was requested, so operators can debug "why did my
-/// requested 4K60 get downgraded."
-fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) -> RequestedSettings {
+/// requested 4K60 get downgraded." `transport` selects which bitrate
+/// ceiling applies (USB sessions get the higher `--max-bitrate-usb`
+/// ceiling); resolution/fps/codec ceilings are shared across transports.
+fn clamp_requested_settings(
+    shared: &SharedState,
+    mut req: RequestedSettings,
+    transport: ControlTransport,
+) -> RequestedSettings {
     if let (Some(w), Some(h)) = (req.width, req.height) {
         let clamped_w = clamp_u32(w, STNG_RESOLUTION_FLOOR_W, shared.max_width);
         let clamped_h = clamp_u32(h, STNG_RESOLUTION_FLOOR_H, shared.max_height);
@@ -608,9 +652,13 @@ fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) ->
     }
 
     if let Some(bitrate) = req.bitrate_bps {
-        let clamped = clamp_u32(bitrate, STNG_BITRATE_FLOOR_BPS, shared.bitrate_max_bps);
+        let ceiling = transport.bitrate_ceiling(shared);
+        let clamped = clamp_u32(bitrate, STNG_BITRATE_FLOOR_BPS, ceiling);
         if clamped != bitrate {
-            println!("[control] STNG requested bitrate {bitrate} clamped to {clamped}");
+            println!(
+                "[control] STNG requested bitrate {bitrate} clamped to {clamped} ({} ceiling {ceiling})",
+                transport.log_label()
+            );
         }
         req.bitrate_bps = Some(clamped);
     }
@@ -620,8 +668,9 @@ fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) ->
 
 /// Handle an inbound `STNG` control message: parse, clamp, and hand off to
 /// the capture thread via the `pending_settings` condvar for the *next*
-/// session it starts (see main.rs's capture loop).
-fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
+/// session it starts (see main.rs's capture loop). `transport` selects the
+/// bitrate ceiling used for clamping — see `clamp_requested_settings`.
+fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8], transport: ControlTransport) {
     let Some(parsed) = parse_stng_body(body) else {
         eprintln!(
             "[control] malformed STNG message ({} bytes), ignoring",
@@ -630,7 +679,7 @@ fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
         return;
     };
 
-    let clamped = clamp_requested_settings(shared, parsed);
+    let clamped = clamp_requested_settings(shared, parsed, transport);
     println!("[control] received STNG, will apply to next session: {clamped:?}");
 
     let (lock, cvar) = &*shared.pending_settings;
@@ -743,7 +792,11 @@ pub fn handle_periph_packet_data(_shared: &Arc<SharedState>, data: &[u8]) {
     }
 }
 
-pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
+pub fn handle_control_message_data(
+    shared: &Arc<SharedState>,
+    ctrl: &[u8],
+    transport: ControlTransport,
+) {
     if ctrl.starts_with(PLI_MAGIC) {
         shared.note_pli();
         shared.force_idr.store(true, Ordering::Relaxed);
@@ -751,7 +804,7 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     }
 
     if ctrl.starts_with(STNG_MAGIC) {
-        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..]);
+        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..], transport);
         return;
     }
 

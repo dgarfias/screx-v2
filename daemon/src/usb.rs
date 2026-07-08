@@ -277,7 +277,10 @@ fn activate_usb_transport(shared: &Arc<SharedState>, mut sender: TcpFramedSender
         }
     }
 
-    let caps_payload = crate::stream_server::build_caps_message(shared);
+    let caps_payload = crate::stream_server::build_caps_message(
+        shared,
+        crate::stream_server::ControlTransport::Usb,
+    );
     if let Err(e) = sender.send_control(&caps_payload) {
         eprintln!("[usb] failed to send capabilities: {e:#}");
     }
@@ -371,7 +374,11 @@ fn read_control_loop(
                 // CAMCFG/MICCFG config magics share the "CAM"/"MIC" prefix with the
                 // CAM/MIC data magics below, so they must be routed to the control
                 // handler here before the data branches would otherwise swallow them.
-                crate::stream_server::handle_control_message_data(shared, ctrl);
+                crate::stream_server::handle_control_message_data(
+                    shared,
+                    ctrl,
+                    crate::stream_server::ControlTransport::Usb,
+                );
             } else if ctrl.starts_with(b"CAM") && ctrl.len() > 3 {
                 cam_chunks += 1;
                 if let Some(jpeg) = cam_reassembler.feed(&ctrl[3..]) {
@@ -399,7 +406,11 @@ fn read_control_loop(
                     }
                 }
             } else {
-                crate::stream_server::handle_control_message_data(shared, ctrl);
+                crate::stream_server::handle_control_message_data(
+                    shared,
+                    ctrl,
+                    crate::stream_server::ControlTransport::Usb,
+                );
             }
         }
     }

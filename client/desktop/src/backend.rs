@@ -731,29 +731,70 @@ impl BackendWorker {
     }
 
     /// Called when a `CAPS` frame has been parsed off the wire for the given
-    /// session. Clamps the user's persisted stream-settings choice against
-    /// what the daemon actually advertised and sends exactly one `STNG`
-    /// frame. A no-op if this session already resolved capabilities (e.g.
-    /// the 2s timeout already fired, or a duplicate CAPS arrived).
+    /// session. Validates the user's persisted stream-settings choice against
+    /// what the daemon actually advertised: if everything fits, sends exactly
+    /// one `STNG` frame with the user's unmodified settings; if anything is
+    /// out of range, per product decision this does NOT clamp or drop the
+    /// offending value — it fails the connection outright (see
+    /// `fail_connection`) so the user can go edit their settings and
+    /// reconnect. A no-op if this session already resolved capabilities
+    /// (e.g. the 2s timeout already fired, or a duplicate CAPS arrived).
     fn handle_caps_received(&mut self, session_id: u64, caps: DaemonCapabilities) {
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        if active.session_id != session_id || active.caps_resolved {
+        let should_resolve = self
+            .active
+            .as_ref()
+            .map(|active| active.session_id == session_id && !active.caps_resolved)
+            .unwrap_or(false);
+        if !should_resolve {
             return;
         }
-        active.caps_resolved = true;
+        if let Some(active) = self.active.as_mut() {
+            active.caps_resolved = true;
+        }
         (self.ui)(UiEvent::SetCapabilities(caps.clone()));
 
         let choice = self.storage.get_stream_settings_choice();
         let requested = choice.to_requested();
-        let clamped = capabilities::clamp_settings(&requested, &caps);
-        let stng = capabilities::build_stng(&clamped);
-        if let Err(error) = active.control.send_payload(&stng) {
-            (self.ui)(UiEvent::SetStatus(format!(
-                "Failed to send stream settings: {error:#}"
-            )));
+        let violations = capabilities::validate_settings(&requested, &caps);
+        if !violations.is_empty() {
+            self.fail_connection(format!("Failed to connect: {}", violations.join("; ")));
+            return;
         }
+
+        let stng = capabilities::build_stng(&requested);
+        if let Some(active) = self.active.as_ref() {
+            if let Err(error) = active.control.send_payload(&stng) {
+                (self.ui)(UiEvent::SetStatus(format!(
+                    "Failed to send stream settings: {error:#}"
+                )));
+            }
+        }
+    }
+
+    /// Tear down the active session (the same machinery `handle_disconnect`
+    /// uses for a user-initiated disconnect, run quietly so its generic
+    /// "Disconnected..." status doesn't leak through) and then report
+    /// `reason` as the final status instead. Used when validating the user's
+    /// stream settings against the daemon's `CAPS` fails: the session must
+    /// not be left half-open, but the user needs to see *why* it failed, not
+    /// a generic disconnect message.
+    fn fail_connection(&mut self, reason: String) {
+        self.handle_disconnect(true);
+        (self.ui)(UiEvent::SetConnecting(false));
+        (self.ui)(UiEvent::ClearPinPrompt);
+        (self.ui)(UiEvent::SetDirectControl(None));
+        (self.ui)(UiEvent::SetConnected(false));
+        (self.ui)(UiEvent::SetSessionTitle("No active session".into()));
+        (self.ui)(UiEvent::SetStatus(reason));
+        (self.ui)(UiEvent::SetCodecLabel("Waiting for stream".into()));
+        (self.ui)(UiEvent::SetResolutionLabel("Pending".into()));
+        (self.ui)(UiEvent::SetStats {
+            fps: 0,
+            bitrate_mbps: 0.0,
+            latency_ms: 0,
+            dropped_frames: 0,
+        });
+        (self.ui)(UiEvent::SetCapabilities(DaemonCapabilities::default()));
     }
 
     /// Called ~2s after session establishment if no CAPS frame ever arrived.

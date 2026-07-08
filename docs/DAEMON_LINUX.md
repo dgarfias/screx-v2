@@ -103,6 +103,7 @@ sudo ./target/release/screx unpair --all
 | `-f, --max-framerate` | `60` | Maximum framerate clients may request (also the default when a client doesn't ask) |
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
+| `--max-bitrate-usb` | `100M` | Maximum encoder bitrate USB-connected clients may request (ceiling; USB links have far more headroom than typical networks) |
 | `-p, --port` | `9000` | UDP/TCP streaming port |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
@@ -111,11 +112,12 @@ sudo ./target/release/screx unpair --all
 | `--usb-only` | off | Disable network pairing and UDP streaming |
 | `--no-camera-exclusive-caps` | off | Disable v4l2loopback exclusive capture caps for better app compatibility |
 
-`--max-width`/`--max-height`/`--max-framerate`/`--max-bitrate` are per-daemon ceilings and defaults,
-not fixed values every session gets: connecting clients may propose any resolution, framerate,
-codec, or bitrate at or below these bounds during connection, and the daemon starts that session
-with the negotiated values. See [ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation) for the
-negotiation protocol.
+`--max-width`/`--max-height`/`--max-framerate`/`--max-bitrate`/`--max-bitrate-usb` are per-daemon
+ceilings and defaults, not fixed values every session gets: connecting clients may propose any
+resolution, framerate, codec, or bitrate at or below these bounds during connection, and the
+daemon starts that session with the negotiated values. `--max-bitrate-usb` applies only to
+sessions negotiated over the USB transport; all other ceilings are shared across transports. See
+[ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation) for the negotiation protocol.
 
 ## Use
 

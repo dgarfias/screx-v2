@@ -46,11 +46,9 @@ const TAG_BITRATE: u8 = 0x04;
 pub const CODEC_H264: u8 = 0x00;
 pub const CODEC_H265: u8 = 0x01;
 
-/// Validation/clamping floors — see the plan's "Validation/clamping bounds"
-/// section. Ceilings come from the daemon's advertised `DaemonCapabilities`.
-pub const MIN_WIDTH: u32 = 640;
-pub const MIN_HEIGHT: u32 = 360;
-pub const MIN_FPS: u32 = 15;
+/// Permissive fallback for the daemon's minimum advertised bitrate, used by
+/// `DaemonCapabilities::default()` when a `CAPS` message omits the bitrate
+/// range tag (or for a legacy daemon that never sends `CAPS` at all).
 pub const MIN_BITRATE_BPS: u32 = 500_000;
 
 /// What the daemon told us it can do. Also used, via `Default`, as the
@@ -192,39 +190,76 @@ pub struct RequestedSettings {
     pub bitrate_bps: Option<u32>,
 }
 
-/// Clamp a client's requested settings against what the daemon actually
-/// advertised. Mirrors the daemon-side clamping rules in the plan so the
-/// client never sends a value the daemon would have had to clamp anyway.
-/// A codec the daemon didn't advertise is dropped entirely (omitted, so the
-/// daemon picks its own default) rather than sent and rejected.
-pub fn clamp_settings(requested: &RequestedSettings, caps: &DaemonCapabilities) -> RequestedSettings {
-    let mut out = RequestedSettings::default();
+/// Format a bits-per-second value as a trimmed Mbps string for user-facing
+/// messages, e.g. `20_000_000` -> `"20"`, `12_500_000` -> `"12.5"`.
+fn fmt_mbps(bps: u32) -> String {
+    let mbps = bps as f64 / 1_000_000.0;
+    let formatted = format!("{mbps:.2}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// Check a client's requested settings against what the daemon actually
+/// advertised. Per product decision, the client never clamps or silently
+/// drops an out-of-range setting — instead this returns a human-readable
+/// description of every violation found (empty if `requested` fits entirely
+/// within `caps`). The caller fails the connection and surfaces these
+/// messages verbatim (joined) to the user rather than sending an `STNG` the
+/// daemon would have to reject or clamp itself.
+///
+/// Only `Some` fields are checked; `None` means "daemon default," which is
+/// always acceptable.
+pub fn validate_settings(requested: &RequestedSettings, caps: &DaemonCapabilities) -> Vec<String> {
+    let mut violations = Vec::new();
 
     if let (Some(w), Some(h)) = (requested.width, requested.height) {
-        let max_w = caps.max_width.max(MIN_WIDTH);
-        let max_h = caps.max_height.max(MIN_HEIGHT);
-        out.width = Some(w.clamp(MIN_WIDTH, max_w));
-        out.height = Some(h.clamp(MIN_HEIGHT, max_h));
+        if w > caps.max_width || h > caps.max_height {
+            violations.push(format!(
+                "resolution is higher than maximum allowed by daemon (current: {w}\u{d7}{h}, maximum allowed: {}\u{d7}{})",
+                caps.max_width, caps.max_height
+            ));
+        }
     }
 
     if let Some(fps) = requested.fps {
-        let max_fps = caps.max_fps.max(MIN_FPS);
-        out.fps = Some(fps.clamp(MIN_FPS, max_fps));
+        if fps > caps.max_fps {
+            violations.push(format!(
+                "framerate is higher than maximum allowed by daemon (current: {fps} fps, maximum allowed: {} fps)",
+                caps.max_fps
+            ));
+        }
     }
 
     if let Some(codec) = requested.codec {
-        if caps.codecs.contains(&codec) {
-            out.codec = Some(codec);
+        if !caps.codecs.contains(&codec) {
+            let name = match codec {
+                CODEC_H264 => "H.264".to_string(),
+                CODEC_H265 => "H.265".to_string(),
+                other => format!("0x{other:02x}"),
+            };
+            violations.push(format!("codec {name} is not supported by the daemon"));
         }
     }
 
     if let Some(bps) = requested.bitrate_bps {
-        let lo = caps.bitrate_min_bps.max(MIN_BITRATE_BPS);
-        let hi = caps.bitrate_max_bps.max(lo);
-        out.bitrate_bps = Some(bps.clamp(lo, hi));
+        if bps > caps.bitrate_max_bps {
+            violations.push(format!(
+                "bitrate is higher than maximum allowed by daemon (current: {} Mbps, maximum allowed: {} Mbps)",
+                fmt_mbps(bps),
+                fmt_mbps(caps.bitrate_max_bps)
+            ));
+        } else if bps < caps.bitrate_min_bps {
+            violations.push(format!(
+                "bitrate is lower than minimum allowed by daemon (current: {} Mbps, minimum allowed: {} Mbps)",
+                fmt_mbps(bps),
+                fmt_mbps(caps.bitrate_min_bps)
+            ));
+        }
     }
 
-    out
+    violations
 }
 
 /// Build an `STNG` message containing only the entries the caller actually
@@ -375,9 +410,8 @@ mod tests {
         assert_eq!(stng[5], 0); // entry_count
     }
 
-    #[test]
-    fn clamp_settings_respects_bounds() {
-        let caps = DaemonCapabilities {
+    fn test_caps() -> DaemonCapabilities {
+        DaemonCapabilities {
             max_width: 1920,
             max_height: 1080,
             max_fps: 30,
@@ -385,7 +419,104 @@ mod tests {
             bitrate_max_bps: 5_000_000,
             codecs: vec![CODEC_H264],
             ..DaemonCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn validate_settings_in_range_is_empty() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30),
+            codec: Some(CODEC_H264),
+            bitrate_bps: Some(5_000_000),
         };
+        assert!(validate_settings(&requested, &caps).is_empty());
+    }
+
+    #[test]
+    fn validate_settings_all_none_is_empty() {
+        let caps = test_caps();
+        assert!(validate_settings(&RequestedSettings::default(), &caps).is_empty());
+    }
+
+    #[test]
+    fn validate_settings_flags_resolution_too_high() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            width: Some(3840),
+            height: Some(2160),
+            ..Default::default()
+        };
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0],
+            "resolution is higher than maximum allowed by daemon (current: 3840\u{d7}2160, maximum allowed: 1920\u{d7}1080)"
+        );
+    }
+
+    #[test]
+    fn validate_settings_flags_framerate_too_high() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            fps: Some(60),
+            ..Default::default()
+        };
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0],
+            "framerate is higher than maximum allowed by daemon (current: 60 fps, maximum allowed: 30 fps)"
+        );
+    }
+
+    #[test]
+    fn validate_settings_flags_unsupported_codec() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            codec: Some(CODEC_H265),
+            ..Default::default()
+        };
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0], "codec H.265 is not supported by the daemon");
+    }
+
+    #[test]
+    fn validate_settings_flags_bitrate_too_high() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            bitrate_bps: Some(25_000_000),
+            ..Default::default()
+        };
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0],
+            "bitrate is higher than maximum allowed by daemon (current: 25 Mbps, maximum allowed: 5 Mbps)"
+        );
+    }
+
+    #[test]
+    fn validate_settings_flags_bitrate_too_low() {
+        let caps = test_caps();
+        let requested = RequestedSettings {
+            bitrate_bps: Some(200_000),
+            ..Default::default()
+        };
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0],
+            "bitrate is lower than minimum allowed by daemon (current: 0.2 Mbps, minimum allowed: 1 Mbps)"
+        );
+    }
+
+    #[test]
+    fn validate_settings_reports_multiple_violations_together() {
+        let caps = test_caps();
         let requested = RequestedSettings {
             width: Some(3840),
             height: Some(2160),
@@ -393,12 +524,12 @@ mod tests {
             codec: Some(CODEC_H265),
             bitrate_bps: Some(20_000_000),
         };
-        let clamped = clamp_settings(&requested, &caps);
-        assert_eq!(clamped.width, Some(1920));
-        assert_eq!(clamped.height, Some(1080));
-        assert_eq!(clamped.fps, Some(30));
-        assert_eq!(clamped.codec, None); // H.265 not advertised -> omitted
-        assert_eq!(clamped.bitrate_bps, Some(5_000_000));
+        let violations = validate_settings(&requested, &caps);
+        assert_eq!(violations.len(), 4);
+        assert!(violations[0].starts_with("resolution is higher"));
+        assert!(violations[1].starts_with("framerate is higher"));
+        assert!(violations[2].starts_with("codec H.265"));
+        assert!(violations[3].starts_with("bitrate is higher"));
     }
 
     #[test]

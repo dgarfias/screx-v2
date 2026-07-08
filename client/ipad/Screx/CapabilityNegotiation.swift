@@ -147,35 +147,67 @@ struct DaemonCapabilities: Equatable {
         return result
     }
 
-    /// Clamps client-preferred stream settings to this daemon's advertised bounds
-    /// (Validation/clamping bounds: resolution floor 640x360, framerate floor 15,
-    /// bitrate floor 500 Kbps fixed; ceilings come from this struct). A value that
-    /// doesn't fit is dropped (set to nil) rather than snapped to the nearest bound, so
-    /// the daemon falls back to its own configured default for that field instead of
-    /// getting a fabricated substitute.
-    func clamp(_ settings: StreamSettings) -> StreamSettings {
-        var clamped = StreamSettings()
+    /// Returns human-readable violations of `settings` against these capabilities, empty
+    /// if everything fits. Messages are shown verbatim to the user after
+    /// "Failed to connect: ". A `nil` field in `settings` means "use the daemon's own
+    /// default", which always fits and is never checked.
+    ///
+    /// This is a fail-fast check, not a clamp: the caller must not modify or snap the
+    /// user's configured settings when a violation is reported — it must refuse to
+    /// connect so the user can adjust their settings and reconnect instead.
+    func validate(_ settings: StreamSettings) -> [String] {
+        var violations: [String] = []
 
-        if let width = settings.width, let height = settings.height,
-           width >= 640, height >= 360, width <= maxWidth, height <= maxHeight {
-            clamped.width = width
-            clamped.height = height
+        if let width = settings.width, let height = settings.height {
+            if width > maxWidth || height > maxHeight {
+                violations.append(
+                    "resolution is higher than maximum allowed by daemon (current: \(width)×\(height), maximum allowed: \(maxWidth)×\(maxHeight))"
+                )
+            }
         }
 
-        if let fps = settings.fps, fps >= 15, fps <= maxFps {
-            clamped.fps = fps
+        if let fps = settings.fps, fps > maxFps {
+            violations.append(
+                "framerate is higher than maximum allowed by daemon (current: \(fps) fps, maximum allowed: \(maxFps) fps)"
+            )
         }
 
-        if let codecId = settings.codecId, codecs.contains(codecId) {
-            clamped.codecId = codecId
+        if let codecId = settings.codecId, !codecs.contains(codecId) {
+            let codecLabel = codecId == Self.codecH265 ? "H.265" : "H.264"
+            violations.append("codec \(codecLabel) is not supported by the daemon")
         }
 
-        if let bitrateBps = settings.bitrateBps,
-           bitrateBps >= bitrateMinBps, bitrateBps <= bitrateMaxBps {
-            clamped.bitrateBps = bitrateBps
+        if let bitrateBps = settings.bitrateBps {
+            if bitrateBps > bitrateMaxBps {
+                violations.append(
+                    "bitrate is higher than maximum allowed by daemon (current: \(Self.formatMbps(bitrateBps)) Mbps, maximum allowed: \(Self.formatMbps(bitrateMaxBps)) Mbps)"
+                )
+            } else if bitrateBps < bitrateMinBps {
+                violations.append(
+                    "bitrate is lower than minimum allowed by daemon (current: \(Self.formatMbps(bitrateBps)) Mbps, minimum allowed: \(Self.formatMbps(bitrateMinBps)) Mbps)"
+                )
+            }
         }
 
-        return clamped
+        return violations
+    }
+
+    /// Formats a bps value as a trimmed Mbps string, e.g. `12_500_000` -> "12.5",
+    /// `20_000_000` -> "20".
+    private static func formatMbps(_ bps: UInt32) -> String {
+        let mbps = Double(bps) / 1_000_000
+        let rounded = (mbps * 100).rounded() / 100
+        if rounded == rounded.rounded() {
+            return String(format: "%.0f", rounded)
+        }
+        var text = String(format: "%.2f", rounded)
+        while text.hasSuffix("0") {
+            text.removeLast()
+        }
+        if text.hasSuffix(".") {
+            text.removeLast()
+        }
+        return text
     }
 }
 

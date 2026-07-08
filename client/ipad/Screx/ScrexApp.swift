@@ -170,13 +170,18 @@ enum ConnectionHealthState: String {
 }
 
 /// User-facing resolution presets offered in the Stream Settings sheet. `daemonDefault`
-/// means "omit the resolution TLV entry from `STNG`" (let the daemon pick).
+/// means "omit the resolution TLV entry from `STNG`" (let the daemon pick). `native`
+/// means "this device's own panel resolution", detected at runtime from `UIScreen`.
 enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
+    case native = "native"
     case p720 = "720p"
     case p1080 = "1080p"
     case p1440 = "1440p"
     case uhd4k = "4k"
+    case wxga1610 = "1280x800"
+    case wuxga = "1920x1200"
+    case wqxga = "2560x1600"
     case ipadMini = "2266x1488"
     case ipadBase = "2160x1620"
     case ipadA16 = "2360x1640"
@@ -187,13 +192,30 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// This device's native panel resolution in landscape orientation (width >= height),
+    /// derived once from `UIScreen.main.nativeBounds` (a pixel size, not points).
+    /// Cached because `UIScreen.main` access and the width/height normalization never
+    /// change for the lifetime of the process.
+    private static let nativeResolution: (width: Int, height: Int) = {
+        let bounds = UIScreen.main.nativeBounds
+        let long = Int(max(bounds.width, bounds.height))
+        let short = Int(min(bounds.width, bounds.height))
+        return (long, short)
+    }()
+
     var label: String {
         switch self {
         case .daemonDefault: return "Daemon default"
+        case .native:
+            let native = Self.nativeResolution
+            return "This iPad (\(native.width)×\(native.height))"
         case .p720: return "720p (1280×720)"
         case .p1080: return "1080p (1920×1080)"
         case .p1440: return "1440p (2560×1440)"
         case .uhd4k: return "4K (3840×2160)"
+        case .wxga1610: return "1280×800 (16:10)"
+        case .wuxga: return "1920×1200 (16:10)"
+        case .wqxga: return "2560×1600 (16:10)"
         case .ipadMini: return "2266×1488 (iPad mini)"
         case .ipadBase: return "2160×1620 (iPad 7th–9th gen)"
         case .ipadA16: return "2360×1640 (iPad 10th/11th gen, Air 11″)"
@@ -207,10 +229,14 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     var resolution: (width: Int, height: Int)? {
         switch self {
         case .daemonDefault: return nil
+        case .native: return Self.nativeResolution
         case .p720: return (1280, 720)
         case .p1080: return (1920, 1080)
         case .p1440: return (2560, 1440)
         case .uhd4k: return (3840, 2160)
+        case .wxga1610: return (1280, 800)
+        case .wuxga: return (1920, 1200)
+        case .wqxga: return (2560, 1600)
         case .ipadMini: return (2266, 1488)
         case .ipadBase: return (2160, 1620)
         case .ipadA16: return (2360, 1640)
@@ -274,7 +300,7 @@ enum StreamCodecPreset: String, CaseIterable, Identifiable {
 
 /// User-facing bitrate presets offered in the Stream Settings sheet. `.custom` has no
 /// fixed `bitrateBps` of its own — its effective value comes from
-/// `StreamViewModel.customBitrateMbps` instead (see `resolvedBitrateBps(clampingTo:)`).
+/// `StreamViewModel.customBitrateMbps` instead (see `StreamViewModel.resolvedBitrateBps`).
 enum StreamBitratePreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
     case low = "low"
@@ -451,8 +477,10 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var daemonCapabilities: DaemonCapabilities?
 
     /// Stream-settings preferences the user picked in the Stream Settings sheet,
-    /// persisted in UserDefaults and re-sent (clamped to the daemon's advertised bounds)
-    /// as `STNG` on every connect.
+    /// persisted in UserDefaults and re-sent unmodified as `STNG` on every connect —
+    /// validated against the daemon's advertised bounds first (see
+    /// `handleDaemonCapabilities`); a setting that doesn't fit fails the connection
+    /// instead of being silently clamped.
     @Published var preferredResolution: StreamResolutionPreset = StreamViewModel.loadPreferredResolution()
     @Published var preferredFramerate: StreamFrameratePreset = StreamViewModel.loadPreferredFramerate()
     @Published var preferredCodec: StreamCodecPreset = StreamViewModel.loadPreferredCodec()
@@ -593,14 +621,21 @@ final class StreamViewModel: ObservableObject {
     private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
     private static let defaultCustomBitrateMbps: Double = 10.0
 
+    /// Falls back to `.native` (this device's own panel resolution) both when no
+    /// preference has ever been stored and when a stored rawValue is unrecognized
+    /// (e.g. a preset removed in a later version).
     private static func loadPreferredResolution() -> StreamResolutionPreset {
-        let raw = UserDefaults.standard.string(forKey: preferredResolutionKey) ?? StreamResolutionPreset.daemonDefault.rawValue
-        return StreamResolutionPreset(rawValue: raw) ?? .daemonDefault
+        guard let raw = UserDefaults.standard.string(forKey: preferredResolutionKey) else {
+            return .native
+        }
+        return StreamResolutionPreset(rawValue: raw) ?? .native
     }
 
     private static func loadPreferredFramerate() -> StreamFrameratePreset {
-        let raw = UserDefaults.standard.string(forKey: preferredFramerateKey) ?? StreamFrameratePreset.daemonDefault.rawValue
-        return StreamFrameratePreset(rawValue: raw) ?? .daemonDefault
+        guard let raw = UserDefaults.standard.string(forKey: preferredFramerateKey) else {
+            return .fps30
+        }
+        return StreamFrameratePreset(rawValue: raw) ?? .fps30
     }
 
     private static func loadPreferredCodec() -> StreamCodecPreset {
@@ -611,15 +646,19 @@ final class StreamViewModel: ObservableObject {
     /// Loads the persisted bitrate preset, migrating raw values from before the
     /// Low/Medium/High/Very high/Custom rename (`"saver"` → `.low`, `"balanced"` →
     /// `.medium`; the old `"high"` rawValue is unchanged and matches `.high` directly).
+    /// Falls back to `.medium` (8 Mbps) both when no preference has ever been stored and
+    /// when a stored rawValue is unrecognized and doesn't match a legacy migration.
     private static func loadPreferredBitrate() -> StreamBitratePreset {
-        let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) ?? StreamBitratePreset.daemonDefault.rawValue
+        guard let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) else {
+            return .medium
+        }
         if let preset = StreamBitratePreset(rawValue: raw) {
             return preset
         }
         switch raw {
         case "saver": return .low
         case "balanced": return .medium
-        default: return .daemonDefault
+        default: return .medium
         }
     }
 
@@ -631,7 +670,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     /// Called when the Stream Settings sheet is dismissed to persist whatever the user
-    /// picked. These persisted values are what feed the clamped `STNG` sent on every
+    /// picked. These persisted values are what feed the `STNG` validated and sent on every
     /// subsequent connect (see `handleDaemonCapabilities`).
     func persistStreamSettingsPreferences() {
         let defaults = UserDefaults.standard
@@ -642,36 +681,37 @@ final class StreamViewModel: ObservableObject {
         defaults.set(customBitrateMbps, forKey: Self.customBitrateMbpsKey)
     }
 
-    private func preferredStreamSettings(for capabilities: DaemonCapabilities) -> StreamSettings {
+    /// The user's configured stream settings, exactly as picked in the Stream Settings
+    /// sheet — no clamping or snapping against any daemon's advertised bounds. Sent to
+    /// the daemon as-is (see `handleDaemonCapabilities`) once `DaemonCapabilities.validate`
+    /// confirms it fits; otherwise the connection is failed instead of adjusting this.
+    private var preferredStreamSettings: StreamSettings {
         let resolution = preferredResolution.resolution
         return StreamSettings(
             width: resolution?.width,
             height: resolution?.height,
             fps: preferredFramerate.fps,
             codecId: preferredCodec.codecId,
-            bitrateBps: resolvedBitrateBps(clampingTo: capabilities)
+            bitrateBps: resolvedBitrateBps
         )
     }
 
     /// Resolves `preferredBitrate` (and, for `.custom`, `customBitrateMbps`) to a concrete
-    /// bps value to put on the wire. For `.custom` the raw Mbps input is snapped into
-    /// `capabilities.bitrateMinBps...bitrateMaxBps` client-side, because
-    /// `DaemonCapabilities.clamp` *drops* out-of-range values to nil rather than snapping
-    /// them — without this, a custom value slightly outside the daemon's advertised range
-    /// would silently fall back to "daemon default" instead of clamping to the nearest
-    /// supported bound. Non-finite or non-positive input is treated as "no preference"
-    /// (nil), same as daemon default.
-    private func resolvedBitrateBps(clampingTo capabilities: DaemonCapabilities) -> UInt32? {
+    /// bps value to put on the wire, unmodified. Non-finite or non-positive custom input
+    /// is treated as "no preference" (nil), same as daemon default; a finite custom value
+    /// is capped only against `UInt32.max` to guard the `Double` -> `UInt32` conversion
+    /// from overflowing, never against the daemon's advertised range — that's
+    /// `DaemonCapabilities.validate`'s job, and it fails the connection rather than
+    /// snapping this value.
+    private var resolvedBitrateBps: UInt32? {
         guard preferredBitrate == .custom else {
             return preferredBitrate.bitrateBps
         }
         guard customBitrateMbps.isFinite, customBitrateMbps > 0 else { return nil }
         let rawBps = (customBitrateMbps * 1_000_000).rounded()
         guard rawBps.isFinite, rawBps > 0 else { return nil }
-        let minBps = Double(capabilities.bitrateMinBps)
-        let maxBps = Double(capabilities.bitrateMaxBps)
-        let snapped = min(max(rawBps, minBps), maxBps)
-        return UInt32(snapped)
+        let capped = min(rawBps, Double(UInt32.max))
+        return UInt32(capped)
     }
 
     private func rememberRecentConnection(name: String, host: String, port: UInt16) {
@@ -881,16 +921,57 @@ final class StreamViewModel: ObservableObject {
     }
 
     /// Called when a real `CAPS` message arrives from the daemon. Cancels the timeout
-    /// fallback, publishes the capabilities, and replies with a clamped `STNG` built
-    /// from the user's persisted preferences.
+    /// fallback, publishes the capabilities, then validates the user's persisted stream
+    /// settings against them: if everything fits, sends the settings on to the daemon
+    /// exactly as configured (no clamping); if anything doesn't fit, fails the connection
+    /// instead of silently adjusting the user's preference — see
+    /// `DaemonCapabilities.validate` and `failConnection`.
     private func handleDaemonCapabilities(_ capabilities: DaemonCapabilities) {
         capsTimeoutWorkItem?.cancel()
         capsTimeoutWorkItem = nil
         daemonCapabilities = capabilities
 
-        let clamped = capabilities.clamp(preferredStreamSettings(for: capabilities))
-        log("CAPS received: \(capabilities); sending STNG: \(clamped)")
-        sendStreamSettingsTransportState(clamped)
+        let settings = preferredStreamSettings
+        let violations = capabilities.validate(settings)
+        guard violations.isEmpty else {
+            log("CAPS received: \(capabilities); settings \(settings) violate capabilities: \(violations)")
+            failConnection(detail: "Failed to connect: " + violations.joined(separator: "; "))
+            return
+        }
+
+        log("CAPS received: \(capabilities); sending STNG: \(settings)")
+        sendStreamSettingsTransportState(settings)
+    }
+
+    /// Fails the in-progress connection because the daemon's advertised capabilities
+    /// don't satisfy the user's configured stream settings. Tears down whichever
+    /// transport is active — mirroring the abrupt teardown `usb.onDisconnected` performs
+    /// (stream, network control, USB listener, decoder/audio/camera/mic/peripheral state,
+    /// and capability-negotiation state) — then reports the failure through the same
+    /// `applyConnectionHealth(.connectionError, ...)` surface every other connection
+    /// failure uses, so the UI shows it identically. Safe to call regardless of which
+    /// transport (or none) is actually active: every teardown call here is nil-safe.
+    private func failConnection(detail: String) {
+        log("failConnection: \(detail)")
+        usbConnected = false
+        isUSBListening = false
+        usbListener?.stop()
+        usbListener = nil
+        stream?.onEvent = nil
+        stream?.onDisconnect = nil
+        stream?.disconnect()
+        stream = nil
+        closeNetworkControl(gracefully: false)
+        pairingService?.cancel()
+        pairingService = nil
+        decoder.setSuspended(false)
+        audioPlayer.stop()
+        micCapture.stop()
+        configureAudioSession()
+        cameraCapture.stop()
+        stopPeripheralMonitoring()
+        resetCapabilityNegotiation()
+        applyConnectionHealth(.connectionError, detail: detail, transport: .none)
     }
 
     private func sendStreamSettingsTransportState(_ settings: StreamSettings) {
@@ -2352,7 +2433,7 @@ struct ContentView: View {
                 Text("Stream Settings")
                     .font(.title2.bold())
 
-                Text("Applied on your next connection. The daemon may clamp these to what it actually supports.")
+                Text("Applied on your next connection. If a setting is beyond what the daemon supports, the connection will fail instead of being adjusted automatically.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 

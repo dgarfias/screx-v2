@@ -771,8 +771,11 @@ ApplicationWindow {
                     model: [
                         { label: "Daemon default", value: "default" },
                         { label: "1280 × 720", value: "1280x720" },
+                        { label: "1280 × 800 (16:10)", value: "1280x800" },
                         { label: "1920 × 1080", value: "1920x1080" },
+                        { label: "1920 × 1200 (16:10)", value: "1920x1200" },
                         { label: "2560 × 1440", value: "2560x1440" },
+                        { label: "2560 × 1600 (16:10)", value: "2560x1600" },
                         { label: "3840 × 2160", value: "3840x2160" }
                     ]
                     delegate: Button {

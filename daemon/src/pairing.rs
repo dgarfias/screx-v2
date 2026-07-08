@@ -584,7 +584,10 @@ fn run_control_loop(
         }
     }
 
-    let caps_payload = crate::stream_server::build_caps_message(shared);
+    let caps_payload = crate::stream_server::build_caps_message(
+        shared,
+        crate::stream_server::ControlTransport::Network,
+    );
     if let Err(e) = send_control_frame(&mut stream, &cipher, &mut send_seq, &caps_payload) {
         eprintln!("[control] failed to send capabilities: {e:#}");
     }
@@ -653,7 +656,11 @@ fn run_control_loop(
             break;
         }
 
-        crate::stream_server::handle_control_message_data(shared, plaintext);
+        crate::stream_server::handle_control_message_data(
+            shared,
+            plaintext,
+            crate::stream_server::ControlTransport::Network,
+        );
     }
 
     crate::stream_server::drop_network_client(shared, session_id);

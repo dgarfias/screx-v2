@@ -72,6 +72,11 @@ struct Cli {
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
     max_bitrate: u32,
 
+    /// Maximum video bitrate clients may request over USB (ceiling; USB
+    /// links have far more headroom than typical networks)
+    #[arg(long = "max-bitrate-usb", default_value = "100M", value_parser = parse_bitrate)]
+    max_bitrate_usb: u32,
+
     /// UDP/TCP streaming port
     #[arg(short, long, default_value_t = 9000)]
     port: u16,
@@ -120,6 +125,7 @@ struct AppConfig {
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
+    bitrate_usb_max_bps: u32,
     stream_port: u16,
     camera_exclusive_caps: bool,
 }
@@ -140,6 +146,7 @@ impl AppConfig {
             fps: cli.max_framerate,
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.max_bitrate,
+            bitrate_usb_max_bps: cli.max_bitrate_usb,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
@@ -184,6 +191,10 @@ async fn main() -> Result<()> {
         config.encoder_backend,
     );
     println!("[main] daemon capabilities: {startup_capabilities:?}");
+    println!(
+        "[main] USB bitrate ceiling: {} bps (network ceiling: {} bps)",
+        config.bitrate_usb_max_bps, config.bitrate_bps
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -218,6 +229,7 @@ async fn main() -> Result<()> {
         config.height,
         config.fps,
         config.bitrate_bps,
+        config.bitrate_usb_max_bps,
         config.encoder_backend,
     ));
 
