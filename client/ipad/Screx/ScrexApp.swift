@@ -170,11 +170,9 @@ enum ConnectionHealthState: String {
 }
 
 /// User-facing resolution presets offered in the Stream Settings sheet. `daemonDefault`
-/// means "omit the resolution TLV entry from `STNG`" (let the daemon pick). `native`
-/// means "this device's own panel resolution", detected at runtime from `UIScreen`.
+/// means "omit the resolution TLV entry from `STNG`" (let the daemon pick).
 enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
-    case native = "native"
     case p720 = "720p"
     case p1080 = "1080p"
     case p1440 = "1440p"
@@ -203,12 +201,18 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
         return (long, short)
     }()
 
+    /// The preset matching this device's native panel resolution, if the list has one
+    /// (it does for every iPad model the list was built from). Used as the first-run
+    /// default so the device's own resolution is selected without needing a separate
+    /// "This iPad" entry duplicating a listed value.
+    static let deviceNative: StreamResolutionPreset? = allCases.first { preset in
+        guard let resolution = preset.resolution else { return false }
+        return resolution == nativeResolution
+    }
+
     var label: String {
         switch self {
         case .daemonDefault: return "Daemon default"
-        case .native:
-            let native = Self.nativeResolution
-            return "This iPad (\(native.width)×\(native.height))"
         case .p720: return "720p (1280×720)"
         case .p1080: return "1080p (1920×1080)"
         case .p1440: return "1440p (2560×1440)"
@@ -229,7 +233,6 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     var resolution: (width: Int, height: Int)? {
         switch self {
         case .daemonDefault: return nil
-        case .native: return Self.nativeResolution
         case .p720: return (1280, 720)
         case .p1080: return (1920, 1080)
         case .p1440: return (2560, 1440)
@@ -621,14 +624,16 @@ final class StreamViewModel: ObservableObject {
     private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
     private static let defaultCustomBitrateMbps: Double = 10.0
 
-    /// Falls back to `.native` (this device's own panel resolution) both when no
-    /// preference has ever been stored and when a stored rawValue is unrecognized
-    /// (e.g. a preset removed in a later version).
+    /// Falls back to the preset matching this device's own panel resolution (see
+    /// `StreamResolutionPreset.deviceNative`) both when no preference has ever been
+    /// stored and when a stored rawValue is unrecognized (e.g. a preset removed in a
+    /// later version); `.daemonDefault` if no listed preset matches this device.
     private static func loadPreferredResolution() -> StreamResolutionPreset {
+        let fallback = StreamResolutionPreset.deviceNative ?? .daemonDefault
         guard let raw = UserDefaults.standard.string(forKey: preferredResolutionKey) else {
-            return .native
+            return fallback
         }
-        return StreamResolutionPreset(rawValue: raw) ?? .native
+        return StreamResolutionPreset(rawValue: raw) ?? fallback
     }
 
     private static func loadPreferredFramerate() -> StreamFrameratePreset {
