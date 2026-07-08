@@ -632,10 +632,10 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Stream settings preferences
 
-    private static let preferredResolutionKey = "screx_pref_resolution_v2"
-    private static let preferredFramerateKey = "screx_pref_framerate_v2"
+    private static let preferredResolutionKey = "screx_pref_resolution"
+    private static let preferredFramerateKey = "screx_pref_framerate"
     private static let preferredCodecKey = "screx_pref_codec"
-    private static let preferredBitrateKey = "screx_pref_bitrate_v2"
+    private static let preferredBitrateKey = "screx_pref_bitrate"
     private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
     private static let defaultCustomBitrateMbps: Double = 10.0
 
