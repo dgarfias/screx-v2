@@ -28,4 +28,4 @@ Either client works with either daemon — the wire protocol is identical on bot
 4. If it is the first network connection, enter the PIN shown by the daemon.
 5. On Linux hosts, enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
 
-The clients remember recent and pinned network targets, and the in-session controls give access to keyboard, audio, camera, controllers, and connection info.
+The clients remember recent and pinned network targets, and stream settings (resolution, framerate, codec, and bitrate) are chosen from the connect screen before connecting. The in-session controls give access to keyboard, audio, camera, controllers, and connection info.

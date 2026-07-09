@@ -57,15 +57,50 @@ pub struct GamepadState {
     pub hat_y: i8,
 }
 
+/// Cheap capability probe for virtual gamepad passthrough. Returns the max
+/// number of simultaneous controllers supported, or `None` if this daemon
+/// can't do gamepad passthrough at all right now.
+pub fn probe_gamepad_max_controllers() -> Option<u8> {
+    #[cfg(target_os = "linux")]
+    {
+        // uinput gamepad creation only fails if /dev/uinput isn't openable;
+        // treat presence of the device node as the probe (mirrors
+        // `VirtualGamepad::new` in platform::linux::uinput). The Linux
+        // backend keys pads in a HashMap with no fixed cap; 4 matches the
+        // controller_id range (0..4) the rest of the protocol assumes (see
+        // the disconnect cleanup loop in main.rs).
+        if std::path::Path::new("/dev/uinput").exists() {
+            Some(4)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if crate::platform::windows::vigem::probe_available() {
+            Some(4)
+        } else {
+            None
+        }
+    }
+}
+
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
-    /// Tells the backend where the captured output actually sits on screen —
-    /// (left, top, width, height) in absolute virtual-desktop coordinates.
-    /// Wire touch/mouse coordinates are 0..width/0..height relative to the
-    /// captured frame; backends that inject via absolute screen coordinates
-    /// (Windows) need this offset. No-op where it doesn't apply (Linux
-    /// injects into a dedicated virtual input device sized to match, so no
-    /// translation is needed).
+    /// Tells the backend the current session's stream resolution and, where
+    /// meaningful, where the captured output sits on screen — (left, top,
+    /// width, height). Wire touch/mouse coordinates are always 0..width/
+    /// 0..height in *negotiated session stream* space, which can differ from
+    /// the backend's underlying input device geometry (e.g. a client
+    /// requesting 1920x1080 while the daemon's virtual devices are sized to
+    /// a larger startup ceiling). Windows injects via absolute
+    /// virtual-desktop coordinates, so it uses (left, top, width, height) to
+    /// translate frame-local coordinates onto the desktop. Linux ignores
+    /// left/top (its virtual touchscreen is a fixed-size device that
+    /// gsettings maps directly onto the captured EVDI output, so there is no
+    /// desktop-absolute translation to do) and instead scales incoming
+    /// coordinates from session-resolution space onto its fixed-size virtual
+    /// touchscreen's ABS range.
     fn set_target_rect(&mut self, _left: i32, _top: i32, _width: u32, _height: u32) {}
 
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;

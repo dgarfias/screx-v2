@@ -44,4 +44,8 @@ The app requests these on first use:
 ## Use
 
 See [README.md](../README.md#use) for the end-to-end connect flow (network vs. USB, PIN pairing,
-enabling the virtual display). For the wire protocol, see [ARCHITECTURE.md](ARCHITECTURE.md).
+enabling the virtual display).
+
+Before connecting, tap **Stream Settings** to choose the resolution, framerate, codec, and bitrate
+for the next session. These settings are validated against the daemon's advertised capabilities and
+sent during connection setup. For the wire protocol, see [ARCHITECTURE.md](ARCHITECTURE.md).

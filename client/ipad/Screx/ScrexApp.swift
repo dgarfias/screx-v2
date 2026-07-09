@@ -169,6 +169,189 @@ enum ConnectionHealthState: String {
     }
 }
 
+/// User-facing resolution presets offered in the Stream Settings sheet. `daemonDefault`
+/// means "omit the resolution TLV entry from `STNG`" (let the daemon pick). `native`
+/// ("This iPad") is this device's own panel resolution, detected from `UIScreen`; it is
+/// only offered in the picker when no listed preset already matches the panel (see
+/// `pickerCases`), so current models don't see a duplicate entry but a future unlisted
+/// iPad still defaults to its exact panel resolution.
+enum StreamResolutionPreset: String, CaseIterable, Identifiable {
+    case daemonDefault = "default"
+    case native = "native"
+    case p720 = "720p"
+    case p1080 = "1080p"
+    case p1440 = "1440p"
+    case uhd4k = "4k"
+    case wxga1610 = "1280x800"
+    case wuxga = "1920x1200"
+    case wqxga = "2560x1600"
+    case ipadMini = "2266x1488"
+    case ipadBase = "2160x1620"
+    case ipadA16 = "2360x1640"
+    case ipadPro11 = "2388x1668"
+    case ipadPro11M4 = "2420x1668"
+    case ipadPro129 = "2732x2048"
+    case ipadPro13M4 = "2752x2064"
+
+    var id: String { rawValue }
+
+    /// This device's native panel resolution in landscape orientation (width >= height),
+    /// derived once from `UIScreen.main.nativeBounds` (a pixel size, not points).
+    /// Cached because `UIScreen.main` access and the width/height normalization never
+    /// change for the lifetime of the process.
+    private static let nativeResolution: (width: Int, height: Int) = {
+        let bounds = UIScreen.main.nativeBounds
+        let long = Int(max(bounds.width, bounds.height))
+        let short = Int(min(bounds.width, bounds.height))
+        return (long, short)
+    }()
+
+    /// The listed preset matching this device's native panel resolution, if the list has
+    /// one (it does for every iPad model the list was built from). `.native` itself is
+    /// excluded from the search — it always matches by construction, and the point is to
+    /// find a *listed* duplicate of it.
+    static let deviceNative: StreamResolutionPreset? = allCases.first { preset in
+        guard preset != .native, let resolution = preset.resolution else { return false }
+        return resolution == nativeResolution
+    }
+
+    /// The cases offered in the Stream Settings picker: `.native` ("This iPad") is
+    /// included only when no listed preset matches this device's panel, so it never
+    /// shows up as a duplicate of a listed value.
+    static let pickerCases: [StreamResolutionPreset] =
+        deviceNative == nil ? allCases : allCases.filter { $0 != .native }
+
+    var label: String {
+        switch self {
+        case .daemonDefault: return "Daemon default"
+        case .native:
+            let native = Self.nativeResolution
+            return "This iPad (\(native.width)×\(native.height))"
+        case .p720: return "720p (1280×720)"
+        case .p1080: return "1080p (1920×1080)"
+        case .p1440: return "1440p (2560×1440)"
+        case .uhd4k: return "4K (3840×2160)"
+        case .wxga1610: return "1280×800 (16:10)"
+        case .wuxga: return "1920×1200 (16:10)"
+        case .wqxga: return "2560×1600 (16:10)"
+        case .ipadMini: return "2266×1488 (iPad mini)"
+        case .ipadBase: return "2160×1620 (iPad 7th–9th gen)"
+        case .ipadA16: return "2360×1640 (iPad 10th/11th gen, Air 11″)"
+        case .ipadPro11: return "2388×1668 (iPad Pro 11″)"
+        case .ipadPro11M4: return "2420×1668 (iPad Pro 11″ M4)"
+        case .ipadPro129: return "2732×2048 (iPad Pro 12.9″, Air 13″)"
+        case .ipadPro13M4: return "2752×2064 (iPad Pro 13″ M4)"
+        }
+    }
+
+    var resolution: (width: Int, height: Int)? {
+        switch self {
+        case .daemonDefault: return nil
+        case .native: return Self.nativeResolution
+        case .p720: return (1280, 720)
+        case .p1080: return (1920, 1080)
+        case .p1440: return (2560, 1440)
+        case .uhd4k: return (3840, 2160)
+        case .wxga1610: return (1280, 800)
+        case .wuxga: return (1920, 1200)
+        case .wqxga: return (2560, 1600)
+        case .ipadMini: return (2266, 1488)
+        case .ipadBase: return (2160, 1620)
+        case .ipadA16: return (2360, 1640)
+        case .ipadPro11: return (2388, 1668)
+        case .ipadPro11M4: return (2420, 1668)
+        case .ipadPro129: return (2732, 2048)
+        case .ipadPro13M4: return (2752, 2064)
+        }
+    }
+}
+
+/// User-facing framerate presets offered in the Stream Settings sheet.
+enum StreamFrameratePreset: String, CaseIterable, Identifiable {
+    case daemonDefault = "default"
+    case fps30 = "30"
+    case fps60 = "60"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .daemonDefault: return "Daemon default"
+        case .fps30: return "30 fps"
+        case .fps60: return "60 fps"
+        }
+    }
+
+    var fps: Int? {
+        switch self {
+        case .daemonDefault: return nil
+        case .fps30: return 30
+        case .fps60: return 60
+        }
+    }
+}
+
+/// User-facing codec presets offered in the Stream Settings sheet.
+enum StreamCodecPreset: String, CaseIterable, Identifiable {
+    case daemonDefault = "default"
+    case h264 = "h264"
+    case h265 = "h265"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .daemonDefault: return "Daemon default"
+        case .h264: return "H.264"
+        case .h265: return "H.265"
+        }
+    }
+
+    var codecId: UInt8? {
+        switch self {
+        case .daemonDefault: return nil
+        case .h264: return DaemonCapabilities.codecH264
+        case .h265: return DaemonCapabilities.codecH265
+        }
+    }
+}
+
+/// User-facing bitrate presets offered in the Stream Settings sheet. `.custom` has no
+/// fixed `bitrateBps` of its own — its effective value comes from
+/// `StreamViewModel.customBitrateMbps` instead (see `StreamViewModel.resolvedBitrateBps`).
+enum StreamBitratePreset: String, CaseIterable, Identifiable {
+    case daemonDefault = "default"
+    case low = "low"
+    case medium = "medium"
+    case high = "high"
+    case veryHigh = "veryhigh"
+    case custom = "custom"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .daemonDefault: return "Daemon default"
+        case .low: return "Low (3 Mbps)"
+        case .medium: return "Medium (8 Mbps)"
+        case .high: return "High (15 Mbps)"
+        case .veryHigh: return "Very high (20 Mbps)"
+        case .custom: return "Custom…"
+        }
+    }
+
+    var bitrateBps: UInt32? {
+        switch self {
+        case .daemonDefault: return nil
+        case .low: return 3_000_000
+        case .medium: return 8_000_000
+        case .high: return 15_000_000
+        case .veryHigh: return 20_000_000
+        case .custom: return nil
+        }
+    }
+}
+
 final class ScrexRootViewController: GCEventViewController {
     private let model: StreamViewModel
     private let hostingController: UIHostingController<AnyView>
@@ -307,6 +490,22 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var receiveRateText: String = "0 B/s"
     @Published private(set) var sendRateText: String = "0 B/s"
 
+    /// What the currently-connected daemon advertised via `CAPS`. Nil until a `CAPS`
+    /// message arrives (or the 2s timeout fallback fires, see `beginCapabilityNegotiation`).
+    @Published private(set) var daemonCapabilities: DaemonCapabilities?
+
+    /// Stream-settings preferences the user picked in the Stream Settings sheet,
+    /// persisted in UserDefaults and re-sent unmodified as `STNG` on every connect —
+    /// validated against the daemon's advertised bounds first (see
+    /// `handleDaemonCapabilities`); a setting that doesn't fit fails the connection
+    /// instead of being silently clamped.
+    @Published var preferredResolution: StreamResolutionPreset = StreamViewModel.loadPreferredResolution()
+    @Published var preferredFramerate: StreamFrameratePreset = StreamViewModel.loadPreferredFramerate()
+    @Published var preferredCodec: StreamCodecPreset = StreamViewModel.loadPreferredCodec()
+    @Published var preferredBitrate: StreamBitratePreset = StreamViewModel.loadPreferredBitrate()
+    /// Effective bitrate (in Mbps) when `preferredBitrate == .custom`. Ignored otherwise.
+    @Published var customBitrateMbps: Double = StreamViewModel.loadCustomBitrateMbps()
+
     let decoder = VideoDecoder()
     let avSync = AVSyncState()
     let audioPlayer: AudioPlayer
@@ -336,6 +535,12 @@ final class StreamViewModel: ObservableObject {
     private var activeTransport: ConnectionTransport = .none
     private var trafficTimer: DispatchSourceTimer?
     private nonisolated let trafficCounter = TrafficCounter()
+
+    /// Fires if no `CAPS` message arrives within `capsTimeoutInterval` of the session
+    /// coming up, meaning "assume this is an old daemon that predates capability
+    /// negotiation." Cancelled if a real `CAPS` arrives first.
+    private var capsTimeoutWorkItem: DispatchWorkItem?
+    private static let capsTimeoutInterval: TimeInterval = 2.0
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
@@ -423,6 +628,105 @@ final class StreamViewModel: ObservableObject {
         } catch {
             log("failed to persist recent connections: \(error)")
         }
+    }
+
+    // MARK: - Stream settings preferences
+
+    private static let preferredResolutionKey = "screx_pref_resolution"
+    private static let preferredFramerateKey = "screx_pref_framerate"
+    private static let preferredCodecKey = "screx_pref_codec"
+    private static let preferredBitrateKey = "screx_pref_bitrate"
+    private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
+    private static let defaultCustomBitrateMbps: Double = 10.0
+
+    /// Falls back to this device's own panel resolution — the matching listed preset
+    /// when there is one, `.native` ("This iPad") otherwise — both when no preference
+    /// has ever been stored and when a stored rawValue is unrecognized (e.g. a preset
+    /// removed in a later version). A stored `.native` is normalized to the matching
+    /// listed preset when one exists, since `.native` isn't offered in the picker then.
+    private static func loadPreferredResolution() -> StreamResolutionPreset {
+        let fallback = StreamResolutionPreset.deviceNative ?? .native
+        guard let raw = UserDefaults.standard.string(forKey: preferredResolutionKey),
+              let preset = StreamResolutionPreset(rawValue: raw) else {
+            return fallback
+        }
+        if preset == .native, let listed = StreamResolutionPreset.deviceNative {
+            return listed
+        }
+        return preset
+    }
+
+    private static func loadPreferredFramerate() -> StreamFrameratePreset {
+        guard let raw = UserDefaults.standard.string(forKey: preferredFramerateKey) else {
+            return .fps30
+        }
+        return StreamFrameratePreset(rawValue: raw) ?? .fps30
+    }
+
+    private static func loadPreferredCodec() -> StreamCodecPreset {
+        let raw = UserDefaults.standard.string(forKey: preferredCodecKey) ?? StreamCodecPreset.daemonDefault.rawValue
+        return StreamCodecPreset(rawValue: raw) ?? .daemonDefault
+    }
+
+    /// Falls back to `.medium` (8 Mbps) both when no preference has ever been stored and
+    /// when a stored rawValue is unrecognized (e.g. a preset removed in a later version).
+    private static func loadPreferredBitrate() -> StreamBitratePreset {
+        guard let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) else {
+            return .medium
+        }
+        return StreamBitratePreset(rawValue: raw) ?? .medium
+    }
+
+    private static func loadCustomBitrateMbps() -> Double {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: customBitrateMbpsKey) != nil else { return defaultCustomBitrateMbps }
+        let value = defaults.double(forKey: customBitrateMbpsKey)
+        return value.isFinite && value > 0 ? value : defaultCustomBitrateMbps
+    }
+
+    /// Called when the Stream Settings sheet is dismissed to persist whatever the user
+    /// picked. These persisted values are what feed the `STNG` validated and sent on every
+    /// subsequent connect (see `handleDaemonCapabilities`).
+    func persistStreamSettingsPreferences() {
+        let defaults = UserDefaults.standard
+        defaults.set(preferredResolution.rawValue, forKey: Self.preferredResolutionKey)
+        defaults.set(preferredFramerate.rawValue, forKey: Self.preferredFramerateKey)
+        defaults.set(preferredCodec.rawValue, forKey: Self.preferredCodecKey)
+        defaults.set(preferredBitrate.rawValue, forKey: Self.preferredBitrateKey)
+        defaults.set(customBitrateMbps, forKey: Self.customBitrateMbpsKey)
+    }
+
+    /// The user's configured stream settings, exactly as picked in the Stream Settings
+    /// sheet — no clamping or snapping against any daemon's advertised bounds. Sent to
+    /// the daemon as-is (see `handleDaemonCapabilities`) once `DaemonCapabilities.validate`
+    /// confirms it fits; otherwise the connection is failed instead of adjusting this.
+    private var preferredStreamSettings: StreamSettings {
+        let resolution = preferredResolution.resolution
+        return StreamSettings(
+            width: resolution?.width,
+            height: resolution?.height,
+            fps: preferredFramerate.fps,
+            codecId: preferredCodec.codecId,
+            bitrateBps: resolvedBitrateBps
+        )
+    }
+
+    /// Resolves `preferredBitrate` (and, for `.custom`, `customBitrateMbps`) to a concrete
+    /// bps value to put on the wire, unmodified. Non-finite or non-positive custom input
+    /// is treated as "no preference" (nil), same as daemon default; a finite custom value
+    /// is capped only against `UInt32.max` to guard the `Double` -> `UInt32` conversion
+    /// from overflowing, never against the daemon's advertised range — that's
+    /// `DaemonCapabilities.validate`'s job, and it fails the connection rather than
+    /// snapping this value.
+    private var resolvedBitrateBps: UInt32? {
+        guard preferredBitrate == .custom else {
+            return preferredBitrate.bitrateBps
+        }
+        guard customBitrateMbps.isFinite, customBitrateMbps > 0 else { return nil }
+        let rawBps = (customBitrateMbps * 1_000_000).rounded()
+        guard rawBps.isFinite, rawBps > 0 else { return nil }
+        let capped = min(rawBps, Double(UInt32.max))
+        return UInt32(capped)
     }
 
     private func rememberRecentConnection(name: String, host: String, port: UInt16) {
@@ -609,6 +913,102 @@ final class StreamViewModel: ObservableObject {
         sendSpeakerTransportState(isEnabled: audioPlayer.isOutputEnabled)
     }
 
+    // MARK: - Capability negotiation
+
+    /// Called once a session is up (network `.sessionEstablished`, or USB `onConnected`).
+    /// Starts the ~2s "assume legacy daemon" fallback timer and clears any capabilities
+    /// left over from a previous session. If a real `CAPS` message arrives first,
+    /// `handleDaemonCapabilities` cancels this timer.
+    private func beginCapabilityNegotiation(transport: ConnectionTransport) {
+        log("beginCapabilityNegotiation(transport: \(transport.rawValue))")
+        capsTimeoutWorkItem?.cancel()
+        daemonCapabilities = nil
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.log("CAPS timeout: assuming legacy daemon, all features available")
+            self.daemonCapabilities = .assumeAllAvailable
+            // Deliberately do NOT send STNG here — an old daemon that predates this
+            // feature may not safely ignore an unrecognized control-message prefix.
+        }
+        capsTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.capsTimeoutInterval, execute: workItem)
+    }
+
+    /// Called when a real `CAPS` message arrives from the daemon. Cancels the timeout
+    /// fallback, publishes the capabilities, then validates the user's persisted stream
+    /// settings against them: if everything fits, sends the settings on to the daemon
+    /// exactly as configured (no clamping); if anything doesn't fit, fails the connection
+    /// instead of silently adjusting the user's preference — see
+    /// `DaemonCapabilities.validate` and `failConnection`.
+    private func handleDaemonCapabilities(_ capabilities: DaemonCapabilities) {
+        capsTimeoutWorkItem?.cancel()
+        capsTimeoutWorkItem = nil
+        daemonCapabilities = capabilities
+
+        let settings = preferredStreamSettings
+        let violations = capabilities.validate(settings)
+        guard violations.isEmpty else {
+            log("CAPS received: \(capabilities); settings \(settings) violate capabilities: \(violations)")
+            failConnection(detail: "Failed to connect: " + violations.joined(separator: "; "))
+            return
+        }
+
+        log("CAPS received: \(capabilities); sending STNG: \(settings)")
+        sendStreamSettingsTransportState(settings)
+    }
+
+    /// Fails the in-progress connection because the daemon's advertised capabilities
+    /// don't satisfy the user's configured stream settings. Tears down whichever
+    /// transport is active — mirroring the abrupt teardown `usb.onDisconnected` performs
+    /// (stream, network control, USB listener, decoder/audio/camera/mic/peripheral state,
+    /// and capability-negotiation state) — then reports the failure through the same
+    /// `applyConnectionHealth(.connectionError, ...)` surface every other connection
+    /// failure uses, so the UI shows it identically. Safe to call regardless of which
+    /// transport (or none) is actually active: every teardown call here is nil-safe.
+    private func failConnection(detail: String) {
+        log("failConnection: \(detail)")
+        usbConnected = false
+        isUSBListening = false
+        usbListener?.stop()
+        usbListener = nil
+        stream?.onEvent = nil
+        stream?.onDisconnect = nil
+        stream?.disconnect()
+        stream = nil
+        closeNetworkControl(gracefully: false)
+        pairingService?.cancel()
+        pairingService = nil
+        decoder.setSuspended(false)
+        audioPlayer.stop()
+        micCapture.stop()
+        configureAudioSession()
+        cameraCapture.stop()
+        stopPeripheralMonitoring()
+        resetCapabilityNegotiation()
+        applyConnectionHealth(.connectionError, detail: detail, transport: .none)
+    }
+
+    private func sendStreamSettingsTransportState(_ settings: StreamSettings) {
+        // Keyed off usbConnected rather than activeTransport: the latter is only set via
+        // applyConnectionHealth, which may not have run yet when CAPS arrives right after
+        // the USB session comes up.
+        if usbConnected {
+            usbListener?.sendStreamSettings(settings)
+        } else {
+            networkControl?.sendStreamSettings(settings)
+        }
+    }
+
+    /// Clears capability-negotiation state on disconnect so a fresh connection starts
+    /// from a clean slate (pre-CAPS "everything available" state) rather than carrying
+    /// over the previous session's daemon capabilities.
+    private func resetCapabilityNegotiation() {
+        capsTimeoutWorkItem?.cancel()
+        capsTimeoutWorkItem = nil
+        daemonCapabilities = nil
+    }
+
     func handleAppDidEnterBackground() {
         log("sceneDidEnterBackground")
         guard activeTransport != .none || isConnecting || isUSBListening || pairingService != nil else { return }
@@ -723,6 +1123,11 @@ final class StreamViewModel: ObservableObject {
                 self?.updateSessionHostname(hostname)
             }
         }
+        usb.onCapabilities = { [weak self] capabilities in
+            Task { @MainActor in
+                self?.handleDaemonCapabilities(capabilities)
+            }
+        }
         usb.onConnected = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -731,6 +1136,7 @@ final class StreamViewModel: ObservableObject {
                 self.isUSBListening = false
                 self.stream?.suppressTimeout = true
                 self.decoder.setSuspended(false)
+                self.beginCapabilityNegotiation(transport: .usb)
                 self.syncSpeakerPassthroughState()
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
@@ -755,6 +1161,7 @@ final class StreamViewModel: ObservableObject {
                 self.micCapture.stop()
                 self.cameraCapture.stop()
                 self.stopPeripheralMonitoring()
+                self.resetCapabilityNegotiation()
                 self.applyConnectionHealth(.connectionError, detail: "USB disconnected. \(self.disconnectedPrompt())", transport: .none)
             }
         }
@@ -908,6 +1315,14 @@ final class StreamViewModel: ObservableObject {
                         self.updateSessionHostname(hostname)
                     }
                 }
+                control.onCapabilities = { [weak self, weak control] capabilities in
+                    Task { @MainActor in
+                        guard let self, let control else { return }
+                        guard self.networkControl === control else { return }
+                        self.handleDaemonCapabilities(capabilities)
+                    }
+                }
+                self.beginCapabilityNegotiation(transport: .network)
                 control.start()
                 self.decoder.setSuspended(false)
                 self.syncSpeakerPassthroughState()
@@ -1042,6 +1457,7 @@ final class StreamViewModel: ObservableObject {
         configureAudioSession()
         cameraCapture.stop()
         stopPeripheralMonitoring()
+        resetCapabilityNegotiation()
         if preservedHealth.isTerminalFailure {
             applyConnectionHealth(preservedHealth, detail: preservedStatus, transport: .none)
         } else {
@@ -1079,6 +1495,7 @@ final class StreamViewModel: ObservableObject {
         configureAudioSession()
         cameraCapture.stop()
         stopPeripheralMonitoring()
+        resetCapabilityNegotiation()
         lastNetEndpoint = nil
         lastNetName = nil
         sessionDisplayName = ""
@@ -1548,7 +1965,12 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Camera
 
+    /// True while `daemonCapabilities` is nil (pre-CAPS state, treat everything as
+    /// available) or once `CAPS` reports camera support.
+    var isCameraAvailable: Bool { daemonCapabilities?.camera ?? true }
+
     func toggleCamera() {
+        guard isCameraAvailable else { return }
         if cameraCapture.isRunning {
             cameraCapture.stop()
             sendCameraDisable()
@@ -1601,7 +2023,12 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Microphone
 
+    /// True while `daemonCapabilities` is nil (pre-CAPS state) or once `CAPS` reports
+    /// microphone support.
+    var isMicAvailable: Bool { daemonCapabilities?.microphone ?? true }
+
     func toggleMic() {
+        guard isMicAvailable else { return }
         let speakerWasEnabled = audioPlayer.isOutputEnabled
         if micCapture.isRunning {
             micCapture.stop()
@@ -1669,7 +2096,12 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Speakers / Controllers
 
+    /// True while `daemonCapabilities` is nil (pre-CAPS state) or once `CAPS` reports
+    /// speaker/system-audio support.
+    var isSpeakerAvailable: Bool { daemonCapabilities?.speaker ?? true }
+
     func toggleSpeaker() {
+        guard isSpeakerAvailable else { return }
         let isEnabled = !audioPlayer.isOutputEnabled
         audioPlayer.setOutputEnabled(isEnabled)
         sendSpeakerTransportState(isEnabled: isEnabled)
@@ -1678,7 +2110,16 @@ final class StreamViewModel: ObservableObject {
 
     var isSpeakerActive: Bool { audioPlayer.isOutputEnabled }
 
+    /// True while `daemonCapabilities` is nil (pre-CAPS state) or once `CAPS` reports a
+    /// non-nil `gamepadMaxControllers` (nil there means gamepad passthrough is
+    /// unsupported by this daemon).
+    var isControllerAvailable: Bool {
+        guard let daemonCapabilities else { return true }
+        return daemonCapabilities.gamepadMaxControllers != nil
+    }
+
     func toggleControllerPassthrough() {
+        guard isControllerAvailable else { return }
         isControllerPassthroughEnabled.toggle()
         refreshControllerPassthrough()
     }
@@ -1703,6 +2144,7 @@ struct ContentView: View {
     @State private var viewSize: CGSize = .zero
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
+    @State private var showStreamSettings = false
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -1798,6 +2240,17 @@ struct ContentView: View {
                         .buttonStyle(.bordered)
                         .tint(model.isUSBListening ? .red : .green)
                         .disabled(!model.isUSBListening && (!model.isCharging || model.isConnecting))
+
+                        Button {
+                            showStreamSettings = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "slider.horizontal.3")
+                                Text("Stream Settings")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
 
                         if !model.pinnedConnections.isEmpty {
                             VStack(alignment: .leading, spacing: 6) {
@@ -1989,6 +2442,31 @@ struct ContentView: View {
             .padding(32)
             .interactiveDismissDisabled()
         }
+        .sheet(isPresented: $showStreamSettings) {
+            StreamSettingsSheet(
+                resolution: model.preferredResolution,
+                framerate: model.preferredFramerate,
+                codec: model.preferredCodec,
+                bitrate: model.preferredBitrate,
+                customBitrateMbps: model.customBitrateMbps,
+                onSave: { resolution, framerate, codec, bitrate, customBitrateMbps in
+                    model.preferredResolution = resolution
+                    model.preferredFramerate = framerate
+                    model.preferredCodec = codec
+                    model.preferredBitrate = bitrate
+                    if let customBitrateMbps {
+                        model.customBitrateMbps = customBitrateMbps
+                    }
+                    model.persistStreamSettingsPreferences()
+                }
+            )
+            // The parent ContentView re-renders ~every second from chatty model
+            // traffic/health updates. Wrapping the sheet in .equatable() and
+            // comparing only the seeded initial values lets SwiftUI skip those
+            // identical parent-driven re-renders while @State-driven user edits
+            // still invalidate the view normally.
+            .equatable()
+        }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onChange(of: model.physicalKeyboardConnected) { connected in
@@ -2033,29 +2511,53 @@ struct ContentView: View {
                     toolbarButton(
                         icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
                         active: model.isControllerPassthroughEnabled,
-                        color: model.isControllerPassthroughEnabled ? .green : .white
-                    ) { model.toggleControllerPassthrough() }
+                        color: !model.isControllerAvailable ? .gray : (model.isControllerPassthroughEnabled ? .green : .white)
+                    ) {
+                        if model.isControllerAvailable {
+                            model.toggleControllerPassthrough()
+                        } else {
+                            showToolbarMessage("Gamepad passthrough not supported by this daemon")
+                        }
+                    }
 
                     toolbarButton(
                         icon: model.isCameraActive
                             ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")
                             : "video",
                         active: model.isCameraActive,
-                        color: model.isCameraActive ? .green : .white
-                    ) { model.toggleCamera() }
+                        color: !model.isCameraAvailable ? .gray : (model.isCameraActive ? .green : .white)
+                    ) {
+                        if model.isCameraAvailable {
+                            model.toggleCamera()
+                        } else {
+                            showToolbarMessage("Camera not supported by this daemon")
+                        }
+                    }
                         .onLongPressGesture(minimumDuration: 0.5) { model.flipCamera() }
 
                     toolbarButton(
                         icon: model.isMicActive ? "mic.fill" : "mic",
                         active: model.isMicActive,
-                        color: model.isMicActive ? .green : .white
-                    ) { model.toggleMic() }
+                        color: !model.isMicAvailable ? .gray : (model.isMicActive ? .green : .white)
+                    ) {
+                        if model.isMicAvailable {
+                            model.toggleMic()
+                        } else {
+                            showToolbarMessage("Microphone not supported by this daemon")
+                        }
+                    }
 
                     toolbarButton(
                         icon: model.isSpeakerActive ? "speaker.wave.2.fill" : "speaker.slash.fill",
                         active: model.isSpeakerActive,
-                        color: model.isSpeakerActive ? .green : .white
-                    ) { model.toggleSpeaker() }
+                        color: !model.isSpeakerAvailable ? .gray : (model.isSpeakerActive ? .green : .white)
+                    ) {
+                        if model.isSpeakerAvailable {
+                            model.toggleSpeaker()
+                        } else {
+                            showToolbarMessage("Speaker not supported by this daemon")
+                        }
+                    }
                 }
 
                 toolbarButton(
@@ -2299,5 +2801,154 @@ struct ContentView: View {
 
     private static func saveToolbarExpanded(_ expanded: Bool) {
         UserDefaults.standard.set(expanded, forKey: expandedKey)
+    }
+}
+
+/// Stream Settings sheet content, extracted out of `ContentView` so it does not observe
+/// `StreamViewModel` at all. `ContentView` re-renders roughly every second from the
+/// model's chatty `@Published` properties (connection health, discovery, stats); while a
+/// `.pickerStyle(.menu)` menu is open, each re-render used to rebuild the menu content and
+/// snap its scroll position back to the top. This view only depends on local `@State`
+/// seeded once from the model when the sheet is presented, so it never re-renders because
+/// of model changes.
+private struct StreamSettingsSheet: View, Equatable {
+    @Environment(\.dismiss) private var dismiss
+
+    // Seeded values passed by the parent. These never change during the lifetime
+    // of the sheet, so they are used only for Equatable comparison to skip
+    // parent-driven re-renders caused by the chatty StreamViewModel.
+    private let initialResolution: StreamResolutionPreset
+    private let initialFramerate: StreamFrameratePreset
+    private let initialCodec: StreamCodecPreset
+    private let initialBitrate: StreamBitratePreset
+    private let initialCustomBitrateMbps: Double
+
+    @State private var resolution: StreamResolutionPreset
+    @State private var framerate: StreamFrameratePreset
+    @State private var codec: StreamCodecPreset
+    @State private var bitrate: StreamBitratePreset
+    @State private var customBitrateText: String
+
+    let onSave: (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
+
+    static func == (lhs: StreamSettingsSheet, rhs: StreamSettingsSheet) -> Bool {
+        lhs.initialResolution == rhs.initialResolution
+            && lhs.initialFramerate == rhs.initialFramerate
+            && lhs.initialCodec == rhs.initialCodec
+            && lhs.initialBitrate == rhs.initialBitrate
+            && lhs.initialCustomBitrateMbps == rhs.initialCustomBitrateMbps
+    }
+
+    init(
+        resolution: StreamResolutionPreset,
+        framerate: StreamFrameratePreset,
+        codec: StreamCodecPreset,
+        bitrate: StreamBitratePreset,
+        customBitrateMbps: Double,
+        onSave: @escaping (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
+    ) {
+        self.initialResolution = resolution
+        self.initialFramerate = framerate
+        self.initialCodec = codec
+        self.initialBitrate = bitrate
+        self.initialCustomBitrateMbps = customBitrateMbps
+        _resolution = State(initialValue: resolution)
+        _framerate = State(initialValue: framerate)
+        _codec = State(initialValue: codec)
+        _bitrate = State(initialValue: bitrate)
+        _customBitrateText = State(initialValue: String(format: "%.1f", customBitrateMbps))
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Stream Settings")
+                .font(.title2.bold())
+
+            Text("Applied on your next connection. If a setting is beyond what the daemon supports, the connection will fail instead of being adjusted automatically.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 14) {
+                streamSettingRow(title: "Resolution") {
+                    Picker("Resolution", selection: $resolution) {
+                        ForEach(StreamResolutionPreset.pickerCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Framerate") {
+                    Picker("Framerate", selection: $framerate) {
+                        ForEach(StreamFrameratePreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Codec") {
+                    Picker("Codec", selection: $codec) {
+                        ForEach(StreamCodecPreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                streamSettingRow(title: "Bitrate") {
+                    HStack(spacing: 8) {
+                        Picker("Bitrate", selection: $bitrate) {
+                            ForEach(StreamBitratePreset.allCases) { preset in
+                                Text(preset.label).tag(preset)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+
+                        if bitrate == .custom {
+                            HStack(spacing: 4) {
+                                TextField("Mbps", text: $customBitrateText)
+                                    .keyboardType(.decimalPad)
+                                    .multilineTextAlignment(.trailing)
+                                    .frame(width: 64)
+                                    .textFieldStyle(.roundedBorder)
+                                Text("Mbps")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button("Done") { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(32)
+        .onDisappear {
+            let parsedCustomBitrate: Double? = {
+                guard bitrate == .custom, let parsed = Double(customBitrateText), parsed.isFinite, parsed > 0 else {
+                    return nil
+                }
+                return parsed
+            }()
+            onSave(resolution, framerate, codec, bitrate, parsedCustomBitrate)
+        }
+    }
+
+    @ViewBuilder
+    private func streamSettingRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack {
+            Text(title)
+                .font(.subheadline.weight(.medium))
+            Spacer()
+            content()
+        }
     }
 }

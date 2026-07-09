@@ -24,6 +24,7 @@ final class USBListener {
     var onDisconnected: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var onHostname: ((String) -> Void)?
+    var onCapabilities: ((DaemonCapabilities) -> Void)?
 
     private static let msgVideo: UInt8 = 0x01
     private static let msgAudio: UInt8 = 0x02
@@ -33,6 +34,7 @@ final class USBListener {
     private static let micCfgMagic = Data("MICCFG".utf8)
     private static let cameraCfgMagic = Data("CAMCFG".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
+    private static let capsMagic = Data("CAPS".utf8)
 
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
@@ -243,13 +245,20 @@ final class USBListener {
                 audioPlayer.enqueueAudio(pcm, timestampMs: tsMs)
 
             case Self.msgControl:
-                if msgData.dropFirst().starts(with: Self.hostnameMagic) {
+                let controlPayload = msgData.dropFirst()
+                if controlPayload.starts(with: Self.hostnameMagic) {
                     let hostname = String(
                         decoding: msgData.dropFirst(1 + Self.hostnameMagic.count),
                         as: UTF8.self
                     ).trimmingCharacters(in: .whitespacesAndNewlines)
                     if !hostname.isEmpty {
                         onHostname?(hostname)
+                    }
+                } else if controlPayload.starts(with: Self.capsMagic) {
+                    if let capabilities = DaemonCapabilities.parse(controlPayload) {
+                        onCapabilities?(capabilities)
+                    } else {
+                        print("[usb] failed to parse CAPS payload: \(controlPayload.count) bytes")
                     }
                 }
                 break
@@ -349,6 +358,27 @@ final class USBListener {
         conn.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 print("[usb] miccfg send error: \(error)")
+            } else {
+                self.onTraffic?(0, frame.count)
+            }
+        })
+    }
+
+    /// Sends client-proposed stream settings (resolution/fps/codec/bitrate) to the daemon
+    /// in response to a `CAPS` message, per the capability-negotiation protocol.
+    func sendStreamSettings(_ settings: StreamSettings) {
+        guard let conn = connection else { return }
+
+        let stngPayload = settings.encode()
+        let payloadLen = UInt32(1 + stngPayload.count)
+        var frame = Data()
+        withUnsafeBytes(of: payloadLen.bigEndian) { frame.append(contentsOf: $0) }
+        frame.append(Self.msgControl)
+        frame.append(stngPayload)
+
+        conn.send(content: frame, completion: .contentProcessed { error in
+            if let error {
+                print("[usb] stng send error: \(error)")
             } else {
                 self.onTraffic?(0, frame.count)
             }

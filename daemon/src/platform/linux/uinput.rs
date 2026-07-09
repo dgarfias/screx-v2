@@ -197,6 +197,15 @@ pub struct LinuxInput {
     keyboard: Option<VirtualKeyboard>,
     mouse: Option<VirtualMouse>,
     gamepads: std::collections::HashMap<u8, VirtualGamepad>,
+    /// Negotiated per-session stream resolution, in wire coordinate space.
+    /// `None` until the first `set_target_rect` call. The virtual
+    /// touchscreen itself is created once at startup sized to the CLI/config
+    /// ceiling (recreating it per session would re-trigger the ~800ms
+    /// gsettings output-mapping sleep and device churn in GNOME), so when
+    /// this differs from the touchscreen's own dimensions, incoming touch
+    /// coordinates need to be rescaled onto the touchscreen's fixed ABS
+    /// range before injection.
+    session_size: Option<(u32, u32)>,
 }
 
 impl LinuxInput {
@@ -211,14 +220,40 @@ impl LinuxInput {
             keyboard,
             mouse: None,
             gamepads: std::collections::HashMap::new(),
+            session_size: None,
         })
     }
 }
 
 impl InputBackend for LinuxInput {
+    fn set_target_rect(&mut self, _left: i32, _top: i32, width: u32, height: u32) {
+        // left/top are ignored here: the gsettings tablet->EVDI-output
+        // mapping (see `map_to_output`) already confines the fixed-size
+        // virtual touchscreen to the captured output, so there is no
+        // desktop-absolute offset to apply. What changes per session is the
+        // *resolution* touch coordinates are expressed in on the wire, which
+        // we need in order to scale them onto the touchscreen's ABS range.
+        if let Some(ref ts) = self.touch {
+            println!(
+                "[touch] session stream resolution {width}x{height}, tablet ABS range {}x{}",
+                ts.width, ts.height
+            );
+        }
+        self.session_size = Some((width, height));
+    }
+
     fn touch(&mut self, contacts: &[TouchContact]) -> Result<()> {
         if let Some(ref mut ts) = self.touch {
-            ts.handle_contacts(contacts);
+            match self.session_size {
+                Some((sw, sh)) if (sw, sh) != (ts.width as u32, ts.height as u32) => {
+                    let scaled: Vec<TouchContact> = contacts
+                        .iter()
+                        .map(|c| ts.scale_contact(c, sw, sh))
+                        .collect();
+                    ts.handle_contacts(&scaled);
+                }
+                _ => ts.handle_contacts(contacts),
+            }
         }
         Ok(())
     }
@@ -475,6 +510,32 @@ impl VirtualTouchscreen {
         events.push(input_event(EV_SYN, SYN_REPORT, 0));
         emit_batch(&mut self.file, events);
         events.clear();
+    }
+
+    /// Rescales a wire touch contact from session-stream coordinate space
+    /// (0..session_w-1 / 0..session_h-1) onto this device's fixed ABS range
+    /// (0..width-1 / 0..height-1). Uses u64 intermediate math with
+    /// round-to-nearest, and clamps the result into range to guard against
+    /// rounding overshoot at the extreme edge. Falls back to the raw,
+    /// unscaled coordinate when the session dimension isn't usable as a
+    /// scale denominator (<=1 pixel) — `send_touch` clamps into range
+    /// regardless, so this degenerates safely.
+    fn scale_contact(&self, c: &TouchContact, session_w: u32, session_h: u32) -> TouchContact {
+        let scale = |v: u16, src: u32, dst: i32| -> u16 {
+            if src <= 1 || dst <= 1 {
+                return v;
+            }
+            let num = v as u64 * (dst as u64 - 1);
+            let den = src as u64 - 1;
+            let scaled = (num + den / 2) / den;
+            scaled.min(dst as u64 - 1) as u16
+        };
+        TouchContact {
+            slot: c.slot,
+            event_type: c.event_type,
+            x: scale(c.x, session_w, self.width),
+            y: scale(c.y, session_h, self.height),
+        }
     }
 
     pub fn handle_contacts(&mut self, contacts: &[TouchContact]) {

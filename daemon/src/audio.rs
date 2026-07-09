@@ -42,6 +42,34 @@ pub fn create_audio_backend() -> Box<dyn AudioBackend> {
     }
 }
 
+/// Cheap capability probe: is virtual-microphone forwarding likely to work
+/// right now? Linux: PipeWire/PulseAudio mic support is always available
+/// when the daemon can run at all. Windows: requires the VB-CABLE driver.
+pub fn probe_mic_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::wasapi::probe_mic_available()
+    }
+}
+
+/// Cheap capability probe: is speaker/system-audio forwarding likely to
+/// work right now? Linux: always available (PulseAudio null-sink). Windows:
+/// requires the Steam Streaming Speakers endpoint.
+pub fn probe_speaker_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::wasapi::probe_speaker_available()
+    }
+}
+
 /// Remove any leftover audio state from a previous crash.
 pub fn cleanup_stale_modules() {
     #[cfg(target_os = "linux")]
