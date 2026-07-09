@@ -125,6 +125,8 @@ pub enum EncoderBackend {
     Qsv,
     #[cfg(target_os = "windows")]
     Mf,
+    #[cfg(target_os = "macos")]
+    VideoToolbox,
     Software,
 }
 
@@ -140,6 +142,8 @@ impl EncoderBackend {
             "qsv" => Self::Qsv,
             #[cfg(target_os = "windows")]
             "mf" => Self::Mf,
+            #[cfg(target_os = "macos")]
+            "videotoolbox" | "vt" => Self::VideoToolbox,
             "software" | "sw" | "x264" | "libx264" | "x265" | "libx265" => Self::Software,
             _ => Self::Auto,
         }
@@ -171,6 +175,10 @@ fn resolved_codec_name(backend: EncoderBackend, codec: VideoCodec) -> Option<&'s
         (EncoderBackend::Mf, VideoCodec::H264) => "h264_mf",
         #[cfg(target_os = "windows")]
         (EncoderBackend::Mf, VideoCodec::H265) => "hevc_mf",
+        #[cfg(target_os = "macos")]
+        (EncoderBackend::VideoToolbox, VideoCodec::H264) => "h264_videotoolbox",
+        #[cfg(target_os = "macos")]
+        (EncoderBackend::VideoToolbox, VideoCodec::H265) => "hevc_videotoolbox",
         (EncoderBackend::Software, VideoCodec::H264) => "libx264",
         (EncoderBackend::Software, VideoCodec::H265) => "libx265",
         (EncoderBackend::Auto, _) => return None,
@@ -215,6 +223,10 @@ pub fn probe_available_codecs(backend: EncoderBackend) -> Vec<VideoCodec> {
                     EncoderBackend::Mf,
                     EncoderBackend::Software,
                 ]
+            }
+            #[cfg(target_os = "macos")]
+            {
+                vec![EncoderBackend::VideoToolbox, EncoderBackend::Software]
             }
         }
         other => vec![other],
@@ -298,6 +310,11 @@ impl Encoder {
                 let enc = HwEncoder::new_mf(&config)?;
                 ActiveEncoder::HwAccel(enc)
             }
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox => {
+                let enc = HwEncoder::new_videotoolbox(&config)?;
+                ActiveEncoder::HwAccel(enc)
+            }
             EncoderBackend::Software => {
                 let enc = SwEncoder::new(&config)?;
                 ActiveEncoder::Software(enc)
@@ -331,6 +348,17 @@ impl Encoder {
                         ActiveEncoder::HwAccel(enc)
                     } else if let Ok(enc) = HwEncoder::new_qsv(&config) {
                         println!("[encode] auto-selected: qsv ({codec_name})");
+                        ActiveEncoder::HwAccel(enc)
+                    } else {
+                        println!("[encode] no hw encoder available, using software ({codec_name})");
+                        let enc = SwEncoder::new(&config)?;
+                        ActiveEncoder::Software(enc)
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(enc) = HwEncoder::new_videotoolbox(&config) {
+                        println!("[encode] auto-selected: videotoolbox ({codec_name})");
                         ActiveEncoder::HwAccel(enc)
                     } else {
                         println!("[encode] no hw encoder available, using software ({codec_name})");
@@ -377,6 +405,10 @@ impl Encoder {
                     HwKind::Qsv => ActiveEncoder::HwAccel(HwEncoder::new_qsv(&self.config)?),
                     #[cfg(target_os = "windows")]
                     HwKind::Mf => ActiveEncoder::HwAccel(HwEncoder::new_mf(&self.config)?),
+                    #[cfg(target_os = "macos")]
+                    HwKind::VideoToolbox => {
+                        ActiveEncoder::HwAccel(HwEncoder::new_videotoolbox(&self.config)?)
+                    }
                 },
                 ActiveEncoder::Software(_) => {
                     ActiveEncoder::Software(SwEncoder::new(&self.config)?)
@@ -440,6 +472,8 @@ enum HwKind {
     Qsv,
     #[cfg(target_os = "windows")]
     Mf,
+    #[cfg(target_os = "macos")]
+    VideoToolbox,
 }
 
 struct HwEncoder {
@@ -559,6 +593,16 @@ impl HwEncoder {
         Self::new_with_vaapi_hevc_mode(config, HwKind::Mf, VaapiHevcMode::Bitrate)
     }
 
+    /// Stub — real VideoToolbox encoder setup lands in M1. Deliberately does
+    /// not call `new_with_vaapi_hevc_mode`: that function builds an
+    /// AVHWFramesContext/hw_device_ctx per VA-API/NVENC/AMF/QSV/MF, which
+    /// isn't the shape VideoToolbox's AVHWDeviceType needs, and there is no
+    /// real encoder body to construct yet anyway.
+    #[cfg(target_os = "macos")]
+    fn new_videotoolbox(_config: &EncoderConfig) -> Result<Self> {
+        bail!("VideoToolbox encoder not yet implemented — lands in M1")
+    }
+
     fn new_with_vaapi_hevc_mode(
         config: &EncoderConfig,
         kind: HwKind,
@@ -637,6 +681,14 @@ impl HwEncoder {
                 ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
                 "0",
             ),
+            #[cfg(target_os = "macos")]
+            (HwKind::VideoToolbox, _) => {
+                // VideoToolbox never reaches this generic hw-device-context
+                // path (see new_videotoolbox's stub, which bails before
+                // calling here); this arm exists only to keep the match
+                // exhaustive over HwKind.
+                bail!("VideoToolbox does not use the generic hw encoder path")
+            }
         };
 
         let kind_name = match kind {
@@ -649,11 +701,17 @@ impl HwEncoder {
             HwKind::Qsv => "QSV",
             #[cfg(target_os = "windows")]
             HwKind::Mf => "MediaFoundation",
+            #[cfg(target_os = "macos")]
+            HwKind::VideoToolbox => "VideoToolbox",
         };
 
         #[cfg(target_os = "windows")]
         let uses_sw_frames = matches!(kind, HwKind::Amf | HwKind::Mf);
-        #[cfg(not(target_os = "windows"))]
+        // VideoToolbox takes plain NV12 system-memory frames and does its own
+        // internal GPU upload, same as AMF/MF — see push_frame()'s split path.
+        #[cfg(target_os = "macos")]
+        let uses_sw_frames = matches!(kind, HwKind::VideoToolbox);
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let uses_sw_frames = false;
 
         unsafe {
@@ -806,6 +864,8 @@ impl HwEncoder {
                     let low_latency = std::ffi::CString::new("low_latency").unwrap();
                     ffi::av_opt_set((*ctx).priv_data, low_latency.as_ptr(), one.as_ptr(), 0);
                 }
+                #[cfg(target_os = "macos")]
+                HwKind::VideoToolbox => { /* options set in M1 */ }
             }
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());

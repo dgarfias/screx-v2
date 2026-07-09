@@ -219,6 +219,15 @@ async fn main() -> Result<()> {
                     })?;
             Arc::new(Mutex::new(backend))
         }
+        #[cfg(target_os = "macos")]
+        {
+            let backend = crate::platform::macos::input::MacInput::new(config.width, config.height)
+                .map_err(|e| {
+                    eprintln!("[main] input backend failed (input disabled): {e:#}");
+                    e
+                })?;
+            Arc::new(Mutex::new(backend))
+        }
     };
 
     let shared = Arc::new(stream_server::SharedState::new(

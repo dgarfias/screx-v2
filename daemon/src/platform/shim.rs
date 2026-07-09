@@ -18,11 +18,22 @@ pub fn config_dir() -> PathBuf {
             .map(|p| p.join("screx"))
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Temp\screx"))
     }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("screx")
+        } else {
+            PathBuf::from("/tmp/screx")
+        }
+    }
 }
 
 /// Return the local host name.
 pub fn hostname() -> Option<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut buf = [0u8; 256];
         let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };

@@ -83,6 +83,11 @@ pub fn probe_gamepad_max_controllers() -> Option<u8> {
             None
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // No gamepad passthrough backend on macOS.
+        None
+    }
 }
 
 /// Backend-specific input injection.

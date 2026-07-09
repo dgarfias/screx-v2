@@ -47,6 +47,8 @@ pub trait DisplayBackend {
 pub enum CaptureBackend {
     Evdi,
     Vdd,
+    #[cfg(target_os = "macos")]
+    MacVirtualDisplay,
 }
 
 impl CaptureBackend {
@@ -70,7 +72,11 @@ impl CaptureBackend {
         {
             Self::Vdd
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacVirtualDisplay
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             Self::Evdi
         }
@@ -116,5 +122,17 @@ pub fn create_display_backend(config: &CaptureConfig) -> Result<Box<dyn DisplayB
                 config.fps,
             )?,
         ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS always uses the ScreenCaptureKit/CGVirtualDisplay based
+        // capture path regardless of the requested variant (Evdi/Vdd are
+        // Linux/Windows-only; map any request to MacVirtualDisplay).
+        let _ = config.backend;
+        Ok(Box::new(crate::platform::macos::display::MacDisplay::new(
+            config.width,
+            config.height,
+            config.fps,
+        )?))
     }
 }

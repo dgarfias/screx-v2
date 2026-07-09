@@ -57,6 +57,10 @@ fn create_mux_client() -> Box<dyn MuxClient> {
     {
         Box::new(crate::platform::windows::usbmux::WindowsMuxClient::new())
     }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::platform::macos::usbmux::MacMuxClient::new())
+    }
 }
 
 /// Thread-safe TCP sender for framed messages over USB.

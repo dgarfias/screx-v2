@@ -40,6 +40,10 @@ pub fn create_audio_backend() -> Box<dyn AudioBackend> {
     {
         Box::new(crate::platform::windows::wasapi::WasapiBackend::new())
     }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::platform::macos::audio::MacAudioBackend::new())
+    }
 }
 
 /// Cheap capability probe: is virtual-microphone forwarding likely to work
@@ -53,6 +57,12 @@ pub fn probe_mic_available() -> bool {
     #[cfg(target_os = "windows")]
     {
         crate::platform::windows::wasapi::probe_mic_available()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Mic forwarding is deferred — needs a third-party virtual audio
+        // driver on macOS (no built-in equivalent to PulseAudio null-sinks).
+        false
     }
 }
 
@@ -68,6 +78,12 @@ pub fn probe_speaker_available() -> bool {
     {
         crate::platform::windows::wasapi::probe_speaker_available()
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Real ScreenCaptureKit speaker capture is a separate milestone
+        // (M3); report honestly unavailable until it lands.
+        false
+    }
 }
 
 /// Remove any leftover audio state from a previous crash.
@@ -79,6 +95,10 @@ pub fn cleanup_stale_modules() {
     #[cfg(target_os = "windows")]
     {
         crate::platform::windows::wasapi::cleanup_stale_audio_endpoints();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Nothing to clean up yet.
     }
 }
 

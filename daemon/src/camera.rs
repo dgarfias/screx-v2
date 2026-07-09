@@ -38,6 +38,11 @@ pub fn probe_camera_available() -> bool {
     {
         crate::platform::windows::vcam::probe_camera_available()
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Virtual camera forwarding is deferred on macOS.
+        false
+    }
 }
 
 /// Create a platform camera backend.
@@ -53,6 +58,38 @@ pub fn create_camera_backend(exclusive_caps: bool) -> Box<dyn CameraBackend> {
         let _ = exclusive_caps;
         Box::new(crate::platform::windows::vcam::WindowsCamera::new())
     }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = exclusive_caps;
+        Box::new(MacCameraStub::new())
+    }
+}
+
+/// Stub camera backend — real virtual-camera forwarding on macOS is
+/// deferred (no design work has landed yet); `probe_camera_available()`
+/// honestly reports `false` so this backend should never actually be
+/// invoked in practice.
+#[cfg(target_os = "macos")]
+struct MacCameraStub;
+
+#[cfg(target_os = "macos")]
+impl MacCameraStub {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl CameraBackend for MacCameraStub {
+    fn start(&mut self, _w: u32, _h: u32, _fps: u32) -> Result<()> {
+        anyhow::bail!("camera forwarding not implemented on macOS yet")
+    }
+
+    fn write_jpeg(&mut self, _jpeg: &[u8]) -> Result<()> {
+        anyhow::bail!("camera forwarding not implemented on macOS yet")
+    }
+
+    fn stop(&mut self) {}
 }
 
 /// Convenience writer used by `stream_server`.
