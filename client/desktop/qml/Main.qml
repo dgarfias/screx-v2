@@ -153,8 +153,9 @@ ApplicationWindow {
                         // ── Stream settings entry point ──
                         // Opened before connecting (not a blocking mid-connection
                         // step) — the chosen resolution/framerate/codec/bitrate
-                        // presets are persisted and applied, clamped against the
-                        // daemon's advertised CAPS, once a session is established.
+                        // presets are persisted and validated against the daemon's
+                        // advertised CAPS once a session is established; the
+                        // connection fails with an error if they're out of bounds.
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 6

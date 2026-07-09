@@ -4,7 +4,9 @@ Cross-platform desktop client (macOS, Windows, Linux) that connects to a Screx d
 [Linux](DAEMON_LINUX.md) or [Windows](DAEMON_WINDOWS.md); the wire protocol is identical on both.
 Decodes the stream and forwards input, audio, and camera back to the host. Source lives in
 `client/desktop`; the UI is Qt Quick/QML (`qml/Main.qml`) driven by a Rust backend
-(`src/backend.rs`). Network transport only — no USB support.
+(`src/backend.rs`). Network transport only — no USB support. It negotiates capabilities with the
+daemon and exposes a Stream Settings UI for choosing resolution, framerate, codec, and bitrate
+before connecting.
 
 ## Requirements
 

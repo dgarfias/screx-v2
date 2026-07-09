@@ -106,6 +106,7 @@ Responsibilities:
 
 - manual connection UI for network and USB
 - PIN pairing flow
+- capability negotiation (`CAPS`/`STNG`) with the daemon
 - network media receive path
 - USB media receive path
 - low-latency video decode and display
@@ -113,6 +114,7 @@ Responsibilities:
 - input forwarding
 - microphone and camera forwarding
 - connection-health UI and session state
+- Stream Settings sheet for choosing resolution, framerate, codec, and bitrate before connecting
 
 ### Desktop client
 
@@ -129,6 +131,8 @@ Responsibilities (network transport only — no USB support):
 
 - connection UI (Qt Quick/QML) driving a Rust backend
 - PIN pairing flow
+- capability negotiation (`CAPS`/`STNG`) with the daemon
+- Stream Settings UI for choosing resolution, framerate, codec, and bitrate before connecting
 - network media receive path, with zero-copy hardware-accelerated decode/display where available
   (VA-API on Linux, D3D11VA on Windows)
 - local audio playback and microphone capture
@@ -141,8 +145,8 @@ Responsibilities (network transport only — no USB support):
 
 - Pairing and control use a persistent TCP connection.
 - Media uses UDP.
-- Video and audio are sent daemon -> iPad over UDP.
-- Mic and camera data are sent iPad -> daemon over UDP.
+- Video and audio are sent daemon -> client over UDP.
+- Mic and camera data are sent client -> daemon over UDP.
 - Touch/keyboard/mouse/controller/peripheral state travel over encrypted TCP control.
 
 Why:
@@ -172,7 +176,7 @@ Why:
 4. TCP control channel stays open.
 5. iPad opens UDP path and starts sending encrypted register packets.
 6. Daemon authenticates first UDP packets and starts media.
-7. First decoded frame on iPad moves session into streaming state.
+7. First decoded frame on the client moves session into streaming state.
 
 ### USB session
 
