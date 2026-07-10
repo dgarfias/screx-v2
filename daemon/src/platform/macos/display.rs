@@ -19,9 +19,12 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2::msg_send;
 use objc2_core_foundation::{CFRetained, CGFloat, CGSize};
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayStream, CGDisplayStreamFrameStatus,
-    CGDisplayStreamUpdate, CGError, CGGetOnlineDisplayList, CGPreflightScreenCaptureAccess,
-    CGRequestScreenCaptureAccess,
+    CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
+    CGConfigureDisplayMirrorOfDisplay, CGConfigureDisplayOrigin, CGConfigureOption,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayConfigRef, CGDisplayIsInMirrorSet,
+    CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayStream, CGDisplayStreamFrameStatus,
+    CGDisplayStreamUpdate, CGError, CGGetOnlineDisplayList, CGMainDisplayID,
+    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
 };
 use objc2_foundation::{NSArray, NSString};
 use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
@@ -33,6 +36,178 @@ use crate::capture::{CaptureFrame, DisplayBackend, DisplayMode};
 fn get_class(name: &std::ffi::CStr) -> Result<&'static AnyClass> {
     AnyClass::get(name)
         .ok_or_else(|| anyhow!("class {:?} not found (unsupported macOS version?)", name))
+}
+
+/// `kCGNullDirectDisplay`: the CoreGraphics sentinel meaning "no display" —
+/// e.g. "stop mirroring" when passed as the `master` argument to
+/// `CGConfigureDisplayMirrorOfDisplay`. It's a C `#define 0`, not exposed as
+/// a named binding by objc2-core-graphics, so it's spelled out here.
+const K_CG_NULL_DIRECT_DISPLAY: CGDirectDisplayID = 0;
+
+/// Prints the current placement/mirroring state of a display: its global
+/// desktop bounds, whether it's the main display, whether it's part of a
+/// mirror set, and (if so) which display it mirrors. Used both to diagnose
+/// the OS's default behavior for a newly attached virtual display and to
+/// verify the outcome of `force_extended_placement` below.
+fn log_display_state(label: &str, id: CGDirectDisplayID) {
+    let bounds = CGDisplayBounds(id);
+    let in_mirror_set = CGDisplayIsInMirrorSet(id);
+    let mirrors_display = CGDisplayMirrorsDisplay(id);
+    let is_main = CGDisplayIsMain(id);
+    println!(
+        "[display]   {label}: id={id} bounds=(x={}, y={}, w={}, h={}) is_main={is_main} \
+         in_mirror_set={in_mirror_set} mirrors_display={mirrors_display}",
+        bounds.origin.x as i32,
+        bounds.origin.y as i32,
+        bounds.size.width as u32,
+        bounds.size.height as u32,
+    );
+}
+
+/// Forces the newly-attached virtual display into the product-required
+/// default: an *extended* desktop (not mirrored), placed at a deterministic,
+/// non-overlapping origin immediately to the right of the main display.
+///
+/// Background: macOS has no documented guarantee about how a freshly
+/// attached display is initially arranged — it may come up mirrored onto
+/// the main display (sharing/overlapping desktop coordinates), or extended
+/// at some origin the Arrangement system picked on its own. Either way,
+/// `output_rect()` (and the input-injection coordinate math downstream of
+/// it) needs a known-good, non-overlapping global rect, so this pins the
+/// arrangement explicitly instead of trusting the default.
+///
+/// Uses the public `CGBeginDisplayConfiguration` / `CGConfigureDisplay*` /
+/// `CGCompleteDisplayConfiguration` transaction API with
+/// `kCGConfigureForSession` (not `kCGConfigurePermanently`): the change is
+/// process/session-scoped and nothing durable gets written to the user's
+/// saved display preferences (the virtual display disappears at detach()
+/// anyway, and CoreGraphics also unwinds session-scoped config when the
+/// display goes offline). This only sets the *initial* state — it does not
+/// fight a user who later switches to mirroring via System Settings.
+///
+/// Empirically observed on this machine: `CGCompleteDisplayConfiguration`
+/// intermittently returns a non-Success `CGError` (seen: `CGError(1014)`,
+/// not one of the documented `kCGError*` constants — likely a private
+/// SkyLight/WindowServer-internal code surfacing through the public
+/// display-configuration transaction when applied to a `CGVirtualDisplay`)
+/// even with valid arguments and a display already confirmed online via
+/// `CGGetOnlineDisplayList`, at roughly a 50% rate across repeated
+/// attach/detach cycles in manual testing. When it happens, the display
+/// stays registered/online for on the order of minutes afterward (far
+/// longer than the sub-5s teardown seen on a clean detach) before the OS
+/// reclaims it, even though the Rust-side `CGVirtualDisplay` object is
+/// dropped immediately. The caller in `attach()` treats failures from this
+/// function as non-fatal (logs a warning, keeps going) specifically
+/// because of this: failing the whole attach() over a placement nicety
+/// would abort capture AND leave the display stuck for minutes, which is
+/// strictly worse than an imperfectly-placed-but-working capture session.
+/// If this proves to be a real limitation of `CGConfigureDisplayMirrorOfDisplay`
+/// / `CGConfigureDisplayOrigin` on virtual displays rather than a transient
+/// WindowServer hiccup, alternatives worth trying: (a) split the unmirror
+/// and origin changes into two separate Begin/Complete transactions instead
+/// of one, in case combining them is what trips the internal validation;
+/// (b) retry the transaction a couple of times with a short backoff before
+/// giving up, since the same inputs succeeded on other attempts; (c) skip
+/// `CGConfigureDisplayMirrorOfDisplay` entirely when `CGDisplayIsInMirrorSet`
+/// is already false (this environment's failures did not correlate with
+/// that flag, but it's an obvious first thing to try in an environment
+/// where they do).
+fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
+    // Ground truth for "is there another display to extend onto" is the
+    // online display list, NOT CGMainDisplayID(). Attaching the virtual
+    // display can itself become the new main display (observed on this
+    // machine: CGMainDisplayID() returns the virtual display's own id
+    // immediately after attach), which does not mean no other display
+    // exists — it just means the OS handed the new display the menu
+    // bar/main status. Trusting CGMainDisplayID() here previously caused
+    // this function to skip the fixup even when a real second display
+    // (id=1) was sitting right there in the online list.
+    let mut ids = [0u32; 32];
+    let mut count: u32 = 0;
+    let list_err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if list_err != CGError::Success {
+        bail!("CGGetOnlineDisplayList failed: {list_err:?}");
+    }
+    let online = ids[..count as usize].to_vec();
+    println!(
+        "[display] online displays at fixup time: {online:?} (CGMainDisplayID()={})",
+        CGMainDisplayID()
+    );
+
+    println!("[display] arrangement before extend/placement fixup:");
+    log_display_state("virtual", display_id);
+    for &id in &online {
+        if id != display_id {
+            log_display_state("other", id);
+        }
+    }
+
+    // Pick any other currently-online display to place/extend relative to.
+    let Some(reference_id) = online.iter().copied().find(|&id| id != display_id) else {
+        println!(
+            "[display] no other online display besides the virtual one ({display_id}); \
+             nothing to extend/place it relative to, leaving as-is"
+        );
+        return Ok(());
+    };
+
+    let reference_bounds = CGDisplayBounds(reference_id);
+    let target_x = (reference_bounds.origin.x + reference_bounds.size.width) as i32;
+    let target_y = reference_bounds.origin.y as i32;
+
+    let mut config: CGDisplayConfigRef = std::ptr::null_mut();
+    let begin_err = unsafe { CGBeginDisplayConfiguration(&mut config) };
+    if begin_err != CGError::Success {
+        bail!("CGBeginDisplayConfiguration failed: {begin_err:?}");
+    }
+
+    // Un-mirror (harmless/idempotent no-op if it wasn't mirrored) and place
+    // it deterministically to the right of the reference display, in the
+    // same transaction.
+    let unmirror_err = unsafe {
+        CGConfigureDisplayMirrorOfDisplay(config, display_id, K_CG_NULL_DIRECT_DISPLAY)
+    };
+    let origin_err = unsafe { CGConfigureDisplayOrigin(config, display_id, target_x, target_y) };
+
+    if unmirror_err != CGError::Success || origin_err != CGError::Success {
+        unsafe { CGCancelDisplayConfiguration(config) };
+        bail!(
+            "display configuration failed: CGConfigureDisplayMirrorOfDisplay={unmirror_err:?} \
+             CGConfigureDisplayOrigin={origin_err:?}"
+        );
+    }
+
+    let complete_err =
+        unsafe { CGCompleteDisplayConfiguration(config, CGConfigureOption::ForSession) };
+    if complete_err != CGError::Success {
+        bail!("CGCompleteDisplayConfiguration failed: {complete_err:?}");
+    }
+
+    println!(
+        "[display] applied extend+placement fixup: reference={reference_id} \
+         target_origin=(x={target_x}, y={target_y})"
+    );
+    println!("[display] arrangement after extend/placement fixup:");
+    log_display_state("virtual", display_id);
+    log_display_state("other", reference_id);
+
+    if CGDisplayIsInMirrorSet(display_id) {
+        eprintln!(
+            "[display] WARNING: display {display_id} still reports in_mirror_set=true after \
+             CGConfigureDisplayMirrorOfDisplay(..., kCGNullDirectDisplay) — mirroring may not \
+             be undoable this way for a CGVirtualDisplay, or something else re-mirrored it"
+        );
+    }
+    let final_bounds = CGDisplayBounds(display_id);
+    if final_bounds.origin.x as i32 != target_x || final_bounds.origin.y as i32 != target_y {
+        eprintln!(
+            "[display] WARNING: display {display_id} bounds after fixup are \
+             (x={}, y={}) but the requested origin was (x={target_x}, y={target_y})",
+            final_bounds.origin.x as i32, final_bounds.origin.y as i32
+        );
+    }
+
+    Ok(())
 }
 
 /// Shared frame buffer written by the CGDisplayStream callback (on a GCD
@@ -215,6 +390,30 @@ impl DisplayBackend for MacDisplay {
             );
         }
         println!("[display] virtual display {display_id} is online");
+
+        // Best-effort, not fatal: the private display-configuration
+        // transaction this performs has been observed (empirically, on
+        // this machine) to intermittently fail with a non-Success CGError
+        // from CGCompleteDisplayConfiguration even with legitimate
+        // arguments and a display already confirmed online — see the
+        // detailed comment on `force_extended_placement` for the exact
+        // error and reproduction rate observed. Treating that as fatal to
+        // attach() would be strictly worse than the placement glitch it's
+        // trying to fix: it would abort the whole capture session AND
+        // leave the freshly-created virtual display occupying a
+        // CGDirectDisplayID (observed to linger online for on the order of
+        // minutes before the OS reclaims it) for no capture benefit at
+        // all. So: try to force extended placement, but if it fails, warn
+        // loudly and continue attaching/streaming with whatever placement
+        // the OS already gave the display — `output_rect()` reads live
+        // bounds, so callers still get a geometrically correct (if
+        // possibly not ideally positioned) rect either way.
+        if let Err(e) = force_extended_placement(display_id) {
+            eprintln!(
+                "[display] WARNING: extend/placement fixup failed, continuing with whatever \
+                 arrangement the OS already gave display {display_id}: {e:#}"
+            );
+        }
 
         // --- Frame capture via CGDisplayStream ---
         let frame_state = Arc::new(FrameState::new(mode.width, mode.height));
@@ -429,6 +628,22 @@ mod tests {
             height: 800,
             fps: 30,
         };
+
+        // Baseline, before any virtual display exists: what does this
+        // session's display landscape look like already? Distinguishes "the
+        // virtual display became main because it's the only display this
+        // session can see" from "something in our fixup logic is wrong".
+        {
+            let mut ids = [0u32; 32];
+            let mut count: u32 = 0;
+            let err =
+                unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+            println!(
+                "[baseline] CGGetOnlineDisplayList err={err:?} count={count} ids={:?}",
+                &ids[..count as usize]
+            );
+            println!("[baseline] CGMainDisplayID()={}", CGMainDisplayID());
+        }
 
         for round in 0..2 {
             println!("=== round {round} ===");
