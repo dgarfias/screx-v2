@@ -49,7 +49,24 @@ objc2-core-media = "0.3"
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"
 core-foundation = "0.10"
-core-graphics = "0.25"
+# "highsierra" feature gate is required to get CGEvent::new_scroll_event
+# (the non-variadic CGEventCreateScrollWheelEvent2 wrapper) compiled into the
+# crate at all — used by platform/macos/input.rs for two-finger-scroll/wheel
+# injection. No new crate added, just a feature flag on the existing one.
+core-graphics = { version = "0.25", features = ["highsierra"] }
+# Added in M1 for the CGDisplayStream-based capture path (see
+# platform/macos/display.rs): objc2-core-graphics carries real bindings for
+# the public (if deprecated) CGDisplayStream/CGDirectDisplay/CGError APIs;
+# objc2-io-surface for locking/reading the delivered IOSurfaces;
+# objc2-core-foundation for CFDictionary/CFBoolean/CGSize plumbing shared
+# with those APIs; dispatch2 to create the serial dispatch queues
+# CGVirtualDisplayDescriptor/CGDisplayStream want. All four were already
+# transitively resolved via objc2-screen-capture-kit, so this adds no new
+# crates to the dependency graph, only direct access to ones already there.
+objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
 
 [build-dependencies]
 cc = "1"

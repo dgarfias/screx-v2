@@ -593,14 +593,15 @@ impl HwEncoder {
         Self::new_with_vaapi_hevc_mode(config, HwKind::Mf, VaapiHevcMode::Bitrate)
     }
 
-    /// Stub — real VideoToolbox encoder setup lands in M1. Deliberately does
-    /// not call `new_with_vaapi_hevc_mode`: that function builds an
-    /// AVHWFramesContext/hw_device_ctx per VA-API/NVENC/AMF/QSV/MF, which
-    /// isn't the shape VideoToolbox's AVHWDeviceType needs, and there is no
-    /// real encoder body to construct yet anyway.
+    /// VideoToolbox (h264_videotoolbox/hevc_videotoolbox) takes plain NV12
+    /// system-memory frames and does its own internal GPU upload, exactly
+    /// like the AMF/MF path on Windows — see `uses_sw_frames` and
+    /// `push_frame_sw`. So construction reuses the same generic codepath as
+    /// every other HwKind; no AVHWFramesContext/hw_device_ctx is built for
+    /// it (that branch is skipped via `uses_sw_frames`).
     #[cfg(target_os = "macos")]
-    fn new_videotoolbox(_config: &EncoderConfig) -> Result<Self> {
-        bail!("VideoToolbox encoder not yet implemented — lands in M1")
+    fn new_videotoolbox(config: &EncoderConfig) -> Result<Self> {
+        Self::new_with_vaapi_hevc_mode(config, HwKind::VideoToolbox, VaapiHevcMode::Bitrate)
     }
 
     fn new_with_vaapi_hevc_mode(
@@ -681,14 +682,25 @@ impl HwEncoder {
                 ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
                 "0",
             ),
+            // VideoToolbox uses uses_sw_frames = true (below), so hw_type/
+            // hw_pix_fmt/device_path here are dead values: they're only read
+            // inside the `if !uses_sw_frames { ... }` branch, which
+            // VideoToolbox skips entirely. AV_HWDEVICE_TYPE_NONE/whatever
+            // pixel format is irrelevant, but needs to type-check.
             #[cfg(target_os = "macos")]
-            (HwKind::VideoToolbox, _) => {
-                // VideoToolbox never reaches this generic hw-device-context
-                // path (see new_videotoolbox's stub, which bails before
-                // calling here); this arm exists only to keep the match
-                // exhaustive over HwKind.
-                bail!("VideoToolbox does not use the generic hw encoder path")
-            }
+            (HwKind::VideoToolbox, VideoCodec::H264) => (
+                "h264_videotoolbox",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                "",
+            ),
+            #[cfg(target_os = "macos")]
+            (HwKind::VideoToolbox, VideoCodec::H265) => (
+                "hevc_videotoolbox",
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                "",
+            ),
         };
 
         let kind_name = match kind {
@@ -865,7 +877,14 @@ impl HwEncoder {
                     ffi::av_opt_set((*ctx).priv_data, low_latency.as_ptr(), one.as_ptr(), 0);
                 }
                 #[cfg(target_os = "macos")]
-                HwKind::VideoToolbox => { /* options set in M1 */ }
+                HwKind::VideoToolbox => {
+                    // Confirmed via `ffmpeg -h encoder=h264_videotoolbox`:
+                    // `-realtime <boolean> ... Hint that encoding should
+                    // happen in real-time if not faster`.
+                    let realtime = std::ffi::CString::new("realtime").unwrap();
+                    let one = std::ffi::CString::new("1").unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, realtime.as_ptr(), one.as_ptr(), 0);
+                }
             }
 
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
@@ -1474,5 +1493,123 @@ impl Drop for SwEncoder {
                 ffi::avcodec_free_context(&mut self.ctx);
             }
         }
+    }
+}
+
+// Scratch verification test for the M1 VideoToolbox encoder path — isolated,
+// no display/capture subsystem involved: just Encoder::new + encode_frame on
+// synthetic BGRA frames.
+#[cfg(all(test, target_os = "macos"))]
+mod videotoolbox_smoke_test {
+    use super::*;
+
+    #[test]
+    fn videotoolbox_encodes_first_frame_as_idr() {
+        let width = 320u32;
+        let height = 240u32;
+        let config = EncoderConfig {
+            bitrate_bps: 2_000_000,
+            gop: 60,
+            fps: 30,
+            width,
+            height,
+            backend: EncoderBackend::VideoToolbox,
+            codec: VideoCodec::H264,
+        };
+
+        let mut encoder = Encoder::new(config).expect("VideoToolbox encoder should construct");
+
+        let frame_bytes = (width as usize) * (height as usize) * 4;
+        let mut aus_seen = Vec::new();
+        for i in 0..5u8 {
+            // Synthetic BGRA content; value doesn't matter for this test, just
+            // needs to be the right size and not literally identical every
+            // time so a real encoder wouldn't just emit skip frames.
+            let data = vec![i.wrapping_mul(17); frame_bytes];
+            let capture_frame = CaptureFrame {
+                width,
+                height,
+                data: &data,
+            };
+            let aus = encoder
+                .encode_frame(&capture_frame, false)
+                .expect("encode_frame should succeed");
+            aus_seen.push(aus);
+        }
+
+        let all_aus: Vec<&EncodedAccessUnit> = aus_seen.iter().flatten().collect();
+        assert!(
+            !all_aus.is_empty(),
+            "expected at least one encoded access unit across 5 pushed frames"
+        );
+        assert!(
+            all_aus.iter().any(|au| !au.annex_b.is_empty()),
+            "expected at least one non-empty encoded access unit"
+        );
+        assert!(
+            all_aus[0].is_idr,
+            "first encoded access unit should be an IDR/keyframe"
+        );
+    }
+
+    #[test]
+    fn videotoolbox_reconfigure_bitrate_changes_output_size() {
+        let width = 640u32;
+        let height = 480u32;
+        let config = EncoderConfig {
+            bitrate_bps: 300_000,
+            gop: 300,
+            fps: 30,
+            width,
+            height,
+            backend: EncoderBackend::VideoToolbox,
+            codec: VideoCodec::H264,
+        };
+
+        // Per-frame pseudo-random noise (changes every frame, seeded by frame
+        // index) so P-frames have real residual/motion to encode instead of
+        // compressing to near-zero regardless of the configured bitrate cap.
+        let frame_bytes = (width as usize) * (height as usize) * 4;
+        let mut encoder = Encoder::new(config).expect("construct");
+
+        fn measure(
+            encoder: &mut Encoder,
+            width: u32,
+            height: u32,
+            frame_bytes: usize,
+            seed_start: u32,
+            frames: u32,
+        ) -> u64 {
+            let mut total = 0u64;
+            for f in 0..frames {
+                let seed = seed_start + f;
+                let mut data = vec![0u8; frame_bytes];
+                for (i, b) in data.iter_mut().enumerate() {
+                    *b = ((i as u32).wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(40503)) % 256)
+                        as u8;
+                }
+                let cf = CaptureFrame {
+                    width,
+                    height,
+                    data: &data,
+                };
+                let aus = encoder.encode_frame(&cf, false).expect("encode");
+                for au in &aus {
+                    total += au.annex_b.len() as u64;
+                }
+            }
+            total
+        }
+
+        let low = measure(&mut encoder, width, height, frame_bytes, 0, 15);
+        encoder
+            .reconfigure_bitrate(20_000_000)
+            .expect("reconfigure_bitrate should succeed");
+        let high = measure(&mut encoder, width, height, frame_bytes, 1000, 15);
+        println!("[bitrate check] low(300kbps)={low} bytes, after reconfigure to 20mbps={high} bytes");
+        assert!(
+            high > low,
+            "expected reconfigure_bitrate to a much higher bitrate to produce more encoded bytes over 15 frames (low={low}, high={high})"
+        );
     }
 }
