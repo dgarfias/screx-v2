@@ -80,9 +80,9 @@ pub fn probe_speaker_available() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        // Real ScreenCaptureKit speaker capture is a separate milestone
-        // (M3); report honestly unavailable until it lands.
-        false
+        // ScreenCaptureKit system-audio capture (M3) — verified end-to-end
+        // via the `macos_audio_smoke` test in platform/macos/audio.rs.
+        true
     }
 }
 

@@ -67,6 +67,13 @@ objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-io-surface = "0.3"
 objc2-core-foundation = "0.3"
 dispatch2 = "0.3"
+# Added in M3 for the ScreenCaptureKit audio capture path (see
+# platform/macos/audio.rs): AudioBufferList/AudioBuffer/AudioStreamBasicDescription
+# and the kAudioFormatFlag* constants used to interpret the Float32 PCM
+# CMSampleBuffers SCStream's `.audio` output delivers. Already resolved
+# transitively via objc2-core-media, so this adds no new crate to the
+# dependency graph, only direct access to types already there.
+objc2-core-audio-types = "0.3"
 
 [build-dependencies]
 cc = "1"
