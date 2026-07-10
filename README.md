@@ -1,6 +1,6 @@
 # Screx
 
-Screx turns a Linux or Windows machine into a low-latency remote display host for iPad and desktop clients.
+Screx turns a Linux, Windows, or macOS machine into a low-latency remote display host for iPad and desktop clients.
 
 You run a daemon that creates a virtual monitor, then connect from either the iPad app or the desktop client over Wi-Fi (or USB, for the iPad app). The clients can also forward touch, keyboard, mouse, controllers, microphone, speakers, and camera.
 
@@ -10,6 +10,7 @@ For implementation details and protocol documentation, see [`docs/ARCHITECTURE.m
 
 - [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md) — build and run the Linux daemon
 - [`docs/DAEMON_WINDOWS.md`](docs/DAEMON_WINDOWS.md) — build and run the Windows daemon
+- [`docs/DAEMON_MACOS.md`](docs/DAEMON_MACOS.md) — build and run the macOS daemon
 
 ## Clients
 
@@ -20,7 +21,7 @@ Either client works with either daemon — the wire protocol is identical on bot
 
 ## Use
 
-1. Start the daemon (Linux or Windows).
+1. Start the daemon (Linux, Windows, or macOS).
 2. Open Screx on the iPad or launch the desktop client on macOS, Windows, or Linux.
 3. Choose one transport:
     - **Network**: enter the host/IP and tap `Connect`

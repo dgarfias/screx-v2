@@ -10,7 +10,6 @@
 //! module is a reasonable future cleanup, but is not worth blocking this
 //! milestone on.
 
-use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;

@@ -2,7 +2,7 @@
 name = "screx"
 version = "0.1.0"
 edition = "2021"
-description = "Low-latency Linux screen streaming daemon for Screx V2"
+description = "Low-latency screen streaming daemon for Screx V2"
 license = "MIT"
 
 [lib]

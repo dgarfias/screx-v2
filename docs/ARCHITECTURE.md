@@ -2,22 +2,23 @@
 
 ## Overview
 
-Screx is a remote display system built around a virtual monitor on a host machine (Linux or
-Windows) and custom low-latency clients on iPad and desktop (macOS/Windows/Linux).
+Screx is a remote display system built around a virtual monitor on a host machine (Linux,
+Windows, or macOS) and custom low-latency clients on iPad and desktop (macOS/Windows/Linux).
 
 At a high level:
 
 - the daemon creates a virtual display (EVDI on Linux, a DXGI-duplicated virtual monitor via a
-  third-party driver on Windows)
+  third-party driver on Windows, a private `CGVirtualDisplay` on macOS)
 - the host compositor renders to that virtual display
 - the daemon captures, encodes, and streams video/audio to the client
 - the client sends back touch/mouse/keyboard, controller, microphone, camera, and session control
   messages
 
 The daemon binary and wire protocol are the same across host platforms — see
-[DAEMON_LINUX.md](DAEMON_LINUX.md) and [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for platform-specific
-build/run/driver details. Either daemon works with either client — see
-[CLIENT_IPAD.md](CLIENT_IPAD.md) and [CLIENT_DESKTOP.md](CLIENT_DESKTOP.md).
+[DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
+[DAEMON_MACOS.md](DAEMON_MACOS.md) for platform-specific build/run/driver details. Either daemon
+works with either client — see [CLIENT_IPAD.md](CLIENT_IPAD.md) and
+[CLIENT_DESKTOP.md](CLIENT_DESKTOP.md).
 
 The system supports two transports:
 
@@ -25,13 +26,13 @@ The system supports two transports:
   - UDP for media
   - encrypted TCP for pairing and control
 - **USB** (iPad client only)
-  - framed TCP over `iproxy` (Linux) / Apple Mobile Device Service (Windows)
+  - framed TCP over `iproxy` (Linux/macOS) / Apple Mobile Device Service (Windows)
 
 ## High-Level Data Flow
 
 ```text
 Host desktop/compositor
-    -> virtual monitor (EVDI / DXGI duplication)
+    -> virtual monitor (EVDI / DXGI duplication / CGVirtualDisplay)
     -> capture
     -> encode
     -> transport
@@ -40,7 +41,8 @@ Host desktop/compositor
 Client input/peripherals
     -> control transport
     -> daemon
-    -> uinput+PipeWire+v4l2loopback (Linux) / SendInput+WASAPI+DirectShow+ViGEmBus (Windows)
+    -> uinput+PipeWire+v4l2loopback (Linux) / SendInput+WASAPI+DirectShow+ViGEmBus (Windows) /
+       CGEventPost+ScreenCaptureKit (macOS)
 ```
 
 ## Main Components
@@ -82,9 +84,13 @@ Platform-specific implementations live behind the `crate::platform` module
   filter DLL for the virtual webcam (`vcam.rs`, `vcam_filter/lib.rs`), ViGEmBus for virtual Xbox
   360 gamepads (`vigem.rs`), and native usbmuxd-protocol speech to Apple Mobile Device Service for
   USB detection (`usbmux.rs`)
+- `daemon/src/platform/macos/` — a private `CGVirtualDisplay` for the virtual monitor, captured via
+  the public `CGDisplayStream` API and encoded with VideoToolbox (`display.rs`), `CGEventPost`-based
+  input (`input.rs`), a ScreenCaptureKit audio-only stream for speaker capture (`audio.rs`), and
+  `idevice_id`/`iproxy` (macOS ships `usbmuxd` natively) for USB detection (`usbmux.rs`)
 
-See [DAEMON_LINUX.md](DAEMON_LINUX.md) and [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for the
-dependencies and drivers each backend needs.
+See [DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
+[DAEMON_MACOS.md](DAEMON_MACOS.md) for the dependencies and drivers each backend needs.
 
 ### iPad app
 
@@ -490,7 +496,9 @@ External keyboard HID-like packets use `"RAWKEY"`.
 ### Speakers
 
 - Linux creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`; Windows
-  installs/enables the "Steam Streaming Speakers" device and loopback-captures it via WASAPI
+  installs/enables the "Steam Streaming Speakers" device and loopback-captures it via WASAPI;
+  macOS uses a ScreenCaptureKit audio-only stream (`capturesAudio`, 48 kHz stereo) — host audio
+  keeps playing locally since ScreenCaptureKit taps the stream rather than rerouting it
 - audio is sent to the client
 - the speaker toggle can hard-detach the sink using the `SPKR` control message
 
@@ -498,13 +506,15 @@ External keyboard HID-like packets use `"RAWKEY"`.
 
 - the client captures microphone audio and encodes it as Opus
 - on Linux the daemon decodes and exposes a virtual microphone source via PipeWire/PulseAudio; on
-  Windows it decodes into VB-Audio VB-CABLE's input
+  Windows it decodes into VB-Audio VB-CABLE's input; on macOS this is deferred (no built-in
+  equivalent to a PulseAudio null-sink) and `CAPS` honestly reports it unavailable
 
 ### Camera
 
 - the client captures camera frames as JPEG
 - on Linux the daemon writes them into a `v4l2loopback` webcam device; on Windows it writes them
-  into a shared-memory buffer read by a registered DirectShow capture filter (`screx_vcam.dll`)
+  into a shared-memory buffer read by a registered DirectShow capture filter (`screx_vcam.dll`); on
+  macOS this is deferred and `CAPS` honestly reports it unavailable
 
 ## Connection Health Model
 
@@ -551,9 +561,24 @@ The daemon may create/enable:
 Microphone forwarding on Windows relies on the separately-installed VB-Audio VB-CABLE rather than
 a daemon-managed device — see [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md).
 
+### macOS
+
+The daemon may create/enable:
+
+- a private `CGVirtualDisplay` virtual monitor, captured via the public `CGDisplayStream` API
+- input injection via `CGEventPost` (no persistent device object)
+- a ScreenCaptureKit audio-only stream for client speaker output
+
+Camera and microphone forwarding are deferred on macOS (no virtual camera/mic design has landed
+yet), and gamepad passthrough has no macOS equivalent to ViGEmBus or `uinput` — `CAPS` reports all
+three as unavailable so clients hide those controls. See
+[DAEMON_MACOS.md](DAEMON_MACOS.md) for the required TCC permissions and other platform notes.
+
 ## Notes on Compatibility
 
 - Network mode is the main path for pairing and remote use.
 - USB mode (iPad only) is lower-latency and more stable when tethered.
 - The Linux virtual webcam uses `v4l2loopback`; some applications behave differently depending on `exclusive_caps` mode. See the v4l2loopback troubleshooting notes in the ArchWiki for compatibility context: [ArchWiki: v4l2loopback Troubleshooting](https://wiki.archlinux.org/title/V4l2loopback#Troubleshooting).
 - See [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for the Windows-specific drivers required and their compatibility notes.
+- See [DAEMON_MACOS.md](DAEMON_MACOS.md) for the macOS-specific TCC permissions, the private-API
+  caveat, and other compatibility notes.

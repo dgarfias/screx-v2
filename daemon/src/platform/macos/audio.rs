@@ -211,7 +211,7 @@ struct SendRetained<T>(Retained<T>);
 unsafe impl<T> Send for SendRetained<T> {}
 
 fn nserror_string(e: &NSError) -> String {
-    format!("{}", unsafe { e.localizedDescription() })
+    format!("{}", e.localizedDescription())
 }
 
 /// Fetch `SCShareableContent` (async, completion-handler API) and return its

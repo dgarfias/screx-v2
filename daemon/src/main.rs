@@ -39,7 +39,7 @@ fn parse_bitrate(s: &str) -> std::result::Result<u32, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "screx",
-    about = "Low-latency Linux-to-iPad screen streaming daemon"
+    about = "Low-latency screen streaming daemon for Screx V2"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -157,6 +157,17 @@ impl AppConfig {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose);
+
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "[main] refusing to run as root — CGVirtualDisplay, ScreenCaptureKit, and \
+             CGEventPost all require the logged-in user's WindowServer session and per-user TCC \
+             grants, which sudo/root does not have. Run this binary directly as your normal user \
+             (no sudo)."
+        );
+        std::process::exit(1);
+    }
 
     match &cli.command {
         Some(Commands::Unpair { device_id }) => {
