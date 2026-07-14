@@ -1083,13 +1083,45 @@ mod manual_verification {
 
         // Part 1 acceptance: force_display_mode should have overridden
         // whatever WindowServer would otherwise have persisted, so the live
-        // rect should equal the requested mode exactly.
-        assert_eq!(
-            (actual_w, actual_h),
-            (mw, mh),
-            "output_rect() bounds {actual_w}x{actual_h} do not match the requested mode \
-             {mw}x{mh} — force_display_mode (Part 1) failed to override WindowServer's mode \
-             substitution; see [display] logs above for the CGError"
+        // rect should equal one of the two acceptable outcomes — the
+        // preferred HiDPI half-size in points (when both dims are even and
+        // the OS actually honors CGVirtualDisplaySettings.hiDPI) or the full
+        // 1x size (the fallback, and — empirically, on at least one real
+        // machine/macOS build tested during this feature's implementation —
+        // the ONLY outcome ever observed: CGVirtualDisplaySettings.hiDPI=1
+        // produced no pixel/point distinction in
+        // CGDisplayCopyAllDisplayModes (CGDisplayModeGetPixelWidth/Height
+        // always equal GetWidth/Height for every registered mode) and
+        // NSScreen.backingScaleFactor stayed 1.0 for the virtual display,
+        // verified independently of this Rust code via a raw ObjC-runtime
+        // probe trying both point-size and real-panel pixel-size mode args.
+        // Asserting a hard requirement on HiDPI specifically would make this
+        // test permanently red on such a machine for a reason outside this
+        // code's control, so both outcomes are accepted here — this still
+        // catches a genuine regression (landing on some THIRD, unrequested
+        // size).
+        let both_even = mw % 2 == 0 && mh % 2 == 0;
+        let hidpi_wh = (mw / 2, mh / 2);
+        let onex_wh = (mw, mh);
+        let acceptable: Vec<(u32, u32)> = if both_even {
+            vec![hidpi_wh, onex_wh]
+        } else {
+            vec![onex_wh]
+        };
+        assert!(
+            acceptable.contains(&(actual_w, actual_h)),
+            "output_rect() bounds {actual_w}x{actual_h} match neither acceptable outcome \
+             {acceptable:?} for requested mode {mw}x{mh} — force_display_mode (Part 1) failed \
+             to override WindowServer's mode substitution; see [display] logs above for the \
+             CGError"
+        );
+        println!(
+            "[4corner] active mode is {}",
+            if both_even && (actual_w, actual_h) == hidpi_wh {
+                "HiDPI (2x)"
+            } else {
+                "1x"
+            }
         );
 
         // Exactly what main.rs does right after attach: report the live

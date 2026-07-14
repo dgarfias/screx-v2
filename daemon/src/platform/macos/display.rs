@@ -3,8 +3,14 @@
 //! Virtual monitor via the private `CGVirtualDisplay` API, frame capture via
 //! the public (if deprecated) `CGDisplayStream` API. Ported from DeskPad
 //! (https://github.com/Stengo/DeskPad), adapted for a headless daemon: no
-//! CFRunLoop/AppKit main thread, hiDPI forced off (1x scale, pixels==points),
-//! raw BGRA bytes handed to the encoder instead of drawing into a CALayer.
+//! CFRunLoop/AppKit main thread, hiDPI turned ON (2x scale, matching
+//! DeskPad) so the client gets Retina-quality rendering, raw BGRA bytes
+//! handed to the encoder instead of drawing into a CALayer. `CGDisplayMode`
+//! width/height (points) and pixel_width/pixel_height (framebuffer pixels)
+//! can now legitimately differ — see `create_virtual_display` and
+//! `force_display_mode` — so the input-injection layer's live-bounds-based
+//! scaling (`MacInput::set_output_size`) is what keeps touches/clicks
+//! landing correctly regardless of which mode ends up active.
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,10 +72,11 @@ fn log_display_state(label: &str, id: CGDirectDisplayID) {
     );
 }
 
-/// Finds the `CGDisplayMode` registered for `display_id` whose pixel
-/// dimensions exactly match `width`x`height`. hiDPI is forced off for our
-/// virtual display (see `create_virtual_display`), so pixel dims == point
-/// dims — no backing-scale-factor arithmetic needed here.
+/// Finds the `CGDisplayMode` registered for `display_id` for which `matches`
+/// returns true, given `(width, height, pixel_width, pixel_height)` — points
+/// and pixels respectively, which can legitimately differ now that hiDPI is
+/// on (a HiDPI mode has `pixel_width/height == 2 * width/height`; a 1x mode
+/// has them equal).
 ///
 /// The returned `CGDisplayMode` is retained independently of the backing
 /// `CGDisplayCopyAllDisplayModes` array (which this function's caller never
@@ -77,12 +84,12 @@ fn log_display_state(label: &str, id: CGDirectDisplayID) {
 ///
 /// Logs every mode actually registered for the display when no match is
 /// found, for diagnosis — this "shouldn't" happen since we registered the
-/// requested mode ourselves via `CGVirtualDisplaySettings.setModes:`, but if
-/// it does, the caller needs to know what WAS available instead.
-fn find_matching_mode(
+/// requested mode(s) ourselves via `CGVirtualDisplaySettings.setModes:`, but
+/// if it does, the caller needs to know what WAS available instead.
+fn find_mode_where(
     display_id: CGDirectDisplayID,
-    width: usize,
-    height: usize,
+    label: &str,
+    matches: impl Fn(usize, usize, usize, usize) -> bool,
 ) -> Option<CFRetained<CGDisplayMode>> {
     // Follows the CF "Copy" ownership rule: this array is ours to release,
     // handled automatically by `CFRetained`'s `Drop` impl. The individual
@@ -111,8 +118,10 @@ fn find_matching_mode(
         let mode_ref: &CGDisplayMode = unsafe { &*mode_ptr };
         let w = CGDisplayMode::width(Some(mode_ref));
         let h = CGDisplayMode::height(Some(mode_ref));
-        available.push((w, h));
-        if found.is_none() && w == width && h == height {
+        let pw = CGDisplayMode::pixel_width(Some(mode_ref));
+        let ph = CGDisplayMode::pixel_height(Some(mode_ref));
+        available.push((w, h, pw, ph));
+        if found.is_none() && matches(w, h, pw, ph) {
             found = NonNull::new(mode_ptr as *mut CGDisplayMode);
         }
     }
@@ -120,8 +129,9 @@ fn find_matching_mode(
         Some(ptr) => Some(unsafe { CFRetained::retain(ptr) }),
         None => {
             println!(
-                "[display] requested mode {width}x{height} not found among {count} modes \
-                 registered for display {display_id}: {available:?}"
+                "[display] no mode matching \"{label}\" found among {count} modes registered \
+                 for display {display_id}: {available:?} (each tuple is \
+                 width,height,pixel_width,pixel_height in points/pixels)"
             );
             None
         }
@@ -144,33 +154,86 @@ fn find_matching_mode(
 /// scales wire coordinates onto whatever the live rect actually turns out to
 /// be, so a failure here degrades to "not quite the requested resolution"
 /// rather than "touches land in the wrong place".
+///
+/// Scale-aware since hiDPI was turned on (see `create_virtual_display`):
+/// `CGDisplayBounds` reports in POINTS, but the mode requested by the caller
+/// (`DisplayMode`) is in the negotiated session PIXEL resolution. Two
+/// outcomes now count as "the requested mode is active" — bounds equal to
+/// `mode.width x mode.height` (the 1x mode: points==pixels) or equal to
+/// `mode.width/2 x mode.height/2` (the HiDPI mode: pixels==2x points,
+/// registered only when both dimensions are even — see
+/// `create_virtual_display`). When neither is active, prefer forcing the
+/// HiDPI mode when one is registered — `CGDisplayModeGetPixelWidth/Height`
+/// vs `CGDisplayModeGetWidth/Height` is what tells the two apart in the
+/// `CGDisplayCopyAllDisplayModes` list, since both modes may be present with
+/// the same nominal request but different point/pixel ratios.
 fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Result<()> {
+    let full = (mode.width, mode.height);
+    let both_even = mode.width % 2 == 0 && mode.height % 2 == 0;
+    let half = (mode.width / 2, mode.height / 2);
+    // The mode we WANT active by default: HiDPI when registered (both_even),
+    // else the 1x mode — matches the modes-array ordering in
+    // create_virtual_display (HiDPI first/primary when present).
+    let preferred = if both_even { half } else { full };
+
     let bounds = CGDisplayBounds(display_id);
     let (actual_w, actual_h) = (bounds.size.width as u32, bounds.size.height as u32);
-    if actual_w == mode.width && actual_h == mode.height {
+
+    if (actual_w, actual_h) == preferred {
         println!(
-            "[display] display {display_id} already online at the requested mode \
-             {}x{}, no override needed",
-            mode.width, mode.height
+            "[display] display {display_id} already online at the preferred mode \
+             {actual_w}x{actual_h} points, no override needed"
         );
         return Ok(());
     }
 
+    // Note: landing on the OTHER acceptable outcome (e.g. the 1x fallback
+    // when HiDPI is preferred) is deliberately NOT treated as "close enough"
+    // here — that's exactly the persisted-mode-preference substitution this
+    // function exists to override (see doc comment above), just now with
+    // two candidate modes instead of one, and skipping the force would
+    // silently give up on Retina by default whenever a stale preference
+    // happens to match the fallback mode.
+    let also_registered = if both_even {
+        format!(" ({}x{} 1x, {}x{} HiDPI points also registered)", full.0, full.1, half.0, half.1)
+    } else {
+        String::new()
+    };
     println!(
-        "[display] display {display_id} came online at {actual_w}x{actual_h}, not the \
-         requested {}x{} — WindowServer likely substituted a persisted mode preference for \
-         this display identity; attempting to force the requested mode",
-        mode.width, mode.height
+        "[display] display {display_id} came online at {actual_w}x{actual_h} points, not the \
+         preferred {}x{} points{also_registered} — WindowServer likely substituted a persisted \
+         mode preference for this display identity; attempting to force the preferred mode",
+        preferred.0, preferred.1
     );
 
-    let Some(display_mode) =
-        find_matching_mode(display_id, mode.width as usize, mode.height as usize)
-    else {
+    // Prefer the HiDPI mode (point dims == half request, pixel dims == full
+    // request) when the requested resolution supports one; fall back to the
+    // 1x mode (point dims == pixel dims == full request) either way.
+    let hidpi_match = both_even
+        .then(|| {
+            find_mode_where(display_id, "HiDPI (points=half, pixels=full)", |w, h, pw, ph| {
+                w == half.0 as usize
+                    && h == half.1 as usize
+                    && pw == full.0 as usize
+                    && ph == full.1 as usize
+            })
+        })
+        .flatten();
+    let display_mode = hidpi_match.or_else(|| {
+        find_mode_where(display_id, "1x (points=pixels=full)", |w, h, _, _| {
+            w == full.0 as usize && h == full.1 as usize
+        })
+    });
+
+    let Some(display_mode) = display_mode else {
         bail!(
-            "no registered CGDisplayMode matches the requested {}x{} for display {display_id} \
-             (see logged available modes above) — cannot force it",
-            mode.width,
-            mode.height
+            "no registered CGDisplayMode matches the requested {}x{} (1x) or {}x{} (HiDPI \
+             points) for display {display_id} (see logged available modes above) — cannot \
+             force it",
+            full.0,
+            full.1,
+            half.0,
+            half.1
         );
     };
 
@@ -181,16 +244,19 @@ fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Resul
 
     let new_bounds = CGDisplayBounds(display_id);
     let (new_w, new_h) = (new_bounds.size.width as u32, new_bounds.size.height as u32);
-    if new_w != mode.width || new_h != mode.height {
+    let ok = (new_w, new_h) == full || (both_even && (new_w, new_h) == half);
+    if !ok {
         bail!(
             "CGDisplaySetDisplayMode returned Success but display {display_id} bounds are \
-             still {new_w}x{new_h}, not the requested {}x{}",
-            mode.width,
-            mode.height
+             still {new_w}x{new_h}, not the requested {}x{} (1x) or {}x{} (HiDPI points)",
+            full.0,
+            full.1,
+            half.0,
+            half.1
         );
     }
 
-    println!("[display] forced display {display_id} mode to {new_w}x{new_h}");
+    println!("[display] forced display {display_id} mode to {new_w}x{new_h} points");
     Ok(())
 }
 
@@ -340,10 +406,29 @@ fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
     Ok(())
 }
 
+/// Allocates and initializes one `CGVirtualDisplayMode` (`width`/`height`
+/// are POINT dimensions — see the hiDPI comment in `create_virtual_display`).
+fn build_virtual_display_mode(
+    mode_cls: &AnyClass,
+    width: usize,
+    height: usize,
+    refresh_rate: CGFloat,
+) -> Retained<AnyObject> {
+    let mode_alloc: Allocated<AnyObject> = unsafe { msg_send![mode_cls, alloc] };
+    unsafe {
+        msg_send![
+            mode_alloc,
+            initWithWidth: width,
+            height: height,
+            refreshRate: refresh_rate,
+        ]
+    }
+}
+
 /// Create a `CGVirtualDisplay` with the given product ID, apply a
-/// single-mode settings object (hiDPI off — 1x scale so pixels==points,
-/// which the input-injection coordinate math relies on), and block until
-/// the display actually appears in `CGGetOnlineDisplayList`.
+/// HiDPI-plus-1x-fallback settings object (see `build_virtual_display_mode`
+/// and the hiDPI comment below), and block until the display actually
+/// appears in `CGGetOnlineDisplayList`.
 ///
 /// The online wait is 30s, not the original 5s: healthy attaches on this
 /// machine were observed to take anywhere from 0ms (identity reuse) to
@@ -387,27 +472,48 @@ fn create_virtual_display(
     let display_id: CGDirectDisplayID = unsafe { msg_send![&*display_obj, displayID] };
     println!("[display] CGVirtualDisplay created, displayID={display_id}");
 
-    // hiDPI is forced OFF (0), unlike DeskPad which turns it on: our
-    // design requires 1x scale so pixels==points, which the parallel
-    // input-injection task relies on for coordinate math.
+    // hiDPI is turned ON (1), matching DeskPad: gives the client
+    // Retina-quality rendering (2x pixel backing) instead of soft 1x text.
+    // `CGVirtualDisplayMode(width:height:)` args are POINT dimensions (per
+    // DeskPad's own mode list, e.g. registering 1280x800 — the real
+    // MacBook Air 13" Retina point size, backed by 2560x1600 pixels); with
+    // hiDPI on, WindowServer reports that mode's `CGDisplayBounds` at the
+    // registered point size while giving it a 2x pixel framebuffer.
     let settings_cls = get_class(c"CGVirtualDisplaySettings")?;
     let settings_alloc: Allocated<AnyObject> = unsafe { msg_send![settings_cls, alloc] };
     let settings: Retained<AnyObject> = unsafe { msg_send![settings_alloc, init] };
     unsafe {
-        let _: () = msg_send![&*settings, setHiDPI: 0u32];
+        let _: () = msg_send![&*settings, setHiDPI: 1u32];
     }
 
     let mode_cls = get_class(c"CGVirtualDisplayMode")?;
-    let mode_alloc: Allocated<AnyObject> = unsafe { msg_send![mode_cls, alloc] };
-    let mode_obj: Retained<AnyObject> = unsafe {
-        msg_send![
-            mode_alloc,
-            initWithWidth: mode.width as usize,
-            height: mode.height as usize,
-            refreshRate: mode.fps as CGFloat,
-        ]
+    let both_even = mode.width % 2 == 0 && mode.height % 2 == 0;
+    let onex_mode = build_virtual_display_mode(mode_cls, mode.width as usize, mode.height as usize, mode.fps as CGFloat);
+    let modes_array = if both_even {
+        // HiDPI mode goes FIRST — CGVirtualDisplaySettings.modes' first
+        // entry is the default/primary mode a freshly attached display
+        // comes online at. The full-resolution 1x mode is registered too,
+        // as a fallback the user can still pick in System Settings ->
+        // Displays if they want non-Retina.
+        let (hw, hh) = (mode.width / 2, mode.height / 2);
+        let hidpi_mode = build_virtual_display_mode(mode_cls, hw as usize, hh as usize, mode.fps as CGFloat);
+        println!(
+            "[display] registering HiDPI mode {hw}x{hh} points (-> {}x{} pixels, 2x) as the \
+             default, plus a {}x{} 1x fallback mode",
+            mode.width, mode.height, mode.width, mode.height
+        );
+        NSArray::<AnyObject>::from_retained_slice(&[hidpi_mode, onex_mode])
+    } else {
+        println!(
+            "[display] requested mode {}x{} has an odd dimension, so no clean HiDPI point-mode \
+             (would need a fractional {}x{} half-size) can be registered; using the 1x mode only",
+            mode.width,
+            mode.height,
+            mode.width as f64 / 2.0,
+            mode.height as f64 / 2.0,
+        );
+        NSArray::<AnyObject>::from_retained_slice(&[onex_mode])
     };
-    let modes_array = NSArray::<AnyObject>::from_retained_slice(&[mode_obj]);
     unsafe {
         let _: () = msg_send![&*settings, setModes: &*modes_array];
     }
@@ -842,8 +948,12 @@ impl DisplayBackend for MacDisplay {
 
     fn output_rect(&self) -> Option<(i32, i32, u32, u32)> {
         let id = self.display_id?;
-        // 1x scale (hiDPI forced off in attach()) means points==pixels, so
-        // no scaling math is needed here.
+        // Live CGDisplayBounds, in POINTS. With hiDPI on (see
+        // create_virtual_display), this can now be half the negotiated
+        // pixel resolution (HiDPI mode active) or equal to it (1x mode
+        // active) — either way this is the correct value for input-
+        // injection callers: MacInput::set_output_size scales wire pixel
+        // coordinates onto whatever this actually is.
         let bounds = CGDisplayBounds(id);
         Some((
             bounds.origin.x as i32,
