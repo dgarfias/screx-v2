@@ -48,9 +48,29 @@ enum HeldButton {
 /// Shared, lockable pointer/target-rect state. Mouse and touch both funnel
 /// through this so touch-as-pointer translation shares tracked position with
 /// real mouse events.
+///
+/// Two independently-set sizes are tracked, not one, because they can
+/// legitimately differ on macOS: `wire_size` is the negotiated session
+/// stream resolution wire touch coordinates are expressed in (set via
+/// `set_target_rect`, per the `InputBackend` trait's documented contract);
+/// `output_size` is the captured output's actual on-screen size (set via
+/// `set_output_size`). They're equal in the common case, but WindowServer
+/// can silently substitute a persisted display-mode preference for a
+/// virtual display's requested mode (see `force_display_mode` in
+/// `display.rs`), leaving the live rect smaller/larger than the session
+/// resolution. When that happens, wire coordinates need to be scaled by
+/// `output_size / wire_size` before being placed on the desktop.
 struct PointerState {
-    /// (left, top, width, height) of the captured output on the desktop.
-    rect: (i32, i32, u32, u32),
+    /// (left, top) origin of the captured output on the desktop.
+    origin: (i32, i32),
+    /// Negotiated session/stream resolution — the space wire touch/mouse
+    /// coordinates are expressed in.
+    wire_size: (u32, u32),
+    /// Actual on-screen size of the captured output. Defaults to
+    /// `wire_size` until `set_output_size` is called at least once (i.e.
+    /// "assume no substitution happened" — correct for every platform/test
+    /// that never calls it).
+    output_size: (u32, u32),
     /// Last-known absolute desktop position of the cursor.
     pos: (i32, i32),
     /// Currently-held mouse button, if any (for move-vs-drag event typing).
@@ -58,8 +78,12 @@ struct PointerState {
 }
 
 impl PointerState {
+    /// Clamps to the captured output's actual on-screen extent
+    /// (`output_size`, not `wire_size` — the desktop boundary is physical,
+    /// not the wire/session resolution).
     fn clamp_to_rect(&self, x: i32, y: i32) -> (i32, i32) {
-        let (left, top, width, height) = self.rect;
+        let (left, top) = self.origin;
+        let (width, height) = self.output_size;
         let max_x = left + width.saturating_sub(1) as i32;
         let max_y = top + height.saturating_sub(1) as i32;
         (
@@ -67,6 +91,18 @@ impl PointerState {
             y.clamp(top, max_y.max(top)),
         )
     }
+}
+
+/// Scales a wire-space coordinate/delta onto the captured output's actual
+/// on-screen space: `value * out / wire`. Identity when `wire == out` (the
+/// common case — output-size substitution has only been observed on macOS,
+/// see `PointerState`'s doc comment) or when `wire == 0` (nothing sane to
+/// divide by; treat as unscaled rather than panic/produce garbage).
+fn scale_dim(value: i64, wire: u32, out: u32) -> i32 {
+    if wire == 0 || wire == out {
+        return value as i32;
+    }
+    ((value as f64) * (out as f64) / (wire as f64)).round() as i32
 }
 
 /// Matches the Windows backend's contact-count limit.
@@ -185,7 +221,9 @@ impl MacInput {
         Ok(Self {
             source,
             pointer: Arc::new(Mutex::new(PointerState {
-                rect: (0, 0, width, height),
+                origin: (0, 0),
+                wire_size: (width, height),
+                output_size: (width, height),
                 pos: (0, 0),
                 held: None,
             })),
@@ -512,7 +550,13 @@ unsafe impl Send for SendSource {}
 impl InputBackend for MacInput {
     fn set_target_rect(&mut self, left: i32, top: i32, width: u32, height: u32) {
         let mut state = self.pointer.lock().unwrap();
-        state.rect = (left, top, width, height);
+        state.origin = (left, top);
+        state.wire_size = (width, height);
+    }
+
+    fn set_output_size(&mut self, width: u32, height: u32) {
+        let mut state = self.pointer.lock().unwrap();
+        state.output_size = (width, height);
     }
 
     fn touch(&mut self, contacts: &[TouchContact]) -> Result<()> {
@@ -528,9 +572,20 @@ impl InputBackend for MacInput {
             return Ok(());
         }
 
-        let (left, top, _w, _h) = self.pointer.lock().unwrap().rect;
+        let (left, top, wire_size, output_size) = {
+            let p = self.pointer.lock().unwrap();
+            (p.origin.0, p.origin.1, p.wire_size, p.output_size)
+        };
+        let (wire_w, wire_h) = wire_size;
+        let (out_w, out_h) = output_size;
 
         let mut state = self.touch.lock().unwrap();
+        // Final position carried by a TOUCH_UP in this packet. The per-slot
+        // tracker below clears the slot on UP (so active_count stays right),
+        // which would otherwise discard the lift coordinates — but the
+        // Dragging-release branch needs them to post LeftMouseUp where the
+        // finger actually ended, not back at the gesture's start anchor.
+        let mut lift_pos: Option<(i32, i32)> = None;
         for c in contacts {
             let slot = c.slot as usize;
             if slot >= MAX_TOUCH_SLOTS {
@@ -538,14 +593,29 @@ impl InputBackend for MacInput {
                 continue;
             }
             // Unlike MouseEvent::MoveAbsolute (0..65535 normalized), touch
-            // wire coordinates are already in the daemon's target
-            // width/height space (mirrors the Windows backend's `touch()`),
-            // so just offset by where the captured output sits on screen.
-            let x = left + c.x as i32;
-            let y = top + c.y as i32;
+            // wire coordinates are in the daemon's negotiated session
+            // stream width/height space (mirrors the Windows backend's
+            // `touch()`). Scale onto the captured output's actual on-screen
+            // size before offsetting by where it sits on screen — identity
+            // when wire_size == output_size (the common case), but
+            // WindowServer can substitute a different live mode for a
+            // macOS virtual display (see `force_display_mode` in
+            // display.rs), in which case this scaling is what keeps
+            // touches landing in the right place instead of drifting
+            // toward the far corners.
+            let x = left + scale_dim(c.x as i64, wire_w, out_w);
+            let y = top + scale_dim(c.y as i64, wire_h, out_h);
             match c.event_type {
                 TOUCH_DOWN | TOUCH_MOVE => state.slots[slot] = Some((x, y)),
-                TOUCH_UP => state.slots[slot] = None,
+                TOUCH_UP => {
+                    // First (lowest-slot) UP in the packet wins — for the
+                    // single-finger gestures this feeds, that is the primary
+                    // contact.
+                    if lift_pos.is_none() {
+                        lift_pos = Some((x, y));
+                    }
+                    state.slots[slot] = None;
+                }
                 other => crate::vlog!("[input] unknown touch event_type {other}"),
             }
         }
@@ -580,6 +650,7 @@ impl InputBackend for MacInput {
                     drop(state);
                     post_button_event(&self.source, x, y, HeldButton::Left, true);
                     post_button_event(&self.source, x, y, HeldButton::Left, false);
+                    self.sync_pointer_pos(x, y);
                 } else if active_count >= 2 {
                     // Second finger joined in time — this was actually a
                     // two-finger scroll starting, not a click. Cancel the
@@ -595,7 +666,15 @@ impl InputBackend for MacInput {
             }
             GestureMode::Dragging => {
                 if active_count == 0 {
-                    let (x, y) = state.primary_pos().unwrap_or(state.anchor);
+                    // All slots are cleared by the time we get here, so
+                    // `primary_pos()` is always None on release — use the
+                    // lift coordinates captured above. (Falling back to
+                    // `state.anchor` here was a real bug: it posted the
+                    // LeftMouseUp back at the drag's DOWN position, snapping
+                    // the cursor/drop-point to the gesture start.)
+                    let (x, y) = lift_pos
+                        .or_else(|| state.primary_pos())
+                        .unwrap_or(state.anchor);
                     state.mode = GestureMode::Idle;
                     drop(state);
                     post_button_event(&self.source, x, y, HeldButton::Left, false);
@@ -698,11 +777,18 @@ impl InputBackend for MacInput {
         match ev {
             MouseEvent::MoveAbsolute { x, y } => {
                 let mut state = self.pointer.lock().unwrap();
-                let (left, top, width, height) = state.rect;
+                let (left, top) = state.origin;
+                // 0..65535 is already a normalized fraction of the full
+                // captured output, independent of the session/stream
+                // resolution — so this scales directly onto `output_size`
+                // (the real on-screen extent), not `wire_size`. No
+                // wire/output ratio needed here (unlike touch()): the
+                // fraction IS the wire value, over a fixed 65535 range.
+                let (out_w, out_h) = state.output_size;
                 let fx = x as f32 / 65535.0;
                 let fy = y as f32 / 65535.0;
-                let abs_x = left + (fx * width as f32) as i32;
-                let abs_y = top + (fy * height as f32) as i32;
+                let abs_x = left + (fx * out_w as f32) as i32;
+                let abs_y = top + (fy * out_h as f32) as i32;
                 let (cx, cy) = state.clamp_to_rect(abs_x, abs_y);
                 let delta = (cx - state.pos.0, cy - state.pos.1);
                 let held = state.held;
@@ -713,11 +799,21 @@ impl InputBackend for MacInput {
             MouseEvent::MoveRelative { dx, dy } => {
                 let mut state = self.pointer.lock().unwrap();
                 let (px, py) = state.pos;
-                let (cx, cy) = state.clamp_to_rect(px + dx as i32, py + dy as i32);
+                let (wire_w, wire_h) = state.wire_size;
+                let (out_w, out_h) = state.output_size;
+                // Relative deltas arrive in the same wire (session-stream)
+                // pixel space as absolute touch coordinates, not desktop
+                // pixels — scale them the same way for consistency, so a
+                // drag of N wire-pixels always covers the same fraction of
+                // the captured output regardless of whether WindowServer
+                // substituted a different live mode.
+                let sdx = scale_dim(dx as i64, wire_w, out_w);
+                let sdy = scale_dim(dy as i64, wire_h, out_h);
+                let (cx, cy) = state.clamp_to_rect(px + sdx, py + sdy);
                 let held = state.held;
                 state.pos = (cx, cy);
                 drop(state);
-                self.post_move(cx, cy, held, Some((dx as i32, dy as i32)));
+                self.post_move(cx, cy, held, Some((sdx, sdy)));
             }
             MouseEvent::Button {
                 btn,
@@ -767,6 +863,20 @@ mod manual_verification {
     //!   cargo test --lib platform::macos::input::manual_verification -- --ignored --nocapture
     use super::*;
     use std::time::Duration;
+
+    /// Independent ground truth for "where did CGEventPost actually put the
+    /// cursor" — queries the live HID cursor position via
+    /// `CGEventCreate(NULL)` + `CGEventGetLocation`, entirely independent of
+    /// anything this module tracks internally (`PointerState`/`TouchState`
+    /// could be wrong in a way that's self-consistent but still not what the
+    /// OS actually did).
+    fn current_cursor_pos() -> (i32, i32) {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .expect("CGEventSourceCreate failed");
+        let event = CGEvent::new(source).expect("CGEventCreate failed");
+        let p = event.location();
+        (p.x as i32, p.y as i32)
+    }
 
     #[test]
     #[ignore]
@@ -901,5 +1011,224 @@ mod manual_verification {
                 y: 310,
             }])
             .unwrap();
+    }
+
+    /// End-to-end touch-mapping acceptance test (the 4-corner test from the
+    /// design doc's verification section): attach a REAL virtual display via
+    /// the standard code path, wire it up exactly like main.rs does
+    /// (`set_output_size` with the live rect's actual on-screen size, then
+    /// `set_target_rect` with the REQUESTED mode as the session/wire
+    /// resolution — the two can differ, see below), then inject a touch at
+    /// each of the 4 corners plus the center, probing in *requested-mode*
+    /// wire space — each as a full down / (past TAP_GRACE) / up cycle so the
+    /// Dragging path (deferred LeftMouseDown, drag-move, release) is what
+    /// gets exercised — and after each cycle read the true cursor position
+    /// back via an independent CGEventCreate/CGEventGetLocation query,
+    /// asserting it is within ±2px of the expected absolute desktop
+    /// coordinate.
+    ///
+    /// This guards against a real bug that a previous version of this test
+    /// masked: WindowServer can silently substitute a persisted mode
+    /// preference for a virtual display's requested mode (e.g. requesting
+    /// 1280x800, coming online at 1024x768 instead — see
+    /// `force_display_mode` in display.rs). The old version of this test
+    /// fed `output_rect()`'s live dims as BOTH the wire space AND the
+    /// expected space, which is self-consistent even when the two
+    /// resolutions disagree — it can never catch this bug. This version
+    /// probes in the space a real client actually uses (the negotiated
+    /// session resolution == the mode we requested), independent of
+    /// whatever the display actually came online at, so a broken
+    /// substitution (or broken scaling compensating for it) shows up as a
+    /// real, non-trivial pixel error.
+    ///
+    /// Also hard-asserts that `output_rect()`'s bounds equal the requested
+    /// mode — i.e. that `force_display_mode` (Part 1) actually overrode
+    /// whatever WindowServer would otherwise have persisted. If that
+    /// assertion ever fails on a healthy run, the scaling in `touch()`/
+    /// `mouse()` (Part 2) is what's actually keeping the corner probes
+    /// passing — see the expected-value formula below, which stays correct
+    /// either way.
+    ///
+    /// Requires Screen Recording + Accessibility permissions granted to the
+    /// test binary. Run with:
+    ///   cargo test --release --bin screx touch_mapping_four_corners -- --ignored --nocapture
+    /// and again with a second resolution:
+    ///   SCREX_TEST_MODE=1024x768 cargo test --release --bin screx touch_mapping_four_corners -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn touch_mapping_four_corners() {
+        use crate::capture::{DisplayBackend, DisplayMode};
+        use crate::platform::macos::display::MacDisplay;
+
+        // Optionally override the requested session resolution, e.g.
+        //   SCREX_TEST_MODE=1024x768 cargo test ... touch_mapping_four_corners ...
+        let (mw, mh) = std::env::var("SCREX_TEST_MODE")
+            .ok()
+            .and_then(|s| {
+                let (w, h) = s.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .unwrap_or((1280u32, 800u32));
+        let mode = DisplayMode {
+            width: mw,
+            height: mh,
+            fps: 30,
+        };
+        let mut display = MacDisplay::new(mode.width, mode.height, mode.fps).unwrap();
+        display.attach(mode).expect("attach failed");
+        let (left, top, actual_w, actual_h) = display.output_rect().expect("output_rect");
+        println!(
+            "[4corner] requested mode {mw}x{mh}, output_rect = ({left}, {top}, {actual_w}, {actual_h})"
+        );
+
+        // Part 1 acceptance: force_display_mode should have overridden
+        // whatever WindowServer would otherwise have persisted, so the live
+        // rect should equal the requested mode exactly.
+        assert_eq!(
+            (actual_w, actual_h),
+            (mw, mh),
+            "output_rect() bounds {actual_w}x{actual_h} do not match the requested mode \
+             {mw}x{mh} — force_display_mode (Part 1) failed to override WindowServer's mode \
+             substitution; see [display] logs above for the CGError"
+        );
+
+        // Exactly what main.rs does right after attach: report the live
+        // output size, then set the target rect with the SESSION/wire
+        // resolution (the requested mode) — the two are asserted equal
+        // above, but the test still goes through both calls, and the
+        // wire/expected formula below, to exercise the real code path
+        // rather than assuming the identity case.
+        let mut input = MacInput::new(mw, mh).expect("MacInput::new failed");
+        input.set_output_size(actual_w, actual_h);
+        input.set_target_rect(left, top, mw, mh);
+
+        // Let the desktop finish settling on the new display (Dock/menu bar
+        // shuffling right after attach was observed to briefly perturb the
+        // cursor, producing a one-off ~100px outlier in an early run).
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Expected-position formula per the design doc: wire coordinates
+        // (in requested-mode space) scale onto the actual on-screen rect.
+        // Collapses to the identity mapping when actual == requested (the
+        // assertion above), but is written out in full so this test still
+        // means something if that assertion is ever loosened.
+        let expected_for = |wx: u16, wy: u16| -> (i32, i32) {
+            let ex = (wx as i64) * (actual_w as i64) / (mw as i64);
+            let ey = (wy as i64) * (actual_h as i64) / (mh as i64);
+            (left + ex as i32, top + ey as i32)
+        };
+
+        // 4 corners + center, in requested-mode wire (stream-pixel)
+        // coordinates. Corners use the last addressable pixel (w-1, h-1),
+        // matching what a letterbox-aware client can actually send.
+        let probes = [
+            ("top-left", 0u16, 0u16),
+            ("top-right", (mw - 1) as u16, 0u16),
+            ("bottom-left", 0u16, (mh - 1) as u16),
+            ("bottom-right", (mw - 1) as u16, (mh - 1) as u16),
+            ("center", (mw / 2) as u16, (mh / 2) as u16),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, wx, wy) in probes {
+            let expected = expected_for(wx, wy);
+
+            input
+                .touch(&[TouchContact {
+                    slot: 0,
+                    event_type: TOUCH_DOWN,
+                    x: wx,
+                    y: wy,
+                }])
+                .unwrap();
+            // Wait past TAP_GRACE so the deferred flush commits to Dragging
+            // and posts the real LeftMouseDown.
+            std::thread::sleep(Duration::from_millis(60));
+            input
+                .touch(&[TouchContact {
+                    slot: 0,
+                    event_type: TOUCH_UP,
+                    x: wx,
+                    y: wy,
+                }])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+
+            let actual = current_cursor_pos();
+            let dx = (actual.0 - expected.0).abs();
+            let dy = (actual.1 - expected.1).abs();
+            let ok = dx <= 2 && dy <= 2;
+            println!(
+                "[4corner] {label}: wire=({wx},{wy}) expected={expected:?} actual={actual:?} \
+                 delta=({dx},{dy}) {}",
+                if ok { "OK" } else { "FAIL" }
+            );
+            if !ok {
+                failures.push(format!(
+                    "{label}: expected {expected:?}, got {actual:?} (delta {dx},{dy})"
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Drag regression probe: down at center, drag to (3/4w, 3/4h), lift
+        // THERE. Verifies the LeftMouseUp posts at the lift position — the
+        // stale-anchor bug this test guards against posted it back at the
+        // down position instead. Also in requested-mode wire space.
+        {
+            let (sx, sy) = ((mw / 2) as u16, (mh / 2) as u16);
+            let (ex, ey) = ((mw * 3 / 4) as u16, (mh * 3 / 4) as u16);
+            let expected = expected_for(ex, ey);
+            input
+                .touch(&[TouchContact {
+                    slot: 0,
+                    event_type: TOUCH_DOWN,
+                    x: sx,
+                    y: sy,
+                }])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            input
+                .touch(&[TouchContact {
+                    slot: 0,
+                    event_type: TOUCH_MOVE,
+                    x: ex,
+                    y: ey,
+                }])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            input
+                .touch(&[TouchContact {
+                    slot: 0,
+                    event_type: TOUCH_UP,
+                    x: ex,
+                    y: ey,
+                }])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            let actual = current_cursor_pos();
+            let dx = (actual.0 - expected.0).abs();
+            let dy = (actual.1 - expected.1).abs();
+            let ok = dx <= 2 && dy <= 2;
+            println!(
+                "[4corner] drag-release: wire=({sx},{sy})->({ex},{ey}) expected={expected:?} \
+                 actual={actual:?} delta=({dx},{dy}) {}",
+                if ok { "OK" } else { "FAIL" }
+            );
+            if !ok {
+                failures.push(format!(
+                    "drag-release: expected {expected:?}, got {actual:?} (delta {dx},{dy})"
+                ));
+            }
+        }
+
+        display.detach();
+
+        assert!(
+            failures.is_empty(),
+            "touch mapping off by more than 2px:\n{}",
+            failures.join("\n")
+        );
     }
 }

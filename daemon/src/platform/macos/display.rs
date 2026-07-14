@@ -6,6 +6,7 @@
 //! CFRunLoop/AppKit main thread, hiDPI forced off (1x scale, pixels==points),
 //! raw BGRA bytes handed to the encoder instead of drawing into a CALayer.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -21,10 +22,11 @@ use objc2_core_foundation::{CFRetained, CGFloat, CGSize};
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
     CGConfigureDisplayMirrorOfDisplay, CGConfigureDisplayOrigin, CGConfigureOption,
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayConfigRef, CGDisplayIsInMirrorSet,
-    CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayStream, CGDisplayStreamFrameStatus,
-    CGDisplayStreamUpdate, CGError, CGGetOnlineDisplayList, CGMainDisplayID,
-    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayConfigRef, CGDisplayCopyAllDisplayModes,
+    CGDisplayIsInMirrorSet, CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode,
+    CGDisplaySetDisplayMode, CGDisplayStream, CGDisplayStreamFrameStatus, CGDisplayStreamUpdate,
+    CGError, CGGetOnlineDisplayList, CGMainDisplayID, CGPreflightScreenCaptureAccess,
+    CGRequestScreenCaptureAccess,
 };
 use objc2_foundation::{NSArray, NSString};
 use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
@@ -62,6 +64,134 @@ fn log_display_state(label: &str, id: CGDirectDisplayID) {
         bounds.size.width as u32,
         bounds.size.height as u32,
     );
+}
+
+/// Finds the `CGDisplayMode` registered for `display_id` whose pixel
+/// dimensions exactly match `width`x`height`. hiDPI is forced off for our
+/// virtual display (see `create_virtual_display`), so pixel dims == point
+/// dims — no backing-scale-factor arithmetic needed here.
+///
+/// The returned `CGDisplayMode` is retained independently of the backing
+/// `CGDisplayCopyAllDisplayModes` array (which this function's caller never
+/// sees), so it's safe for the caller to use after this function returns.
+///
+/// Logs every mode actually registered for the display when no match is
+/// found, for diagnosis — this "shouldn't" happen since we registered the
+/// requested mode ourselves via `CGVirtualDisplaySettings.setModes:`, but if
+/// it does, the caller needs to know what WAS available instead.
+fn find_matching_mode(
+    display_id: CGDirectDisplayID,
+    width: usize,
+    height: usize,
+) -> Option<CFRetained<CGDisplayMode>> {
+    // Follows the CF "Copy" ownership rule: this array is ours to release,
+    // handled automatically by `CFRetained`'s `Drop` impl. The individual
+    // `CGDisplayModeRef` values inside it are NOT independently owned by us
+    // (per CFArrayGetValueAtIndex semantics) — they stay valid only as long
+    // as the array itself is alive, which is exactly the scope of this
+    // function, so any match found is explicitly re-retained before
+    // returning it to a caller that will use it after the array is gone.
+    let modes = unsafe { CGDisplayCopyAllDisplayModes(display_id, None) }?;
+    let count = modes.count();
+    let mut available = Vec::with_capacity(count as usize);
+    let mut found: Option<NonNull<CGDisplayMode>> = None;
+    for i in 0..count {
+        // SAFETY: `i` is in `0..modes.count()`, and the array is not
+        // mutated while this reference is alive (it's a local, freshly
+        // copied array we never hand a mutable/shared reference to
+        // anything else).
+        let ptr = unsafe { modes.value_at_index(i) };
+        if ptr.is_null() {
+            continue;
+        }
+        let mode_ptr = ptr as *const CGDisplayMode;
+        // SAFETY: non-null CGDisplayModeRef from CFArrayGetValueAtIndex on
+        // an array CGDisplayCopyAllDisplayModes populated with
+        // CGDisplayModeRefs.
+        let mode_ref: &CGDisplayMode = unsafe { &*mode_ptr };
+        let w = CGDisplayMode::width(Some(mode_ref));
+        let h = CGDisplayMode::height(Some(mode_ref));
+        available.push((w, h));
+        if found.is_none() && w == width && h == height {
+            found = NonNull::new(mode_ptr as *mut CGDisplayMode);
+        }
+    }
+    match found {
+        Some(ptr) => Some(unsafe { CFRetained::retain(ptr) }),
+        None => {
+            println!(
+                "[display] requested mode {width}x{height} not found among {count} modes \
+                 registered for display {display_id}: {available:?}"
+            );
+            None
+        }
+    }
+}
+
+/// Forces the virtual display's live mode to match `mode`, working around
+/// WindowServer silently substituting a persisted per-display-identity mode
+/// preference for the mode actually requested via
+/// `CGVirtualDisplaySettings.setModes:` — the same persistence mechanism
+/// documented in `create_virtual_display`'s identity-strategy comment, just
+/// manifesting as a wrong *mode* instead of a wedged identity. Empirically
+/// observed on this machine: requesting 1280x800 for a virtual display, the
+/// display came online at 1024x768 instead (a size that was never asked
+/// for, but apparently sticks per display identity across attach/detach
+/// cycles).
+///
+/// This is a best-effort fixup, not fatal to `attach()` if it fails — see
+/// the caller. The downstream input-injection path (`MacInput::set_output_size`)
+/// scales wire coordinates onto whatever the live rect actually turns out to
+/// be, so a failure here degrades to "not quite the requested resolution"
+/// rather than "touches land in the wrong place".
+fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Result<()> {
+    let bounds = CGDisplayBounds(display_id);
+    let (actual_w, actual_h) = (bounds.size.width as u32, bounds.size.height as u32);
+    if actual_w == mode.width && actual_h == mode.height {
+        println!(
+            "[display] display {display_id} already online at the requested mode \
+             {}x{}, no override needed",
+            mode.width, mode.height
+        );
+        return Ok(());
+    }
+
+    println!(
+        "[display] display {display_id} came online at {actual_w}x{actual_h}, not the \
+         requested {}x{} — WindowServer likely substituted a persisted mode preference for \
+         this display identity; attempting to force the requested mode",
+        mode.width, mode.height
+    );
+
+    let Some(display_mode) =
+        find_matching_mode(display_id, mode.width as usize, mode.height as usize)
+    else {
+        bail!(
+            "no registered CGDisplayMode matches the requested {}x{} for display {display_id} \
+             (see logged available modes above) — cannot force it",
+            mode.width,
+            mode.height
+        );
+    };
+
+    let set_err = unsafe { CGDisplaySetDisplayMode(display_id, Some(&display_mode), None) };
+    if set_err != CGError::Success {
+        bail!("CGDisplaySetDisplayMode failed: {set_err:?}");
+    }
+
+    let new_bounds = CGDisplayBounds(display_id);
+    let (new_w, new_h) = (new_bounds.size.width as u32, new_bounds.size.height as u32);
+    if new_w != mode.width || new_h != mode.height {
+        bail!(
+            "CGDisplaySetDisplayMode returned Success but display {display_id} bounds are \
+             still {new_w}x{new_h}, not the requested {}x{}",
+            mode.width,
+            mode.height
+        );
+    }
+
+    println!("[display] forced display {display_id} mode to {new_w}x{new_h}");
+    Ok(())
 }
 
 /// Forces the newly-attached virtual display into the product-required
@@ -210,6 +340,113 @@ fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
     Ok(())
 }
 
+/// Create a `CGVirtualDisplay` with the given product ID, apply a
+/// single-mode settings object (hiDPI off — 1x scale so pixels==points,
+/// which the input-injection coordinate math relies on), and block until
+/// the display actually appears in `CGGetOnlineDisplayList`.
+///
+/// The online wait is 30s, not the original 5s: healthy attaches on this
+/// machine were observed to take anywhere from 0ms (identity reuse) to
+/// ~15s (new identity, or shortly after a WindowServer restart / a
+/// previous virtual-display detach), so 5s produced spurious attach
+/// failures for displays that were about to appear. A slow attach still
+/// beats a failed session.
+///
+/// On failure the (never-online) display object is dropped, which unplugs
+/// whatever half-registered state WindowServer holds for it.
+fn create_virtual_display(
+    descriptor_queue: &DispatchQueue,
+    mode: DisplayMode,
+    product_id: u32,
+) -> Result<(Retained<AnyObject>, CGDirectDisplayID)> {
+    let descriptor_cls = get_class(c"CGVirtualDisplayDescriptor")?;
+    let descriptor_alloc: Allocated<AnyObject> = unsafe { msg_send![descriptor_cls, alloc] };
+    let descriptor: Retained<AnyObject> = unsafe { msg_send![descriptor_alloc, init] };
+
+    unsafe {
+        let _: () = msg_send![&*descriptor, setQueue: descriptor_queue];
+        let name = NSString::from_str("Screx Virtual");
+        let _: () = msg_send![&*descriptor, setName: &*name];
+        let _: () = msg_send![&*descriptor, setMaxPixelsWide: mode.width as usize];
+        let _: () = msg_send![&*descriptor, setMaxPixelsHigh: mode.height as usize];
+        let _: () = msg_send![
+            &*descriptor,
+            setSizeInMillimeters: CGSize { width: 1600.0, height: 1000.0 }
+        ];
+        println!("[display] virtual display identity: vendor=0x3456 product={product_id:#06x}");
+        let _: () = msg_send![&*descriptor, setProductID: product_id];
+        let _: () = msg_send![&*descriptor, setVendorID: 0x3456u32];
+        let _: () = msg_send![&*descriptor, setSerialNum: 0x0001u32];
+    }
+
+    let display_cls = get_class(c"CGVirtualDisplay")?;
+    let display_alloc: Allocated<AnyObject> = unsafe { msg_send![display_cls, alloc] };
+    let display_obj: Retained<AnyObject> =
+        unsafe { msg_send![display_alloc, initWithDescriptor: &*descriptor] };
+
+    let display_id: CGDirectDisplayID = unsafe { msg_send![&*display_obj, displayID] };
+    println!("[display] CGVirtualDisplay created, displayID={display_id}");
+
+    // hiDPI is forced OFF (0), unlike DeskPad which turns it on: our
+    // design requires 1x scale so pixels==points, which the parallel
+    // input-injection task relies on for coordinate math.
+    let settings_cls = get_class(c"CGVirtualDisplaySettings")?;
+    let settings_alloc: Allocated<AnyObject> = unsafe { msg_send![settings_cls, alloc] };
+    let settings: Retained<AnyObject> = unsafe { msg_send![settings_alloc, init] };
+    unsafe {
+        let _: () = msg_send![&*settings, setHiDPI: 0u32];
+    }
+
+    let mode_cls = get_class(c"CGVirtualDisplayMode")?;
+    let mode_alloc: Allocated<AnyObject> = unsafe { msg_send![mode_cls, alloc] };
+    let mode_obj: Retained<AnyObject> = unsafe {
+        msg_send![
+            mode_alloc,
+            initWithWidth: mode.width as usize,
+            height: mode.height as usize,
+            refreshRate: mode.fps as CGFloat,
+        ]
+    };
+    let modes_array = NSArray::<AnyObject>::from_retained_slice(&[mode_obj]);
+    unsafe {
+        let _: () = msg_send![&*settings, setModes: &*modes_array];
+    }
+
+    let applied: bool = unsafe { msg_send![&*display_obj, applySettings: &*settings] };
+    if !applied {
+        bail!("CGVirtualDisplay applySettings: failed (returned NO)");
+    }
+
+    // Defensive poll: the trait contract requires attach() to block
+    // until the OS actually sees the new monitor.
+    let poll_start = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut online = false;
+    while Instant::now() < deadline {
+        let mut ids = [0u32; 32];
+        let mut count: u32 = 0;
+        let err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+        if err == CGError::Success && ids[..count as usize].contains(&display_id) {
+            online = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !online {
+        bail!(
+            "virtual display {display_id} (product id {product_id:#06x}) did not appear in \
+             CGGetOnlineDisplayList within 30s — WindowServer's persisted display state may \
+             have wedged this display identity (see identity-strategy comment in attach())"
+        );
+    }
+    println!(
+        "[display] virtual display {display_id} is online (took {:?})",
+        poll_start.elapsed()
+    );
+
+    Ok((display_obj, display_id))
+}
+
 /// Shared frame buffer written by the CGDisplayStream callback (on a GCD
 /// worker thread) and read by `run_capture_loop` (on the capture thread).
 struct FrameSlot {
@@ -309,87 +546,83 @@ impl DisplayBackend for MacDisplay {
         // one.
         let descriptor_queue = DispatchQueue::new("com.screx.daemon.display.descriptor", None);
 
-        let descriptor_cls = get_class(c"CGVirtualDisplayDescriptor")?;
-        let descriptor_alloc: Allocated<AnyObject> = unsafe { msg_send![descriptor_cls, alloc] };
-        let descriptor: Retained<AnyObject> = unsafe { msg_send![descriptor_alloc, init] };
+        // Display identity strategy, driven by two empirically-observed
+        // WindowServer behaviors (this machine, 2026-07-13):
+        //
+        //  1. WindowServer persists per-display-identity state on disk
+        //     (/Library/Preferences/com.apple.windowserver.displays.plist
+        //     and the ByHost variant), and an unclean virtual-display
+        //     teardown can wedge that record such that a display with the
+        //     SAME product ID is silently never brought online again —
+        //     applySettings: returns YES, a display ID is assigned, but it
+        //     never appears in CGGetOnlineDisplayList, surviving reboots.
+        //     (Observed with the original fixed placeholder 0x1234: it never
+        //     came online regardless of vendor/serial variation, while any
+        //     other product ID worked with identical code.)
+        //
+        //  2. A previously-seen identity comes back online near-instantly,
+        //     while a BRAND-NEW identity can take 0-15s normally and can
+        //     stall indefinitely once WindowServer has churned through many
+        //     virtual-display create/destroy cycles in a boot.
+        //
+        // So: try a STABLE product ID first (fast, predictable reuse), and
+        // if that display never comes online, fall back once to a fresh
+        // randomized ID (escapes a wedged persisted record for the stable
+        // ID at the cost of the slower new-identity registration).
+        // SCREX_VDISP_PRODUCT_ID overrides the stable ID (hex or decimal)
+        // if a machine's persisted state ever needs manual sidestepping.
+        // The default value is arbitrary (any value except a wedged one
+        // works; the specific choice is already cleanly registered on the
+        // original dev machine).
+        let stable_product_id: u32 = std::env::var("SCREX_VDISP_PRODUCT_ID")
+            .ok()
+            .and_then(|s| {
+                let s = s.trim();
+                s.strip_prefix("0x")
+                    .map(|h| u32::from_str_radix(h, 16).ok())
+                    .unwrap_or_else(|| s.parse().ok())
+            })
+            .unwrap_or(0x997C);
 
-        unsafe {
-            let _: () = msg_send![&*descriptor, setQueue: &*descriptor_queue];
-            let name = NSString::from_str("Screx Virtual");
-            let _: () = msg_send![&*descriptor, setName: &*name];
-            let _: () = msg_send![&*descriptor, setMaxPixelsWide: mode.width as usize];
-            let _: () = msg_send![&*descriptor, setMaxPixelsHigh: mode.height as usize];
-            let _: () = msg_send![
-                &*descriptor,
-                setSizeInMillimeters: CGSize { width: 1600.0, height: 1000.0 }
-            ];
-            // Arbitrary but fixed placeholder identifiers, matching DeskPad's
-            // style — the OS doesn't validate these against anything.
-            let _: () = msg_send![&*descriptor, setProductID: 0x1234u32];
-            let _: () = msg_send![&*descriptor, setVendorID: 0x3456u32];
-            let _: () = msg_send![&*descriptor, setSerialNum: 0x0001u32];
-        }
-
-        let display_cls = get_class(c"CGVirtualDisplay")?;
-        let display_alloc: Allocated<AnyObject> = unsafe { msg_send![display_cls, alloc] };
-        let display_obj: Retained<AnyObject> =
-            unsafe { msg_send![display_alloc, initWithDescriptor: &*descriptor] };
-
-        let display_id: CGDirectDisplayID = unsafe { msg_send![&*display_obj, displayID] };
-        println!("[display] CGVirtualDisplay created, displayID={display_id}");
-
-        // hiDPI is forced OFF (0), unlike DeskPad which turns it on: our
-        // design requires 1x scale so pixels==points, which the parallel
-        // input-injection task relies on for coordinate math.
-        let settings_cls = get_class(c"CGVirtualDisplaySettings")?;
-        let settings_alloc: Allocated<AnyObject> = unsafe { msg_send![settings_cls, alloc] };
-        let settings: Retained<AnyObject> = unsafe { msg_send![settings_alloc, init] };
-        unsafe {
-            let _: () = msg_send![&*settings, setHiDPI: 0u32];
-        }
-
-        let mode_cls = get_class(c"CGVirtualDisplayMode")?;
-        let mode_alloc: Allocated<AnyObject> = unsafe { msg_send![mode_cls, alloc] };
-        let mode_obj: Retained<AnyObject> = unsafe {
-            msg_send![
-                mode_alloc,
-                initWithWidth: mode.width as usize,
-                height: mode.height as usize,
-                refreshRate: mode.fps as CGFloat,
-            ]
-        };
-        let modes_array = NSArray::<AnyObject>::from_retained_slice(&[mode_obj]);
-        unsafe {
-            let _: () = msg_send![&*settings, setModes: &*modes_array];
-        }
-
-        let applied: bool = unsafe { msg_send![&*display_obj, applySettings: &*settings] };
-        if !applied {
-            bail!("CGVirtualDisplay applySettings: failed (returned NO)");
-        }
-
-        // Defensive poll: the trait contract requires attach() to block
-        // until the OS actually sees the new monitor.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut online = false;
-        while Instant::now() < deadline {
-            let mut ids = [0u32; 32];
-            let mut count: u32 = 0;
-            let err = unsafe {
-                CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count)
+        let (display_obj, display_id) =
+            match create_virtual_display(&descriptor_queue, mode, stable_product_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    let fresh_product_id: u32 = 0x0100
+                        + (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos())
+                            .unwrap_or(0)
+                            ^ std::process::id())
+                            % 0xFE00;
+                    eprintln!(
+                        "[display] attach with stable product id {stable_product_id:#06x} failed \
+                         ({e:#}); retrying once with fresh product id {fresh_product_id:#06x}"
+                    );
+                    create_virtual_display(&descriptor_queue, mode, fresh_product_id)?
+                }
             };
-            if err == CGError::Success && ids[..count as usize].contains(&display_id) {
-                online = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if !online {
-            bail!(
-                "virtual display {display_id} did not appear in CGGetOnlineDisplayList within 5s"
+
+        // Best-effort, not fatal: see `force_display_mode`'s doc comment for
+        // the exact failure mode this works around (WindowServer silently
+        // substituting a persisted mode preference for the requested one).
+        // Run this BEFORE the placement fixup below — a mode change can
+        // itself perturb placement, so fix size first, then position.
+        if let Err(e) = force_display_mode(display_id, mode) {
+            let bounds = CGDisplayBounds(display_id);
+            eprintln!(
+                "[display] WARNING: failed to force display {display_id} to the requested mode \
+                 {}x{}@{} ({e:#}); continuing with whatever mode WindowServer actually gave it \
+                 (currently {}x{}) — MacInput::set_output_size compensates for this at the \
+                 input-injection layer, so touches/clicks still land correctly, just at a \
+                 possibly-different resolution than negotiated",
+                mode.width,
+                mode.height,
+                mode.fps,
+                bounds.size.width as u32,
+                bounds.size.height as u32,
             );
         }
-        println!("[display] virtual display {display_id} is online");
 
         // Best-effort, not fatal: the private display-configuration
         // transaction this performs has been observed (empirically, on
@@ -408,10 +641,36 @@ impl DisplayBackend for MacDisplay {
         // the OS already gave the display — `output_rect()` reads live
         // bounds, so callers still get a geometrically correct (if
         // possibly not ideally positioned) rect either way.
-        if let Err(e) = force_extended_placement(display_id) {
+        // Single retry with a short backoff: the observed CGError(1014) from
+        // CGCompleteDisplayConfiguration is transient (~50% of first
+        // attempts in stress testing, same inputs succeed on other tries),
+        // so one more attempt recovers most sessions. This matters for
+        // input, not just aesthetics: a failed fixup can leave the virtual
+        // display mirrored/overlapping at an unplanned origin, and
+        // `output_rect()` -> `set_target_rect` downstream would then aim
+        // every injected touch/click at that unplanned region.
+        let placement = force_extended_placement(display_id).or_else(|first_err| {
             eprintln!(
-                "[display] WARNING: extend/placement fixup failed, continuing with whatever \
-                 arrangement the OS already gave display {display_id}: {e:#}"
+                "[display] extend/placement fixup failed ({first_err:#}), retrying once in 200ms"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            force_extended_placement(display_id)
+        });
+        if let Err(e) = placement {
+            let bounds = CGDisplayBounds(display_id);
+            eprintln!(
+                "[display] WARNING: extend/placement fixup failed twice, continuing with \
+                 whatever arrangement the OS already gave display {display_id}: {e:#}"
+            );
+            eprintln!(
+                "[display] WARNING: display {display_id} final bounds are (x={}, y={}, w={}, h={}) \
+                 in_mirror_set={} — injected input will target this region; if it overlaps \
+                 another display, touches will land there",
+                bounds.origin.x as i32,
+                bounds.origin.y as i32,
+                bounds.size.width as u32,
+                bounds.size.height as u32,
+                CGDisplayIsInMirrorSet(display_id),
             );
         }
 
@@ -676,6 +935,16 @@ mod tests {
             });
 
             display.detach();
+
+            // Empirical WindowServer behavior on this machine (2026-07-13):
+            // a re-attach shortly after a detach takes much longer to come
+            // online (~15-20s, vs 0-8s cold) — attach()'s 30s online wait
+            // absorbs that, but give WindowServer a moment of quiet between
+            // rounds so round 1 measures re-attach, not teardown contention.
+            if round == 0 {
+                println!("[smoke] waiting 10s for WindowServer to settle before re-attach");
+                std::thread::sleep(Duration::from_secs(10));
+            }
         }
     }
 }

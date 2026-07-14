@@ -560,20 +560,39 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Backends that inject via absolute screen coordinates (Windows)
-                // need to know where the captured output actually sits on the
-                // desktop; wire touch/mouse coordinates only carry frame-local
-                // 0..width/0..height values in the negotiated session
-                // resolution. Prefer the backend's own notion of output
-                // placement (Windows); fall back to the session resolution at
-                // the origin otherwise — Linux ignores left/top and instead
-                // scales incoming coordinates onto its fixed-size virtual
-                // touchscreen, but still needs the session dims to do that.
-                let (left, top, width, height) = display
+                // Backends that inject via absolute screen coordinates (Windows,
+                // macOS) need to know where the captured output actually sits on
+                // the desktop; wire touch/mouse coordinates only carry
+                // frame-local 0..width/0..height values in the negotiated
+                // session resolution — NOT necessarily the output's real
+                // on-screen size (macOS: WindowServer can silently substitute a
+                // persisted display-mode preference for the virtual display's
+                // requested mode, so the live rect can come back smaller/larger
+                // than the session resolution). Prefer the backend's own notion
+                // of output placement (Windows/macOS); fall back to the session
+                // resolution at the origin otherwise — Linux ignores left/top
+                // and instead scales incoming coordinates onto its fixed-size
+                // virtual touchscreen, but still needs the session dims to do
+                // that.
+                //
+                // `set_output_size` reports the live rect's actual w/h (which
+                // can differ from the session dims on macOS); `set_target_rect`
+                // always carries the SESSION dims per the trait's documented
+                // contract (Linux needs those, Windows/macOS rect size ==
+                // session dims in the common case). MacInput is the only
+                // backend that keeps both around, to scale wire coordinates
+                // from session space onto the real output rect.
+                let (left, top, rect_width, rect_height) = display
                     .output_rect()
                     .unwrap_or((0, 0, capture_config.width, capture_config.height));
+                println!(
+                    "[capture] input target rect: left={left} top={top} width={rect_width} height={rect_height} \
+                     (session resolution {}x{})",
+                    capture_config.width, capture_config.height
+                );
                 if let Ok(mut backend) = capture_shared.input_backend.lock() {
-                    backend.set_target_rect(left, top, width, height);
+                    backend.set_output_size(rect_width, rect_height);
+                    backend.set_target_rect(left, top, capture_config.width, capture_config.height);
                 }
 
                 println!("[capture] starting display capture session");

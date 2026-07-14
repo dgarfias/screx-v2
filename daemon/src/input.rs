@@ -108,6 +108,20 @@ pub trait InputBackend: Send {
     /// touchscreen's ABS range.
     fn set_target_rect(&mut self, _left: i32, _top: i32, _width: u32, _height: u32) {}
 
+    /// Reports the captured output's actual on-screen size, for backends
+    /// where that can differ from the session/stream resolution passed to
+    /// `set_target_rect` — currently only macOS: WindowServer can silently
+    /// substitute a persisted display-mode preference for a virtual
+    /// display's requested mode (e.g. asking for 1280x800 but the display
+    /// coming online at 1024x768), so the desktop rect the OS actually
+    /// gives the display can be smaller/larger than the negotiated stream
+    /// resolution wire coordinates are expressed in. A backend that
+    /// implements this scales incoming wire coordinates by
+    /// `output_size / stream_size` before translating them onto the
+    /// desktop; the default no-op is correct for backends where the two are
+    /// always equal (Linux, Windows).
+    fn set_output_size(&mut self, _width: u32, _height: u32) {}
+
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;
     fn key_text(&mut self, text: &str) -> anyhow::Result<()>;
     fn key_special(&mut self, code: u8, modifiers: u8) -> anyhow::Result<()>;
