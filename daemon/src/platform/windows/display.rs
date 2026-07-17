@@ -410,6 +410,7 @@ impl DisplayBackend for WindowsDisplay {
                 on_frame(CaptureFrame {
                     width: self.output_width,
                     height: self.output_height,
+                    format: crate::capture::CapturePixelFormat::Bgra,
                     data: &self.frame_data[..(self.output_width * self.output_height * 4) as usize],
                 });
                 last_emit = Instant::now();

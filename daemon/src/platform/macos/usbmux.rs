@@ -130,7 +130,9 @@ mod tests {
             Ok(_) => {
                 // Only plausible if libimobiledevice happens to be installed
                 // and iproxy could bind/connect. Not an error either way.
-                println!("[test] connect() unexpectedly succeeded (is libimobiledevice installed?)");
+                println!(
+                    "[test] connect() unexpectedly succeeded (is libimobiledevice installed?)"
+                );
             }
             Err(e) => {
                 let msg = format!("{e:#}");

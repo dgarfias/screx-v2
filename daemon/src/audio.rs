@@ -174,7 +174,6 @@ pub fn run_audio_capture(
         let client_addr = &shared.client_addr;
         let usb_active = &shared.usb_active;
         let usb_sender = &shared.usb_sender;
-        let audio_output_enabled = &shared.audio_output_enabled;
         let start_time = shared.start_time;
 
         let mut on_chunk = |chunk: &[u8]| {
@@ -215,17 +214,30 @@ pub fn run_audio_capture(
 
         println!("[audio] starting platform audio loopback capture");
         let loopback_stop = Arc::new(AtomicBool::new(false));
+        let watchdog_done = Arc::new(AtomicBool::new(false));
 
-        let result = {
-            let loopback_stop = Arc::clone(&loopback_stop);
-            backend.run_loopback(&loopback_stop, &mut |chunk: &[u8]| {
-                if !audio_output_enabled.load(Ordering::SeqCst) {
-                    loopback_stop.store(true, Ordering::SeqCst);
-                    return;
+        let result = std::thread::scope(|scope| {
+            let watchdog_stop = Arc::clone(&loopback_stop);
+            let watchdog_done_for_thread = Arc::clone(&watchdog_done);
+            let global_stop = &stop;
+            let shared_state = &shared;
+            scope.spawn(move || {
+                while !watchdog_done_for_thread.load(Ordering::Relaxed) {
+                    if global_stop.load(Ordering::Relaxed)
+                        || !shared_state.has_active_client.load(Ordering::Relaxed)
+                        || !shared_state.audio_output_enabled.load(Ordering::SeqCst)
+                    {
+                        watchdog_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                on_chunk(chunk);
-            })
-        };
+            });
+
+            let result = backend.run_loopback(&loopback_stop, &mut on_chunk);
+            watchdog_done.store(true, Ordering::Relaxed);
+            result
+        });
 
         if let Err(e) = result {
             eprintln!("[audio] loopback error: {e:#}");

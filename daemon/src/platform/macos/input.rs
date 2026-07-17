@@ -22,6 +22,11 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use objc2_core_graphics::{
+    CGDirectDisplayID, CGDisplayBounds, CGDisplayVendorNumber, CGError,
+    CGEventField as ObjcCGEventField, CGGetOnlineDisplayList, CGScrollPhase,
+};
+use objc2_foundation::{NSString, NSUserDefaults};
 
 use crate::input::{
     GamepadState, InputBackend, MouseEvent, TouchContact, SPECIAL_BACKSPACE, TOUCH_DOWN,
@@ -75,9 +80,36 @@ struct PointerState {
     pos: (i32, i32),
     /// Currently-held mouse button, if any (for move-vs-drag event typing).
     held: Option<HeldButton>,
+    display_id: Option<CGDirectDisplayID>,
 }
 
 impl PointerState {
+    fn refresh_output_rect(&mut self) {
+        let mut ids = [0u32; 32];
+        let mut count = 0u32;
+        let err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+        if err != CGError::Success {
+            return;
+        }
+        let online = &ids[..count as usize];
+        let display_id = self
+            .display_id
+            .filter(|id| online.contains(id))
+            .or_else(|| {
+                online
+                    .iter()
+                    .copied()
+                    .find(|id| CGDisplayVendorNumber(*id) == 0x3456)
+            });
+        let Some(display_id) = display_id else {
+            return;
+        };
+        let bounds = CGDisplayBounds(display_id);
+        self.display_id = Some(display_id);
+        self.origin = (bounds.origin.x as i32, bounds.origin.y as i32);
+        self.output_size = (bounds.size.width as u32, bounds.size.height as u32);
+    }
+
     /// Clamps to the captured output's actual on-screen extent
     /// (`output_size`, not `wire_size` — the desktop boundary is physical,
     /// not the wire/session resolution).
@@ -86,44 +118,35 @@ impl PointerState {
         let (width, height) = self.output_size;
         let max_x = left + width.saturating_sub(1) as i32;
         let max_y = top + height.saturating_sub(1) as i32;
-        (
-            x.clamp(left, max_x.max(left)),
-            y.clamp(top, max_y.max(top)),
-        )
+        (x.clamp(left, max_x.max(left)), y.clamp(top, max_y.max(top)))
     }
 }
 
-/// Scales a wire-space coordinate/delta onto the captured output's actual
-/// on-screen space: `value * out / wire`. Identity when `wire == out` (the
-/// common case — output-size substitution has only been observed on macOS,
-/// see `PointerState`'s doc comment) or when `wire == 0` (nothing sane to
-/// divide by; treat as unscaled rather than panic/produce garbage).
-fn scale_dim(value: i64, wire: u32, out: u32) -> i32 {
-    if wire == 0 || wire == out {
+/// Scale an absolute pixel index while preserving both addressable endpoints.
+fn scale_position(value: u16, wire: u32, out: u32) -> i32 {
+    if wire <= 1 || out <= 1 || wire == out {
         return value as i32;
     }
-    ((value as f64) * (out as f64) / (wire as f64)).round() as i32
+    ((value as f64) * ((out - 1) as f64) / ((wire - 1) as f64)).round() as i32
 }
 
 /// Matches the Windows backend's contact-count limit.
 const MAX_TOUCH_SLOTS: usize = 10;
 
-/// Grace window used to disambiguate a single-finger tap/click from the
-/// first frame of a two-finger scroll gesture — see `TouchState`/`touch()`.
-const TAP_GRACE: Duration = Duration::from_millis(30);
+/// Direct-touch gestures use movement, rather than a short timer, to
+/// distinguish a left drag from a stationary long-press secondary click.
+const TOUCH_MOVE_THRESHOLD: i32 = 8;
+const LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 
 /// Coarse gesture state derived from how many contacts are simultaneously
-/// active, updated once per `touch()` call (which always carries the full
-/// currently-active contact set, per `parse_touch_packet`).
+/// active. Each `touch()` call carries transitions; `TouchState::slots`
+/// reconstructs the full active set across calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GestureMode {
     /// Nothing down.
     Idle,
-    /// Exactly one contact went down; holding off on the synthetic
-    /// LeftMouseDown for `TAP_GRACE` in case a second finger joins (which
-    /// would mean this is actually the start of a two-finger scroll, not a
-    /// click/drag). `generation` lets the deferred flush thread tell whether
-    /// its pending tap is still the current one.
+    /// Exactly one contact went down. Movement commits it to a left drag;
+    /// remaining stationary long enough commits it to a secondary click.
     Pending { generation: u64 },
     /// Single-finger click/drag committed; a real LeftMouseDown has been
     /// posted and is being held.
@@ -131,6 +154,9 @@ enum GestureMode {
     /// Two (or more) fingers down; translating movement to scroll-wheel
     /// events instead of a click.
     Scrolling,
+    /// A stationary long-press already emitted a secondary click; consume
+    /// the eventual lift without emitting another click.
+    SecondaryClicked,
 }
 
 struct TouchState {
@@ -180,11 +206,9 @@ impl TouchState {
         if active.is_empty() {
             return (0, 0);
         }
-        let (sx, sy) = active
-            .iter()
-            .fold((0i64, 0i64), |(sx, sy), (x, y)| {
-                (sx + *x as i64, sy + *y as i64)
-            });
+        let (sx, sy) = active.iter().fold((0i64, 0i64), |(sx, sy), (x, y)| {
+            (sx + *x as i64, sy + *y as i64)
+        });
         (
             (sx / active.len() as i64) as i32,
             (sy / active.len() as i64) as i32,
@@ -196,6 +220,7 @@ pub struct MacInput {
     source: CGEventSource,
     pointer: Arc<Mutex<PointerState>>,
     touch: Arc<Mutex<TouchState>>,
+    natural_scroll: bool,
 }
 
 // `CGEventSource` wraps a Core Foundation object (retain/release counted via
@@ -217,6 +242,10 @@ impl MacInput {
 
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow::anyhow!("CGEventSourceCreate failed"))?;
+        let scroll_direction_key = NSString::from_str("com.apple.swipescrolldirection");
+        let natural_scroll =
+            NSUserDefaults::standardUserDefaults().boolForKey(&scroll_direction_key);
+        crate::vlog!("[input] natural scrolling enabled: {natural_scroll}");
 
         Ok(Self {
             source,
@@ -226,27 +255,28 @@ impl MacInput {
                 output_size: (width, height),
                 pos: (0, 0),
                 held: None,
+                display_id: None,
             })),
             touch: Arc::new(Mutex::new(TouchState::new())),
+            natural_scroll,
         })
     }
 
-    /// Spawn a one-shot thread that waits out `TAP_GRACE` and then, if the
-    /// pending tap identified by `generation` hasn't been resolved in the
-    /// meantime (cancelled into a scroll, or flushed early by a quick
-    /// lift-off), posts the buffered LeftMouseDown and commits to Dragging.
-    fn arm_tap_flush(&self, generation: u64) {
+    /// Emit a secondary click if a single contact remains stationary for the
+    /// touchscreen-standard long-press interval.
+    fn arm_long_press(&self, generation: u64) {
         let touch = Arc::clone(&self.touch);
         let source = SendSource(self.source.clone());
         thread::spawn(move || {
-            thread::sleep(TAP_GRACE);
+            thread::sleep(LONG_PRESS_DURATION);
             let source = source; // move into this thread
             let mut state = touch.lock().unwrap();
             if state.mode == (GestureMode::Pending { generation }) {
                 let (x, y) = state.anchor;
-                state.mode = GestureMode::Dragging;
+                state.mode = GestureMode::SecondaryClicked;
                 drop(state);
-                post_button_event(&source.0, x, y, HeldButton::Left, true);
+                post_button_event(&source.0, x, y, HeldButton::Right, true);
+                post_button_event(&source.0, x, y, HeldButton::Right, false);
             }
         });
     }
@@ -259,11 +289,17 @@ impl MacInput {
         post_button_event(&self.source, x, y, btn, pressed);
     }
 
-    /// Post a pixel-unit scroll-wheel event. `dy`/`dx` pass through untuned —
-    /// see report for details on units/sign conventions not yet calibrated
-    /// against a real trackpad.
-    fn post_scroll_pixels(&self, dy: i32, dx: i32) {
-        post_scroll_event(&self.source, dy, dx);
+    /// Touch coordinates and pixel scroll units are both measured in output
+    /// points. Apply the user's macOS scroll-direction preference to the 1:1
+    /// centroid delta, matching native trackpad behavior.
+    fn post_scroll_pixels(&self, dy: i32, dx: i32, phase: CGScrollPhase) {
+        let direction = if self.natural_scroll { 1 } else { -1 };
+        post_scroll_event(
+            &self.source,
+            dy.saturating_mul(direction),
+            dx.saturating_mul(direction),
+            phase,
+        );
     }
 
     /// Keep the shared cursor-position tracker in sync with wherever touch
@@ -294,7 +330,7 @@ fn cg_button(held: Option<HeldButton>) -> CGMouseButton {
 /// Post a mouse-moved/dragged event at `(x, y)`, with optional relative delta
 /// fields set (for pointer-lock-style consumers reading raw deltas instead of
 /// absolute position). Free function (not a method) so both `MacInput` and
-/// the deferred tap-flush thread (which only has a cloned `CGEventSource`,
+/// the deferred long-press thread (which only has a cloned `CGEventSource`,
 /// not `&MacInput`) can post through it.
 fn post_move_event(
     source: &CGEventSource,
@@ -343,8 +379,22 @@ fn post_button_event(source: &CGEventSource, x: i32, y: i32, btn: HeldButton, pr
     }
 }
 
-fn post_scroll_event(source: &CGEventSource, dy: i32, dx: i32) {
-    if let Ok(event) = CGEvent::new_scroll_event(source.clone(), ScrollEventUnit::PIXEL, 2, dy, dx, 0)
+fn post_scroll_event(source: &CGEventSource, dy: i32, dx: i32, phase: CGScrollPhase) {
+    if let Ok(event) =
+        CGEvent::new_scroll_event(source.clone(), ScrollEventUnit::PIXEL, 2, dy, dx, 0)
+    {
+        event.set_integer_value_field(
+            ObjcCGEventField::ScrollWheelEventScrollPhase.0,
+            phase.0 as i64,
+        );
+        event.post(CGEventTapLocation::HID);
+    } else {
+        crate::vlog!("[input] CGEventCreateScrollWheelEvent failed");
+    }
+}
+
+fn post_scroll_lines(source: &CGEventSource, dy: i32) {
+    if let Ok(event) = CGEvent::new_scroll_event(source.clone(), ScrollEventUnit::LINE, 1, dy, 0, 0)
     {
         event.post(CGEventTapLocation::HID);
     } else {
@@ -352,21 +402,18 @@ fn post_scroll_event(source: &CGEventSource, dy: i32, dx: i32) {
     }
 }
 
-/// Wire bit layout: 0x01=shift, 0x02=ctrl, 0x04=alt/option, 0x08=super/meta.
-/// Mapping decided (not smart-remapped): wire ctrl -> macOS Control literally,
-/// wire super/meta -> macOS Command literally.
+/// KEY combo modifier bits from docs/ARCHITECTURE.md: 0x01=Ctrl,
+/// 0x02=Alt, 0x04=Super. On macOS these map literally to Control, Option,
+/// and Command. Shifted characters are already shifted in the text payload.
 fn modifier_flags(modifiers: u8) -> CGEventFlags {
     let mut flags = CGEventFlags::empty();
     if modifiers & 0x01 != 0 {
-        flags |= CGEventFlags::CGEventFlagShift;
-    }
-    if modifiers & 0x02 != 0 {
         flags |= CGEventFlags::CGEventFlagControl;
     }
-    if modifiers & 0x04 != 0 {
+    if modifiers & 0x02 != 0 {
         flags |= CGEventFlags::CGEventFlagAlternate;
     }
-    if modifiers & 0x08 != 0 {
+    if modifiers & 0x04 != 0 {
         flags |= CGEventFlags::CGEventFlagCommand;
     }
     flags
@@ -402,8 +449,16 @@ fn post_unicode_text(source: &CGEventSource, text: &str, flags: Option<CGEventFl
 }
 
 /// Post a virtual-keycode down+up pair with modifier flags applied.
-fn post_key_with_modifiers(source: &CGEventSource, vk: CGKeyCode, modifiers: u8) {
-    let flags = modifier_flags(modifiers);
+fn post_key_with_modifiers(
+    source: &CGEventSource,
+    vk: CGKeyCode,
+    modifiers: u8,
+    needs_shift: bool,
+) {
+    let mut flags = modifier_flags(modifiers);
+    if needs_shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
     if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), vk, true) {
         if !flags.is_empty() {
             down.set_flags(flags);
@@ -420,6 +475,73 @@ fn post_key_with_modifiers(source: &CGEventSource, vk: CGKeyCode, modifiers: u8)
     } else {
         crate::vlog!("[input] CGEventCreateKeyboardEvent (up) failed for vk {vk}");
     }
+}
+
+/// Map text characters to physical keys on the ANSI/US layout. Combo packets
+/// need a real keycode because many macOS shortcuts match the physical key,
+/// not the Unicode string attached to a synthetic keycode-0 event.
+fn char_to_key(c: char) -> Option<(CGKeyCode, bool)> {
+    let needs_shift = c.is_ascii_uppercase();
+    let letter = match c.to_ascii_lowercase() {
+        'a' => Some(KeyCode::ANSI_A),
+        'b' => Some(KeyCode::ANSI_B),
+        'c' => Some(KeyCode::ANSI_C),
+        'd' => Some(KeyCode::ANSI_D),
+        'e' => Some(KeyCode::ANSI_E),
+        'f' => Some(KeyCode::ANSI_F),
+        'g' => Some(KeyCode::ANSI_G),
+        'h' => Some(KeyCode::ANSI_H),
+        'i' => Some(KeyCode::ANSI_I),
+        'j' => Some(KeyCode::ANSI_J),
+        'k' => Some(KeyCode::ANSI_K),
+        'l' => Some(KeyCode::ANSI_L),
+        'm' => Some(KeyCode::ANSI_M),
+        'n' => Some(KeyCode::ANSI_N),
+        'o' => Some(KeyCode::ANSI_O),
+        'p' => Some(KeyCode::ANSI_P),
+        'q' => Some(KeyCode::ANSI_Q),
+        'r' => Some(KeyCode::ANSI_R),
+        's' => Some(KeyCode::ANSI_S),
+        't' => Some(KeyCode::ANSI_T),
+        'u' => Some(KeyCode::ANSI_U),
+        'v' => Some(KeyCode::ANSI_V),
+        'w' => Some(KeyCode::ANSI_W),
+        'x' => Some(KeyCode::ANSI_X),
+        'y' => Some(KeyCode::ANSI_Y),
+        'z' => Some(KeyCode::ANSI_Z),
+        _ => None,
+    };
+    if let Some(vk) = letter {
+        return Some((vk, needs_shift));
+    }
+
+    Some(match c {
+        '1' | '!' => (KeyCode::ANSI_1, c == '!'),
+        '2' | '@' => (KeyCode::ANSI_2, c == '@'),
+        '3' | '#' => (KeyCode::ANSI_3, c == '#'),
+        '4' | '$' => (KeyCode::ANSI_4, c == '$'),
+        '5' | '%' => (KeyCode::ANSI_5, c == '%'),
+        '6' | '^' => (KeyCode::ANSI_6, c == '^'),
+        '7' | '&' => (KeyCode::ANSI_7, c == '&'),
+        '8' | '*' => (KeyCode::ANSI_8, c == '*'),
+        '9' | '(' => (KeyCode::ANSI_9, c == '('),
+        '0' | ')' => (KeyCode::ANSI_0, c == ')'),
+        '-' | '_' => (KeyCode::ANSI_MINUS, c == '_'),
+        '=' | '+' => (KeyCode::ANSI_EQUAL, c == '+'),
+        '[' | '{' => (KeyCode::ANSI_LEFT_BRACKET, c == '{'),
+        ']' | '}' => (KeyCode::ANSI_RIGHT_BRACKET, c == '}'),
+        '\\' | '|' => (KeyCode::ANSI_BACKSLASH, c == '|'),
+        ';' | ':' => (KeyCode::ANSI_SEMICOLON, c == ':'),
+        '\'' | '"' => (KeyCode::ANSI_QUOTE, c == '"'),
+        '`' | '~' => (KeyCode::ANSI_GRAVE, c == '~'),
+        ',' | '<' => (KeyCode::ANSI_COMMA, c == '<'),
+        '.' | '>' => (KeyCode::ANSI_PERIOD, c == '>'),
+        '/' | '?' => (KeyCode::ANSI_SLASH, c == '?'),
+        ' ' => (KeyCode::SPACE, false),
+        '\t' => (KeyCode::TAB, false),
+        '\n' => (KeyCode::RETURN, false),
+        _ => return None,
+    })
 }
 
 /// Map HID keyboard usage page 0x07 values to macOS `kVK_*` virtual
@@ -542,7 +664,7 @@ fn hid_usage_to_vk(usage: u8) -> Option<CGKeyCode> {
 /// `CGEventSource` isn't `Send` (it's a raw `NonNull` under the hood), but
 /// it's just a CFType wrapper — CFRetain/CFRelease are thread-safe, and we
 /// only ever touch the underlying source from one thread at a time (the
-/// caller thread, or the one-shot tap-flush thread below, never both at
+/// caller thread, or the one-shot long-press thread below, never both at
 /// once). Lets a cloned source move into `thread::spawn`.
 struct SendSource(CGEventSource);
 unsafe impl Send for SendSource {}
@@ -552,6 +674,14 @@ impl InputBackend for MacInput {
         let mut state = self.pointer.lock().unwrap();
         state.origin = (left, top);
         state.wire_size = (width, height);
+        let (cx, cy) = state.clamp_to_rect(state.pos.0, state.pos.1);
+        if (cx, cy) != state.pos {
+            let (out_w, out_h) = state.output_size;
+            state.pos = (
+                left + out_w.saturating_sub(1) as i32 / 2,
+                top + out_h.saturating_sub(1) as i32 / 2,
+            );
+        }
     }
 
     fn set_output_size(&mut self, width: u32, height: u32) {
@@ -562,18 +692,17 @@ impl InputBackend for MacInput {
     fn touch(&mut self, contacts: &[TouchContact]) -> Result<()> {
         // No native macOS touch-injection API exists; translate to
         // pointer/scroll events the same way Duet Display/Jump
-        // Desktop/Screens/Splashtop do. `contacts` is always the full
-        // currently-active set (see `parse_touch_packet`), so per call we
-        // can tell 1-finger from 2-finger without necessarily needing a
-        // timer — the grace window below only covers the ambiguous instant
-        // right at first touch-down, before we know if a second finger is
-        // about to join.
+        // Desktop/Screens/Splashtop do. Packets carry contact transitions;
+        // the persisted slots below reconstruct the full active set. The
+        // A stationary primary contact becomes a long-press secondary click;
+        // movement commits it to dragging and a second contact to scrolling.
         if contacts.is_empty() {
             return Ok(());
         }
 
         let (left, top, wire_size, output_size) = {
-            let p = self.pointer.lock().unwrap();
+            let mut p = self.pointer.lock().unwrap();
+            p.refresh_output_rect();
             (p.origin.0, p.origin.1, p.wire_size, p.output_size)
         };
         let (wire_w, wire_h) = wire_size;
@@ -603,8 +732,8 @@ impl InputBackend for MacInput {
             // display.rs), in which case this scaling is what keeps
             // touches landing in the right place instead of drifting
             // toward the far corners.
-            let x = left + scale_dim(c.x as i64, wire_w, out_w);
-            let y = top + scale_dim(c.y as i64, wire_h, out_h);
+            let x = left + scale_position(c.x, wire_w, out_w);
+            let y = top + scale_position(c.y, wire_h, out_h);
             match c.event_type {
                 TOUCH_DOWN | TOUCH_MOVE => state.slots[slot] = Some((x, y)),
                 TOUCH_UP => {
@@ -631,10 +760,13 @@ impl InputBackend for MacInput {
                     state.anchor = anchor;
                     state.mode = GestureMode::Pending { generation };
                     drop(state);
-                    self.arm_tap_flush(generation);
+                    self.arm_long_press(generation);
                 } else if active_count >= 2 {
-                    state.scroll_last = state.centroid();
+                    let centroid = state.centroid();
+                    state.scroll_last = centroid;
                     state.mode = GestureMode::Scrolling;
+                    drop(state);
+                    self.post_scroll_pixels(0, 0, CGScrollPhase::Began);
                 }
                 // active_count == 0 here can't happen (contacts non-empty
                 // implies at least one slot just went to Some/None, and if
@@ -642,8 +774,7 @@ impl InputBackend for MacInput {
             }
             GestureMode::Pending { generation } => {
                 if active_count == 0 {
-                    // Lifted before the grace window elapsed: a quick tap.
-                    // Flush immediately instead of waiting out the timer.
+                    // Lifted before the long-press elapsed: a left click.
                     let (x, y) = state.anchor;
                     state.generation = state.generation.wrapping_add(1);
                     state.mode = GestureMode::Idle;
@@ -658,11 +789,24 @@ impl InputBackend for MacInput {
                     // no-ops) and never post the LeftMouseDown at all.
                     let _ = generation;
                     state.generation = state.generation.wrapping_add(1);
-                    state.scroll_last = state.centroid();
+                    let centroid = state.centroid();
+                    state.scroll_last = centroid;
                     state.mode = GestureMode::Scrolling;
+                    drop(state);
+                    self.post_scroll_pixels(0, 0, CGScrollPhase::Began);
+                } else if let Some((x, y)) = state.primary_pos() {
+                    let dx = x - state.anchor.0;
+                    let dy = y - state.anchor.1;
+                    if dx.abs().max(dy.abs()) > TOUCH_MOVE_THRESHOLD {
+                        let (anchor_x, anchor_y) = state.anchor;
+                        state.generation = state.generation.wrapping_add(1);
+                        state.mode = GestureMode::Dragging;
+                        drop(state);
+                        post_button_event(&self.source, anchor_x, anchor_y, HeldButton::Left, true);
+                        post_move_event(&self.source, x, y, Some(HeldButton::Left), None);
+                        self.sync_pointer_pos(x, y);
+                    }
                 }
-                // active_count == 1: still just the one finger, keep
-                // waiting for the deferred flush thread's timer.
             }
             GestureMode::Dragging => {
                 if active_count == 0 {
@@ -679,7 +823,7 @@ impl InputBackend for MacInput {
                     drop(state);
                     post_button_event(&self.source, x, y, HeldButton::Left, false);
                     self.sync_pointer_pos(x, y);
-                } else if let Some((x, y)) = state.slots[0] {
+                } else if let Some((x, y)) = state.primary_pos() {
                     drop(state);
                     post_move_event(&self.source, x, y, Some(HeldButton::Left), None);
                     self.sync_pointer_pos(x, y);
@@ -697,14 +841,21 @@ impl InputBackend for MacInput {
                     state.scroll_last = centroid;
                     drop(state);
                     if dx != 0 || dy != 0 {
-                        // Sign/unit convention untuned against a real
-                        // trackpad — see report.
-                        self.post_scroll_pixels(dy, dx);
+                        self.post_scroll_pixels(dy, dx, CGScrollPhase::Changed);
                     }
                 } else {
-                    // Down to 0 or 1 fingers ends the scroll gesture; per
-                    // spec, two-finger lift never emits a click.
                     state.mode = GestureMode::Idle;
+                    drop(state);
+                    self.post_scroll_pixels(0, 0, CGScrollPhase::Ended);
+                }
+            }
+            GestureMode::SecondaryClicked => {
+                if active_count == 0 {
+                    state.mode = GestureMode::Idle;
+                    if let Some((x, y)) = lift_pos {
+                        drop(state);
+                        self.sync_pointer_pos(x, y);
+                    }
                 }
             }
         }
@@ -736,9 +887,7 @@ impl InputBackend for MacInput {
             0x0D => KeyCode::OPTION,
             0x0E => KeyCode::COMMAND, // win/meta -> Command, literally, not remapped
             0x0F => {
-                crate::vlog!(
-                    "[input] special key Insert (0x0F) has no macOS equivalent, ignoring"
-                );
+                crate::vlog!("[input] special key Insert (0x0F) has no macOS equivalent, ignoring");
                 return Ok(());
             }
             _ => {
@@ -746,17 +895,24 @@ impl InputBackend for MacInput {
                 return Ok(());
             }
         };
-        post_key_with_modifiers(&self.source, vk, modifiers);
+        post_key_with_modifiers(&self.source, vk, modifiers, false);
         Ok(())
     }
 
     fn key_text_with_modifiers(&mut self, text: &str, modifiers: u8) -> Result<()> {
         let flags = modifier_flags(modifiers);
-        post_unicode_text(
-            &self.source,
-            text,
-            if flags.is_empty() { None } else { Some(flags) },
-        );
+        for c in text.chars() {
+            if let Some((vk, needs_shift)) = char_to_key(c) {
+                post_key_with_modifiers(&self.source, vk, modifiers, needs_shift);
+            } else {
+                let mut utf8 = [0; 4];
+                post_unicode_text(
+                    &self.source,
+                    c.encode_utf8(&mut utf8),
+                    if flags.is_empty() { None } else { Some(flags) },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -765,7 +921,9 @@ impl InputBackend for MacInput {
             if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), vk, pressed) {
                 event.post(CGEventTapLocation::HID);
             } else {
-                crate::vlog!("[input] CGEventCreateKeyboardEvent failed for HID usage 0x{usage:02x}");
+                crate::vlog!(
+                    "[input] CGEventCreateKeyboardEvent failed for HID usage 0x{usage:02x}"
+                );
             }
         } else {
             crate::vlog!("[input] no macOS keycode mapping for HID usage 0x{usage:02x}");
@@ -777,6 +935,7 @@ impl InputBackend for MacInput {
         match ev {
             MouseEvent::MoveAbsolute { x, y } => {
                 let mut state = self.pointer.lock().unwrap();
+                state.refresh_output_rect();
                 let (left, top) = state.origin;
                 // 0..65535 is already a normalized fraction of the full
                 // captured output, independent of the session/stream
@@ -799,21 +958,17 @@ impl InputBackend for MacInput {
             MouseEvent::MoveRelative { dx, dy } => {
                 let mut state = self.pointer.lock().unwrap();
                 let (px, py) = state.pos;
-                let (wire_w, wire_h) = state.wire_size;
-                let (out_w, out_h) = state.output_size;
-                // Relative deltas arrive in the same wire (session-stream)
-                // pixel space as absolute touch coordinates, not desktop
-                // pixels — scale them the same way for consistency, so a
-                // drag of N wire-pixels always covers the same fraction of
-                // the captured output regardless of whether WindowServer
-                // substituted a different live mode.
-                let sdx = scale_dim(dx as i64, wire_w, out_w);
-                let sdy = scale_dim(dy as i64, wire_h, out_h);
-                let (cx, cy) = state.clamp_to_rect(px + sdx, py + sdy);
+                // Physical mouse deltas are device movement, not coordinates
+                // in the negotiated video space. Keep them unscaled and do
+                // not clamp them to the captured output: unlike touch and
+                // absolute input, a real pointer must be able to cross onto
+                // any monitor in the macOS desktop.
+                let (dx, dy) = (dx as i32, dy as i32);
+                let (cx, cy) = (px.saturating_add(dx), py.saturating_add(dy));
                 let held = state.held;
                 state.pos = (cx, cy);
                 drop(state);
-                self.post_move(cx, cy, held, Some((sdx, sdy)));
+                self.post_move(cx, cy, held, Some((dx, dy)));
             }
             MouseEvent::Button {
                 btn,
@@ -833,7 +988,9 @@ impl InputBackend for MacInput {
                 self.post_button(x, y, held_kind, pressed);
             }
             MouseEvent::Scroll { dy } => {
-                self.post_scroll_pixels(dy as i32, 0);
+                // MOUSE_SCROLL carries discrete wheel steps. Touch gestures
+                // use the separate pixel-unit path above.
+                post_scroll_lines(&self.source, dy as i32);
             }
         }
         Ok(())
@@ -864,6 +1021,31 @@ mod manual_verification {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn scaled_position_preserves_hidpi_edges() {
+        assert_eq!(scale_position(0, 1280, 640), 0);
+        assert_eq!(scale_position(1279, 1280, 640), 639);
+        assert_eq!(scale_position(0, 800, 400), 0);
+        assert_eq!(scale_position(799, 800, 400), 399);
+    }
+
+    #[test]
+    fn combo_modifier_bits_match_wire_protocol() {
+        assert_eq!(modifier_flags(0x01), CGEventFlags::CGEventFlagControl);
+        assert_eq!(modifier_flags(0x02), CGEventFlags::CGEventFlagAlternate);
+        assert_eq!(modifier_flags(0x04), CGEventFlags::CGEventFlagCommand);
+        assert!(modifier_flags(0x08).is_empty());
+    }
+
+    #[test]
+    fn combo_characters_use_physical_ansi_keys() {
+        assert_eq!(char_to_key('a'), Some((KeyCode::ANSI_A, false)));
+        assert_eq!(char_to_key('A'), Some((KeyCode::ANSI_A, true)));
+        assert_eq!(char_to_key('c'), Some((KeyCode::ANSI_C, false)));
+        assert_eq!(char_to_key('?'), Some((KeyCode::ANSI_SLASH, true)));
+        assert_eq!(char_to_key('é'), None);
+    }
+
     /// Independent ground truth for "where did CGEventPost actually put the
     /// cursor" — queries the live HID cursor position via
     /// `CGEventCreate(NULL)` + `CGEventGetLocation`, entirely independent of
@@ -888,9 +1070,39 @@ mod manual_verification {
             .mouse(MouseEvent::MoveAbsolute { x: 32767, y: 32767 })
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        input.mouse(MouseEvent::Button { btn: 0, state: 1 }).unwrap();
+        input
+            .mouse(MouseEvent::Button { btn: 0, state: 1 })
+            .unwrap();
         std::thread::sleep(Duration::from_millis(80));
-        input.mouse(MouseEvent::Button { btn: 0, state: 0 }).unwrap();
+        input
+            .mouse(MouseEvent::Button { btn: 0, state: 0 })
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn relative_mouse_crosses_target_boundary() {
+        let mut input = MacInput::new(100, 100).expect("MacInput::new failed");
+        input.set_output_size(100, 100);
+        input.set_target_rect(0, 0, 100, 100);
+        input
+            .mouse(MouseEvent::MoveAbsolute { x: 32767, y: 32767 })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let before = current_cursor_pos();
+        input
+            .mouse(MouseEvent::MoveRelative { dx: 100, dy: 100 })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let after = current_cursor_pos();
+        assert!(
+            (after.0 - before.0 - 100).abs() <= 2,
+            "x delta: {before:?} -> {after:?}"
+        );
+        assert!(
+            (after.1 - before.1 - 100).abs() <= 2,
+            "y delta: {before:?} -> {after:?}"
+        );
     }
 
     #[test]
@@ -904,16 +1116,17 @@ mod manual_verification {
     }
 
     /// Not visual — just exercises the touch gesture state machine
-    /// (Idle->Pending->quick-tap-flush, Idle->Pending->2-finger-cancel->
+    /// (Idle->Pending->quick-tap, Idle->Pending->movement->Dragging,
+    /// Idle->Pending->2-finger-cancel->
     /// Scrolling->Idle) end to end without panicking, including the
-    /// deferred tap-flush background thread.
+    /// deferred long-press background thread.
     #[test]
     #[ignore]
     fn touch_gesture_smoke() {
         let mut input = MacInput::new(1280, 800).expect("MacInput::new failed");
         input.set_target_rect(0, 0, 1280, 800);
 
-        // Quick single-finger tap, lifted well within the grace window.
+        // Quick single-finger tap, lifted before the long-press interval.
         input
             .touch(&[TouchContact {
                 slot: 0,
@@ -983,9 +1196,7 @@ mod manual_verification {
             .unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
-        // Single finger down long enough for the grace window to elapse and
-        // the deferred flush thread to commit to Dragging, then a move and
-        // a lift.
+        // Single-finger movement beyond the threshold commits to Dragging.
         input
             .touch(&[TouchContact {
                 slot: 0,
@@ -994,7 +1205,6 @@ mod manual_verification {
                 y: 300,
             }])
             .unwrap();
-        std::thread::sleep(Duration::from_millis(60));
         input
             .touch(&[TouchContact {
                 slot: 0,
@@ -1020,9 +1230,8 @@ mod manual_verification {
     /// `set_target_rect` with the REQUESTED mode as the session/wire
     /// resolution — the two can differ, see below), then inject a touch at
     /// each of the 4 corners plus the center, probing in *requested-mode*
-    /// wire space — each as a full down / (past TAP_GRACE) / up cycle so the
-    /// Dragging path (deferred LeftMouseDown, drag-move, release) is what
-    /// gets exercised — and after each cycle read the true cursor position
+    /// wire space — each as a full down/up tap — and after each cycle read
+    /// the true cursor position
     /// back via an independent CGEventCreate/CGEventGetLocation query,
     /// asserting it is within ±2px of the expected absolute desktop
     /// coordinate.
@@ -1145,9 +1354,10 @@ mod manual_verification {
         // assertion above), but is written out in full so this test still
         // means something if that assertion is ever loosened.
         let expected_for = |wx: u16, wy: u16| -> (i32, i32) {
-            let ex = (wx as i64) * (actual_w as i64) / (mw as i64);
-            let ey = (wy as i64) * (actual_h as i64) / (mh as i64);
-            (left + ex as i32, top + ey as i32)
+            (
+                left + scale_position(wx, mw, actual_w),
+                top + scale_position(wy, mh, actual_h),
+            )
         };
 
         // 4 corners + center, in requested-mode wire (stream-pixel)
@@ -1162,23 +1372,21 @@ mod manual_verification {
         ];
 
         let mut failures = Vec::new();
-        for (label, wx, wy) in probes {
+        for (probe_index, (label, wx, wy)) in probes.into_iter().enumerate() {
             let expected = expected_for(wx, wy);
+            let slot = probe_index as u8;
 
             input
                 .touch(&[TouchContact {
-                    slot: 0,
+                    slot,
                     event_type: TOUCH_DOWN,
                     x: wx,
                     y: wy,
                 }])
                 .unwrap();
-            // Wait past TAP_GRACE so the deferred flush commits to Dragging
-            // and posts the real LeftMouseDown.
-            std::thread::sleep(Duration::from_millis(60));
             input
                 .touch(&[TouchContact {
-                    slot: 0,
+                    slot,
                     event_type: TOUCH_UP,
                     x: wx,
                     y: wy,
@@ -1212,9 +1420,10 @@ mod manual_verification {
             let (sx, sy) = ((mw / 2) as u16, (mh / 2) as u16);
             let (ex, ey) = ((mw * 3 / 4) as u16, (mh * 3 / 4) as u16);
             let expected = expected_for(ex, ey);
+            let slot = 7;
             input
                 .touch(&[TouchContact {
-                    slot: 0,
+                    slot,
                     event_type: TOUCH_DOWN,
                     x: sx,
                     y: sy,
@@ -1223,7 +1432,7 @@ mod manual_verification {
             std::thread::sleep(Duration::from_millis(60));
             input
                 .touch(&[TouchContact {
-                    slot: 0,
+                    slot,
                     event_type: TOUCH_MOVE,
                     x: ex,
                     y: ey,
@@ -1232,7 +1441,7 @@ mod manual_verification {
             std::thread::sleep(Duration::from_millis(30));
             input
                 .touch(&[TouchContact {
-                    slot: 0,
+                    slot,
                     event_type: TOUCH_UP,
                     x: ex,
                     y: ey,

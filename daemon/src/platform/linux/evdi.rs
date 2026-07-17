@@ -286,6 +286,7 @@ impl DisplayBackend for EvdiDisplay {
                 let frame = CaptureFrame {
                     width: self.width,
                     height: self.height,
+                    format: crate::capture::CapturePixelFormat::Bgra,
                     data: &pixel_buf,
                 };
 
@@ -315,6 +316,7 @@ impl DisplayBackend for EvdiDisplay {
                         let frame = CaptureFrame {
                             width: self.width,
                             height: self.height,
+                            format: crate::capture::CapturePixelFormat::Bgra,
                             data: &pixel_buf,
                         };
                         on_frame(frame);

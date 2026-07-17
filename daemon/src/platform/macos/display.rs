@@ -1,42 +1,55 @@
 //! macOS display backend.
 //!
 //! Virtual monitor via the private `CGVirtualDisplay` API, frame capture via
-//! the public (if deprecated) `CGDisplayStream` API. Ported from DeskPad
+//! ScreenCaptureKit. Ported from DeskPad
 //! (https://github.com/Stengo/DeskPad), adapted for a headless daemon: no
 //! CFRunLoop/AppKit main thread, hiDPI turned ON (2x scale, matching
-//! DeskPad) so the client gets Retina-quality rendering, raw BGRA bytes
-//! handed to the encoder instead of drawing into a CALayer. `CGDisplayMode`
+//! DeskPad) so the client gets Retina-quality rendering, native `420v`
+//! CVPixelBuffers handed to the encoder instead of drawing into a CALayer. `CGDisplayMode`
 //! width/height (points) and pixel_width/pixel_height (framebuffer pixels)
 //! can now legitimately differ — see `create_virtual_display` and
 //! `force_display_mode` — so the input-injection layer's live-bounds-based
 //! scaling (`MacInput::set_output_size`) is what keeps touches/clicks
 //! landing correctly regardless of which mode ends up active.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::{Allocated, Retained};
+use objc2::runtime::ProtocolObject;
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::msg_send;
-use objc2_core_foundation::{CFRetained, CGFloat, CGSize};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2_core_foundation::{
+    CFDictionary, CFNumber, CFRetained, CFString, CFType, CGFloat, CGSize,
+};
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
     CGConfigureDisplayMirrorOfDisplay, CGConfigureDisplayOrigin, CGConfigureOption,
     CGDirectDisplayID, CGDisplayBounds, CGDisplayConfigRef, CGDisplayCopyAllDisplayModes,
     CGDisplayIsInMirrorSet, CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode,
-    CGDisplaySetDisplayMode, CGDisplayStream, CGDisplayStreamFrameStatus, CGDisplayStreamUpdate,
-    CGError, CGGetOnlineDisplayList, CGMainDisplayID, CGPreflightScreenCaptureAccess,
-    CGRequestScreenCaptureAccess,
+    CGDisplaySetDisplayMode, CGError, CGGetOnlineDisplayList, CGMainDisplayID,
+    CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
 };
-use objc2_foundation::{NSArray, NSString};
-use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
+use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_core_video::{
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetHeight,
+    CVPixelBufferGetIOSurface, CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount,
+    CVPixelBufferGetWidth,
+};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamDelegate, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
+};
 
+use super::audio::{nserror_string, wait_for_completion, SendRetained, SCK_CALLBACK_TIMEOUT};
 use crate::capture::{CaptureFrame, DisplayBackend, DisplayMode};
 
 /// Look up an Objective-C class by name, for the private CGVirtualDisplay*
@@ -44,6 +57,24 @@ use crate::capture::{CaptureFrame, DisplayBackend, DisplayMode};
 fn get_class(name: &std::ffi::CStr) -> Result<&'static AnyClass> {
     AnyClass::get(name)
         .ok_or_else(|| anyhow!("class {:?} not found (unsupported macOS version?)", name))
+}
+
+fn display_is_online(display_id: CGDirectDisplayID) -> bool {
+    let mut ids = [0u32; 32];
+    let mut count: u32 = 0;
+    let err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    err == CGError::Success && ids[..count as usize].contains(&display_id)
+}
+
+fn wait_for_display_offline(display_id: CGDirectDisplayID, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !display_is_online(display_id) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !display_is_online(display_id)
 }
 
 /// `kCGNullDirectDisplay`: the CoreGraphics sentinel meaning "no display" —
@@ -195,7 +226,10 @@ fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Resul
     // silently give up on Retina by default whenever a stale preference
     // happens to match the fallback mode.
     let also_registered = if both_even {
-        format!(" ({}x{} 1x, {}x{} HiDPI points also registered)", full.0, full.1, half.0, half.1)
+        format!(
+            " ({}x{} 1x, {}x{} HiDPI points also registered)",
+            full.0, full.1, half.0, half.1
+        )
     } else {
         String::new()
     };
@@ -211,14 +245,25 @@ fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Resul
     // 1x mode (point dims == pixel dims == full request) either way.
     let hidpi_match = both_even
         .then(|| {
-            find_mode_where(display_id, "HiDPI (points=half, pixels=full)", |w, h, pw, ph| {
-                w == half.0 as usize
-                    && h == half.1 as usize
-                    && pw == full.0 as usize
-                    && ph == full.1 as usize
-            })
+            find_mode_where(
+                display_id,
+                "HiDPI (points=half, pixels=full)",
+                |w, h, pw, ph| {
+                    w == half.0 as usize
+                        && h == half.1 as usize
+                        && pw == full.0 as usize
+                        && ph == full.1 as usize
+                },
+            )
         })
         .flatten();
+    if hidpi_match.is_none() && (actual_w, actual_h) == full {
+        println!(
+            "[display] display {display_id} is already at the requested {actual_w}x{actual_h} \
+             1x mode and no usable HiDPI mode is registered; no override needed"
+        );
+        return Ok(());
+    }
     let display_mode = hidpi_match.or_else(|| {
         find_mode_where(display_id, "1x (points=pixels=full)", |w, h, _, _| {
             w == full.0 as usize && h == full.1 as usize
@@ -260,9 +305,9 @@ fn force_display_mode(display_id: CGDirectDisplayID, mode: DisplayMode) -> Resul
     Ok(())
 }
 
-/// Forces the newly-attached virtual display into the product-required
-/// default: an *extended* desktop (not mirrored), placed at a deterministic,
-/// non-overlapping origin immediately to the right of the main display.
+/// Ensures the newly-attached virtual display is extended and non-overlapping.
+/// A valid arrangement chosen by WindowServer is left untouched; otherwise,
+/// the display is placed immediately to the right of another online display.
 ///
 /// Background: macOS has no documented guarantee about how a freshly
 /// attached display is initially arranged — it may come up mirrored onto
@@ -320,7 +365,8 @@ fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
     // (id=1) was sitting right there in the online list.
     let mut ids = [0u32; 32];
     let mut count: u32 = 0;
-    let list_err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    let list_err =
+        unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
     if list_err != CGError::Success {
         bail!("CGGetOnlineDisplayList failed: {list_err:?}");
     }
@@ -347,6 +393,25 @@ fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
         return Ok(());
     };
 
+    let virtual_bounds = CGDisplayBounds(display_id);
+    let overlaps_other = online.iter().copied().any(|id| {
+        if id == display_id {
+            return false;
+        }
+        let other = CGDisplayBounds(id);
+        virtual_bounds.origin.x < other.origin.x + other.size.width
+            && other.origin.x < virtual_bounds.origin.x + virtual_bounds.size.width
+            && virtual_bounds.origin.y < other.origin.y + other.size.height
+            && other.origin.y < virtual_bounds.origin.y + virtual_bounds.size.height
+    });
+    if !CGDisplayIsInMirrorSet(display_id) && !overlaps_other {
+        println!(
+            "[display] virtual display {display_id} is already extended and non-overlapping; \
+             leaving WindowServer's placement unchanged"
+        );
+        return Ok(());
+    }
+
     let reference_bounds = CGDisplayBounds(reference_id);
     let target_x = (reference_bounds.origin.x + reference_bounds.size.width) as i32;
     let target_y = reference_bounds.origin.y as i32;
@@ -360,9 +425,8 @@ fn force_extended_placement(display_id: CGDirectDisplayID) -> Result<()> {
     // Un-mirror (harmless/idempotent no-op if it wasn't mirrored) and place
     // it deterministically to the right of the reference display, in the
     // same transaction.
-    let unmirror_err = unsafe {
-        CGConfigureDisplayMirrorOfDisplay(config, display_id, K_CG_NULL_DIRECT_DISPLAY)
-    };
+    let unmirror_err =
+        unsafe { CGConfigureDisplayMirrorOfDisplay(config, display_id, K_CG_NULL_DIRECT_DISPLAY) };
     let origin_err = unsafe { CGConfigureDisplayOrigin(config, display_id, target_x, target_y) };
 
     if unmirror_err != CGError::Success || origin_err != CGError::Success {
@@ -488,7 +552,12 @@ fn create_virtual_display(
 
     let mode_cls = get_class(c"CGVirtualDisplayMode")?;
     let both_even = mode.width % 2 == 0 && mode.height % 2 == 0;
-    let onex_mode = build_virtual_display_mode(mode_cls, mode.width as usize, mode.height as usize, mode.fps as CGFloat);
+    let onex_mode = build_virtual_display_mode(
+        mode_cls,
+        mode.width as usize,
+        mode.height as usize,
+        mode.fps as CGFloat,
+    );
     let modes_array = if both_even {
         // HiDPI mode goes FIRST — CGVirtualDisplaySettings.modes' first
         // entry is the default/primary mode a freshly attached display
@@ -496,7 +565,8 @@ fn create_virtual_display(
         // as a fallback the user can still pick in System Settings ->
         // Displays if they want non-Retina.
         let (hw, hh) = (mode.width / 2, mode.height / 2);
-        let hidpi_mode = build_virtual_display_mode(mode_cls, hw as usize, hh as usize, mode.fps as CGFloat);
+        let hidpi_mode =
+            build_virtual_display_mode(mode_cls, hw as usize, hh as usize, mode.fps as CGFloat);
         println!(
             "[display] registering HiDPI mode {hw}x{hh} points (-> {}x{} pixels, 2x) as the \
              default, plus a {}x{} 1x fallback mode",
@@ -529,10 +599,7 @@ fn create_virtual_display(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut online = false;
     while Instant::now() < deadline {
-        let mut ids = [0u32; 32];
-        let mut count: u32 = 0;
-        let err = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
-        if err == CGError::Success && ids[..count as usize].contains(&display_id) {
+        if display_is_online(display_id) {
             online = true;
             break;
         }
@@ -553,36 +620,204 @@ fn create_virtual_display(
     Ok((display_obj, display_id))
 }
 
-/// Shared frame buffer written by the CGDisplayStream callback (on a GCD
-/// worker thread) and read by `run_capture_loop` (on the capture thread).
+/// Latest retained display surface written by the ScreenCaptureKit callback
+/// and consumed by `run_capture_loop` on the capture thread.
 struct FrameSlot {
-    data: Vec<u8>,
+    pixel_buffer: Option<SendPixelBuffer>,
     width: u32,
     height: u32,
     seq: u64,
 }
 
+struct SendPixelBuffer(CFRetained<CVPixelBuffer>);
+
+// CoreVideo objects are retainable across threads. This wrapper only transfers
+// ownership between the serial display callback and capture thread.
+unsafe impl Send for SendPixelBuffer {}
+unsafe impl Sync for SendPixelBuffer {}
+
 struct FrameState {
     slot: Mutex<FrameSlot>,
     cvar: Condvar,
+    terminal_error: Mutex<Option<String>>,
+}
+
+fn black_nv12(width: u32, height: u32) -> Vec<u8> {
+    let y_len = width as usize * height as usize;
+    let mut data = vec![16u8; y_len + y_len / 2];
+    data[y_len..].fill(128);
+    data
 }
 
 impl FrameState {
     fn new(width: u32, height: u32) -> Self {
         Self {
             slot: Mutex::new(FrameSlot {
-                data: vec![0u8; width as usize * height as usize * 4],
+                pixel_buffer: None,
                 width,
                 height,
                 seq: 0,
             }),
             cvar: Condvar::new(),
+            terminal_error: Mutex::new(None),
         }
     }
 }
 
-type FrameHandlerBlock =
-    RcBlock<dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate)>;
+fn sample_frame_is_complete(sample_buffer: &CMSampleBuffer) -> bool {
+    let Some(attachments) = (unsafe { sample_buffer.sample_attachments_array(false) }) else {
+        return false;
+    };
+    if attachments.count() == 0 {
+        return false;
+    }
+    let dictionary = unsafe { attachments.value_at_index(0).cast::<CFType>().as_ref() }
+        .and_then(|value| value.downcast_ref::<CFDictionary>());
+    let Some(dictionary) = dictionary else {
+        return false;
+    };
+    let status_key = unsafe { SCStreamFrameInfoStatus };
+    let status_key: &CFString = unsafe { &*((status_key as *const NSString).cast()) };
+    let status = unsafe {
+        dictionary
+            .value((status_key as *const CFString).cast())
+            .cast::<CFType>()
+            .as_ref()
+    }
+    .and_then(|value| value.downcast_ref::<CFNumber>())
+    .and_then(CFNumber::as_isize);
+    status == Some(SCFrameStatus::Complete.0)
+}
+
+pub struct DisplayOutputIvars {
+    state: Arc<FrameState>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = DisplayOutputIvars]
+    struct DisplayStreamOutput;
+
+    unsafe impl NSObjectProtocol for DisplayStreamOutput {}
+
+    unsafe impl SCStreamOutput for DisplayStreamOutput {
+        #[allow(non_snake_case)]
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        unsafe fn stream_didOutputSampleBuffer_ofType(
+            &self,
+            _stream: &SCStream,
+            sample_buffer: &CMSampleBuffer,
+            r#type: SCStreamOutputType,
+        ) {
+            if r#type != SCStreamOutputType::Screen {
+                return;
+            }
+            let state = Arc::clone(&self.ivars().state);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                if !unsafe { sample_buffer.is_valid() }
+                    || !unsafe { sample_buffer.data_is_ready() }
+                    || !sample_frame_is_complete(sample_buffer)
+                {
+                    return;
+                }
+                let Some(pixel_buffer) = (unsafe { sample_buffer.image_buffer() }) else {
+                    return;
+                };
+                if CVPixelBufferGetPixelFormatType(&pixel_buffer)
+                    != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                    || CVPixelBufferGetPlaneCount(&pixel_buffer) < 2
+                {
+                    return;
+                }
+
+                let width = CVPixelBufferGetWidth(&pixel_buffer);
+                let height = CVPixelBufferGetHeight(&pixel_buffer);
+                if CVPixelBufferGetIOSurface(Some(&pixel_buffer)).is_none() {
+                    return;
+                }
+                let mut slot = state.slot.lock().unwrap();
+                if slot.width as usize == width && slot.height as usize == height {
+                    slot.pixel_buffer = Some(SendPixelBuffer(pixel_buffer));
+                    slot.seq = slot.seq.wrapping_add(1);
+                    drop(slot);
+                    state.cvar.notify_all();
+                }
+            }));
+        }
+    }
+
+    unsafe impl SCStreamDelegate for DisplayStreamOutput {
+        #[allow(non_snake_case)]
+        #[unsafe(method(stream:didStopWithError:))]
+        unsafe fn stream_didStopWithError(&self, _stream: &SCStream, error: &NSError) {
+            let state = Arc::clone(&self.ivars().state);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                *state.terminal_error.lock().unwrap() = Some(nserror_string(error));
+                state.cvar.notify_all();
+            }));
+        }
+    }
+);
+
+impl DisplayStreamOutput {
+    fn new(state: Arc<FrameState>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(DisplayOutputIvars { state });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn fetch_sck_display(display_id: CGDirectDisplayID) -> Result<Retained<SCDisplay>> {
+    let pair: Arc<(
+        Mutex<Option<Result<SendRetained<SCDisplay>, String>>>,
+        Condvar,
+    )> = Arc::new((Mutex::new(None), Condvar::new()));
+    let cb_pair = Arc::clone(&pair);
+    let block = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let result = (|| {
+                if content.is_null() {
+                    return Err(if error.is_null() {
+                        "no shareable content and no error".to_string()
+                    } else {
+                        nserror_string(unsafe { &*error })
+                    });
+                }
+                let content = unsafe { Retained::retain(content) }
+                    .ok_or_else(|| "SCShareableContent retain failed".to_string())?;
+                let displays = unsafe { content.displays() };
+                let available: Vec<_> = displays
+                    .to_vec()
+                    .into_iter()
+                    .map(|display| (unsafe { display.displayID() }, display))
+                    .collect();
+                available
+                    .into_iter()
+                    .find_map(|(id, display)| (id == display_id).then_some(SendRetained(display)))
+                    .ok_or_else(|| format!("display {display_id} is not yet shareable"))
+            })();
+            let (lock, cvar) = &*cb_pair;
+            *lock.lock().unwrap() = Some(result);
+            cvar.notify_all();
+        },
+    );
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&block) };
+
+    let (lock, cvar) = &*pair;
+    let guard = lock.lock().unwrap();
+    let (mut guard, timeout) = cvar
+        .wait_timeout_while(guard, SCK_CALLBACK_TIMEOUT, |result| result.is_none())
+        .unwrap();
+    if timeout.timed_out() && guard.is_none() {
+        bail!(
+            "timed out waiting for display {display_id} in SCShareableContent after {SCK_CALLBACK_TIMEOUT:?}"
+        );
+    }
+    guard
+        .take()
+        .unwrap()
+        .map(|display| display.0)
+        .map_err(|error| anyhow!("SCShareableContent fetch failed: {error}"))
+}
 
 #[allow(dead_code)]
 pub struct MacDisplay {
@@ -595,14 +830,14 @@ pub struct MacDisplay {
     virtual_display: Option<Retained<AnyObject>>,
     descriptor_queue: Option<DispatchRetained<DispatchQueue>>,
     stream_queue: Option<DispatchRetained<DispatchQueue>>,
-    stream: Option<CFRetained<CGDisplayStream>>,
-    frame_block: Option<FrameHandlerBlock>,
+    stream: Option<Retained<SCStream>>,
+    stream_output: Option<Retained<DisplayStreamOutput>>,
     frame_state: Option<Arc<FrameState>>,
 }
 
 // SAFETY: MacDisplay is only ever driven from a single OS thread (the
 // capture thread: attach/run_capture_loop/detach all run there, in that
-// order, per session). The CGDisplayStream frame callback runs on its own
+// order, per session). The SCStream frame callback runs on its own
 // GCD queue but only touches the `Arc<FrameState>` (Mutex/Condvar guarded),
 // never the ObjC display/stream objects directly. This mirrors the
 // `unsafe impl Send` used for EvdiDisplay's raw handle on Linux.
@@ -619,7 +854,7 @@ impl MacDisplay {
             descriptor_queue: None,
             stream_queue: None,
             stream: None,
-            frame_block: None,
+            stream_output: None,
             frame_state: None,
         })
     }
@@ -628,7 +863,7 @@ impl MacDisplay {
 impl DisplayBackend for MacDisplay {
     fn attach(&mut self, mode: DisplayMode) -> Result<()> {
         // TCC preflight: fail with an actionable message instead of letting
-        // this surface as a cryptic downstream CGDisplayStream error.
+        // this surface as a cryptic downstream ScreenCaptureKit error.
         if !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess();
             bail!(
@@ -642,9 +877,8 @@ impl DisplayBackend for MacDisplay {
             mode.width, mode.height, mode.fps
         );
 
-        // A single serial dispatch queue backs both the descriptor (used
-        // internally by CGVirtualDisplay for mode-change/termination
-        // callbacks) and the display stream below. Unlike DeskPad (a GUI
+        // A serial dispatch queue backs the descriptor (used internally by
+        // CGVirtualDisplay for mode-change/termination callbacks). Unlike DeskPad (a GUI
         // app that hands these DispatchQueue.main, serviced by its already-
         // running CFRunLoop/AppKit main loop), this is a headless daemon
         // with no main-thread run loop — GCD services a custom serial queue
@@ -688,7 +922,7 @@ impl DisplayBackend for MacDisplay {
                     .map(|h| u32::from_str_radix(h, 16).ok())
                     .unwrap_or_else(|| s.parse().ok())
             })
-            .unwrap_or(0x997C);
+            .unwrap_or(0xA5A5);
 
         let (display_obj, display_id) =
             match create_virtual_display(&descriptor_queue, mode, stable_product_id) {
@@ -780,77 +1014,79 @@ impl DisplayBackend for MacDisplay {
             );
         }
 
-        // --- Frame capture via CGDisplayStream ---
+        // --- Frame capture via ScreenCaptureKit ---
         let frame_state = Arc::new(FrameState::new(mode.width, mode.height));
-        let cb_state = Arc::clone(&frame_state);
-
-        let block: FrameHandlerBlock = RcBlock::new(
-            move |status: CGDisplayStreamFrameStatus,
-                  _display_time: u64,
-                  surface: *mut IOSurfaceRef,
-                  _update: *const CGDisplayStreamUpdate| {
-                if status != CGDisplayStreamFrameStatus::FrameComplete || surface.is_null() {
-                    return;
+        let lookup_deadline = Instant::now() + Duration::from_secs(10);
+        let sck_display = loop {
+            match fetch_sck_display(display_id) {
+                Ok(display) => break display,
+                Err(error) if Instant::now() < lookup_deadline => {
+                    crate::vlog!(
+                        "[display] waiting for ScreenCaptureKit to expose display {display_id}: {error:#}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                // SAFETY: non-null, valid for the duration of the callback
-                // per CGDisplayStream's contract.
-                let surface: &IOSurfaceRef = unsafe { &*surface };
-                let mut seed: u32 = 0;
-                let lock_result = unsafe { surface.lock(IOSurfaceLockOptions::ReadOnly, &mut seed) };
-                if lock_result != 0 {
-                    return;
-                }
-                let w = surface.width();
-                let h = surface.height();
-                let bpr = surface.bytes_per_row();
-                let base = surface.base_address().as_ptr() as *const u8;
-
-                {
-                    let mut slot = cb_state.slot.lock().unwrap();
-                    if slot.width as usize == w && slot.height as usize == h {
-                        let dst_stride = w * 4;
-                        // Stride-safe row-by-row copy: bytesPerRow is
-                        // virtually always > width*4 due to alignment
-                        // padding. Copying the whole buffer flat instead
-                        // produces a visibly sheared/skewed image.
-                        for row in 0..h {
-                            unsafe {
-                                let src = base.add(row * bpr);
-                                let dst = slot.data.as_mut_ptr().add(row * dst_stride);
-                                std::ptr::copy_nonoverlapping(src, dst, dst_stride);
-                            }
-                        }
-                        slot.seq = slot.seq.wrapping_add(1);
-                    }
-                }
-                cb_state.cvar.notify_all();
-
-                unsafe {
-                    surface.unlock(IOSurfaceLockOptions::ReadOnly, std::ptr::null_mut());
-                }
-            },
-        );
-        let handler_ptr = RcBlock::as_ptr(&block);
-
-        let stream_queue = DispatchQueue::new("com.screx.daemon.display.stream", None);
-        let stream = unsafe {
-            CGDisplayStream::with_dispatch_queue(
-                display_id,
-                mode.width as usize,
-                mode.height as usize,
-                0x4247_5241, // 'BGRA' packed little-endian ARGB8888
-                None,
-                &stream_queue,
-                handler_ptr,
+                Err(error) => return Err(error),
+            }
+        };
+        let excluded_windows = NSArray::<SCWindow>::from_retained_slice(&[]);
+        let filter = unsafe {
+            SCContentFilter::initWithDisplay_excludingWindows(
+                SCContentFilter::alloc(),
+                &sck_display,
+                &excluded_windows,
             )
-        }
-        .ok_or_else(|| anyhow!("CGDisplayStreamCreateWithDispatchQueue returned NULL"))?;
+        };
+        let config = unsafe { SCStreamConfiguration::new() };
+        let stream = unsafe {
+            config.setWidth(mode.width as usize);
+            config.setHeight(mode.height as usize);
+            config.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+            config.setMinimumFrameInterval(CMTime::new(1, mode.fps.max(1) as i32));
+            config.setQueueDepth(8);
+            config.setCapturesAudio(false);
+            config.setShowsCursor(true);
 
-        let start_err = CGDisplayStream::start(Some(&stream));
-        if start_err != CGError::Success {
-            bail!("CGDisplayStreamStart failed: {start_err:?}");
+            let output = DisplayStreamOutput::new(Arc::clone(&frame_state));
+            let delegate: &ProtocolObject<dyn SCStreamDelegate> =
+                ProtocolObject::from_ref(&*output);
+            let stream = SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &filter,
+                &config,
+                Some(delegate),
+            );
+            (stream, output)
+        };
+        let (stream, stream_output) = stream;
+        let stream_queue = DispatchQueue::new("com.screx.daemon.display.sck-sample", None);
+        let output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*stream_output);
+        unsafe {
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    output,
+                    SCStreamOutputType::Screen,
+                    Some(&stream_queue),
+                )
+                .map_err(|error| {
+                    anyhow!(
+                        "addStreamOutput (screen) failed: {}",
+                        nserror_string(&error)
+                    )
+                })?;
         }
-        println!("[display] CGDisplayStream started");
+        let start_result = wait_for_completion(|block| unsafe {
+            stream.startCaptureWithCompletionHandler(Some(block));
+        });
+        if let Err(error) = start_result {
+            let _ =
+                unsafe { stream.removeStreamOutput_type_error(output, SCStreamOutputType::Screen) };
+            stream_queue.exec_sync(|| {});
+            return Err(error).context("SCStream startCapture (screen) failed");
+        }
+        println!(
+            "[display] ScreenCaptureKit stream started for display {display_id} (native 420v)"
+        );
 
         self.width = mode.width;
         self.height = mode.height;
@@ -860,7 +1096,7 @@ impl DisplayBackend for MacDisplay {
         self.descriptor_queue = Some(descriptor_queue);
         self.stream_queue = Some(stream_queue);
         self.stream = Some(stream);
-        self.frame_block = Some(block);
+        self.stream_output = Some(stream_output);
         self.frame_state = Some(frame_state);
 
         Ok(())
@@ -877,16 +1113,15 @@ impl DisplayBackend for MacDisplay {
             .clone()
             .ok_or_else(|| anyhow!("run_capture_loop called before attach"))?;
         let fps = self.fps.max(1);
-        // "timeout ≈ 2/fps" per the force_refresh/starvation-resend contract:
-        // if no new frame (or force_refresh) shows up within that window,
-        // resend the last captured (or black bootstrap) frame so the client
-        // never starves.
-        let wait_timeout = Duration::from_secs_f64(2.0 / fps as f64);
+        // The timeout keeps stop/refresh response bounded. Plain timeouts do
+        // not submit duplicate frames: heartbeats keep idle sessions alive.
+        let wait_timeout = Duration::from_secs_f64(1.0 / fps as f64);
         let mut last_seq: u64 = 0;
-        let mut scratch = vec![0u8; self.width as usize * self.height as usize * 4];
+        let bootstrap = black_nv12(self.width, self.height);
+        let mut last_pixel_buffer: Option<SendPixelBuffer> = None;
 
         println!(
-            "[capture] entering CGDisplayStream capture loop ({}x{}@{fps})",
+            "[capture] entering ScreenCaptureKit capture loop ({}x{}@{fps})",
             self.width, self.height
         );
 
@@ -904,45 +1139,96 @@ impl DisplayBackend for MacDisplay {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            if let Some(error) = frame_state.terminal_error.lock().unwrap().take() {
+                bail!("ScreenCaptureKit stream stopped unexpectedly: {error}");
+            }
 
+            let has_new_frame = slot_guard.seq != last_seq;
+            let refresh_requested = force_refresh.swap(false, Ordering::Relaxed);
             last_seq = slot_guard.seq;
             let w = slot_guard.width;
             let h = slot_guard.height;
-            if scratch.len() == slot_guard.data.len() {
-                scratch.copy_from_slice(&slot_guard.data);
+            let mut slot_guard = slot_guard;
+            if has_new_frame {
+                if let Some(pixel_buffer) = slot_guard.pixel_buffer.take() {
+                    last_pixel_buffer = Some(pixel_buffer);
+                }
             }
             drop(slot_guard);
-            force_refresh.store(false, Ordering::Relaxed);
 
+            if !has_new_frame && !refresh_requested {
+                continue;
+            }
+
+            let surface = last_pixel_buffer
+                .as_ref()
+                .and_then(|pixel_buffer| CVPixelBufferGetIOSurface(Some(&pixel_buffer.0)));
             on_frame(CaptureFrame {
                 width: w,
                 height: h,
-                data: &scratch,
+                format: crate::capture::CapturePixelFormat::Nv12,
+                data: if last_pixel_buffer.is_some() {
+                    &[]
+                } else {
+                    &bootstrap
+                },
+                io_surface: surface.as_deref(),
+                cv_pixel_buffer: last_pixel_buffer
+                    .as_ref()
+                    .map(|pixel_buffer| &*pixel_buffer.0),
             });
         }
 
-        println!("[capture] CGDisplayStream capture loop stopped");
+        println!("[capture] ScreenCaptureKit capture loop stopped");
         Ok(())
     }
 
     fn detach(&mut self) {
         if let Some(stream) = self.stream.take() {
-            let err = CGDisplayStream::stop(Some(&stream));
-            if err != CGError::Success {
-                eprintln!("[display] CGDisplayStreamStop failed: {err:?}");
+            if let Err(error) = wait_for_completion(|block| unsafe {
+                stream.stopCaptureWithCompletionHandler(Some(block));
+            }) {
+                eprintln!("[display] SCStream stopCapture (screen) error: {error:#}");
+            }
+            if let Some(output) = &self.stream_output {
+                let output: &ProtocolObject<dyn SCStreamOutput> =
+                    ProtocolObject::from_ref(&**output);
+                if let Err(error) = unsafe {
+                    stream.removeStreamOutput_type_error(output, SCStreamOutputType::Screen)
+                } {
+                    eprintln!(
+                        "[display] removeStreamOutput (screen) failed: {}",
+                        nserror_string(&error)
+                    );
+                }
+            }
+            if let Some(queue) = &self.stream_queue {
+                queue.exec_sync(|| {});
             }
         }
-        self.frame_block = None;
+        self.stream_output = None;
         self.stream_queue = None;
         self.frame_state = None;
 
+        let display_id = self.display_id.take();
         if let Some(display) = self.virtual_display.take() {
             // Dropping the last reference to the CGVirtualDisplay instance
             // is what unplugs the monitor.
             drop(display);
         }
+        if let Some(queue) = &self.descriptor_queue {
+            queue.exec_sync(|| {});
+        }
+        if let Some(display_id) = display_id {
+            if wait_for_display_offline(display_id, Duration::from_secs(30)) {
+                println!("[display] virtual display {display_id} is offline");
+            } else {
+                eprintln!(
+                    "[display] WARNING: virtual display {display_id} remained online for 30s after teardown"
+                );
+            }
+        }
         self.descriptor_queue = None;
-        self.display_id = None;
         println!("[display] detached");
     }
 
@@ -980,7 +1266,7 @@ impl Drop for MacDisplay {
 mod tests {
     use super::*;
 
-    /// Manual smoke test exercising the real CGVirtualDisplay/CGDisplayStream
+    /// Manual smoke test exercising the real CGVirtualDisplay/ScreenCaptureKit
     /// path end to end: attach, pump the capture loop for a few seconds
     /// while logging frame byte counts, then detach and attach again (the
     /// repeated-session lifecycle main.rs relies on). Ignored by default
@@ -1033,12 +1319,13 @@ mod tests {
                 display
                     .run_capture_loop(&stop, &force_refresh, &mut |frame| {
                         frame_count += 1;
-                        let sum: u64 = frame.data.iter().map(|&b| b as u64).sum();
                         println!(
-                            "frame {frame_count}: {}x{} bytes={} byte_sum={sum}",
+                            "frame {frame_count}: {}x{} bytes={} iosurface={} cv_pixel_buffer={}",
                             frame.width,
                             frame.height,
-                            frame.data.len()
+                            frame.data.len(),
+                            frame.io_surface.is_some(),
+                            frame.cv_pixel_buffer.is_some()
                         );
                     })
                     .unwrap();

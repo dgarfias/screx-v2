@@ -1,7 +1,7 @@
 # Desktop Client
 
-Cross-platform desktop client (macOS, Windows, Linux) that connects to a Screx daemon —
-[Linux](DAEMON_LINUX.md) or [Windows](DAEMON_WINDOWS.md); the wire protocol is identical on both.
+Cross-platform desktop client (macOS, Windows, Linux) that connects to a Screx daemon -
+[Linux](DAEMON_LINUX.md), [Windows](DAEMON_WINDOWS.md), or [macOS](DAEMON_MACOS.md).
 Decodes the stream and forwards input, audio, and camera back to the host. Source lives in
 `client/desktop`; the UI is Qt Quick/QML (`qml/Main.qml`) driven by a Rust backend
 (`src/backend.rs`). Network transport only — no USB support. It negotiates capabilities with the
@@ -32,6 +32,7 @@ make build
 - Output: `client/desktop/target/release/Screx.app`
 - Run: `open client/desktop/target/release/Screx.app`
 - Minimum OS: macOS 12
+- Video display uses VideoToolbox decoding and Metal rendering where available
 
 ## Linux
 

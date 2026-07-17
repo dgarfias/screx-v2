@@ -102,7 +102,10 @@ impl WindowsMuxClient {
                 .and_then(Value::as_string)
                 .unwrap_or("");
             if conn_type.eq_ignore_ascii_case("USB") {
-                if let Some(id) = dev_dict.get("DeviceID").and_then(Value::as_unsigned_integer) {
+                if let Some(id) = dev_dict
+                    .get("DeviceID")
+                    .and_then(Value::as_unsigned_integer)
+                {
                     return Ok(Some(id as u32));
                 }
             }
@@ -223,8 +226,8 @@ impl MuxClient for WindowsMuxClient {
             }
         };
 
-        let mut stream = mux_connect()
-            .context("usbmux: failed to connect to Apple Mobile Device Service")?;
+        let mut stream =
+            mux_connect().context("usbmux: failed to connect to Apple Mobile Device Service")?;
 
         let mut req = Dictionary::new();
         req.insert(

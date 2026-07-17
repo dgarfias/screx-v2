@@ -110,11 +110,16 @@ Same CLI flags as the [Linux daemon](DAEMON_LINUX.md#run) — see that page's fl
 `-p, --port`, `-e, --backend`, `-c, --codec`, `-v, --verbose`, `--network-only`, `--usb-only`);
 `-w`/`-H`/`-f`/`-b`/`--max-bitrate-usb` are per-daemon ceilings and defaults, not fixed values —
 connecting clients may request lower values during connection (see
-[ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation)). `-e/--backend vaapi` and
-`--no-camera-exclusive-caps` are Linux-only and have no effect on Windows.
+[ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation)).
+
+Practical Windows encoder choices for `-e/--backend` are `auto`, `nvenc`, `amf`, `qsv`, `mf`, and
+`software`. Availability depends on the installed GPU, drivers, and FFmpeg build; `auto` probes the
+available encoders. `vaapi` is Linux-only; on a Windows build that name is treated as `auto`.
+`--no-camera-exclusive-caps` is Linux-only and has no effect on Windows.
 
 ## Use
 
-Same as the [Linux daemon's "Use" section](DAEMON_LINUX.md#use) — connect from the iPad app or
-desktop client over network or USB, enter the PIN on first connection. There's no GNOME-Settings
-equivalent step: the virtual display activates automatically once the VDD devnode is enabled.
+Same as the [Linux daemon's "Use" section](DAEMON_LINUX.md#use) - connect from either client over
+the network, or from the iPad app over USB, and enter the PIN on the first network connection.
+There is no GNOME Settings equivalent step: the virtual display activates automatically once the
+VDD devnode is enabled.

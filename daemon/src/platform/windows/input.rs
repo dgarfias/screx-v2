@@ -11,8 +11,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
     VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL,
-    VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
-    VK_RWIN, VK_SHIFT, VK_TAB, VK_UP,
+    VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Input::Pointer::{
     InitializeTouchInjection, InjectTouchInput, POINTER_FLAGS, POINTER_FLAG_DOWN,
@@ -311,10 +311,8 @@ impl InputBackend for WindowsInput {
                         mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
                         // Windows uses an exclusive range (0..65535 maps to
                         // 0..sw-1), so multiply by 65535 and clamp.
-                        mi.dx = (((abs_x as i64) * 65535) / (sw as i64 - 1))
-                            .clamp(0, 65535) as i32;
-                        mi.dy = (((abs_y as i64) * 65535) / (sh as i64 - 1))
-                            .clamp(0, 65535) as i32;
+                        mi.dx = (((abs_x as i64) * 65535) / (sw as i64 - 1)).clamp(0, 65535) as i32;
+                        mi.dy = (((abs_y as i64) * 65535) / (sh as i64 - 1)).clamp(0, 65535) as i32;
                     }
                 }
             }
@@ -405,19 +403,15 @@ fn press_key(vk: VIRTUAL_KEY, modifiers: u8) {
 
 fn modifier_vks(modifiers: u8) -> Vec<VIRTUAL_KEY> {
     let mut vks = Vec::new();
-    // Bit layout matches the iPad protocol: shift=1, ctrl=2, alt=4, cmd/meta=8.
+    // KEY combo modifier bits from docs/ARCHITECTURE.md.
     if modifiers & 0x01 != 0 {
-        vks.push(VK_SHIFT);
-    }
-    if modifiers & 0x02 != 0 {
         vks.push(VK_CONTROL);
     }
-    if modifiers & 0x04 != 0 {
-        vks.push(VK_LMENU);
+    if modifiers & 0x02 != 0 {
+        vks.push(VK_MENU);
     }
-    if modifiers & 0x08 != 0 {
-        // Windows key; map to VK_LWIN when available. For now use VK_MENU as a placeholder.
-        vks.push(VK_LMENU);
+    if modifiers & 0x04 != 0 {
+        vks.push(VK_LWIN);
     }
     vks
 }

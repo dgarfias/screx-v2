@@ -11,13 +11,13 @@ At a high level:
   third-party driver on Windows, a private `CGVirtualDisplay` on macOS)
 - the host compositor renders to that virtual display
 - the daemon captures, encodes, and streams video/audio to the client
-- the client sends back touch/mouse/keyboard, controller, microphone, camera, and session control
-  messages
+- clients send back their supported input, peripheral, and session-control messages; the daemon
+  advertises which optional host features are available
 
 The daemon binary and wire protocol are the same across host platforms — see
 [DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
-[DAEMON_MACOS.md](DAEMON_MACOS.md) for platform-specific build/run/driver details. Either daemon
-works with either client — see [CLIENT_IPAD.md](CLIENT_IPAD.md) and
+[DAEMON_MACOS.md](DAEMON_MACOS.md) for platform-specific build/run/driver details. Every daemon
+platform works over the network with either client - see [CLIENT_IPAD.md](CLIENT_IPAD.md) and
 [CLIENT_DESKTOP.md](CLIENT_DESKTOP.md).
 
 The system supports two transports:
@@ -69,7 +69,8 @@ Responsibilities:
 - stream media over network or USB
 - manage pairing and session keys
 - parse touch/keyboard/mouse/controller input messages
-- expose virtual microphone, webcam, and speaker devices
+- expose optional virtual microphone, webcam, speaker, and gamepad devices where the platform
+  backend and required drivers support them
 
 ### Daemon (platform backends)
 
@@ -85,8 +86,12 @@ Platform-specific implementations live behind the `crate::platform` module
   360 gamepads (`vigem.rs`), and native usbmuxd-protocol speech to Apple Mobile Device Service for
   USB detection (`usbmux.rs`)
 - `daemon/src/platform/macos/` — a private `CGVirtualDisplay` for the virtual monitor, captured via
-  the public `CGDisplayStream` API and encoded with VideoToolbox (`display.rs`), `CGEventPost`-based
-  input (`input.rs`), a ScreenCaptureKit audio-only stream for speaker capture (`audio.rs`), and
+  a screen-only ScreenCaptureKit stream (`display.rs`) as native IOSurface-backed `420v`
+  CVPixelBuffers. The original ScreenCaptureKit CVPixelBuffer is retained and submitted directly to
+  VideoToolbox through FFmpeg's `AV_PIX_FMT_VIDEOTOOLBOX` path without a CPU pixel copy; IOSurface
+  rewrapping is only a fallback when an original CVPixelBuffer is unavailable. The backend also
+  provides `CGEventPost`-based input (`input.rs`), a ScreenCaptureKit audio-only stream for speaker
+  capture (`audio.rs`), and
   `idevice_id`/`iproxy` (macOS ships `usbmuxd` natively) for USB detection (`usbmux.rs`)
 
 See [DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
@@ -139,10 +144,10 @@ Responsibilities (network transport only — no USB support):
 - PIN pairing flow
 - capability negotiation (`CAPS`/`STNG`) with the daemon
 - Stream Settings UI for choosing resolution, framerate, codec, and bitrate before connecting
-- network media receive path, with zero-copy hardware-accelerated decode/display where available
-  (VA-API on Linux, D3D11VA on Windows)
+- network media receive path, with hardware-accelerated decode/display where available (VA-API on
+  Linux, D3D11VA on Windows, VideoToolbox and Metal on macOS)
 - local audio playback and microphone capture
-- input forwarding, including OS-level keyboard grabbing
+- mouse and focused-window keyboard forwarding; OS-level keyboard grabbing is not currently wired
 - webcam forwarding via `nokhwa`
 
 ## Transport Model
@@ -176,11 +181,11 @@ Why:
 
 ### Network session
 
-1. iPad opens TCP to daemon.
+1. Client opens TCP to daemon.
 2. Pairing or reconnect handshake runs.
 3. Session key is established.
 4. TCP control channel stays open.
-5. iPad opens UDP path and starts sending encrypted register packets.
+5. Client opens UDP path and starts sending encrypted register packets.
 6. Daemon authenticates first UDP packets and starts media.
 7. First decoded frame on the client moves session into streaming state.
 
@@ -199,11 +204,11 @@ Pairing happens only on the network path.
 
 ### New device flow
 
-1. iPad sends `SCREX_PAIR` + device ID + X25519 public key
+1. Client sends `SCREX_PAIR` + device ID + X25519 public key
 2. daemon generates its own X25519 keypair and a 6-digit PIN
 3. daemon sends `SCREX_PIN` + server public key
-4. user enters PIN on iPad
-5. iPad sends `SCREX_ANSWER` + encrypted PIN
+4. User enters the PIN in the client
+5. Client sends `SCREX_ANSWER` + encrypted PIN
 6. daemon verifies PIN
 7. daemon derives and stores a pairing key
 8. both sides derive a session key
@@ -211,7 +216,7 @@ Pairing happens only on the network path.
 
 ### Reconnect flow
 
-1. iPad sends `SCREX_HELLO` + device ID + client nonce
+1. Client sends `SCREX_HELLO` + device ID + client nonce
 2. daemon loads pairing key
 3. both sides derive a fresh session key using nonces
 4. daemon sends `SCREX_OK` + server nonce + HMAC
@@ -242,10 +247,10 @@ If a session is already active, the daemon replies with `SCREX_BUSY`.
 
 ### Nonce directions
 
-- daemon -> iPad UDP uses `nonce_server`
-- iPad -> daemon UDP uses `nonce_client`
-- iPad -> daemon TCP control uses `nonce_control_client`
-- daemon -> iPad TCP control uses `nonce_control_server`
+- daemon -> client UDP uses `nonce_server`
+- client -> daemon UDP uses `nonce_client`
+- client -> daemon TCP control uses `nonce_control_client`
+- daemon -> client TCP control uses `nonce_control_server`
 
 ## Protocol Details
 
@@ -270,6 +275,8 @@ Notes:
 - optional Reed-Solomon parity is added for video
 - audio is small enough to go without FEC
 - client-to-daemon media packets prepend a 4-byte sequence number before encrypted payload
+- the iPad retains incomplete video assemblies for 100 ms, then reconstructs recoverable frames
+  from parity or discards them and requests recovery
 
 ### Network Control Transport (TCP)
 
@@ -295,6 +302,10 @@ Control payloads include messages such as:
 - `CAPS` (daemon -> client, capability negotiation)
 - `STNG` (client -> daemon, capability negotiation)
 - `DISCONNECT`
+
+`PLI` requests an IDR and raises a capture-refresh signal. Linux and macOS use that signal to obtain
+or resend a frame, allowing a static desktop such as a ScreenCaptureKit stream with no new frame to
+answer the recovery request. Windows already emits its cached frame periodically.
 
 ### USB Transport (TCP)
 
@@ -336,8 +347,9 @@ ASCII prefix plus message body, for example:
 ## Capability Negotiation
 
 Right after the daemon sends `HOST<hostname>` on the control channel — network TCP control and USB
-control alike — it sends `CAPS`, telling the client what it can actually do. The client replies with
-`STNG`, proposing session settings within the bounds `CAPS` advertised. Both messages travel inside
+control alike — it sends `CAPS` with the results of inexpensive availability probes. Later device
+or session initialization may still fail. The client replies with `STNG`, proposing session
+settings within the bounds `CAPS` advertised. Both messages travel inside
 the same control framing already used for `HOST` (network: AES-GCM control frame via
 `send_control_frame`; USB: `type = 0x03` control payload) — there is no new transport, socket, or
 crypto involved.
@@ -357,13 +369,17 @@ each entry: tag(u8) + length(u16 BE) + value(length bytes)
 
 v1 tags:
 
+Capability availability is based on inexpensive platform probes performed for each connection. It
+reflects known backend and driver availability but does not guarantee that later device or session
+initialization cannot fail.
+
 | Tag | Name | Value layout | Meaning |
 |---|---|---|---|
-| `0x01` | CAMERA | `available(u8 0/1)` | Virtual webcam forwarding works right now |
-| `0x02` | MICROPHONE | `available(u8 0/1)` | Virtual microphone forwarding works right now |
-| `0x03` | SPEAKER | `available(u8 0/1)` | Speaker/system-audio forwarding works right now |
-| `0x04` | GAMEPAD | `available(u8 0/1)` + `max_controllers(u8)` | Gamepad passthrough works, and how many simultaneous controllers |
-| `0x05` | CODECS | `count(u8)` + `count` bytes of codec id (`0x00`=H.264, `0x01`=H.265) | Which codecs this daemon can actually encode right now |
+| `0x01` | CAMERA | `available(u8 0/1)` | Virtual webcam availability probe result |
+| `0x02` | MICROPHONE | `available(u8 0/1)` | Virtual microphone availability probe result |
+| `0x03` | SPEAKER | `available(u8 0/1)` | Speaker/system-audio availability probe result |
+| `0x04` | GAMEPAD | `available(u8 0/1)` + `max_controllers(u8)` | Gamepad availability probe result and simultaneous-controller limit |
+| `0x05` | CODECS | `count(u8)` + `count` bytes of codec id (`0x00`=H.264, `0x01`=H.265) | Codec IDs for which the selected backend has a matching FFmpeg encoder registered; hardware or session initialization may still fail when streaming starts |
 | `0x06` | MAX_RESOLUTION | `width(u16 BE)` + `height(u16 BE)` | Upper bound the client may request |
 | `0x07` | MAX_FRAMERATE | `fps(u8)` | Upper bound the client may request |
 | `0x08` | BITRATE_RANGE | `min_bps(u32 BE)` + `max_bps(u32 BE)` | Bounds the client may request |
@@ -467,6 +483,10 @@ Modifier bits:
 - `0x02` = Alt
 - `0x04` = Super
 
+`KEY` combo packets do not define a Shift modifier bit. Shifted printable characters are carried in
+the nested text payload; physical Shift key transitions, including external keyboards, use
+`RAWKEY`.
+
 ### Touch
 
 Touch payloads use `"TOUCH"` followed by packed contact data from the iPad surface.
@@ -497,10 +517,13 @@ External keyboard HID-like packets use `"RAWKEY"`.
 
 - Linux creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`; Windows
   installs/enables the "Steam Streaming Speakers" device and loopback-captures it via WASAPI;
-  macOS uses a ScreenCaptureKit audio-only stream (`capturesAudio`, 48 kHz stereo) — host audio
-  keeps playing locally since ScreenCaptureKit taps the stream rather than rerouting it
+  macOS uses a ScreenCaptureKit audio-only stream (`capturesAudio`, 48 kHz stereo), requires a
+  settable mute control on the default output, follows default-device changes, and restores prior
+  mute state when forwarding stops
 - audio is sent to the client
-- the speaker toggle can hard-detach the sink using the `SPKR` control message
+- the `SPKR` control message starts or stops the platform speaker-forwarding path: it
+  attaches/detaches the virtual sink where one exists, or starts/stops ScreenCaptureKit capture and
+  local-output muting on macOS
 
 ### Microphone
 
@@ -565,7 +588,8 @@ a daemon-managed device — see [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md).
 
 The daemon may create/enable:
 
-- a private `CGVirtualDisplay` virtual monitor, captured via the public `CGDisplayStream` API
+- a private `CGVirtualDisplay` virtual monitor, captured via a screen-only ScreenCaptureKit stream
+- the macOS host cursor included by ScreenCaptureKit in the captured stream
 - input injection via `CGEventPost` (no persistent device object)
 - a ScreenCaptureKit audio-only stream for client speaker output
 

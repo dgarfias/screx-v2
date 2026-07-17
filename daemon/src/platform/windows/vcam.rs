@@ -161,7 +161,10 @@ impl CameraBackend for WindowsCamera {
         if !self.registered {
             let dll_path = find_vcam_dll_path()
                 .context("screx_vcam.dll not found; set SCREX_VCAM_DLL_PATH to its full path")?;
-            println!("[camera] registering Screx Camera DLL: {}", dll_path.display());
+            println!(
+                "[camera] registering Screx Camera DLL: {}",
+                dll_path.display()
+            );
             screx_vcam::register(&dll_path.to_string_lossy(), CAMERA_FRIENDLY_NAME)
                 .context("failed to register Screx Camera capture device")?;
             self.registered = true;

@@ -658,9 +658,9 @@ final class StreamViewModel: ObservableObject {
 
     private static func loadPreferredFramerate() -> StreamFrameratePreset {
         guard let raw = UserDefaults.standard.string(forKey: preferredFramerateKey) else {
-            return .fps30
+            return .fps60
         }
-        return StreamFrameratePreset(rawValue: raw) ?? .fps30
+        return StreamFrameratePreset(rawValue: raw) ?? .fps60
     }
 
     private static func loadPreferredCodec() -> StreamCodecPreset {

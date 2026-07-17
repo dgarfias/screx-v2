@@ -14,6 +14,7 @@ final class PairingService {
     private var connection: NWConnection?
     private let debugId = String(UUID().uuidString.prefix(6))
     private var didComplete = false
+    private var connectTimeoutWorkItem: DispatchWorkItem?
 
     private static let magicPair   = Data("SCREX_PAIR".utf8)    // 10 bytes
     private static let magicHello  = Data("SCREX_HELLO".utf8)   // 11 bytes
@@ -29,6 +30,7 @@ final class PairingService {
     private static let hmacLen     = 32
     private static let pinDigits   = 6
     private static let tagLen      = 16
+    private static let connectTimeout: TimeInterval = 8
 
     var onResult: ((PairingResult) -> Void)?
 
@@ -53,6 +55,7 @@ final class PairingService {
             self.log("tcp state -> \(state)")
             switch state {
             case .ready:
+                self.cancelConnectTimeout()
                 if let firstKey = candidateKeys.first {
                     self.log("tcp ready, trying reconnect HELLO flow")
                     self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId, candidateKeys: candidateKeys)
@@ -61,10 +64,12 @@ final class PairingService {
                     self.sendPairRequest(conn: conn, host: host, port: port, deviceId: deviceId)
                 }
             case .waiting(let error):
+                self.cancelConnectTimeout()
                 self.connection?.cancel()
                 self.connection = nil
                 self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
             case .failed(let error):
+                self.cancelConnectTimeout()
                 self.connection = nil
                 self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
             case .cancelled:
@@ -74,14 +79,31 @@ final class PairingService {
             }
         }
 
+        let timeout = DispatchWorkItem { [weak self, weak conn] in
+            guard let self, let conn else { return }
+            guard self.connection === conn, !self.didComplete else { return }
+            self.log("TCP connect timed out after \(Self.connectTimeout)s")
+            self.connectTimeoutWorkItem = nil
+            self.connection = nil
+            conn.cancel()
+            self.emitResult(.error("TCP connect timed out after \(Int(Self.connectTimeout)) seconds"))
+        }
+        connectTimeoutWorkItem = timeout
+        queue.asyncAfter(deadline: .now() + Self.connectTimeout, execute: timeout)
         conn.start(queue: queue)
     }
 
     func cancel() {
         log("cancel()")
+        cancelConnectTimeout()
         didComplete = true
         connection?.cancel()
         connection = nil
+    }
+
+    private func cancelConnectTimeout() {
+        connectTimeoutWorkItem?.cancel()
+        connectTimeoutWorkItem = nil
     }
 
     // MARK: - New device pairing (SCREX_PAIR flow)

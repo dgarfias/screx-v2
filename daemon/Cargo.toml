@@ -46,6 +46,7 @@ plist = "1"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-core-media = "0.3"
+objc2-core-video = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"
 core-foundation = "0.10"
@@ -54,13 +55,12 @@ core-foundation = "0.10"
 # crate at all — used by platform/macos/input.rs for two-finger-scroll/wheel
 # injection. No new crate added, just a feature flag on the existing one.
 core-graphics = { version = "0.25", features = ["highsierra"] }
-# Added in M1 for the CGDisplayStream-based capture path (see
-# platform/macos/display.rs): objc2-core-graphics carries real bindings for
-# the public (if deprecated) CGDisplayStream/CGDirectDisplay/CGError APIs;
-# objc2-io-surface for locking/reading the delivered IOSurfaces;
+# Added for the macOS virtual-display and zero-copy capture path:
+# objc2-core-graphics carries CGDirectDisplay/CGError APIs used to configure
+# the virtual monitor; objc2-io-surface carries surfaces delivered by SCK;
 # objc2-core-foundation for CFDictionary/CFBoolean/CGSize plumbing shared
 # with those APIs; dispatch2 to create the serial dispatch queues
-# CGVirtualDisplayDescriptor/CGDisplayStream want. All four were already
+# CGVirtualDisplayDescriptor and SCStream want. All four were already
 # transitively resolved via objc2-screen-capture-kit, so this adds no new
 # crates to the dependency graph, only direct access to ones already there.
 objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
@@ -74,6 +74,7 @@ dispatch2 = "0.3"
 # transitively via objc2-core-media, so this adds no new crate to the
 # dependency graph, only direct access to types already there.
 objc2-core-audio-types = "0.3"
+objc2-core-audio = "0.3"
 
 [build-dependencies]
 cc = "1"

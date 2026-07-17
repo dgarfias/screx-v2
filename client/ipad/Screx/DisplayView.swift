@@ -389,17 +389,22 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
         }
     }
 
-    private func mapToDisplay(_ point: CGPoint) -> (UInt16, UInt16)? {
+    private func mapToDisplay(_ point: CGPoint, clamping: Bool = false) -> (UInt16, UInt16)? {
         let vr = videoRect()
         guard vr.width > 0, vr.height > 0 else { return nil }
 
-        let nx = (point.x - vr.minX) / vr.width
-        let ny = (point.y - vr.minY) / vr.height
+        var nx = (point.x - vr.minX) / vr.width
+        var ny = (point.y - vr.minY) / vr.height
 
-        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
+        if clamping {
+            nx = min(max(nx, 0), 1)
+            ny = min(max(ny, 0), 1)
+        } else {
+            guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
+        }
 
-        let px = UInt16(min(nx * CGFloat(videoWidth), CGFloat(videoWidth - 1)).rounded())
-        let py = UInt16(min(ny * CGFloat(videoHeight), CGFloat(videoHeight - 1)).rounded())
+        let px = UInt16((nx * CGFloat(videoWidth - 1)).rounded())
+        let py = UInt16((ny * CGFloat(videoHeight - 1)).rounded())
         return (px, py)
     }
 
@@ -461,9 +466,17 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
 
         for touch in touches {
             guard shouldForwardTouch(touch) else { continue }
+            let id = ObjectIdentifier(touch)
+            let existingSlot = touchSlots[id]
             let point = touch.location(in: self)
-            guard let (px, py) = mapToDisplay(point) else { continue }
-            let slot = slotFor(touch)
+            guard let (px, py) = mapToDisplay(point, clamping: eventType != 0 && existingSlot != nil) else { continue }
+            let slot: UInt8
+            if eventType == 0 {
+                slot = slotFor(touch)
+            } else {
+                guard let existingSlot else { continue }
+                slot = existingSlot
+            }
 
             // 8 bytes per contact: slot(1) + type(1) + x(2 BE) + y(2 BE) + padding(2)
             contacts.append(slot)

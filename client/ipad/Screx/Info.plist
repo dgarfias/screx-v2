@@ -2,12 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Screx needs local network access to connect to the screen streaming daemon.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Screx uses your camera to stream video to the connected Linux device as a virtual webcam.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Screx uses your microphone to stream audio to the connected Linux device as a virtual microphone.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -30,7 +24,5 @@
 			</array>
 		</dict>
 	</dict>
-	<key>UIApplicationSupportsIndirectInputEvents</key>
-	<true/>
 </dict>
 </plist>

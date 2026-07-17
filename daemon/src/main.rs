@@ -819,6 +819,10 @@ async fn main() -> Result<()> {
 }
 
 fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
+    if frame.format != capture::CapturePixelFormat::Bgra {
+        eprintln!("[capture] raw PPM dump only supports BGRA capture frames");
+        return;
+    }
     let path = std::env::temp_dir()
         .join(format!("screx-daemon-capture-{index:03}.ppm"))
         .to_string_lossy()

@@ -13,7 +13,18 @@ pub struct DisplayMode {
 pub struct CaptureFrame<'a> {
     pub width: u32,
     pub height: u32,
+    pub format: CapturePixelFormat,
     pub data: &'a [u8],
+    #[cfg(target_os = "macos")]
+    pub io_surface: Option<&'a objc2_io_surface::IOSurfaceRef>,
+    #[cfg(target_os = "macos")]
+    pub cv_pixel_buffer: Option<&'a objc2_core_video::CVPixelBuffer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePixelFormat {
+    Bgra,
+    Nv12,
 }
 
 /// Backend-specific display control and frame capture.
@@ -34,10 +45,10 @@ pub trait DisplayBackend {
     fn detach(&mut self);
 
     /// (left, top, width, height) of the captured output in absolute virtual-
-    /// desktop coordinates, if the backend has one (Windows only — input
+    /// desktop coordinates, if the backend has one (Windows and macOS - input
     /// injection needs it to translate wire touch/mouse coordinates, which
-    /// are 0..width/0..height relative to the captured frame, into screen
-    /// coordinates for SendInput/InjectTouchInput).
+    /// are 0..width/0..height relative to the captured frame, into absolute
+    /// screen coordinates for the platform input API).
     fn output_rect(&self) -> Option<(i32, i32, u32, u32)> {
         None
     }
@@ -62,7 +73,8 @@ impl CaptureBackend {
         }
     }
 
-    /// Platform-native default: EVDI on Linux, MTT VDD on Windows.
+    /// Platform-native default: EVDI on Linux, MTT VDD on Windows, and
+    /// CGVirtualDisplay/ScreenCaptureKit on macOS.
     pub fn platform_default() -> Self {
         #[cfg(target_os = "linux")]
         {

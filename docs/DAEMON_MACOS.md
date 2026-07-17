@@ -4,9 +4,9 @@ The macOS daemon is the same `daemon/` crate as the [Linux](DAEMON_LINUX.md) and
 [Windows](DAEMON_WINDOWS.md) daemons — same `screx` binary, same CLI, same wire protocol — with a
 `#[cfg(target_os = "macos")]` backend (`daemon/src/platform/macos/`) that swaps
 EVDI/uinput/v4l2loopback/PipeWire (or DXGI/SendInput/DirectShow/WASAPI/ViGEmBus) for a private
-`CGVirtualDisplay` virtual monitor, public `CGDisplayStream` capture, VideoToolbox hardware
-encode, `CGEventPost` input injection, and a ScreenCaptureKit audio-only stream for speaker
-capture. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol.
+`CGVirtualDisplay` virtual monitor, ScreenCaptureKit video capture, zero-copy CVPixelBuffer-to-
+VideoToolbox hardware encode, `CGEventPost` input injection, and a separate ScreenCaptureKit
+audio-only stream for speaker capture. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ cd daemon
 ```
 
 Run this **as your normal logged-in user — never with `sudo` or as root.** `CGVirtualDisplay`,
-`CGDisplayStream`, `CGEventPost`, and ScreenCaptureKit all operate against the logged-in user's
+`CGEventPost`, and ScreenCaptureKit all operate against the logged-in user's
 WindowServer session, and the TCC permission grants below are per-user. Running as root has no
 session to attach to and no TCC grants of its own, so the daemon checks for this at startup
 (`geteuid() == 0`) and refuses to run with an explanatory message rather than failing deep inside
@@ -59,10 +59,24 @@ and defaults, not fixed values — connecting clients may request lower values d
 (see [ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation)). `--no-camera-exclusive-caps` is
 Linux-only and has no effect on macOS.
 
-`-e/--backend` accepts `auto` (default), `videotoolbox` (or its alias `vt`), or `software`;
-`vaapi`/`nvenc`/`amf`/`qsv`/`mf` are other platforms' backends and aren't recognized here (an
-unrecognized value falls back to `auto`). `auto` prefers VideoToolbox and falls back to the
-software x264/x265 encoder if VideoToolbox is unavailable for the requested codec.
+The practical macOS choices for `-e/--backend` are `auto` (default), `videotoolbox` (or `vt`), and
+`software`. `nvenc` is also recognized and attempted when explicitly selected, although it is not a
+normal macOS configuration. Linux- and Windows-only names such as `vaapi`, `amf`, `qsv`, and `mf`
+are treated as `auto` on a macOS build. `auto` prefers VideoToolbox and falls back to software
+x264/x265 if VideoToolbox is unavailable for the requested codec.
+
+The normal VideoToolbox path retains ScreenCaptureKit's original IOSurface-backed `420v`
+`CVPixelBuffer` and submits it directly to FFmpeg as `AV_PIX_FMT_VIDEOTOOLBOX`, without a CPU pixel
+copy. The CoreVideo reference remains alive until VideoToolbox's asynchronous encode releases the
+FFmpeg frame. Software encoding reads the native NV12 IOSurface into YUV420P; byte-backed NV12 and
+BGRA paths remain for bootstrap, synthetic, and other fallback inputs.
+
+VideoToolbox is configured with best-effort real-time, speed-priority, and constant-bitrate hints.
+FFmpeg or OS versions that do not expose a hint continue without it; if opening with the optional
+hints fails, the daemon retries with VideoToolbox defaults. Because VideoToolbox reads bitrate
+settings when it creates the compression session, a runtime bitrate change constructs a replacement
+encoder and begins the new coding sequence with an IDR frame instead of attempting an in-place
+retune.
 
 ## Required permissions (TCC)
 
@@ -70,8 +84,8 @@ The daemon needs two macOS privacy permissions granted to the built `screx` bina
 preflighted at startup with an actionable error/warning if missing, rather than failing silently
 or partway through a session:
 
-1. **Screen Recording** — required for display capture (`CGDisplayStream`) and for the
-   ScreenCaptureKit speaker-audio stream. Grant at
+1. **Screen Recording** — required for the ScreenCaptureKit display and speaker-audio streams.
+   Grant at
    **System Settings → Privacy & Security → Screen Recording**, enable `screx`, then restart the
    daemon (macOS does not apply a freshly granted Screen Recording permission to an already-running
    process).
@@ -80,15 +94,16 @@ or partway through a session:
    **System Settings → Privacy & Security → Accessibility**, enable `screx`, then restart the
    daemon.
 
-The first run will prompt you to add `screx` to these lists (or print an actionable error naming
-the exact setting to open, if the OS didn't prompt automatically) — grant both, then re-run.
+Screen Recording may prompt on first use. Accessibility is preflighted but not requested through a
+system prompt, so you may need to add or enable `screx` manually in the Accessibility list. Grant
+both permissions, then restart the daemon.
 
-### Gotcha: re-prompts after every rebuild
+### Gotcha: permissions after rebuilds
 
 TCC identifies the granted binary by its code signature. A binary built by `cargo build` gets an
-ad-hoc signature that changes on every rebuild, so macOS treats each new build as a "new" binary
-and re-prompts for both permissions — tedious during development. Fix it by signing `screx` with a
-stable, self-signed certificate instead of the ad-hoc one:
+ad-hoc signature that can change on rebuild, so macOS may treat the result as a new binary and stop
+recognizing the existing grants. Screen Recording may prompt again; Accessibility may instead need
+to be removed and added or enabled manually. A stable, self-signed certificate avoids this churn:
 
 1. Open **Keychain Access** → menu **Keychain Access → Certificate Assistant → Create a
    Certificate…**
@@ -100,17 +115,30 @@ stable, self-signed certificate instead of the ad-hoc one:
    codesign -s screx-dev target/release/screx
    ```
 
-With a stable certificate, TCC recognizes the binary across rebuilds and the grants persist —
-sign once per build, no need to re-grant permissions each time.
+With a stable certificate, TCC can recognize the binary across rebuilds. Sign once per build so the
+existing grants can persist.
 
 ## External display behavior
 
-The daemon creates the virtual display as an **extended** desktop — exactly like plugging in a
-real external monitor — deterministically placed at the right edge of your existing display via a
-session-scoped `CGConfigureDisplay` transaction. It does not come up mirrored, and the daemon
-doesn't fight you if you later switch it to mirrored: enable mirroring anytime in
-**System Settings → Displays** and the daemon leaves your choice alone for the rest of that
-session.
+The daemon ensures that the virtual display is extended and does not overlap another display. If
+WindowServer already provides a valid non-overlapping arrangement, that placement is left
+unchanged. If the display is mirrored or overlapping, the daemon attempts to unmirror it and place
+it immediately to the right of another online display. It retries a failed configuration once,
+then continues with the live arrangement instead of aborting the stream. It does not keep
+reapplying placement, so you can rearrange displays or enable mirroring later in **System Settings
+→ Displays**.
+
+The ScreenCaptureKit video stream includes the macOS host cursor. When an external pointer is
+active, the iPad client hides its local pointer over the video surface so the streamed host cursor
+is the visible cursor.
+
+## Input behavior
+
+macOS has no native remote-touch injection API, so direct touch is translated into pointer
+gestures. A tap produces a left click, movement beyond a small threshold becomes a left drag, a
+stationary 500 ms long press produces a right click, and two-finger movement produces pixel-based
+scrolling with begin/change/end phases. Two-finger touch scrolling follows the host Mac's Natural
+scrolling preference. External mouse-wheel messages remain discrete line-scroll events.
 
 ## Private API caveat
 
@@ -133,10 +161,12 @@ These are honestly reported as unavailable in the daemon's `CAPS` capability mes
 (camera/mic `available = 0`; gamepad `available = 0`), so connecting clients automatically hide
 those toggles instead of offering a control that would fail.
 
-Speaker audio forwarding **is** supported (ScreenCaptureKit audio-only capture, 48 kHz stereo).
-Host audio keeps playing locally through your Mac's normal output while it's also being sent to
-the client — ScreenCaptureKit taps the audio stream rather than rerouting it, so nothing goes
-silent on the host side.
+Speaker audio forwarding uses a dedicated ScreenCaptureKit audio-only stream at 48 kHz stereo. To
+provide client-only playback, activation requires the current default output device to expose a
+settable mute control. The daemon temporarily mutes that device, checks its mute state periodically,
+follows changes to the default output device, and restores each device's prior mute state when
+forwarding stops. If no usable mute control is available, speaker activation fails even though the
+current macOS capability probe advertises the capture backend as available.
 
 ## USB transport
 
@@ -151,8 +181,8 @@ available; network transport is unaffected. Use `--network-only` to disable USB 
 1. Start the daemon.
 2. Open Screx on the iPad or launch the desktop client.
 3. Choose one transport:
-    - **Network**: enter the host/IP and tap `Connect`
-    - **USB**: tap `Connect via USB`
+   - **Network**: enter the host/IP and tap `Connect`
+   - **USB** (iPad only): tap `Connect via USB`
 4. If it is the first network connection, enter the PIN shown by the daemon.
 5. The virtual display comes up automatically — no manual step is needed to enable it (unlike
    GNOME Settings on Linux).
@@ -210,6 +240,6 @@ launchctl unload ~/Library/LaunchAgents/com.screx.daemon.plist
 
 Since the plist has no `UserName`/`GroupName` keys, `launchd` runs it as the same user who loaded
 it via `launchctl load` in their own login session — never as root — which is exactly the session
-the daemon needs for `CGVirtualDisplay`/`CGDisplayStream`/`CGEventPost`/TCC to work. `KeepAlive`
+the daemon needs for `CGVirtualDisplay`/ScreenCaptureKit/`CGEventPost`/TCC to work. `KeepAlive`
 restarts the daemon if it crashes or exits; remove that key (or set it `false`) if you'd rather it
 stay stopped after a failure while you investigate `/tmp/screx-daemon.log`.

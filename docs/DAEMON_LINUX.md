@@ -1,7 +1,7 @@
 # Linux Daemon
 
-Creates a virtual monitor via EVDI, captures and encodes it, and streams it to the
-[iPad app](CLIENT_IPAD.md) or [desktop client](CLIENT_DESKTOP.md) over Wi-Fi or USB. Also injects
+Creates a virtual monitor via EVDI, captures and encodes it, and streams it over the network to the
+[iPad app](CLIENT_IPAD.md) or [desktop client](CLIENT_DESKTOP.md), or over USB to the iPad app. Also injects
 touch/keyboard/mouse/controller input and exposes virtual microphone, webcam, and speaker devices.
 Source lives in `daemon/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol.
 
@@ -124,8 +124,8 @@ sessions negotiated over the USB transport; all other ceilings are shared across
 1. Start the daemon.
 2. Open Screx on the iPad or launch the desktop client.
 3. Choose one transport:
-    - **Network**: enter the host/IP and tap `Connect`
-    - **USB**: tap `Connect via USB`
+   - **Network**: enter the host/IP and tap `Connect`
+   - **USB** (iPad only): tap `Connect via USB`
 4. If it is the first network connection, enter the PIN shown by the daemon.
 5. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already
    active.

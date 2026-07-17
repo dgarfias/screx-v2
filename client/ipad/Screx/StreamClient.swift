@@ -34,7 +34,7 @@ final class StreamClient {
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
-    private static let frameTimeout: TimeInterval = 0.050
+    private static let frameTimeout: TimeInterval = 0.100
     private static let dataTimeout: TimeInterval = 5.0
 
     private static let flagAudio: UInt8 = 0x02
@@ -52,13 +52,14 @@ final class StreamClient {
     private var registerSendCount = 0
     private var receiveCount = 0
     private var decryptFailCount = 0
+    private var lastInboundTime = CACurrentMediaTime()
 
     private func log(_ message: String) {
         print("[stream \(debugId)] \(message)")
     }
 
     private func shouldLogDebug(_ count: Int) -> Bool {
-        count <= 12 || count.isMultiple(of: 25) || (count > 0 && (count & (count - 1)) == 0)
+        count <= 3 || (count > 0 && (count & (count - 1)) == 0)
     }
 
     init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
@@ -167,30 +168,29 @@ final class StreamClient {
     private func startDataTimeout() {
         log("startDataTimeout(timeout=\(Self.dataTimeout)s)")
         dataTimeoutTimer?.cancel()
+        lastInboundTime = CACurrentMediaTime()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + Self.dataTimeout)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
-            self?.handleTimeout()
+            guard let self else { return }
+            if self.suppressTimeout {
+                self.lastInboundTime = CACurrentMediaTime()
+            } else if CACurrentMediaTime() - self.lastInboundTime >= Self.dataTimeout {
+                self.handleTimeout()
+            }
         }
         timer.resume()
         dataTimeoutTimer = timer
     }
 
     private func resetDataTimeout() {
-        dataTimeoutTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + Self.dataTimeout)
-        timer.setEventHandler { [weak self] in
-            self?.handleTimeout()
-        }
-        timer.resume()
-        dataTimeoutTimer = timer
+        lastInboundTime = CACurrentMediaTime()
     }
 
     private func handleTimeout() {
         guard connection != nil else { return }
         if suppressTimeout {
-            resetDataTimeout()
+            lastInboundTime = CACurrentMediaTime()
             return
         }
         log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
@@ -281,6 +281,12 @@ final class StreamClient {
         }
 
         if isAudio {
+            guard totalData > 0,
+                  chunkIdx < totalData,
+                  Int(payloadLen) <= payload.count else {
+                log("ignoring invalid audio shard metadata for frameId=\(frameId)")
+                return
+            }
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
                               totalData: Int(totalData), payload: payload,
                               actualLen: Int(payloadLen), timestampMs: timestampMs)
@@ -288,17 +294,38 @@ final class StreamClient {
         }
 
         // Video path
+        let shardCount = Int(totalData) + Int(totalParity)
+        guard totalData > 0,
+              shardCount <= 4096,
+              Int(chunkIdx) < shardCount,
+              Int(payloadLen) <= Self.chunkPayload,
+              Int(payloadLen) <= payload.count,
+              totalParity == 0 || shardCount <= 255 else {
+            log("ignoring invalid video shard metadata for frameId=\(frameId)")
+            return
+        }
+
         if hasReceivedFirstFrame && frameId < lastCompletedFrameId && (lastCompletedFrameId - frameId) < 0x80000000 {
             return
         }
 
-        let assembly = reassembly[frameId] ?? FrameAssembly(
-            totalData: Int(totalData),
-            totalParity: Int(totalParity),
-            isIdr: isIdr,
-            createdAt: CACurrentMediaTime(),
-            timestampMs: timestampMs
-        )
+        let assembly: FrameAssembly
+        if let existing = reassembly[frameId] {
+            guard existing.totalData == Int(totalData),
+                  existing.totalParity == Int(totalParity) else {
+                log("ignoring inconsistent shard metadata for frameId=\(frameId)")
+                return
+            }
+            assembly = existing
+        } else {
+            assembly = FrameAssembly(
+                totalData: Int(totalData),
+                totalParity: Int(totalParity),
+                isIdr: isIdr,
+                createdAt: CACurrentMediaTime(),
+                timestampMs: timestampMs
+            )
+        }
         reassembly[frameId] = assembly
 
         assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen))
@@ -368,15 +395,23 @@ final class StreamClient {
 
     private func pruneOldFrames() {
         let now = CACurrentMediaTime()
+        var recoverable: [(UInt32, FrameAssembly)] = []
         var expired: [UInt32] = []
         for (fid, assembly) in reassembly {
             if now - assembly.createdAt > Self.frameTimeout {
                 if assembly.canRecover {
-                    deliverFrame(frameId: fid, assembly: assembly, timestampMs: assembly.timestampMs)
+                    recoverable.append((fid, assembly))
                 } else {
                     expired.append(fid)
                 }
             }
+        }
+        // Never mutate `reassembly` while enumerating it. Apart from avoiding
+        // a rare collection-mutation crash, ordering recovered frames keeps a
+        // late older frame from replacing a newer one at the decoder.
+        recoverable.sort { $0.0 < $1.0 }
+        for (fid, assembly) in recoverable {
+            deliverFrame(frameId: fid, assembly: assembly, timestampMs: assembly.timestampMs)
         }
         if !expired.isEmpty {
             for fid in expired {

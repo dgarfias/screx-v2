@@ -4,3 +4,9 @@
 **/.DS_Store
 **/DerivedData/
 **/gschemas.compiled
+
+# Xcode per-user state and generated archives
+**/xcuserdata/
+*.xcuserstate
+*.xcarchive
+*.dSYM/

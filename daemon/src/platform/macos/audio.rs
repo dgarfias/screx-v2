@@ -1,18 +1,12 @@
 //! macOS audio backend — system-audio (speaker) capture via ScreenCaptureKit.
 //!
-//! Unlike Linux (PulseAudio null-sink reroute: the host goes silent while a
-//! client is connected) macOS has no built-in mechanism to *redirect* system
-//! audio into a virtual capture device. Instead we use ScreenCaptureKit's
-//! audio tap (`SCStreamConfiguration.capturesAudio`, macOS 13+): it captures
-//! a copy of whatever the system is playing while audio keeps playing
-//! normally through the Mac's own speakers. That's the accepted v1
-//! semantics per the design doc — there is no "virtual sink" to create or
-//! destroy, so `create_sink`/`destroy_sink` are cheap (a permission
-//! preflight and a no-op, respectively).
+//! ScreenCaptureKit captures a copy of system audio but does not suppress
+//! hardware playback. While speaker forwarding is active, a CoreAudio guard
+//! therefore mutes the current default output device and restores its prior
+//! state when capture stops.
 //!
-//! A dedicated, audio-only `SCStream` is used (a separate `SCContentFilter`
-//! + `SCStreamConfiguration` from the display capture path, which uses
-//! `CGDisplayStream` and shares nothing with ScreenCaptureKit) so that
+//! A dedicated, audio-only `SCStream` is used (separate from the display
+//! capture path's screen-only `SCStream`) so that
 //! display attach/detach and audio start/stop stay fully independent, per
 //! the design doc. We never register a `.screen` stream output — only
 //! `.audio` — so no video frames are delivered or decoded on our side.
@@ -32,7 +26,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -42,6 +36,13 @@ use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2_core_audio::{
+    kAudioDevicePropertyMute, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    AudioObjectGetPropertyData, AudioObjectHasProperty, AudioObjectID,
+    AudioObjectIsPropertySettable, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
+};
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, AudioBuffer, AudioBufferList,
 };
@@ -53,7 +54,163 @@ use objc2_screen_capture_kit::{
     SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
-use crate::audio::{AudioBackend, MicSink, BYTES_PER_CHUNK, CHANNELS, SAMPLE_RATE};
+use crate::audio::{
+    AudioBackend, MicSink, BYTES_PER_CHUNK, CHANNELS, CHUNK_DURATION_MS, SAMPLE_RATE,
+};
+
+pub(super) const SCK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn read_u32_property(object: AudioObjectID, address: &AudioObjectPropertyAddress) -> Result<u32> {
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::new((&mut value as *mut u32).cast()).unwrap(),
+        )
+    };
+    if status != 0 {
+        bail!("AudioObjectGetPropertyData failed with OSStatus {status}");
+    }
+    Ok(value)
+}
+
+fn write_u32_property(
+    object: AudioObjectID,
+    address: &AudioObjectPropertyAddress,
+    value: u32,
+) -> Result<()> {
+    let mut value = value;
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            object,
+            NonNull::from(address),
+            0,
+            std::ptr::null(),
+            std::mem::size_of::<u32>() as u32,
+            NonNull::new((&mut value as *mut u32).cast()).unwrap(),
+        )
+    };
+    if status != 0 {
+        bail!("AudioObjectSetPropertyData failed with OSStatus {status}");
+    }
+    Ok(())
+}
+
+struct DefaultOutputMuteGuard {
+    device: AudioObjectID,
+    original_mute: Option<u32>,
+}
+
+impl DefaultOutputMuteGuard {
+    fn acquire() -> Result<Self> {
+        let default_output_address = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let device = read_u32_property(
+            kAudioObjectSystemObject as AudioObjectID,
+            &default_output_address,
+        )?;
+        if device == kAudioObjectUnknown {
+            bail!("macOS has no default output device to mute");
+        }
+
+        let mute_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        if !unsafe { AudioObjectHasProperty(device, NonNull::from(&mute_address)) } {
+            bail!("default output device {device} has no mute control");
+        }
+        let mut settable = 0u8;
+        let status = unsafe {
+            AudioObjectIsPropertySettable(
+                device,
+                NonNull::from(&mute_address),
+                NonNull::from(&mut settable),
+            )
+        };
+        if status != 0 || settable == 0 {
+            bail!("default output device {device} mute control is not settable");
+        }
+
+        let original_mute = read_u32_property(device, &mute_address)?;
+        if original_mute == 0 {
+            write_u32_property(device, &mute_address, 1)?;
+            println!("[audio] muted local output device {device} while forwarding speakers");
+        } else {
+            println!("[audio] local output device {device} was already muted");
+        }
+        Ok(Self {
+            device,
+            original_mute: Some(original_mute),
+        })
+    }
+
+    fn enforce(&mut self) -> Result<()> {
+        let default_output_address = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let current_device = read_u32_property(
+            kAudioObjectSystemObject as AudioObjectID,
+            &default_output_address,
+        )?;
+        if current_device != self.device {
+            self.restore()?;
+            *self = Self::acquire()?;
+            return Ok(());
+        }
+
+        let mute_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        if read_u32_property(self.device, &mute_address)? != 1 {
+            write_u32_property(self.device, &mute_address, 1)?;
+            println!("[audio] re-muted local output device {}", self.device);
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let Some(original_mute) = self.original_mute.take() else {
+            return Ok(());
+        };
+        let mute_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        // Do not overwrite a user or another app that changed the setting
+        // while forwarding was active.
+        if read_u32_property(self.device, &mute_address)? == 1 {
+            write_u32_property(self.device, &mute_address, original_mute)?;
+            println!(
+                "[audio] restored local output device {} mute state",
+                self.device
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DefaultOutputMuteGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.restore() {
+            eprintln!("[audio] failed to restore local output mute state: {e:#}");
+        }
+    }
+}
 
 pub struct MacAudioBackend;
 
@@ -148,10 +305,34 @@ impl AudioBackend for MacAudioBackend {
         })
         .context("SCStream startCapture (audio) failed")?;
 
+        let mut mute_guard = match DefaultOutputMuteGuard::acquire() {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = wait_for_completion(|block| unsafe {
+                    stream.stopCaptureWithCompletionHandler(Some(block));
+                });
+                return Err(e).context("cannot provide client-only speaker forwarding");
+            }
+        };
+
         println!("[audio] ScreenCaptureKit audio capture started");
 
-        let mut emit_buf: Vec<Vec<u8>> = Vec::new();
+        let chunk_interval = Duration::from_millis(CHUNK_DURATION_MS as u64);
+        let mute_check_interval = Duration::from_secs(1);
+        let mut next_emit = Instant::now();
+        let mut next_mute_check = Instant::now() + mute_check_interval;
+        let mut emit_buf = Vec::with_capacity(BYTES_PER_CHUNK);
+        let mut loop_error = None;
         while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now >= next_mute_check {
+                if let Err(e) = mute_guard.enforce() {
+                    loop_error = Some(e);
+                    break;
+                }
+                next_mute_check = now + mute_check_interval;
+            }
+
             let guard = capture_state.buf.lock().unwrap();
             let (mut guard, _timeout) = capture_state
                 .cvar
@@ -164,15 +345,34 @@ impl AudioBackend for MacAudioBackend {
                 break;
             }
 
-            emit_buf.clear();
-            while guard.len() >= BYTES_PER_CHUNK {
-                emit_buf.push(guard.drain(..BYTES_PER_CHUNK).collect());
+            if guard.len() < BYTES_PER_CHUNK {
+                continue;
             }
+
+            let now = Instant::now();
+            if now < next_emit {
+                let wait = next_emit - now;
+                drop(guard);
+                std::thread::sleep(wait);
+                continue;
+            }
+
+            emit_buf.clear();
+            emit_buf.extend(guard.drain(..BYTES_PER_CHUNK));
             drop(guard);
 
-            for chunk in &emit_buf {
-                on_chunk(chunk);
-            }
+            // Keep a stable 10ms packet cadence even when ScreenCaptureKit
+            // delivers several chunks' worth of samples in one callback. If
+            // capture was late, emit one chunk immediately and restart the
+            // cadence instead of bursting all queued chunks to the client.
+            let now = Instant::now();
+            let scheduled = next_emit + chunk_interval;
+            next_emit = if scheduled > now {
+                scheduled
+            } else {
+                now + chunk_interval
+            };
+            on_chunk(&emit_buf);
         }
 
         let stop_result = wait_for_completion(|block| unsafe {
@@ -181,9 +381,15 @@ impl AudioBackend for MacAudioBackend {
         if let Err(e) = stop_result {
             eprintln!("[audio] SCStream stopCapture (audio) error: {e:#}");
         }
+        if let Err(e) = mute_guard.restore() {
+            eprintln!("[audio] failed to restore local output mute state: {e:#}");
+        }
         println!("[audio] ScreenCaptureKit audio capture stopped");
 
-        Ok(())
+        match loop_error {
+            Some(e) => Err(e).context("failed to keep local output muted"),
+            None => Ok(()),
+        }
     }
 
     fn create_mic(&mut self) -> Result<Box<dyn MicSink>> {
@@ -207,18 +413,20 @@ impl AudioBackend for MacAudioBackend {
 /// class's own thread-safety, so the transfer itself is sound even though
 /// `Retained<T>` isn't (blanket) `Send` — this is the same reasoning
 /// `MacDisplay` relies on for its own `unsafe impl Send`.
-struct SendRetained<T>(Retained<T>);
+pub(super) struct SendRetained<T>(pub(super) Retained<T>);
 unsafe impl<T> Send for SendRetained<T> {}
 
-fn nserror_string(e: &NSError) -> String {
+pub(super) fn nserror_string(e: &NSError) -> String {
     format!("{}", e.localizedDescription())
 }
 
 /// Fetch `SCShareableContent` (async, completion-handler API) and return its
 /// first display, blocking the calling thread until the handler fires.
 fn fetch_first_display() -> Result<Retained<SCDisplay>> {
-    let pair: Arc<(Mutex<Option<Result<SendRetained<SCDisplay>, String>>>, Condvar)> =
-        Arc::new((Mutex::new(None), Condvar::new()));
+    let pair: Arc<(
+        Mutex<Option<Result<SendRetained<SCDisplay>, String>>>,
+        Condvar,
+    )> = Arc::new((Mutex::new(None), Condvar::new()));
     let cb_pair = Arc::clone(&pair);
 
     let block = RcBlock::new(
@@ -254,9 +462,12 @@ fn fetch_first_display() -> Result<Retained<SCDisplay>> {
     }
 
     let (lock, cvar) = &*pair;
-    let mut guard = lock.lock().unwrap();
-    while guard.is_none() {
-        guard = cvar.wait(guard).unwrap();
+    let guard = lock.lock().unwrap();
+    let (mut guard, timeout) = cvar
+        .wait_timeout_while(guard, SCK_CALLBACK_TIMEOUT, |result| result.is_none())
+        .unwrap();
+    if timeout.timed_out() && guard.is_none() {
+        bail!("timed out waiting for SCShareableContent after {SCK_CALLBACK_TIMEOUT:?}");
     }
     guard
         .take()
@@ -267,8 +478,11 @@ fn fetch_first_display() -> Result<Retained<SCDisplay>> {
 
 /// Block the calling thread on an SCK `...CompletionHandler:` call (start
 /// capture / stop capture), which reports success via a `NULL` `NSError*`.
-fn wait_for_completion(register: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) -> Result<()> {
-    let pair: Arc<(Mutex<Option<Option<String>>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
+pub(super) fn wait_for_completion(
+    register: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>),
+) -> Result<()> {
+    let pair: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
+        Arc::new((Mutex::new(None), Condvar::new()));
     let cb_pair = Arc::clone(&pair);
 
     let block = RcBlock::new(move |error: *mut NSError| {
@@ -285,9 +499,12 @@ fn wait_for_completion(register: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSErr
     register(&block);
 
     let (lock, cvar) = &*pair;
-    let mut guard = lock.lock().unwrap();
-    while guard.is_none() {
-        guard = cvar.wait(guard).unwrap();
+    let guard = lock.lock().unwrap();
+    let (mut guard, timeout) = cvar
+        .wait_timeout_while(guard, SCK_CALLBACK_TIMEOUT, |result| result.is_none())
+        .unwrap();
+    if timeout.timed_out() && guard.is_none() {
+        bail!("timed out waiting for ScreenCaptureKit completion after {SCK_CALLBACK_TIMEOUT:?}");
     }
     match guard.take().unwrap() {
         None => Ok(()),
@@ -333,7 +550,10 @@ fn f32_to_i16(x: f32) -> i16 {
 
 /// Convert one ScreenCaptureKit audio `CMSampleBuffer` to interleaved stereo
 /// s16le and push it into `state`'s ring buffer.
-fn handle_sample_buffer(state: &AudioCaptureState, sample_buffer: &objc2_core_media::CMSampleBuffer) {
+fn handle_sample_buffer(
+    state: &AudioCaptureState,
+    sample_buffer: &objc2_core_media::CMSampleBuffer,
+) {
     let num_frames = unsafe { sample_buffer.num_samples() } as usize;
     if num_frames == 0 {
         return;
@@ -412,8 +632,8 @@ fn handle_sample_buffer(state: &AudioCaptureState, sample_buffer: &objc2_core_me
     }
     // Own the +1 retained block buffer for the duration of this function —
     // it backs the sample data that `abl`'s `mData` pointers point into.
-    let _owned_block_buffer =
-        NonNull::new(block_buffer).map(|nn| unsafe { objc2_core_foundation::CFRetained::from_raw(nn) });
+    let _owned_block_buffer = NonNull::new(block_buffer)
+        .map(|nn| unsafe { objc2_core_foundation::CFRetained::from_raw(nn) });
 
     // SAFETY: `buffer_list_ptr` points into `storage`, which we just
     // populated via the call above and which is still alive.
@@ -438,8 +658,7 @@ fn handle_sample_buffer(state: &AudioCaptureState, sample_buffer: &objc2_core_me
         let available = (buf0.mDataByteSize as usize / 4 / ch).min(num_frames);
         // SAFETY: `mData` is valid for `mDataByteSize` bytes per the
         // AudioBufferList contract; we only read `available` frames.
-        let data =
-            unsafe { std::slice::from_raw_parts(buf0.mData as *const f32, available * ch) };
+        let data = unsafe { std::slice::from_raw_parts(buf0.mData as *const f32, available * ch) };
         for i in 0..available {
             if ch >= 2 {
                 stereo[i * 2] = f32_to_i16(data[i * ch]);

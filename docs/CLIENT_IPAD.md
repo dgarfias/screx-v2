@@ -1,9 +1,11 @@
 # iPad Client
 
-Native iPadOS app that connects to a Screx daemon — [Linux](DAEMON_LINUX.md) or
-[Windows](DAEMON_WINDOWS.md); the wire protocol is identical on both. Decodes the video/audio
+Native iPadOS app that connects to a Screx daemon - [Linux](DAEMON_LINUX.md),
+[Windows](DAEMON_WINDOWS.md), or [macOS](DAEMON_MACOS.md). Decodes the video/audio
 stream and forwards touch, keyboard, mouse, controller, microphone, and camera input back to the
-host. Source lives in `client/ipad`.
+host. Peripheral controls are gated by the capabilities advertised by the daemon; the macOS daemon,
+for example, reports camera, microphone, and gamepad forwarding as unavailable. Source lives in
+`client/ipad`.
 
 ## Requirements
 
@@ -49,3 +51,9 @@ enabling the virtual display).
 Before connecting, tap **Stream Settings** to choose the resolution, framerate, codec, and bitrate
 for the next session. These settings are validated against the daemon's advertised capabilities and
 sent during connection setup. For the wire protocol, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+On a fresh install, the preferred framerate defaults to 60 fps; an existing saved preference is
+preserved. Network TCP establishment fails after 8 seconds if the daemon cannot be reached, and an
+established network stream is treated as stale after 5 seconds without inbound UDP data. Active
+touch gestures are clamped to the video boundary so dragging outside the letterboxed image still
+produces a matching release at the nearest display edge.

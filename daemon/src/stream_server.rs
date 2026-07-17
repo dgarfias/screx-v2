@@ -387,7 +387,10 @@ impl SharedState {
     /// session ends so the next (possibly old-client) session isn't stuck
     /// on the previous client's negotiated bitrate.
     pub fn set_base_bitrate(&self, base_bitrate_bps: u32) {
-        self.adaptive_stream.lock().unwrap().set_base(base_bitrate_bps);
+        self.adaptive_stream
+            .lock()
+            .unwrap()
+            .set_base(base_bitrate_bps);
     }
 }
 
@@ -534,7 +537,11 @@ pub fn build_caps_message(shared: &SharedState, transport: ControlTransport) -> 
         .extend_from_slice(&(caps.max_height.min(u32::from(u16::MAX)) as u16).to_be_bytes());
     push_tlv_entry(&mut msg, CAPS_TAG_MAX_RESOLUTION, &resolution_value);
 
-    push_tlv_entry(&mut msg, CAPS_TAG_MAX_FRAMERATE, &[caps.max_fps.min(255) as u8]);
+    push_tlv_entry(
+        &mut msg,
+        CAPS_TAG_MAX_FRAMERATE,
+        &[caps.max_fps.min(255) as u8],
+    );
 
     let mut bitrate_value = Vec::with_capacity(8);
     bitrate_value.extend_from_slice(&caps.bitrate_min_bps.to_be_bytes());
@@ -596,9 +603,8 @@ fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
                 };
             }
             STNG_TAG_BITRATE if len == 4 => {
-                settings.bitrate_bps = Some(u32::from_be_bytes([
-                    value[0], value[1], value[2], value[3],
-                ]));
+                settings.bitrate_bps =
+                    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
             }
             // Unknown tag, or a known tag with an unexpected length: `offset`
             // has already advanced past the value, so parsing just continues
@@ -800,6 +806,9 @@ pub fn handle_control_message_data(
     if ctrl.starts_with(PLI_MAGIC) {
         shared.note_pli();
         shared.force_idr.store(true, Ordering::Relaxed);
+        if let Some(ref refresh) = *shared.force_refresh_handle.lock().unwrap() {
+            refresh.store(true, Ordering::Relaxed);
+        }
         return;
     }
 

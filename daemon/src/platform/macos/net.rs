@@ -10,6 +10,10 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::time::Duration;
+
+const VIDEO_BURST_PACKETS: usize = 8;
+const VIDEO_BURST_PAUSE: Duration = Duration::from_micros(250);
 
 /// Source address pinning for daemon->client UDP packets. Kept for type
 /// compatibility with the shared `stream_server.rs` code; macOS never
@@ -89,7 +93,19 @@ pub fn sendmmsg_batch(
     let mut sent = 0;
     for pkt in pkts {
         match socket.send_to(pkt, dest) {
-            Ok(_) => sent += 1,
+            Ok(_) => {
+                sent += 1;
+                // Darwin has no sendmmsg, and emitting a large motion frame
+                // as one uninterrupted UDP burst readily overflows queues on
+                // the Wi-Fi/iPad side. Short pauses between small groups keep
+                // the same throughput while substantially reducing shard loss.
+                if pkts.len() > VIDEO_BURST_PACKETS
+                    && sent % VIDEO_BURST_PACKETS == 0
+                    && sent < pkts.len()
+                {
+                    std::thread::sleep(VIDEO_BURST_PAUSE);
+                }
+            }
             Err(e) => {
                 if sent == 0 {
                     return Err(e);
