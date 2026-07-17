@@ -16,7 +16,7 @@ For implementation details and protocol documentation, see [`docs/ARCHITECTURE.m
 | Touch input | Yes | Yes | Yes, translated to pointer and scroll gestures |
 | Game controllers | Yes | Yes | No |
 | Client speaker audio | Yes | Yes | Yes |
-| Client microphone | Yes | Yes, with VB-Audio VB-CABLE | No |
+| Client microphone | Yes | Yes | No |
 | Client camera | Yes | Yes | No |
 
 See the [Linux](docs/DAEMON_LINUX.md), [Windows](docs/DAEMON_WINDOWS.md), and [macOS](docs/DAEMON_MACOS.md) daemon guides for setup requirements.
@@ -26,9 +26,8 @@ See the [Linux](docs/DAEMON_LINUX.md), [Windows](docs/DAEMON_WINDOWS.md), and [m
 | Feature | Native iPad client | Desktop client |
 |---|---|---|
 | USB transport | Yes | No |
-| H.264 and H.265 playback | Yes | Yes, with platform hardware acceleration where available |
 | Touch forwarding | Yes | No |
-| Mouse forwarding | Yes, including an external iPad pointer | Yes |
+| Mouse forwarding | Yes | Yes |
 | Keyboard forwarding | Yes, software and external | Focused application input |
 | Game controller forwarding | Yes | No |
 | Speaker playback | Yes | Yes |
