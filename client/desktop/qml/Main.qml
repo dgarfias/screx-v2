@@ -674,14 +674,14 @@ ApplicationWindow {
     // ── Stream settings popup ──
     // Styled after camPopup. Shown from the connection card before
     // connecting; "Save" persists the picks (AppState.set_stream_settings)
-    // and closes. Each group is a segmented list of presets, highlighting
-    // the value currently selected within this open popup session (not
-    // applied until Save is pressed).
+    // and closes. Each group is a styled ComboBox dropdown of presets,
+    // reflecting the value currently selected within this open popup
+    // session (not applied until Save is pressed).
     Popup {
         id: streamSettingsPopup
         anchors.centerIn: parent
         width: Math.min(root.width - 40, 380)
-        height: streamSettingsContent.implicitHeight + 32
+        padding: 16
         modal: true
         focus: true
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
@@ -729,6 +729,29 @@ ApplicationWindow {
                 customBitrateActive = mbpsLabel !== ""
                 customBitrateMbpsText = mbpsLabel
             }
+
+            // Sync each combo box's displayed selection. indexOfValue()
+            // returns -1 for values not in the curated list (e.g. a
+            // persisted legacy/custom resolution) — fall back to showing
+            // index 0 ("Daemon default") without touching the selX
+            // property, so Save still no-ops on that field unless the
+            // user actively picks something.
+            var resIdx = resCombo.indexOfValue(selResolution)
+            resCombo.currentIndex = resIdx >= 0 ? resIdx : 0
+
+            var fpsIdx = fpsCombo.indexOfValue(selFramerate)
+            fpsCombo.currentIndex = fpsIdx >= 0 ? fpsIdx : 0
+
+            var codecIdx = codecCombo.indexOfValue(selCodec)
+            codecCombo.currentIndex = codecIdx >= 0 ? codecIdx : 0
+
+            if (customBitrateActive) {
+                var customIdx = bitrateCombo.indexOfValue("custom")
+                bitrateCombo.currentIndex = customIdx >= 0 ? customIdx : 0
+            } else {
+                var bitrateIdx = bitrateCombo.indexOfValue(selBitrate)
+                bitrateCombo.currentIndex = bitrateIdx >= 0 ? bitrateIdx : 0
+            }
         }
 
         background: Rectangle {
@@ -738,12 +761,8 @@ ApplicationWindow {
             border.width: 1
         }
 
-        ColumnLayout {
+        contentItem: ColumnLayout {
             id: streamSettingsContent
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: 16
             spacing: 10
 
             Text {
@@ -754,173 +773,330 @@ ApplicationWindow {
                 font.weight: 700
             }
 
-            Text {
-                text: "Applied — clamped to what the daemon supports — the next time you connect."
-                color: "#8e8e93"
-                font.family: uiFont()
-                font.pixelSize: 11
-                wrapMode: Text.WordWrap
-                Layout.fillWidth: true
-            }
-
             // ── Resolution ──
             Text { text: "Resolution"; color: "#8e8e93"; font.family: uiFont(); font.pixelSize: 11; font.weight: 700 }
-            Flow {
+            ComboBox {
+                id: resCombo
                 Layout.fillWidth: true
-                spacing: 6
-                Repeater {
-                    model: [
-                        { label: "Daemon default", value: "default" },
-                        { label: "1280 × 720", value: "1280x720" },
-                        { label: "1280 × 800 (16:10)", value: "1280x800" },
-                        { label: "1920 × 1080", value: "1920x1080" },
-                        { label: "1920 × 1200 (16:10)", value: "1920x1200" },
-                        { label: "2560 × 1440", value: "2560x1440" },
-                        { label: "2560 × 1600 (16:10)", value: "2560x1600" },
-                        { label: "3840 × 2160", value: "3840x2160" }
-                    ]
-                    delegate: Button {
+                textRole: "label"
+                valueRole: "value"
+                model: [
+                    { label: "Daemon default", value: "default" },
+                    { label: "1024 × 768 (4:3)", value: "1024x768" },
+                    { label: "1280 × 720 (16:9)", value: "1280x720" },
+                    { label: "1280 × 800 (16:10)", value: "1280x800" },
+                    { label: "1280 × 960 (4:3)", value: "1280x960" },
+                    { label: "1440 × 900 (16:10)", value: "1440x900" },
+                    { label: "1600 × 900 (16:9)", value: "1600x900" },
+                    { label: "1600 × 1200 (4:3)", value: "1600x1200" },
+                    { label: "1680 × 1050 (16:10)", value: "1680x1050" },
+                    { label: "1920 × 1080 (16:9)", value: "1920x1080" },
+                    { label: "1920 × 1200 (16:10)", value: "1920x1200" },
+                    { label: "2048 × 1536 (4:3)", value: "2048x1536" },
+                    { label: "2560 × 1440 (16:9)", value: "2560x1440" },
+                    { label: "2560 × 1600 (16:10)", value: "2560x1600" },
+                    { label: "2880 × 1800 (16:10)", value: "2880x1800" },
+                    { label: "3072 × 1920 (16:10)", value: "3072x1920" },
+                    { label: "3200 × 1800 (16:9)", value: "3200x1800" },
+                    { label: "3840 × 2160 (16:9)", value: "3840x2160" },
+                    { label: "3840 × 2400 (16:10)", value: "3840x2400" },
+                    { label: "5120 × 2880 (16:9)", value: "5120x2880" }
+                ]
+                onActivated: streamSettingsPopup.selResolution = currentValue
+                background: Rectangle {
+                    radius: 6
+                    color: "#2c2c2e"
+                    border.color: "#3a3a3c"
+                    border.width: 1
+                }
+                contentItem: Text {
+                    text: resCombo.displayText
+                    color: "#ffffff"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    rightPadding: resCombo.indicator.width + 10
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+                indicator: Text {
+                    x: resCombo.width - width - 10
+                    y: (resCombo.height - height) / 2
+                    text: "▾"
+                    color: "#8e8e93"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                }
+                delegate: ItemDelegate {
+                    width: resCombo.width
+                    highlighted: resCombo.highlightedIndex === index
+                    background: Rectangle {
+                        radius: 4
+                        color: highlighted ? "#007aff" : "transparent"
+                    }
+                    contentItem: Text {
                         text: modelData.label
+                        color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 12
-                        onClicked: streamSettingsPopup.selResolution = modelData.value
-                        background: Rectangle {
-                            radius: 6
-                            color: streamSettingsPopup.selResolution === modelData.value ? "#007aff" : "#2c2c2e"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#ffffff"
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        leftPadding: 8; rightPadding: 8
-                        topPadding: 6; bottomPadding: 6
+                        leftPadding: 8
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                popup: Popup {
+                    y: resCombo.height + 4
+                    width: resCombo.width
+                    implicitHeight: Math.min(contentItem.implicitHeight, 300)
+                    padding: 4
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1c1c1e"
+                        border.color: "#3a3a3c"
+                        border.width: 1
+                    }
+                    contentItem: ListView {
+                        clip: true
+                        implicitHeight: Math.min(contentHeight, 300)
+                        model: resCombo.popup.visible ? resCombo.delegateModel : null
+                        currentIndex: resCombo.highlightedIndex
+                        ScrollIndicator.vertical: ScrollIndicator {}
                     }
                 }
             }
 
             // ── Framerate ──
             Text { text: "Framerate"; color: "#8e8e93"; font.family: uiFont(); font.pixelSize: 11; font.weight: 700 }
-            Flow {
+            ComboBox {
+                id: fpsCombo
                 Layout.fillWidth: true
-                spacing: 6
-                Repeater {
-                    model: [
-                        { label: "Daemon default", value: "default" },
-                        { label: "30 fps", value: "30" },
-                        { label: "60 fps", value: "60" }
-                    ]
-                    delegate: Button {
+                textRole: "label"
+                valueRole: "value"
+                model: [
+                    { label: "Daemon default", value: "default" },
+                    { label: "30 fps", value: "30" },
+                    { label: "60 fps", value: "60" }
+                ]
+                onActivated: streamSettingsPopup.selFramerate = currentValue
+                background: Rectangle {
+                    radius: 6
+                    color: "#2c2c2e"
+                    border.color: "#3a3a3c"
+                    border.width: 1
+                }
+                contentItem: Text {
+                    text: fpsCombo.displayText
+                    color: "#ffffff"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    rightPadding: fpsCombo.indicator.width + 10
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+                indicator: Text {
+                    x: fpsCombo.width - width - 10
+                    y: (fpsCombo.height - height) / 2
+                    text: "▾"
+                    color: "#8e8e93"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                }
+                delegate: ItemDelegate {
+                    width: fpsCombo.width
+                    highlighted: fpsCombo.highlightedIndex === index
+                    background: Rectangle {
+                        radius: 4
+                        color: highlighted ? "#007aff" : "transparent"
+                    }
+                    contentItem: Text {
                         text: modelData.label
+                        color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 12
-                        onClicked: streamSettingsPopup.selFramerate = modelData.value
-                        background: Rectangle {
-                            radius: 6
-                            color: streamSettingsPopup.selFramerate === modelData.value ? "#007aff" : "#2c2c2e"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#ffffff"
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        leftPadding: 8; rightPadding: 8
-                        topPadding: 6; bottomPadding: 6
+                        leftPadding: 8
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                popup: Popup {
+                    y: fpsCombo.height + 4
+                    width: fpsCombo.width
+                    implicitHeight: Math.min(contentItem.implicitHeight, 300)
+                    padding: 4
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1c1c1e"
+                        border.color: "#3a3a3c"
+                        border.width: 1
+                    }
+                    contentItem: ListView {
+                        clip: true
+                        implicitHeight: Math.min(contentHeight, 300)
+                        model: fpsCombo.popup.visible ? fpsCombo.delegateModel : null
+                        currentIndex: fpsCombo.highlightedIndex
+                        ScrollIndicator.vertical: ScrollIndicator {}
                     }
                 }
             }
 
             // ── Codec ──
             Text { text: "Codec"; color: "#8e8e93"; font.family: uiFont(); font.pixelSize: 11; font.weight: 700 }
-            Flow {
+            ComboBox {
+                id: codecCombo
                 Layout.fillWidth: true
-                spacing: 6
-                Repeater {
-                    model: [
-                        { label: "Daemon default", value: "default" },
-                        { label: "H.264", value: "h264" },
-                        { label: "H.265", value: "h265" }
-                    ]
-                    delegate: Button {
+                textRole: "label"
+                valueRole: "value"
+                model: [
+                    { label: "Daemon default", value: "default" },
+                    { label: "H.264", value: "h264" },
+                    { label: "H.265", value: "h265" }
+                ]
+                onActivated: streamSettingsPopup.selCodec = currentValue
+                background: Rectangle {
+                    radius: 6
+                    color: "#2c2c2e"
+                    border.color: "#3a3a3c"
+                    border.width: 1
+                }
+                contentItem: Text {
+                    text: codecCombo.displayText
+                    color: "#ffffff"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    rightPadding: codecCombo.indicator.width + 10
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+                indicator: Text {
+                    x: codecCombo.width - width - 10
+                    y: (codecCombo.height - height) / 2
+                    text: "▾"
+                    color: "#8e8e93"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                }
+                delegate: ItemDelegate {
+                    width: codecCombo.width
+                    highlighted: codecCombo.highlightedIndex === index
+                    background: Rectangle {
+                        radius: 4
+                        color: highlighted ? "#007aff" : "transparent"
+                    }
+                    contentItem: Text {
                         text: modelData.label
+                        color: "#ffffff"
                         font.family: uiFont()
                         font.pixelSize: 12
-                        onClicked: streamSettingsPopup.selCodec = modelData.value
-                        background: Rectangle {
-                            radius: 6
-                            color: streamSettingsPopup.selCodec === modelData.value ? "#007aff" : "#2c2c2e"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#ffffff"
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        leftPadding: 8; rightPadding: 8
-                        topPadding: 6; bottomPadding: 6
+                        leftPadding: 8
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                popup: Popup {
+                    y: codecCombo.height + 4
+                    width: codecCombo.width
+                    implicitHeight: Math.min(contentItem.implicitHeight, 300)
+                    padding: 4
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1c1c1e"
+                        border.color: "#3a3a3c"
+                        border.width: 1
+                    }
+                    contentItem: ListView {
+                        clip: true
+                        implicitHeight: Math.min(contentHeight, 300)
+                        model: codecCombo.popup.visible ? codecCombo.delegateModel : null
+                        currentIndex: codecCombo.highlightedIndex
+                        ScrollIndicator.vertical: ScrollIndicator {}
                     }
                 }
             }
 
             // ── Bitrate ──
             Text { text: "Bitrate"; color: "#8e8e93"; font.family: uiFont(); font.pixelSize: 11; font.weight: 700 }
-            Flow {
+            ComboBox {
+                id: bitrateCombo
                 Layout.fillWidth: true
-                spacing: 6
-                Repeater {
-                    model: [
-                        { label: "Default", value: "default" },
-                        { label: "Low (3 Mbps)", value: "3000000" },
-                        { label: "Medium (8 Mbps)", value: "8000000" },
-                        { label: "High (15 Mbps)", value: "15000000" },
-                        { label: "Very high (20 Mbps)", value: "20000000" }
-                    ]
-                    delegate: Button {
-                        text: modelData.label
-                        font.family: uiFont()
-                        font.pixelSize: 12
-                        onClicked: {
-                            streamSettingsPopup.selBitrate = modelData.value
-                            streamSettingsPopup.customBitrateActive = false
-                        }
-                        background: Rectangle {
-                            radius: 6
-                            color: (!streamSettingsPopup.customBitrateActive && streamSettingsPopup.selBitrate === modelData.value) ? "#007aff" : "#2c2c2e"
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: "#ffffff"
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        leftPadding: 8; rightPadding: 8
-                        topPadding: 6; bottomPadding: 6
+                textRole: "label"
+                valueRole: "value"
+                model: [
+                    { label: "Default", value: "default" },
+                    { label: "Low (3 Mbps)", value: "3000000" },
+                    { label: "Medium (8 Mbps)", value: "8000000" },
+                    { label: "High (15 Mbps)", value: "15000000" },
+                    { label: "Very high (20 Mbps)", value: "20000000" },
+                    { label: "Custom…", value: "custom" }
+                ]
+                onActivated: {
+                    if (currentValue === "custom") {
+                        streamSettingsPopup.customBitrateActive = true
+                    } else {
+                        streamSettingsPopup.selBitrate = currentValue
+                        streamSettingsPopup.customBitrateActive = false
                     }
                 }
-                Button {
-                    text: "Custom"
+                background: Rectangle {
+                    radius: 6
+                    color: "#2c2c2e"
+                    border.color: "#3a3a3c"
+                    border.width: 1
+                }
+                contentItem: Text {
+                    text: bitrateCombo.displayText
+                    color: "#ffffff"
                     font.family: uiFont()
                     font.pixelSize: 12
-                    onClicked: streamSettingsPopup.customBitrateActive = true
+                    leftPadding: 10
+                    rightPadding: bitrateCombo.indicator.width + 10
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+                indicator: Text {
+                    x: bitrateCombo.width - width - 10
+                    y: (bitrateCombo.height - height) / 2
+                    text: "▾"
+                    color: "#8e8e93"
+                    font.family: uiFont()
+                    font.pixelSize: 12
+                }
+                delegate: ItemDelegate {
+                    width: bitrateCombo.width
+                    highlighted: bitrateCombo.highlightedIndex === index
                     background: Rectangle {
-                        radius: 6
-                        color: streamSettingsPopup.customBitrateActive ? "#007aff" : "#2c2c2e"
+                        radius: 4
+                        color: highlighted ? "#007aff" : "transparent"
                     }
                     contentItem: Text {
-                        text: parent.text
+                        text: modelData.label
                         color: "#ffffff"
-                        font: parent.font
-                        horizontalAlignment: Text.AlignHCenter
+                        font.family: uiFont()
+                        font.pixelSize: 12
+                        leftPadding: 8
+                        elide: Text.ElideRight
                         verticalAlignment: Text.AlignVCenter
                     }
-                    leftPadding: 8; rightPadding: 8
-                    topPadding: 6; bottomPadding: 6
+                }
+                popup: Popup {
+                    y: bitrateCombo.height + 4
+                    width: bitrateCombo.width
+                    implicitHeight: Math.min(contentItem.implicitHeight, 300)
+                    padding: 4
+                    background: Rectangle {
+                        radius: 6
+                        color: "#1c1c1e"
+                        border.color: "#3a3a3c"
+                        border.width: 1
+                    }
+                    contentItem: ListView {
+                        clip: true
+                        implicitHeight: Math.min(contentHeight, 300)
+                        model: bitrateCombo.popup.visible ? bitrateCombo.delegateModel : null
+                        currentIndex: bitrateCombo.highlightedIndex
+                        ScrollIndicator.vertical: ScrollIndicator {}
+                    }
                 }
             }
 
