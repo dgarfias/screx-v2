@@ -23,26 +23,46 @@ const DEVICE_PORT: u16 = 9000;
 
 pub struct MacMuxClient {
     iproxy_child: Option<Child>,
+    /// Set once we've warned that `idevice_id` is missing, so the 2-second
+    /// poll loop doesn't spam the log every tick.
+    warned_missing: bool,
 }
 
 impl MacMuxClient {
     pub fn new() -> Self {
-        Self { iproxy_child: None }
+        Self {
+            iproxy_child: None,
+            warned_missing: false,
+        }
     }
 }
 
 impl MuxClient for MacMuxClient {
     fn device_present(&mut self) -> bool {
-        Command::new("idevice_id")
+        match Command::new("idevice_id")
             .arg("-l")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
-            .map(|o| {
+        {
+            Ok(o) => {
                 let out = String::from_utf8_lossy(&o.stdout);
                 o.status.success() && out.lines().any(|l| !l.trim().is_empty())
-            })
-            .unwrap_or(false)
+            }
+            // Without this, a missing `idevice_id` silently and permanently
+            // disables USB — the daemon just polls dormantly forever with
+            // no indication anything is wrong. Surface it once.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.warned_missing => {
+                eprintln!(
+                    "[usb] idevice_id not found — USB transport disabled. \
+                     Install libimobiledevice (brew install libimobiledevice) \
+                     and restart the daemon."
+                );
+                self.warned_missing = true;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     fn connect(&mut self, _device_port: u16) -> Result<Box<dyn ReadWriteStream>> {
