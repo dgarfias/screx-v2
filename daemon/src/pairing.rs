@@ -250,7 +250,7 @@ pub fn run_pairing_server(
                 stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
-                match handle_handshake(&mut stream, addr, &pairing) {
+                match handle_handshake(&mut stream, addr, &pairing, &shared) {
                     Ok(mut session) => {
                         session.session_id = reserved_session_id;
                         session.local_ip = stream.local_addr().ok().map(|a| a.ip());
@@ -302,6 +302,7 @@ fn handle_handshake(
     stream: &mut TcpStream,
     addr: std::net::SocketAddr,
     pairing: &Arc<Mutex<PairingState>>,
+    shared: &Arc<crate::stream_server::SharedState>,
 ) -> Result<SessionInfo> {
     // The handshake may require more than one round trip. If a client sends
     // HELLO with a stale/missing key, we send REJECT and keep the connection
@@ -318,7 +319,9 @@ fn handle_handshake(
 
         if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
             crate::vlog!("[pairing] handshake type=PAIR from {addr}");
-            return handle_pair_request(stream, addr, &header, pairing);
+            let result = handle_pair_request(stream, addr, &header, pairing, &shared);
+            *shared.pairing_prompt.lock().unwrap() = None;
+            return result;
         } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
             crate::vlog!("[pairing] handshake type=HELLO from {addr}");
             match handle_hello_request(stream, addr, &header, pairing)? {
@@ -339,6 +342,7 @@ fn handle_pair_request(
     addr: std::net::SocketAddr,
     header_buf: &[u8; 12],
     pairing: &Arc<Mutex<PairingState>>,
+    shared: &Arc<crate::stream_server::SharedState>,
 ) -> Result<SessionInfo> {
     // Already read 12 bytes; SCREX_PAIR is 10, so 2 bytes of device_id are in header_buf[10..12]
     // Read remaining: device_id(14 more) + client_pubkey(32) = 46 bytes
@@ -389,6 +393,11 @@ fn handle_pair_request(
     println!("║  Enter this PIN on your device       ║");
     println!("╚══════════════════════════════════════╝");
     println!();
+
+    *shared.pairing_prompt.lock().unwrap() = Some(crate::stream_server::PairingPrompt {
+        ip: addr.ip().to_string(),
+        pin: pin.clone(),
+    });
 
     // Send PIN_CHALLENGE: SCREX_PIN(10) + server_pubkey(32)
     let mut response = Vec::with_capacity(10 + PUBKEY_LEN);

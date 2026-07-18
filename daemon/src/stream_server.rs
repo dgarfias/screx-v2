@@ -231,6 +231,16 @@ impl AdaptiveStreamState {
     }
 }
 
+/// Active pairing attempt to surface in the macOS menu-bar UI. Set while a
+/// client is running the PIN flow; cleared when it resolves. Only read by
+/// the macOS status bar; a harmless no-op field elsewhere.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct PairingPrompt {
+    pub ip: String,
+    pub pin: String,
+}
+
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
     pub force_idr: AtomicBool,
@@ -289,6 +299,9 @@ pub struct SharedState {
     /// the pending session" — the capture thread waits briefly on the
     /// condvar before falling back to the CLI/max defaults.
     pub pending_settings: Arc<(Mutex<Option<RequestedSettings>>, Condvar)>,
+    /// Active pairing attempt to surface in the macOS menu-bar UI. See
+    /// `PairingPrompt`.
+    pub pairing_prompt: Mutex<Option<PairingPrompt>>,
 }
 
 impl SharedState {
@@ -345,6 +358,7 @@ impl SharedState {
             encoder_backend,
             pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
             start_time: Instant::now(),
+            pairing_prompt: Mutex::new(None),
         }
     }
 

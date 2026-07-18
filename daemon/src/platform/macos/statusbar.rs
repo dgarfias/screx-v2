@@ -31,12 +31,14 @@ use objc2::{
     Message,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSImage, NSMenu,
-    NSMenuItem, NSStatusBar, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSColor, NSFloatingWindowLevel, NSFont, NSFontWeightBold, NSImage, NSMenu, NSMenuItem,
+    NSPanel, NSStatusBar, NSTextAlignment, NSTextField, NSVariableStatusItemLength,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{ns_string, NSData, NSNotification, NSSize, NSString, NSTimer};
+use objc2_foundation::{ns_string, NSData, NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
-use crate::stream_server::SharedState;
+use crate::stream_server::{PairingPrompt, SharedState};
 
 /// Menu bar icon — a template (alpha-only) image; macOS derives the
 /// on-screen tint from `isTemplate`, so this renders correctly in both
@@ -74,6 +76,14 @@ struct AppDelegateIvars {
     // Keeps the repeating timer (and the block it owns) alive for the
     // process lifetime; never read again after being set.
     timer: OnceCell<Retained<NSTimer>>,
+    // Floating panel shown while a client is running the PIN pairing flow
+    // (see `SharedState::pairing_prompt`). Built lazily on first use.
+    pairing_panel: OnceCell<Retained<NSPanel>>,
+    pairing_ip_label: OnceCell<Retained<NSTextField>>,
+    pairing_code_label: OnceCell<Retained<NSTextField>>,
+    // PIN currently displayed in the panel, so `tick()` only touches AppKit
+    // when the pairing prompt actually changes (new attempt or cleared).
+    shown_pin: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -113,6 +123,10 @@ impl AppDelegate {
             last_rx: Cell::new(0),
             last_tick: Cell::new(Instant::now()),
             timer: OnceCell::new(),
+            pairing_panel: OnceCell::new(),
+            pairing_ip_label: OnceCell::new(),
+            pairing_code_label: OnceCell::new(),
+            shown_pin: RefCell::new(None),
         };
         let this = Self::alloc(mtm).set_ivars(ivars);
         // SAFETY: `NSObject`'s `init` method signature is correct.
@@ -217,6 +231,119 @@ impl AppDelegate {
                 format_rate(tx_rate)
             )));
         }
+
+        // Surface (or clear) the pairing PIN panel. Clone the prompt out and
+        // drop the lock before touching AppKit — never hold this mutex
+        // across AppKit calls.
+        let prompt = ivars.shared.pairing_prompt.lock().unwrap().clone();
+        let already_shown = ivars.shown_pin.borrow().clone();
+        match prompt {
+            Some(PairingPrompt { ip, pin }) if already_shown.as_deref() != Some(pin.as_str()) => {
+                self.ensure_pairing_panel();
+                if let Some(ip_label) = ivars.pairing_ip_label.get() {
+                    ip_label.setStringValue(&NSString::from_str(&format!("IP address:  {ip}")));
+                }
+                if let Some(code_label) = ivars.pairing_code_label.get() {
+                    code_label.setStringValue(&NSString::from_str(&pin));
+                }
+                // orderFrontRegardless (rather than makeKeyAndOrderFront +
+                // activate) shows the panel on top without stealing keyboard
+                // focus or forcing the background daemon to become active. With
+                // hidesOnDeactivate(false) set at build time, this is enough to
+                // surface it immediately without the user clicking anything.
+                if let Some(panel) = ivars.pairing_panel.get() {
+                    panel.orderFrontRegardless();
+                }
+                *ivars.shown_pin.borrow_mut() = Some(pin);
+            }
+            None if already_shown.is_some() => {
+                if let Some(panel) = ivars.pairing_panel.get() {
+                    panel.orderOut(None);
+                }
+                *ivars.shown_pin.borrow_mut() = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Lazily build the floating pairing-request panel (once). Not shown
+    /// here — callers show/hide it based on `SharedState::pairing_prompt`.
+    fn ensure_pairing_panel(&self) {
+        if self.ivars().pairing_panel.get().is_some() {
+            return;
+        }
+        let mtm = self.mtm();
+
+        let content_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(340.0, 180.0));
+        // A plain titled panel (no HUD/vibrancy) so label text keeps full
+        // contrast — the HUD style rendered the code nearly unreadable.
+        let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            content_rect,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        panel.setTitle(ns_string!("Pairing Request"));
+        panel.setFloatingPanel(true);
+        panel.setLevel(NSFloatingWindowLevel);
+        // An NSPanel's `hidesOnDeactivate` defaults to true. A menu-bar
+        // accessory app is essentially never the active app, so without this
+        // the panel stayed hidden until the user clicked into the app. Keep it
+        // onscreen regardless, and let it ride along on the active Space / above
+        // a fullscreen app.
+        panel.setHidesOnDeactivate(false);
+        panel.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        panel.center();
+
+        let heading = NSTextField::wrappingLabelWithString(
+            ns_string!("Someone is trying to pair with this Mac."),
+            mtm,
+        );
+        heading.setFrame(NSRect::new(NSPoint::new(16.0, 132.0), NSSize::new(308.0, 34.0)));
+        heading.setSelectable(false);
+
+        let ip_label = NSTextField::labelWithString(ns_string!("IP address:"), mtm);
+        ip_label.setFrame(NSRect::new(NSPoint::new(16.0, 100.0), NSSize::new(308.0, 22.0)));
+        ip_label.setSelectable(false);
+
+        // Small static caption above the big digits.
+        let code_caption = NSTextField::labelWithString(ns_string!("Pairing code"), mtm);
+        code_caption.setFrame(NSRect::new(NSPoint::new(16.0, 70.0), NSSize::new(308.0, 18.0)));
+        code_caption.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        code_caption.setAlignment(NSTextAlignment::Center);
+        code_caption.setSelectable(false);
+
+        // The 6 digits only. A single big label prefixed with "Pairing code:"
+        // overflowed its frame and clipped the actual code off the panel — so
+        // the caption above holds the words and this holds just the number.
+        let code_label = NSTextField::labelWithString(ns_string!(""), mtm);
+        code_label.setFrame(NSRect::new(NSPoint::new(16.0, 18.0), NSSize::new(308.0, 48.0)));
+        // SAFETY: `NSFontWeightBold` is an extern static provided by AppKit;
+        // reading it is safe (it's an immutable, framework-initialized CGFloat).
+        let bold_weight = unsafe { NSFontWeightBold };
+        code_label.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(
+            38.0,
+            bold_weight,
+        )));
+        code_label.setTextColor(Some(&NSColor::labelColor()));
+        code_label.setAlignment(NSTextAlignment::Center);
+        code_label.setSelectable(false);
+
+        if let Some(content_view) = panel.contentView() {
+            content_view.addSubview(&heading);
+            content_view.addSubview(&ip_label);
+            content_view.addSubview(&code_caption);
+            content_view.addSubview(&code_label);
+        }
+
+        let _ = self.ivars().pairing_ip_label.set(ip_label);
+        let _ = self.ivars().pairing_code_label.set(code_label);
+        let _ = self.ivars().pairing_panel.set(panel);
     }
 
     fn perform_shutdown(&self) {
