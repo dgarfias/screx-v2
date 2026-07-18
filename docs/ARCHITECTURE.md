@@ -45,6 +45,10 @@ Client input/peripherals
        CGEventPost+ScreenCaptureKit (macOS)
 ```
 
+Pointer model differs per client: the iPad sends **relative** deltas under pointer lock when an
+external mouse/trackpad is attached (touch stays absolute), while the desktop client always sends
+**absolute** positions.
+
 ## Main Components
 
 ### Daemon (shared core)

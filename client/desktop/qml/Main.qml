@@ -28,6 +28,56 @@ ApplicationWindow {
         return "Noto Sans"
     }
 
+    property bool isFullscreen: root.visibility === Window.FullScreen
+
+    function toggleFullscreen() {
+        root.visibility = root.isFullscreen ? Window.Windowed : Window.FullScreen
+    }
+
+    onIsFullscreenChanged: {
+        if (isFullscreen && AppState.connected) {
+            fullscreenToast.opacity = 1
+            toastTimer.restart()
+        }
+    }
+
+    // Leaving the session always drops back to windowed mode.
+    Connections {
+        target: AppState
+        function onConnectedChanged() {
+            if (!AppState.connected) root.visibility = Window.Windowed
+        }
+        function onFullscreen_toggle_requested() {
+            root.toggleFullscreen()
+        }
+    }
+
+    // Only fires when keyGrabber isn't already consuming Ctrl+Alt+F (it forwards
+    // the combo to the remote otherwise handled here would never fire twice).
+    Shortcut {
+        sequence: "Ctrl+Alt+F"
+        enabled: !(AppState.connected && AppState.keyboard_enabled)
+        onActivated: root.toggleFullscreen()
+    }
+
+    // Shared Speaker/Mic/Cam/KB toggle model, used by both the windowed
+    // toolbar and the fullscreen pill panel so the action closures (in
+    // particular the camera popup flow) live in exactly one place.
+    function toggleModel() {
+        return [
+            { label: "Speaker", active: AppState.speaker_enabled, available: AppState.speaker_available, action: function() { AppState.toggle_speaker() } },
+            { label: "Mic", active: AppState.mic_enabled, available: AppState.mic_available, action: function() { AppState.toggle_mic() } },
+            { label: "Cam", active: AppState.camera_enabled, available: AppState.camera_available, action: function() {
+                if (AppState.camera_enabled) {
+                    AppState.toggle_camera()
+                } else {
+                    camPopup.open()
+                }
+            } },
+            { label: "KB", active: AppState.keyboard_enabled, available: true, action: function() { AppState.toggle_keyboard() } }
+        ]
+    }
+
         StackLayout {
         anchors.fill: parent
         currentIndex: AppState.connected ? 1 : 0
@@ -276,10 +326,11 @@ ApplicationWindow {
                     anchors.fill: parent
                     spacing: 0
 
-                    // ── Fixed top toolbar ──
+                    // ── Fixed top toolbar (hidden in fullscreen; the pill overlay takes over) ──
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 40
+                        visible: !root.isFullscreen
                         color: "#1c1c1e"
 
                         RowLayout {
@@ -300,18 +351,7 @@ ApplicationWindow {
                             Rectangle { width: 1; Layout.fillHeight: true; Layout.topMargin: 8; Layout.bottomMargin: 8; color: "#3a3a3c" }
 
                             Repeater {
-                                model: [
-                                    { label: "Speaker", active: AppState.speaker_enabled, available: AppState.speaker_available, action: function() { AppState.toggle_speaker() } },
-                                    { label: "Mic", active: AppState.mic_enabled, available: AppState.mic_available, action: function() { AppState.toggle_mic() } },
-                                    { label: "Cam", active: AppState.camera_enabled, available: AppState.camera_available, action: function() {
-                                        if (AppState.camera_enabled) {
-                                            AppState.toggle_camera()
-                                        } else {
-                                            camPopup.open()
-                                        }
-                                    } },
-                                    { label: "KB", active: AppState.keyboard_enabled, available: true, action: function() { AppState.toggle_keyboard() } }
-                                ]
+                                model: root.toggleModel()
 
                                 delegate: Button {
                                     text: modelData.label
@@ -353,6 +393,29 @@ ApplicationWindow {
                             }
 
                             Rectangle { width: 1; Layout.fillHeight: true; Layout.topMargin: 8; Layout.bottomMargin: 8; color: "#3a3a3c" }
+
+                            Button {
+                                text: "⛶ Full Screen"
+                                font.family: uiFont()
+                                font.pixelSize: 12
+                                font.weight: 600
+                                onClicked: root.toggleFullscreen()
+                                background: Rectangle {
+                                    radius: 4
+                                    color: parent.down ? "#3a3a3c" : "#2c2c2e"
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: "#ffffff"
+                                    font: parent.font
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                leftPadding: 10
+                                rightPadding: 10
+                                topPadding: 4
+                                bottomPadding: 4
+                            }
 
                             Button {
                                 text: "Disconnect"
@@ -472,6 +535,13 @@ ApplicationWindow {
                                     event.accepted = true
                                     return
                                 }
+                                if ((event.modifiers & Qt.ControlModifier) &&
+                                    (event.modifiers & Qt.AltModifier) &&
+                                    event.key === Qt.Key_F) {
+                                    root.toggleFullscreen()
+                                    event.accepted = true
+                                    return
+                                }
                                 AppState.send_raw_key_event(event.key, true)
                                 event.accepted = true
                             }
@@ -482,6 +552,41 @@ ApplicationWindow {
                                 }
                                 AppState.send_raw_key_event(event.key, false)
                                 event.accepted = true
+                            }
+                        }
+
+                        // ── Fullscreen entry toast ──
+                        Rectangle {
+                            id: fullscreenToast
+                            visible: opacity > 0
+                            opacity: 0
+                            z: 200
+                            anchors.top: parent.top
+                            anchors.topMargin: 24
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            radius: 8
+                            color: "#1c1c1e"
+                            border.color: "#3a3a3c"
+                            border.width: 1
+                            width: toastText.implicitWidth + 32
+                            height: toastText.implicitHeight + 16
+
+                            Behavior on opacity { NumberAnimation { duration: 400 } }
+
+                            Text {
+                                id: toastText
+                                anchors.centerIn: parent
+                                text: Qt.platform.os === "osx" ? "⌘ + ⌥ + F to exit full screen" : "Ctrl+Alt+F to exit full screen"
+                                color: "#ffffff"
+                                font.family: uiFont()
+                                font.pixelSize: 13
+                                font.weight: 600
+                            }
+
+                            Timer {
+                                id: toastTimer
+                                interval: 3000
+                                onTriggered: fullscreenToast.opacity = 0
                             }
                         }
                     }

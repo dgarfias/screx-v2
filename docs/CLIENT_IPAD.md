@@ -57,3 +57,13 @@ preserved. Network TCP establishment fails after 8 seconds if the daemon cannot 
 established network stream is treated as stale after 5 seconds without inbound UDP data. Active
 touch gestures are clamped to the video boundary so dragging outside the letterboxed image still
 produces a matching release at the nearest display edge.
+
+## Pointer model
+
+Touch input is **absolute** — a tap maps directly to that point on the remote display (translated
+to pointer + scroll gestures).
+
+When an external mouse or trackpad is connected, the iPad engages **pointer lock**
+(`prefersPointerLocked`) and forwards **relative** motion deltas. This gives a true extended-display
+feel: the remote cursor moves by relative motion and can roam the remote desktop freely, rather than
+being pinned to the viewport.

@@ -8,6 +8,13 @@ Decodes the stream and forwards input, audio, and camera back to the host. Sourc
 daemon and exposes a Stream Settings UI for choosing resolution, framerate, codec, and bitrate
 before connecting.
 
+## Pointer model
+
+The desktop client uses **absolute** pointing in both windowed and fullscreen modes: the cursor's
+position within the video maps 1:1 to an absolute location on the remote display, and positions are
+clamped to the display so the cursor never leaves it. Relative / pointer-lock mode is not used
+(Qt/QML has no native pointer-lock API), which also keeps the local cursor free to leave the window.
+
 ## Requirements
 
 - Rust (stable toolchain)

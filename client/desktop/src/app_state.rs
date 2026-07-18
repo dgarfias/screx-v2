@@ -65,6 +65,7 @@ pub struct AppState {
     pub keyboard_enabled_changed: qt_signal!(),
     pub mouse_grabbed: qt_property!(bool; NOTIFY mouse_grabbed_changed),
     pub mouse_grabbed_changed: qt_signal!(),
+    pub fullscreen_toggle_requested: qt_signal!(),
 
     // ── Daemon-advertised capabilities (CAPS) ──
     // Default to true so the UI is unchanged until a CAPS frame (or the 2s
@@ -528,6 +529,30 @@ impl AppState {
                 self.pin_prompt_visible
             );
         }
+
+        // Client-local shortcut: Ctrl/Cmd + Alt/Opt + F toggles fullscreen.
+        // Handled here in the app-wide key filter so it works even while keyboard
+        // forwarding is enabled — otherwise the forwarding path below consumes it
+        // and sends it to the remote instead of toggling the local window.
+        // macOS: Qt maps Command -> ControlModifier and Option -> AltModifier, so
+        // this one bit-check is Cmd+Opt+F on macOS and Ctrl+Alt+F on Windows/Linux.
+        {
+            const CONTROL_MOD: i32 = 0x0400_0000; // Qt::ControlModifier
+            const ALT_MOD: i32 = 0x0800_0000; // Qt::AltModifier
+            const KEY_F: i32 = 0x46; // Qt::Key_F
+            if self.connected
+                && !self.pin_prompt_visible
+                && modifiers & CONTROL_MOD != 0
+                && modifiers & ALT_MOD != 0
+                && qt_key == KEY_F
+            {
+                if phase == GLOBAL_KEY_PRESS {
+                    self.fullscreen_toggle_requested();
+                }
+                return true; // consume every phase so it never reaches the remote
+            }
+        }
+
         if !self.connected || !self.keyboard_enabled || self.pin_prompt_visible {
             return false;
         }
@@ -778,6 +803,7 @@ impl Default for AppState {
             select_camera_mode: Default::default(),
             send_key_event: Default::default(),
             send_raw_key_event: Default::default(),
+            fullscreen_toggle_requested: Default::default(),
             send_mouse_move: Default::default(),
             send_mouse_move_raw: Default::default(),
             send_mouse_button: Default::default(),
