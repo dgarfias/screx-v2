@@ -251,6 +251,11 @@ pub struct SharedState {
     pub on_client_connected: Mutex<Option<LifecycleCallback>>,
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
+    /// Cumulative wire bytes sent to / received from the client. Used only
+    /// for the macOS menu bar's live throughput display (see
+    /// `platform::macos::statusbar`); harmless no-op bookkeeping elsewhere.
+    pub bytes_tx: AtomicU64,
+    pub bytes_rx: AtomicU64,
     pub audio_output_enabled: AtomicBool,
     pub audio_module_id: Mutex<u32>,
     pub network_session_busy: AtomicBool,
@@ -321,6 +326,8 @@ impl SharedState {
             on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
+            bytes_tx: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
             audio_output_enabled: AtomicBool::new(false),
             audio_module_id: Mutex::new(0),
             network_session_busy: AtomicBool::new(false),
@@ -1174,6 +1181,7 @@ pub fn run_client_manager(
 
         match socket.recv_from(&mut recv_buf) {
             Ok((len, addr)) => {
+                shared.bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
                 recv_count = recv_count.wrapping_add(1);
                 if should_log_debug(recv_count) {
                     let registered_client = *shared.client_addr.lock().unwrap();
@@ -1522,7 +1530,7 @@ impl UdpSender {
         timestamp_ms: u32,
         codec_id: u8,
         tuning: StreamTuning,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let payload: &[u8] = &*au.annex_b;
         let is_idr = au.is_idr;
         if self.log_sent_aus {
@@ -1656,7 +1664,7 @@ impl UdpSender {
             self.stats_start = Instant::now();
         }
 
-        Ok(())
+        Ok(frame_bytes)
     }
 
     fn ensure_packet_capacity(&mut self, total_shards: usize) {

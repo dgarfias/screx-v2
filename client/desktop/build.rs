@@ -1,7 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/main.rs");
     println!("cargo:rerun-if-changed=src/video_surface.rs");
-    println!("cargo:rerun-if-changed=../ipad/Screx/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
+    println!("cargo:rerun-if-changed=assets/AppIcon.png");
 
     // Link libpulse-simple on Linux for audio output
     #[cfg(target_os = "linux")]
@@ -106,7 +106,7 @@ fn embed_windows_icon() {
     use image::imageops::FilterType;
     use std::path::{Path, PathBuf};
 
-    let icon_src = Path::new("../ipad/Screx/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
+    let icon_src = Path::new("assets/AppIcon.png");
     if !icon_src.exists() {
         println!(
             "cargo:warning=Windows icon source not found at {}",

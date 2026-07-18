@@ -75,6 +75,20 @@ dispatch2 = "0.3"
 # dependency graph, only direct access to types already there.
 objc2-core-audio-types = "0.3"
 objc2-core-audio = "0.3"
+# Menu bar status item (see platform/macos/statusbar.rs): NSStatusBar/
+# NSStatusItem/NSMenu/NSMenuItem for the status bar UI itself, NSApplication
+# for the run loop and accessory activation policy, NSImage for the status
+# icon. Not feature-restricted (like objc2-screen-capture-kit above) since
+# this crate's own "default" feature already enables the ~full AppKit
+# surface; a narrower explicit list buys nothing here.
+objc2-app-kit = "0.3"
 
 [build-dependencies]
 cc = "1"
+
+# Embeds assets/AppIcon.png (see build.rs's embed_windows_icon) as the
+# screx.exe icon resource — mirrors client/desktop/Cargo.toml's identical
+# section.
+[target.'cfg(windows)'.build-dependencies]
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+winresource = "0.1"

@@ -687,26 +687,39 @@ async fn main() -> Result<()> {
                                     if use_usb {
                                         let mut usb = session_shared.usb_sender.lock().unwrap();
                                         if let Some(ref mut tcp) = *usb {
-                                            if let Err(e) = tcp.send_video(
+                                            match tcp.send_video(
                                                 &*au.annex_b,
                                                 au.is_idr,
                                                 ts,
                                                 codec_id,
                                             ) {
-                                                eprintln!("[pipeline] USB send error: {e:#}");
-                                                drop(usb);
-                                                session_shared
-                                                    .usb_active
-                                                    .store(false, Ordering::SeqCst);
+                                                Ok(()) => {
+                                                    session_shared.bytes_tx.fetch_add(
+                                                        au.annex_b.len() as u64,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[pipeline] USB send error: {e:#}");
+                                                    drop(usb);
+                                                    session_shared
+                                                        .usb_active
+                                                        .store(false, Ordering::SeqCst);
+                                                }
                                             }
                                             continue;
                                         }
                                     }
                                     if let Some(addr) = udp_addr {
-                                        if let Err(e) =
-                                            sender.send_frame(au, addr, ts, codec_id, tuning)
-                                        {
-                                            eprintln!("[pipeline] send error: {e:#}");
+                                        match sender.send_frame(au, addr, ts, codec_id, tuning) {
+                                            Ok(bytes) => {
+                                                session_shared
+                                                    .bytes_tx
+                                                    .fetch_add(bytes, Ordering::Relaxed);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[pipeline] send error: {e:#}");
+                                            }
                                         }
                                     }
                                 }
@@ -779,42 +792,61 @@ async fn main() -> Result<()> {
         .context("failed to spawn audio thread")?;
 
     // -----------------------------------------------------------------------
-    // Wait for Ctrl-C
+    // Wait for shutdown, then clean up
     // -----------------------------------------------------------------------
 
-    tokio::signal::ctrl_c().await?;
-    println!("\nshutdown requested (ctrl-c)");
-    stop.store(true, Ordering::SeqCst);
-    shared.capture_stop_flag.store(true, Ordering::SeqCst);
+    let status_shared = Arc::clone(&shared);
+    let do_shutdown = move || {
+        stop.store(true, Ordering::SeqCst);
+        shared.capture_stop_flag.store(true, Ordering::SeqCst);
+        {
+            let (_, cvar) = &*shared.capture_start_signal;
+            cvar.notify_all();
+        }
+
+        // Cleanup remaining resources
+        *shared.keyboard_worker.lock().unwrap() = None;
+        *shared.cam_writer.lock().unwrap() = None;
+        if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
+            audio::remove_virtual_mic(mic);
+        }
+        *shared.mic_writer.lock().unwrap() = None;
+        crate::stream_server::disable_virtual_sink(&shared);
+
+        let _ = capture_thread.join();
+        if let Err(err) = audio_thread.join() {
+            eprintln!("[audio] thread join failed: {err:?}");
+        }
+        if let Some(thread) = usb_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = client_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = pairing_thread {
+            let _ = thread.join();
+        }
+
+        println!("screx cleanup complete, exiting");
+    };
+
+    #[cfg(target_os = "macos")]
     {
-        let (_, cvar) = &*shared.capture_start_signal;
-        cvar.notify_all();
+        // Blocks for the remaining life of the process, pumping the AppKit
+        // main run loop that services the menu bar status item; calls
+        // `do_shutdown` once and exits the process when Quit is chosen or
+        // SIGINT/SIGTERM arrives. Never returns.
+        crate::platform::macos::statusbar::run(status_shared, do_shutdown);
     }
 
-    // Cleanup remaining resources
-    *shared.keyboard_worker.lock().unwrap() = None;
-    *shared.cam_writer.lock().unwrap() = None;
-    if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
-        audio::remove_virtual_mic(mic);
-    }
-    *shared.mic_writer.lock().unwrap() = None;
-    crate::stream_server::disable_virtual_sink(&shared);
-
-    let _ = capture_thread.join();
-    if let Err(err) = audio_thread.join() {
-        eprintln!("[audio] thread join failed: {err:?}");
-    }
-    if let Some(thread) = usb_thread {
-        let _ = thread.join();
-    }
-    if let Some(thread) = client_thread {
-        let _ = thread.join();
-    }
-    if let Some(thread) = pairing_thread {
-        let _ = thread.join();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = status_shared;
+        tokio::signal::ctrl_c().await?;
+        println!("\nshutdown requested (ctrl-c)");
+        do_shutdown();
     }
 
-    println!("screx cleanup complete, exiting");
     Ok(())
 }
 

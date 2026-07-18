@@ -359,7 +359,7 @@ sign_nested_bundles() {
 }
 
 build_icon() {
-    local icon_src="$SCRIPT_DIR/../ipad/Screx/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+    local icon_src="$SCRIPT_DIR/assets/AppIcon.png"
     [ -f "$icon_src" ] || return 0
 
     local iconset_dir

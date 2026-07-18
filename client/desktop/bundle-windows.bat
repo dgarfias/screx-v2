@@ -36,8 +36,8 @@ echo === Copying executable ===
 copy "%EXE%" "%DIST%\"
 
 echo === Copying application icon ===
-if exist "..\ipad\Screx\Assets.xcassets\AppIcon.appiconset\AppIcon.png" (
-    copy "..\ipad\Screx\Assets.xcassets\AppIcon.appiconset\AppIcon.png" "%DIST%\AppIcon.png" >nul
+if exist "assets\AppIcon.png" (
+    copy "assets\AppIcon.png" "%DIST%\AppIcon.png" >nul
 )
 
 echo === Deploying Qt runtime ===
