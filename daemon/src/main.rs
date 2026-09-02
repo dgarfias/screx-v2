@@ -66,6 +66,13 @@ struct Cli {
     #[arg(short, long, default_value_t = 90)]
     keyframe: u32,
 
+    /// Replace periodic IDR keyframes with rolling intra-refresh where the
+    /// encoder supports it (software H.264 and NVENC); full IDRs are then
+    /// emitted only when a client requests one. Pass --no-intra-refresh to
+    /// keep the legacy periodic keyframes.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    intra_refresh: bool,
+
     /// Maximum encoder bitrate a session may negotiate (e.g. 20000000, 20M,
     /// 500K; ceiling, not a fixed value — see --max-width)
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
@@ -111,6 +118,7 @@ struct AppConfig {
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
+    intra_refresh: bool,
     stream_port: u16,
     camera_exclusive_caps: bool,
 }
@@ -131,6 +139,7 @@ impl AppConfig {
             fps: cli.max_framerate,
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.max_bitrate,
+            intra_refresh: cli.intra_refresh,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
@@ -444,6 +453,7 @@ async fn main() -> Result<()> {
                     height: session_height,
                     backend: config.encoder_backend,
                     codec: session_codec,
+                    intra_refresh: config.intra_refresh,
                 };
 
                 // Create encoder fresh for each session

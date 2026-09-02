@@ -32,6 +32,19 @@ final class PairingService {
     private static let tagLen      = 16
     private static let connectTimeout: TimeInterval = 8
 
+    /// TCP parameters for the pairing/control connection. Disables Nagle's
+    /// algorithm (`noDelay`) so small input packets (touch/mouse/key) are sent
+    /// immediately instead of being held behind the receiver's delayed-ACK
+    /// timer — the daemon already sets `TCP_NODELAY` on its side, and this
+    /// connection later becomes the control/input channel.
+    private static func tcpParameters() -> NWParameters {
+        let params = NWParameters.tcp
+        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcp.noDelay = true
+        }
+        return params
+    }
+
     var onResult: ((PairingResult) -> Void)?
 
     private func log(_ message: String) {
@@ -47,7 +60,7 @@ final class PairingService {
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(integerLiteral: port)
         )
-        let conn = NWConnection(to: endpoint, using: .tcp)
+        let conn = NWConnection(to: endpoint, using: Self.tcpParameters())
         self.connection = conn
 
         conn.stateUpdateHandler = { [weak self] state in

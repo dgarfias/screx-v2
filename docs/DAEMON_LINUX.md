@@ -93,6 +93,7 @@ sudo ./target/release/screx unpair --all
 | `-H, --max-height` | `2160` | Maximum display height clients may request (also the default when a client doesn't ask) |
 | `-f, --max-framerate` | `60` | Maximum framerate clients may request (also the default when a client doesn't ask) |
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
+| `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--no-intra-refresh` to keep legacy periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
 | `-p, --port` | `9000` | UDP/TCP streaming port |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |

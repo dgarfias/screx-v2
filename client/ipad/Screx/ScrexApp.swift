@@ -478,6 +478,10 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var sessionDisplayName: String = ""
     @Published private(set) var receiveRateText: String = "0 B/s"
     @Published private(set) var sendRateText: String = "0 B/s"
+    /// Control-channel round-trip time from the in-session `PING` probe.
+    @Published private(set) var latencyText: String = "—"
+    /// Inter-sample variation of the control-channel RTT.
+    @Published private(set) var jitterText: String = "—"
 
     /// What the currently-connected daemon advertised via `CAPS`. Nil until a `CAPS`
     /// message arrives (or the 2s timeout fallback fires, see `beginCapabilityNegotiation`).
@@ -540,6 +544,10 @@ final class StreamViewModel: ObservableObject {
 
     private func log(_ message: String) {
         print("[app] \(message)")
+    }
+
+    private static func formatLatency(_ ms: Double) -> String {
+        String(format: "%.0f ms", ms)
     }
 
     /// Configures the shared AVAudioSession based on whether the in-app microphone is active.
@@ -834,6 +842,8 @@ final class StreamViewModel: ObservableObject {
         if transport == .none && !state.isConnected {
             receiveRateText = "0 bytes/s"
             sendRateText = "0 bytes/s"
+            latencyText = "—"
+            jitterText = "—"
         }
     }
 
@@ -1156,6 +1166,14 @@ final class StreamViewModel: ObservableObject {
                         guard let self, let control else { return }
                         guard self.networkControl === control else { return }
                         self.handleDaemonCapabilities(capabilities)
+                    }
+                }
+                control.onLatency = { [weak self, weak control] rttMs, jitterMs in
+                    Task { @MainActor in
+                        guard let self, let control else { return }
+                        guard self.networkControl === control else { return }
+                        self.latencyText = Self.formatLatency(rttMs)
+                        self.jitterText = Self.formatLatency(jitterMs)
                     }
                 }
                 self.beginCapabilityNegotiation(transport: .network)
@@ -1852,6 +1870,8 @@ struct ContentView: View {
                             infoRow(label: "Receiving", value: model.receiveRateText)
                             infoRow(label: "Sending", value: model.sendRateText)
                             infoRow(label: "Codec", value: model.codecLabel)
+                            infoRow(label: "Latency", value: model.latencyText)
+                            infoRow(label: "Jitter", value: model.jitterText)
                         }
 
                         if !model.status.isEmpty {

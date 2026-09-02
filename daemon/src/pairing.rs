@@ -202,6 +202,10 @@ const CONTROL_MAX_FRAME: usize = 65536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
 const CONTROL_DISCONNECT_MAGIC: &[u8] = b"DISCONNECT";
 const CONTROL_HOSTNAME_MAGIC: &[u8] = b"HOST";
+/// Latency probe: the client sends a short `PING` payload and measures the
+/// round trip of the identical payload echoed back. Only ever used while a
+/// session is active; it carries no data of its own.
+const CONTROL_PING_MAGIC: &[u8] = b"PING";
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.
@@ -651,6 +655,13 @@ fn run_control_loop(
         if plaintext == CONTROL_DISCONNECT_MAGIC {
             println!("[control] graceful disconnect requested by client");
             break;
+        }
+
+        if plaintext == CONTROL_PING_MAGIC {
+            // Echo the ping payload back so the client can measure RTT/jitter
+            // on the control plane.
+            send_control_frame(&mut stream, &cipher, &mut send_seq, &plaintext)?;
+            continue;
         }
 
         crate::stream_server::handle_control_message_data(shared, plaintext);

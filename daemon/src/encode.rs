@@ -41,6 +41,11 @@ pub struct EncoderConfig {
     pub height: u32,
     pub backend: EncoderBackend,
     pub codec: VideoCodec,
+    /// Replace periodic full IDR keyframes with rolling intra-refresh where the
+    /// encoder supports it (software H.264, NVENC). Spreads the keyframe cost
+    /// across frames instead of spiking the pipeline every GOP; full IDRs are
+    /// then emitted only when the client explicitly requests one (PLI).
+    pub intra_refresh: bool,
 }
 
 /// Owned reference to an encoded packet's underlying AVBuffer.
@@ -458,9 +463,21 @@ impl Encoder {
         }
 
         let pli_idr = force_idr && self.last_idr_at.elapsed() >= Self::MIN_PLI_IDR_INTERVAL;
-        let is_idr = pli_idr
-            || self.frame_count % u64::from(self.config.gop.max(1)) == 0
-            || self.last_idr_at.elapsed() >= self.max_idr_interval;
+        let intra_idr_supported = match &mut self.inner {
+            ActiveEncoder::HwAccel(enc) => enc.supports_intra_refresh(),
+            ActiveEncoder::Software(enc) => enc.supports_intra_refresh(),
+        };
+        let intra_refresh_active = self.config.intra_refresh && intra_idr_supported;
+        let is_idr = if intra_refresh_active {
+            // Rolling intra-refresh replaces periodic IDRs; only an explicit
+            // request (PLI / reconnect) forces a full IDR, so the pipeline
+            // never takes a recurring keyframe spike.
+            pli_idr
+        } else {
+            pli_idr
+                || self.frame_count % u64::from(self.config.gop.max(1)) == 0
+                || self.last_idr_at.elapsed() >= self.max_idr_interval
+        };
 
         let aus = match &mut self.inner {
             ActiveEncoder::HwAccel(enc) => enc.push_frame(frame, is_idr)?,
@@ -973,6 +990,13 @@ enum VaapiHevcMode {
     Cqp(i64),
 }
 
+/// Whether the given encoder exposes FFmpeg's `intra-refresh` private option.
+/// Verified against FFmpeg 9: NVENC (H.264/H.265) exposes it; VA-API and
+/// VideoToolbox do not, so those keep periodic full IDRs.
+fn hw_supports_intra_refresh(kind: HwKind) -> bool {
+    matches!(kind, HwKind::Nvenc)
+}
+
 fn vaapi_hevc_qp(config: &EncoderConfig) -> i64 {
     // Some Intel VA-API HEVC drivers only expose CQP, so approximate the
     // user-provided bitrate target with a fixed QP chosen from bits/pixel.
@@ -1013,6 +1037,10 @@ impl HwEncoder {
             }
         }
         Ok(())
+    }
+
+    fn supports_intra_refresh(&self) -> bool {
+        hw_supports_intra_refresh(self.kind)
     }
 
     #[cfg(target_os = "linux")]
@@ -1186,6 +1214,8 @@ impl HwEncoder {
         #[cfg(not(target_os = "macos"))]
         let uses_external_frames = false;
 
+        let use_intra_refresh = config.intra_refresh && hw_supports_intra_refresh(kind);
+
         unsafe {
             let codec_cstr = std::ffi::CString::new(codec_name).unwrap();
             let codec = ffi::avcodec_find_encoder_by_name(codec_cstr.as_ptr());
@@ -1269,7 +1299,11 @@ impl HwEncoder {
                 num: config.fps.max(1) as i32,
                 den: 1,
             };
-            (*ctx).gop_size = config.gop as i32;
+            (*ctx).gop_size = if use_intra_refresh {
+                10_000
+            } else {
+                config.gop as i32
+            };
             (*ctx).max_b_frames = 0;
             #[cfg(target_os = "macos")]
             if matches!(kind, HwKind::VideoToolbox) {
@@ -1323,6 +1357,15 @@ impl HwEncoder {
                     let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
                     let one = std::ffi::CString::new("1").unwrap();
                     ffi::av_opt_set((*ctx).priv_data, zerolatency.as_ptr(), one.as_ptr(), 0);
+                    if use_intra_refresh {
+                        let intra_refresh = std::ffi::CString::new("intra-refresh").unwrap();
+                        ffi::av_opt_set(
+                            (*ctx).priv_data,
+                            intra_refresh.as_ptr(),
+                            one.as_ptr(),
+                            0,
+                        );
+                    }
                 }
                 #[cfg(target_os = "windows")]
                 HwKind::Amf => {
@@ -1452,8 +1495,8 @@ impl HwEncoder {
             };
 
             println!(
-                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={}",
-                width, height, config.fps, config.bitrate_bps, config.gop
+                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={} intra_refresh={}",
+                width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
 
             Ok(Self {
@@ -1816,6 +1859,7 @@ struct SwEncoder {
     height: i32,
     frame_index: u64,
     fps: u32,
+    codec: VideoCodec,
     extradata: Vec<u8>,
 }
 
@@ -1835,20 +1879,29 @@ impl SwEncoder {
         Ok(())
     }
 
+    fn supports_intra_refresh(&self) -> bool {
+        self.codec == VideoCodec::H264
+    }
+
     fn new(config: &EncoderConfig) -> Result<Self> {
         let width = config.width as i32;
         let height = config.height as i32;
 
+        let use_intra_refresh = config.intra_refresh && config.codec == VideoCodec::H264;
+
         let (enc_name, opts): (&str, Vec<(&str, &str)>) = match config.codec {
-            VideoCodec::H264 => (
-                "libx264",
-                vec![
+            VideoCodec::H264 => {
+                let mut opts = vec![
                     ("preset", "ultrafast"),
                     ("tune", "zerolatency"),
                     ("forced-idr", "1"),
                     ("profile", "baseline"),
-                ],
-            ),
+                ];
+                if use_intra_refresh {
+                    opts.push(("intra-refresh", "1"));
+                }
+                ("libx264", opts)
+            }
             VideoCodec::H265 => (
                 "libx265",
                 vec![
@@ -1884,7 +1937,13 @@ impl SwEncoder {
             (*ctx).bit_rate = config.bitrate_bps as i64;
             (*ctx).rc_max_rate = config.bitrate_bps as i64;
             (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
-            (*ctx).gop_size = config.gop as i32;
+            // Intra-refresh replaces periodic IDRs with a rolling intra column,
+            // so a near-infinite GOP is safe (full IDRs are only PLI-triggered).
+            (*ctx).gop_size = if use_intra_refresh {
+                10_000
+            } else {
+                config.gop as i32
+            };
             (*ctx).max_b_frames = 0;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
             (*ctx).thread_count = 1;
@@ -1953,8 +2012,8 @@ impl SwEncoder {
             }
 
             println!(
-                "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={}",
-                width, height, config.fps, config.bitrate_bps, config.gop
+                "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={} intra_refresh={}",
+                width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
 
             Ok(Self {
@@ -1966,6 +2025,7 @@ impl SwEncoder {
                 height,
                 frame_index: 0,
                 fps: config.fps.max(1),
+                codec: config.codec,
                 extradata,
             })
         }
@@ -2172,6 +2232,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
         let mut encoder = Encoder::new(config).expect("VideoToolbox encoder should construct");
         let data = vec![128u8; width as usize * height as usize * 3 / 2];
@@ -2208,6 +2269,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
 
         let mut encoder = Encoder::new(config).expect("VideoToolbox encoder should construct");
@@ -2260,6 +2322,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
 
         // Per-frame pseudo-random noise (changes every frame, seeded by frame

@@ -24,15 +24,14 @@ final class VideoDecoder {
     private var naluCount = 0
 
     private var framesReceived: UInt64 = 0
-    private var framesDisplayed: UInt64 = 0
+    private var framesEnqueued: UInt64 = 0
+    private var framesDropped: UInt64 = 0
     private var statsWindowStart = CACurrentMediaTime()
 
     private let renderQueue = DispatchQueue(label: "screx.render", qos: .userInteractive)
     private var naluBuf = [UInt8]()
 
     var sendPliRequest: (() -> Void)?
-    private var lastBackpressureFlushTime: TimeInterval = 0
-    private static let backpressureFlushInterval: TimeInterval = 1.0
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -321,25 +320,29 @@ final class VideoDecoder {
             }
 
             if !self.displayLayer.isReadyForMoreMediaData {
-                let now = CACurrentMediaTime()
-                if now - self.lastBackpressureFlushTime > Self.backpressureFlushInterval {
-                    self.lastBackpressureFlushTime = now
-                    self.displayLayer.flush()
-                    self.sendPliRequest?()
-                }
+                // The display layer is backed up (decode/present can't keep
+                // up). Drop the stale backlog immediately instead of letting
+                // display latency ratchet up on a timer — then enqueue the
+                // freshest frame and ask for a new keyframe so the dropped
+                // tail re-synchronizes. Bounded queue, newest wins.
+                self.framesDropped += 1
+                self.displayLayer.flush()
+                self.sendPliRequest?()
             }
 
             self.displayLayer.enqueue(sampleBuffer)
-            self.framesDisplayed += 1
+            self.framesEnqueued += 1
 
             let now = CACurrentMediaTime()
             let elapsed = now - self.statsWindowStart
             if elapsed >= 2.0 {
                 let recvFps = Double(self.framesReceived) / elapsed
-                let dispFps = Double(self.framesDisplayed) / elapsed
-                print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) display_fps=\(String(format: "%.1f", dispFps))")
+                let enqFps = Double(self.framesEnqueued) / elapsed
+                let dropFps = Double(self.framesDropped) / elapsed
+                print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) enq_fps=\(String(format: "%.1f", enqFps)) drop_fps=\(String(format: "%.1f", dropFps))")
                 self.framesReceived = 0
-                self.framesDisplayed = 0
+                self.framesEnqueued = 0
+                self.framesDropped = 0
                 self.statsWindowStart = now
             }
         }

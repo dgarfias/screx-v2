@@ -31,7 +31,12 @@ final class StreamClient {
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
-    private static let frameTimeout: TimeInterval = 0.100
+    /// How long an incomplete frame may sit before we give up on it. Only a
+    /// loss-recovery deadline (complete frames deliver immediately), so it is
+    /// not a steady-state latency cost. 100 ms is six frames at 60 fps;
+    /// 50 ms (~3 frames) recovers sooner on loss while staying far above
+    /// Wi-Fi reorder jitter. Moonlight uses a ~10 ms reorder window.
+    private static let frameTimeout: TimeInterval = 0.050
     private static let dataTimeout: TimeInterval = 5.0
 
     private static let flagAudio: UInt8 = 0x02
