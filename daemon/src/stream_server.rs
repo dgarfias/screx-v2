@@ -1331,6 +1331,9 @@ pub struct UdpSender {
     packet_pool: Vec<[u8; MAX_PACKET_LEN]>,
     packet_lens: Vec<usize>,
     frame_id: u32,
+    /// Time one frame is allotted on the wire (microseconds). Used to pace
+    /// shard batching so video never floods the shared audio socket.
+    frame_interval: u64,
     stats_start: Instant,
     stats_frames: u64,
     stats_bytes: u64,
@@ -1343,12 +1346,15 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn new(socket: UdpSocket) -> Self {
+    pub fn new(socket: UdpSocket, fps: u32) -> Self {
         Self {
             socket,
             packet_pool: Vec::new(),
             packet_lens: Vec::new(),
             frame_id: 0,
+            // One frame's worth of wire time, in microseconds. Used to pace
+            // shard batching so video never floods the shared audio socket.
+            frame_interval: 1_000_000 / u64::from(fps.max(1)),
             stats_start: Instant::now(),
             stats_frames: 0,
             stats_bytes: 0,
@@ -1525,6 +1531,19 @@ impl UdpSender {
         let mut sent = 0;
         let mut frame_bytes = 0_u64;
 
+        // Moonlight-style pacing for large bursts only. A keyframe can be
+        // ~300 datagrams; blasting them into the shared socket in one go
+        // delays the audio thread's 10ms Opus packets behind the entire burst
+        // (the audible crackle at IDR time). Small frames (<1 sendmmsg batch)
+        // send instantly, so normal latency is untouched. Only when the frame
+        // is large do we cap the per-batch rate: spread it across roughly one
+        // frame interval so video and audio interleave on the socket.
+        let pacing_needed = total_shards > SENDMMSG_BATCH_SIZE;
+        let shard_interval = if pacing_needed {
+            (self.frame_interval / (total_shards as u64).max(1)).min(2000) as u64
+        } else {
+            0
+        };
         while sent < total_shards {
             let end = (sent + SENDMMSG_BATCH_SIZE).min(total_shards);
             let batch: Vec<&[u8]> = (sent..end)
@@ -1558,6 +1577,9 @@ impl UdpSender {
                     }
                     sent = end;
                 }
+            }
+            if shard_interval > 0 {
+                std::thread::sleep(Duration::from_micros(shard_interval));
             }
         }
 

@@ -53,12 +53,16 @@ final class AudioPlayer {
 
     // 48kHz stereo s16le = 192000 bytes/sec = 192 bytes/ms
     private static let bytesPerMs = 192
-    // Target buffer: ~30ms of audio for jitter absorption
-    private static let targetBufferMs = 30
+    // Target buffer: ~50ms of audio for jitter absorption. iOS render is 10ms,
+    // so this is a 5-buffer budget — deep enough to ride over a video burst
+    // (an IDR can momentarily queue a few ms of audio behind it on the shared
+    // socket) without adding perceptible latency. Moonlight/Parsec target
+    // roughly this range rather than a minimal 1-2 buffer.
+    private static let targetBufferMs = 50
     private static let targetBufferBytes = targetBufferMs * bytesPerMs
     // Drift thresholds (ms) before corrective action
     private static let driftDropThresholdMs: Int32 = -40
-    private static let driftTrimThresholdMs: Int32 = 60
+    private static let driftTrimThresholdMs: Int32 = 90
 
     // Standing-latency trim: underruns ratchet the ring depth up (silence is
     // played, then the late audio arrives and queues behind), and timestamp
@@ -240,11 +244,21 @@ final class AudioPlayer {
                 let expectedTs = avSync.expectedDaemonTimeNow()
                 let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
 
+                // Negative drift = this audio segment's nominal time is behind
+                // the video clock. That is normal after any arrival burst or
+                // pause (PacketAudio/tsched, IDR encodes) and is NOT a reason
+                // to throw audio away — the jitter buffer absorbs it. Only
+                // clip at extreme lateness (>100ms, ~10 full packets) and even
+                // then never drop more than half the ring, so a transient can
+                // never punch a hole in playback.
                 if drift < Self.driftDropThresholdMs {
-                    let dropBytes = min(ringCount, Int(-drift) * Self.bytesPerMs)
-                    let aligned = (dropBytes / 4) * 4
-                    if aligned > 0 {
-                        ringDiscard(aligned)
+                    let lateMs = Int(-drift)
+                    if lateMs > 100 && ringCount > 0 {
+                        let dropBytes = min(ringCount / 2, lateMs * Self.bytesPerMs)
+                        let aligned = (dropBytes / 4) * 4
+                        if aligned > 0 {
+                            ringDiscard(aligned)
+                        }
                     }
                 } else if drift > Self.driftTrimThresholdMs {
                     let excess = ringCount - Self.targetBufferBytes

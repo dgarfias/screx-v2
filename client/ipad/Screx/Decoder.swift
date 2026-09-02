@@ -320,14 +320,15 @@ final class VideoDecoder {
             }
 
             if !self.displayLayer.isReadyForMoreMediaData {
-                // The display layer is backed up (decode/present can't keep
-                // up). Drop the stale backlog immediately instead of letting
-                // display latency ratchet up on a timer — then enqueue the
-                // freshest frame and ask for a new keyframe so the dropped
-                // tail re-synchronizes. Bounded queue, newest wins.
+                // The display layer is backed up (decode/present can't keep up).
+                // Drop the stale backlog and enqueue the freshest frame instead
+                // of letting display latency ratchet up. This is NOT loss —
+                // there is no reorder/loss evidence — so we deliberately do not
+                // request a keyframe here (Moonlight/Parsec: no buffer, drop
+                // stale, present newest). PLI is only for confirmed frame_id
+                // gaps in StreamClient.
                 self.framesDropped += 1
                 self.displayLayer.flush()
-                self.sendPliRequest?()
             }
 
             self.displayLayer.enqueue(sampleBuffer)

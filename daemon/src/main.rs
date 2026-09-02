@@ -349,7 +349,7 @@ async fn main() -> Result<()> {
     let capture_thread = thread::Builder::new()
         .name("capture".into())
         .spawn(move || -> Result<()> {
-            let mut sender = stream_server::UdpSender::new(send_socket);
+            let mut sender = stream_server::UdpSender::new(send_socket, config.fps);
             // Backend is constructed ONCE for the life of the process, from
             // the CLI/max-derived `capture_config` above — NOT per session.
             // Per-session resolution/fps changes are applied below via

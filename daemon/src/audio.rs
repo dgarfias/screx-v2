@@ -124,7 +124,10 @@ pub fn run_audio_capture(
         let session_key = &shared.session_key;
         let udp_source = &shared.udp_source;
         let client_addr = &shared.client_addr;
-        let start_time = shared.start_time;
+        // Session-clock anchor for the audio capture session. Each Opus chunk
+        // is stamped base + n*10ms so the timeline is smooth and in the same
+        // epoch as the video timestamps (the iPad's A/V sync compares them).
+        let base_time_ms = shared.start_time.elapsed().as_millis() as u32;
 
         // Opus encoder for this capture session, plus its reusable scratch
         // buffers — created once here (not per 10 ms chunk) to avoid
@@ -144,6 +147,10 @@ pub fn run_audio_capture(
         if let Err(e) = encoder.set_bitrate(opus::Bitrate::Bits(128_000)) {
             eprintln!("[audio] opus set_bitrate failed: {e:?}");
         }
+        // In-band FEC kept OFF: the iPad's swift-opus decoder does not expose
+        // the FEC flag (`OPUS_SET_INBAND_FEC`), so the redundancy would never
+        // be used. Audio ride-ahead of video bursts is handled by the socket
+        // pacing in the video sender instead.
         if let Err(e) = encoder.set_inband_fec(false) {
             eprintln!("[audio] opus set_inband_fec failed: {e:?}");
         }
@@ -153,11 +160,22 @@ pub fn run_audio_capture(
         let mut pcm_scratch = vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize];
         let mut opus_out = vec![0u8; OPUS_MAX_PACKET];
 
+        // Monotonic sample clock for the audio stream. PulseAudio/tsched can
+        // deliver parec fragments in bursts (several 10ms chunks at once), and
+        // stamping each with the wall clock (`elapsed()`) produces a staircase
+        // of identical timestamps. The client compares those against its
+        // smooth video-anchored clock and misreads the staircase as drift,
+        // then discards ring data -> audible gaps. A sample clock advances
+        // 10ms per chunk toward our session-clock anchor no matter how the
+        // chunks arrive, so the client sees a steady, in-epoch timeline.
+        let mut chunk_index: u32 = 0;
+
         let mut on_chunk = |chunk: &[u8]| {
             if chunk.len() != BYTES_PER_CHUNK {
                 return;
             }
-            let ts = start_time.elapsed().as_millis() as u32;
+            let ts = base_time_ms.wrapping_add(chunk_index.wrapping_mul(CHUNK_DURATION_MS));
+            chunk_index = chunk_index.wrapping_add(1);
 
             // `chunk` is little-endian i16 PCM with no alignment guarantee —
             // widen it into the i16 scratch buffer sample by sample rather
