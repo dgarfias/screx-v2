@@ -523,6 +523,9 @@ final class StreamViewModel: ObservableObject {
     @Published private(set) var latencyText: String = "—"
     /// Inter-sample variation of the control-channel RTT.
     @Published private(set) var jitterText: String = "—"
+    /// One-shot user-visible notice (e.g. a denied camera/mic permission).
+    /// ContentView observes it, surfaces it as a transient toast, and clears it.
+    @Published var noticeMessage: String? = nil
 
     /// What the currently-connected daemon advertised via `CAPS`. Nil until a `CAPS`
     /// message arrives (or the 2s timeout fallback fires, see `beginCapabilityNegotiation`).
@@ -1612,16 +1615,42 @@ final class StreamViewModel: ObservableObject {
             cameraCapture.stop()
             sendCameraDisable()
         } else {
-            sendCameraEnable()
-            cameraCapture.onJPEG = { [weak self] jpeg in
+            requestCameraIfNeeded { [weak self] granted in
                 guard let self else { return }
-                let fid = self.camFrameId
-                self.camFrameId = self.camFrameId &+ 1
-                self.stream?.sendCameraFrame(jpeg, frameId: fid)
+                guard granted else {
+                    self.noticeMessage = "Camera access denied. Enable it in Settings > Privacy & Security > Camera."
+                    return
+                }
+                self.sendCameraEnable()
+                self.cameraCapture.onJPEG = { [weak self] jpeg in
+                    guard let self else { return }
+                    let fid = self.camFrameId
+                    self.camFrameId = self.camFrameId &+ 1
+                    self.stream?.sendCameraFrame(jpeg, frameId: fid)
+                }
+                self.cameraCapture.start()
+                self.objectWillChange.send()
             }
-            cameraCapture.start()
         }
         objectWillChange.send()
+    }
+
+    /// Requests camera permission on first use; invokes `completion` on the
+    /// main thread with whether capture may proceed. Denied/permanent-denied
+    /// resolves to `false` (never crash, never silently no-op).
+    private func requestCameraIfNeeded(completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
     }
 
     /// Tells the daemon to create the virtual webcam with our capture profile.
@@ -1662,26 +1691,49 @@ final class StreamViewModel: ObservableObject {
                 resetSpeakerOutput()
             }
         } else {
-            configureAudioSession(micActive: true)
-            sendMicEnable()
-            micCapture.onOpusPacket = { [weak self] opusData in
+            requestMicIfNeeded { [weak self] granted in
                 guard let self else { return }
-                let seq = self.micSeq
-                self.micSeq = self.micSeq &+ 1
+                guard granted else {
+                    self.noticeMessage = "Microphone access denied. Enable it in Settings > Privacy & Security > Microphone."
+                    return
+                }
+                self.configureAudioSession(micActive: true)
+                self.sendMicEnable()
+                self.micCapture.onOpusPacket = { [weak self] opusData in
+                    guard let self else { return }
+                    let seq = self.micSeq
+                    self.micSeq = self.micSeq &+ 1
 
-                // Build MIC packet: "MIC" + seq(4 BE) + opus_data
-                var packet = Data("MIC".utf8)
-                withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
-                packet.append(opusData)
+                    // Build MIC packet: "MIC" + seq(4 BE) + opus_data
+                    var packet = Data("MIC".utf8)
+                    withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
+                    packet.append(opusData)
 
-                self.stream?.sendMicPacket(packet)
-            }
-            micCapture.start()
-            if speakerWasEnabled {
-                resetSpeakerOutput()
+                    self.stream?.sendMicPacket(packet)
+                }
+                self.micCapture.start()
+                if speakerWasEnabled {
+                    self.resetSpeakerOutput()
+                }
+                self.objectWillChange.send()
             }
         }
         objectWillChange.send()
+    }
+
+    private func requestMicIfNeeded(completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        case .denied, .restricted:
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
     }
 
     /// Re-synchronizes playback with the daemon by turning the speaker off and back on.
@@ -1951,6 +2003,11 @@ struct ContentView: View {
             }
             .onChange(of: pillSize) { _ in
                 clampBarPosition(in: geo.size)
+            }
+            .onChange(of: model.noticeMessage) { message in
+                guard let message else { return }
+                showToolbarMessage(message)
+                model.noticeMessage = nil
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in

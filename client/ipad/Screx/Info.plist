@@ -9,6 +9,15 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Screx connects to your Linux computer on the local network to stream its display and forward input.</string>
+	<!-- THE APP USES ENCRYPTION (AES-256-GCM, X25519 ECDH) in its own
+	     transport, so export compliance must be declared. It is exempt:
+	     MIT-licensed open source, mass-market, with source publicly available
+	     (U.S. Export Administration Regulations §734.3 / 15 CFR 742, open
+	     source / mass-market categories). Kept false so App Store Connect
+	     treats the app as exempt; when uploading, answer the export-compliance
+	     prompt accordingly. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
