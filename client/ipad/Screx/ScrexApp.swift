@@ -464,6 +464,49 @@ final class TrafficCounter: @unchecked Sendable {
     }
 }
 
+/// Owns the receive/send byte counters and publishes the formatted rate
+/// strings once a second. Isolated behind its own `ObservableObject` so the
+/// 1s traffic tick only invalidates the small info overlay that reads it —
+/// never the whole `ContentView` (which would tear down an open settings
+/// sheet or interrupt a picker).
+@MainActor
+final class TrafficMonitor: ObservableObject {
+    @Published private(set) var rxText: String = "0 B/s"
+    @Published private(set) var txText: String = "0 B/s"
+
+    private let counter = TrafficCounter()
+    private var timer: DispatchSourceTimer?
+
+    func start() {
+        guard timer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let (rx, tx) = self.counter.readAndReset()
+            let rxText = formatByteRate(Double(rx))
+            let txText = formatByteRate(Double(tx))
+            // Only publish on an actual change so the timer never invalidates
+            // subscribers while the rates read the same.
+            if rxText != self.rxText { self.rxText = rxText }
+            if txText != self.txText { self.txText = txText }
+        }
+        timer.resume()
+        self.timer = timer
+    }
+
+    func add(rxBytes: Int = 0, txBytes: Int = 0) {
+        guard rxBytes > 0 || txBytes > 0 else { return }
+        counter.add(rx: UInt64(rxBytes), tx: UInt64(txBytes))
+    }
+
+    func reset() {
+        _ = counter.readAndReset()
+        rxText = "0 B/s"
+        txText = "0 B/s"
+    }
+}
+
 @MainActor
 final class StreamViewModel: ObservableObject {
     @Published var status: String = "Enter a daemon host or IP to connect."
@@ -476,8 +519,6 @@ final class StreamViewModel: ObservableObject {
     @Published var pairingStatus: String = ""
     @Published var recentConnections: [RecentConnection] = StreamViewModel.loadRecentConnections()
     @Published private(set) var sessionDisplayName: String = ""
-    @Published private(set) var receiveRateText: String = "0 B/s"
-    @Published private(set) var sendRateText: String = "0 B/s"
     /// Control-channel round-trip time from the in-session `PING` probe.
     @Published private(set) var latencyText: String = "—"
     /// Inter-sample variation of the control-channel RTT.
@@ -522,8 +563,10 @@ final class StreamViewModel: ObservableObject {
     private var micSeq: UInt32 = 0
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
-    private var trafficTimer: DispatchSourceTimer?
-    private nonisolated let trafficCounter = TrafficCounter()
+    /// Traffic-rate text lives on its own `TrafficMonitor` observable so the
+    /// 1s tick never invalidates `ContentView`. The model only forwards byte
+    /// counts into it.
+    let trafficMonitor = TrafficMonitor()
 
     /// Fires if no `CAPS` message arrives within `capsTimeoutInterval` of the session
     /// coming up, meaning "assume this is an old daemon that predates capability
@@ -840,8 +883,7 @@ final class StreamViewModel: ObservableObject {
         isConnected = state.isConnected
         isConnecting = state.isConnecting
         if transport == .none && !state.isConnected {
-            receiveRateText = "0 bytes/s"
-            sendRateText = "0 bytes/s"
+            trafficMonitor.reset()
             latencyText = "—"
             jitterText = "—"
         }
@@ -993,29 +1035,9 @@ final class StreamViewModel: ObservableObject {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
-        startTrafficMonitoring()
+        trafficMonitor.start()
         if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
-        }
-    }
-
-    private func startTrafficMonitoring() {
-        trafficTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let (rxDelta, txDelta) = self.trafficCounter.readAndReset()
-            self.receiveRateText = formatByteRate(Double(rxDelta))
-            self.sendRateText = formatByteRate(Double(txDelta))
-        }
-        timer.resume()
-        trafficTimer = timer
-    }
-
-    private nonisolated func recordTraffic(rxBytes: Int = 0, txBytes: Int = 0) {
-        if rxBytes > 0 || txBytes > 0 {
-            trafficCounter.add(rx: UInt64(rxBytes), tx: UInt64(txBytes))
         }
     }
 
@@ -1108,7 +1130,7 @@ final class StreamViewModel: ObservableObject {
 
         applyConnectionHealth(.connecting, detail: "Connecting to \(name).", transport: .network)
         sessionDisplayName = name
-        _ = trafficCounter.readAndReset()
+        trafficMonitor.reset()
 
         // Extract host string from endpoint
         let host: String
@@ -1152,7 +1174,7 @@ final class StreamViewModel: ObservableObject {
                 }
                 self.networkControl = control
                 control.onTraffic = { [weak self] rxBytes, txBytes in
-                    self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
+                    self?.trafficMonitor.add(rxBytes: rxBytes, txBytes: txBytes)
                 }
                 control.onHostname = { [weak self, weak control] hostname in
                     Task { @MainActor in
@@ -1242,7 +1264,7 @@ final class StreamViewModel: ObservableObject {
         }
         self.stream = client
         client.onTraffic = { [weak self] rxBytes, txBytes in
-            self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
+            self?.trafficMonitor.add(rxBytes: rxBytes, txBytes: txBytes)
         }
 
         client.onEvent = { [weak self, weak client] event in
@@ -1867,8 +1889,7 @@ struct ContentView: View {
 
                         VStack(alignment: .leading, spacing: 6) {
                             infoRow(label: "Hostname", value: model.sessionDisplayName.isEmpty ? "Unknown" : model.sessionDisplayName)
-                            infoRow(label: "Receiving", value: model.receiveRateText)
-                            infoRow(label: "Sending", value: model.sendRateText)
+                            ToggleableTrafficRows(trafficMonitor: model.trafficMonitor)
                             infoRow(label: "Codec", value: model.codecLabel)
                             infoRow(label: "Latency", value: model.latencyText)
                             infoRow(label: "Jitter", value: model.jitterText)
@@ -1989,6 +2010,10 @@ struct ContentView: View {
             .interactiveDismissDisabled()
         }
         .sheet(isPresented: $showStreamSettings) {
+            // The parent ContentView no longer re-renders every second (the
+            // 1s traffic tick now lives on TrafficMonitor and only invalidates
+            // the info overlay), but .equatable() + seeded @State keeps the
+            // sheet stable against any residual parent invalidation.
             StreamSettingsSheet(
                 resolution: model.preferredResolution,
                 framerate: model.preferredFramerate,
@@ -2006,11 +2031,6 @@ struct ContentView: View {
                     model.persistStreamSettingsPreferences()
                 }
             )
-            // The parent ContentView re-renders ~every second from chatty model
-            // traffic/health updates. Wrapping the sheet in .equatable() and
-            // comparing only the seeded initial values lets SwiftUI skip those
-            // identical parent-driven re-renders while @State-driven user edits
-            // still invalidate the view normally.
             .equatable()
         }
         .statusBarHidden(true)
@@ -2205,6 +2225,35 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
+        }
+    }
+
+    /// The traffic-rate rows are the only part of the info overlay that
+    /// changes every second. Wrapping them in this small child that observes
+    /// only `TrafficMonitor` keeps the 1s tick from invalidating ContentView
+    /// and tearing down an open settings sheet or picker.
+    private struct ToggleableTrafficRows: View {
+        @ObservedObject var trafficMonitor: TrafficMonitor
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text("Receiving:")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(trafficMonitor.rxText)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                }
+                HStack(spacing: 8) {
+                    Text("Sending:")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(trafficMonitor.txText)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                }
+            }
         }
     }
 
