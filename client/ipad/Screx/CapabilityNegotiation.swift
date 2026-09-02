@@ -1,7 +1,7 @@
 import Foundation
 
-/// Capability negotiation wire format shared by the network control path
-/// (`NetworkControlClient`) and the USB control path (`USBListener`).
+/// Capability negotiation wire format used by the network control path
+/// (`NetworkControlClient`).
 ///
 /// This is a from-scratch Swift reimplementation of the TLV format documented in
 /// docs/ARCHITECTURE.md ("Capability Negotiation") — there is no shared protocol
@@ -19,9 +19,6 @@ struct DaemonCapabilities: Equatable {
     var camera: Bool
     var microphone: Bool
     var speaker: Bool
-    /// nil = gamepad passthrough unsupported; otherwise the max number of simultaneous
-    /// controllers the daemon can pass through.
-    var gamepadMaxControllers: UInt8?
     /// Codec ids the daemon can actually encode right now (0x00 = H.264, 0x01 = H.265).
     var codecs: [UInt8]
     var maxWidth: Int
@@ -38,7 +35,9 @@ struct DaemonCapabilities: Equatable {
     private static let tagCamera: UInt8 = 0x01
     private static let tagMicrophone: UInt8 = 0x02
     private static let tagSpeaker: UInt8 = 0x03
-    private static let tagGamepad: UInt8 = 0x04
+    // 0x04 (gamepad passthrough) is retired: the app no longer passes through
+    // GCController gamepads, and the parser below simply skips unknown tags, so a
+    // daemon that still sends this tag is handled correctly.
     private static let tagCodecs: UInt8 = 0x05
     private static let tagMaxResolution: UInt8 = 0x06
     private static let tagMaxFramerate: UInt8 = 0x07
@@ -54,7 +53,6 @@ struct DaemonCapabilities: Equatable {
         camera: true,
         microphone: true,
         speaker: true,
-        gamepadMaxControllers: 4,
         codecs: [codecH264, codecH265],
         maxWidth: 3840,
         maxHeight: 2160,
@@ -102,12 +100,6 @@ struct DaemonCapabilities: Equatable {
             case tagSpeaker:
                 guard length >= 1 else { continue }
                 result.speaker = value[value.startIndex] != 0
-
-            case tagGamepad:
-                guard length >= 2 else { continue }
-                let available = value[value.startIndex] != 0
-                let maxControllers = value[value.startIndex + 1]
-                result.gamepadMaxControllers = available ? maxControllers : nil
 
             case tagCodecs:
                 guard length >= 1 else { continue }
@@ -240,9 +232,9 @@ struct StreamSettings: Equatable {
         self.bitrateBps = bitrateBps
     }
 
-    /// Builds the `STNG` message body (the control-channel framing around it, e.g. the
-    /// encrypted-frame envelope on the network path or the `msgControl` byte on the USB
-    /// path, is added by the caller exactly like it is for every other control message).
+    /// Builds the `STNG` message body (the control-channel framing around it — the
+    /// encrypted-frame envelope on the network path — is added by the caller exactly like
+    /// it is for every other control message).
     /// A settings value with every field nil still produces a valid message with
     /// `entry_count = 0`, meaning "everything default, just connect."
     func encode() -> Data {

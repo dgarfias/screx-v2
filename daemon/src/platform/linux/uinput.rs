@@ -7,10 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::input::{
-    GamepadState, InputBackend, KeyboardEvent, MouseEvent, TouchContact, GPAD_BTN_EAST,
-    GPAD_BTN_MODE, GPAD_BTN_NORTH, GPAD_BTN_SELECT, GPAD_BTN_SOUTH, GPAD_BTN_START,
-    GPAD_BTN_THUMBL, GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, GPAD_BTN_WEST, SPECIAL_BACKSPACE,
-    TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
+    InputBackend, MouseEvent, TouchContact, SPECIAL_BACKSPACE, TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
 };
 use crate::input::{
     KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_A, KEY_APOSTROPHE,
@@ -46,25 +43,6 @@ const REL_WHEEL: u16 = 0x08;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
-
-const BTN_SOUTH: u16 = 0x130;
-const BTN_EAST: u16 = 0x131;
-const BTN_NORTH: u16 = 0x133;
-const BTN_WEST: u16 = 0x134;
-const BTN_TL: u16 = 0x136;
-const BTN_TR: u16 = 0x137;
-const BTN_SELECT: u16 = 0x13a;
-const BTN_START: u16 = 0x13b;
-const BTN_MODE: u16 = 0x13c;
-const BTN_THUMBL: u16 = 0x13d;
-const BTN_THUMBR: u16 = 0x13e;
-
-const ABS_RX: u16 = 0x03;
-const ABS_RY: u16 = 0x04;
-const ABS_Z: u16 = 0x02;
-const ABS_RZ: u16 = 0x05;
-const ABS_HAT0X: u16 = 0x10;
-const ABS_HAT0Y: u16 = 0x11;
 
 const MAX_SLOTS: i32 = 10;
 const SCREX_VENDOR: u16 = 0x1234;
@@ -195,7 +173,6 @@ pub struct LinuxInput {
     touch: Option<VirtualTouchscreen>,
     keyboard: Option<VirtualKeyboard>,
     mouse: Option<VirtualMouse>,
-    gamepads: std::collections::HashMap<u8, VirtualGamepad>,
     /// Negotiated per-session stream resolution, in wire coordinate space.
     /// `None` until the first `set_target_rect` call. The virtual
     /// touchscreen itself is created once at startup sized to the CLI/config
@@ -218,7 +195,6 @@ impl LinuxInput {
             touch,
             keyboard,
             mouse: None,
-            gamepads: std::collections::HashMap::new(),
             session_size: None,
         })
     }
@@ -318,26 +294,6 @@ impl InputBackend for LinuxInput {
                 crate::vlog!("[mouse] recv scroll: dy={dy}");
                 m.scroll(dy as i32);
             }
-        }
-        Ok(())
-    }
-
-    fn gamepad_attach(&mut self, id: u8) -> Result<()> {
-        if !self.gamepads.contains_key(&id) {
-            self.gamepads.insert(id, VirtualGamepad::new(id)?);
-        }
-        Ok(())
-    }
-
-    fn gamepad_detach(&mut self, id: u8) {
-        self.gamepads.remove(&id);
-    }
-
-    fn gamepad_state(&mut self, id: u8, st: &GamepadState) -> Result<()> {
-        if let Some(pad) = self.gamepads.get_mut(&id) {
-            pad.set_state(
-                st.buttons, st.lx, st.ly, st.rx, st.ry, st.lt, st.rt, st.hat_x, st.hat_y,
-            );
         }
         Ok(())
     }
@@ -682,136 +638,6 @@ impl Drop for VirtualMouse {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
         println!("[mouse] virtual mouse destroyed");
-    }
-}
-
-pub struct VirtualGamepad {
-    file: File,
-    buttons_mask: u16,
-}
-
-impl VirtualGamepad {
-    pub fn new(slot: u8) -> Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .open("/dev/uinput")
-            .context("failed to open /dev/uinput for gamepad")?;
-
-        let fd = file.as_raw_fd();
-
-        unsafe {
-            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int))?;
-            ioctl_check(libc::ioctl(fd, UI_SET_EVBIT, EV_ABS as libc::c_int))?;
-
-            for &btn in &[
-                BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_SELECT, BTN_START,
-                BTN_MODE, BTN_THUMBL, BTN_THUMBR,
-            ] {
-                ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, btn as libc::c_int))?;
-            }
-
-            for &abs in &[
-                ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
-            ] {
-                ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, abs as libc::c_int))?;
-            }
-
-            set_abs(fd, ABS_X, -32768, 32767)?;
-            set_abs(fd, ABS_Y, -32768, 32767)?;
-            set_abs(fd, ABS_RX, -32768, 32767)?;
-            set_abs(fd, ABS_RY, -32768, 32767)?;
-            set_abs(fd, ABS_Z, 0, 1023)?;
-            set_abs(fd, ABS_RZ, 0, 1023)?;
-            set_abs(fd, ABS_HAT0X, -1, 1)?;
-            set_abs(fd, ABS_HAT0Y, -1, 1)?;
-
-            let mut setup: UinputSetup = mem::zeroed();
-            setup.id.bustype = 0x03;
-            setup.id.vendor = SCREX_VENDOR;
-            setup.id.product = SCREX_PRODUCT + 10 + slot as u16;
-            setup.id.version = 1;
-            let name = format!("Screx Virtual Gamepad {}", slot + 1);
-            let name_bytes = name.as_bytes();
-            setup.name[..name_bytes.len()].copy_from_slice(name_bytes);
-
-            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_setup(), &setup))?;
-            ioctl_check(libc::ioctl(fd, ioctl_ui_dev_create()))?;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("[gamepad] virtual gamepad {} created", slot + 1);
-
-        Ok(Self {
-            file,
-            buttons_mask: 0,
-        })
-    }
-
-    pub fn set_state(
-        &mut self,
-        buttons_mask: u16,
-        lx: i16,
-        ly: i16,
-        rx: i16,
-        ry: i16,
-        lt: u16,
-        rt: u16,
-        hat_x: i8,
-        hat_y: i8,
-    ) {
-        let mut events = Vec::with_capacity(19);
-        self.sync_button(&mut events, BTN_SOUTH, GPAD_BTN_SOUTH, buttons_mask);
-        self.sync_button(&mut events, BTN_EAST, GPAD_BTN_EAST, buttons_mask);
-        self.sync_button(&mut events, BTN_WEST, GPAD_BTN_WEST, buttons_mask);
-        self.sync_button(&mut events, BTN_NORTH, GPAD_BTN_NORTH, buttons_mask);
-        self.sync_button(&mut events, BTN_TL, GPAD_BTN_TL, buttons_mask);
-        self.sync_button(&mut events, BTN_TR, GPAD_BTN_TR, buttons_mask);
-        self.sync_button(&mut events, BTN_THUMBL, GPAD_BTN_THUMBL, buttons_mask);
-        self.sync_button(&mut events, BTN_THUMBR, GPAD_BTN_THUMBR, buttons_mask);
-        self.sync_button(&mut events, BTN_SELECT, GPAD_BTN_SELECT, buttons_mask);
-        self.sync_button(&mut events, BTN_START, GPAD_BTN_START, buttons_mask);
-        self.sync_button(&mut events, BTN_MODE, GPAD_BTN_MODE, buttons_mask);
-        self.buttons_mask = buttons_mask;
-
-        events.push(input_event(EV_ABS, ABS_X, lx as i32));
-        events.push(input_event(EV_ABS, ABS_Y, ly as i32));
-        events.push(input_event(EV_ABS, ABS_RX, rx as i32));
-        events.push(input_event(EV_ABS, ABS_RY, ry as i32));
-        events.push(input_event(EV_ABS, ABS_Z, lt as i32));
-        events.push(input_event(EV_ABS, ABS_RZ, rt as i32));
-        events.push(input_event(EV_ABS, ABS_HAT0X, hat_x as i32));
-        events.push(input_event(EV_ABS, ABS_HAT0Y, hat_y as i32));
-        events.push(input_event(EV_SYN, SYN_REPORT, 0));
-        emit_batch(&mut self.file, &events);
-    }
-
-    pub fn release_all(&mut self) {
-        self.set_state(0, 0, 0, 0, 0, 0, 0, 0, 0);
-    }
-
-    fn sync_button(
-        &mut self,
-        events: &mut Vec<InputEvent>,
-        linux_code: u16,
-        bit: u16,
-        new_mask: u16,
-    ) {
-        let prev = (self.buttons_mask & bit) != 0;
-        let next = (new_mask & bit) != 0;
-        if prev != next {
-            events.push(input_event(EV_KEY, linux_code, if next { 1 } else { 0 }));
-        }
-    }
-}
-
-impl Drop for VirtualGamepad {
-    fn drop(&mut self) {
-        self.release_all();
-        unsafe {
-            libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
-        }
-        println!("[gamepad] virtual gamepad destroyed");
     }
 }
 

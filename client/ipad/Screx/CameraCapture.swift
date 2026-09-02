@@ -7,46 +7,11 @@ import UIKit
 final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private static let defaultCompressionQuality: CGFloat = 0.4
 
-    enum CaptureProfile: Equatable {
-        case network
-        case usb
-
-        var sessionPreset: AVCaptureSession.Preset {
-            switch self {
-            case .network:
-                return .hd1280x720
-            case .usb:
-                return .hd1920x1080
-            }
-        }
-
-        var outputSize: CGSize {
-            switch self {
-            case .network:
-                return CGSize(width: 1280, height: 720)
-            case .usb:
-                return CGSize(width: 1920, height: 1080)
-            }
-        }
-
-        var label: String {
-            switch self {
-            case .network:
-                return "720p"
-            case .usb:
-                return "1080p"
-            }
-        }
-
-        var targetFps: Int32 {
-            switch self {
-            case .network:
-                return 30
-            case .usb:
-                return 60
-            }
-        }
-    }
+    // Capture profile for the network transport — the only one there is.
+    private static let sessionPreset: AVCaptureSession.Preset = .hd1280x720
+    static let outputSize = CGSize(width: 1280, height: 720)
+    private static let profileLabel = "720p"
+    static let targetFps: Int32 = 30
 
     private let session = AVCaptureSession()
     private let outputQueue = DispatchQueue(label: "screx.camera", qos: .userInitiated)
@@ -54,16 +19,8 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var running = false
     private var frameCount: UInt32 = 0
     private(set) var usingFront = false
-    private var configuredFps: Int32 = CaptureProfile.network.targetFps
+    private var configuredFps: Int32 = CameraCapture.targetFps
     var compressionQuality: CGFloat = CameraCapture.defaultCompressionQuality
-    var captureProfile: CaptureProfile = .network {
-        didSet {
-            guard captureProfile != oldValue, running else { return }
-            let front = usingFront
-            stop()
-            startSession(front: front)
-        }
-    }
 
     var onJPEG: ((Data) -> Void)?
 
@@ -73,12 +30,11 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func startSession(front: Bool) {
-        let profile = captureProfile
-        if session.canSetSessionPreset(profile.sessionPreset) {
-            session.sessionPreset = profile.sessionPreset
+        if session.canSetSessionPreset(Self.sessionPreset) {
+            session.sessionPreset = Self.sessionPreset
         } else {
             session.sessionPreset = .hd1280x720
-            print("[camera] \(profile.label) preset unavailable, falling back to 720p")
+            print("[camera] \(Self.profileLabel) preset unavailable, falling back to 720p")
         }
 
         let position: AVCaptureDevice.Position = front ? .front : .back
@@ -109,12 +65,12 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             applyOrientation(to: connection)
         }
 
-        configuredFps = configureDevice(device, for: profile)
+        configuredFps = configureDevice(device)
 
         session.startRunning()
         running = true
         usingFront = front
-        print("[camera] capture started (\(profile.label), ~\(configuredFps)fps, \(front ? "front" : "back"))")
+        print("[camera] capture started (\(Self.profileLabel), ~\(configuredFps)fps, \(front ? "front" : "back"))")
     }
 
     func stop() {
@@ -146,7 +102,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.addInput(input)
         session.commitConfiguration()
 
-        configuredFps = configureDevice(device, for: captureProfile)
+        configuredFps = configureDevice(device)
 
         usingFront.toggle()
         print("[camera] flipped to \(usingFront ? "front" : "back")")
@@ -161,7 +117,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         autoreleasepool {
             let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            let outputSize = captureProfile.outputSize
+            let outputSize = Self.outputSize
             let targetRect = CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height)
             let framedImage = frameImage(ciImage, in: targetRect)
             guard let cgImage = ciContext.createCGImage(framedImage, from: targetRect) else { return }
@@ -204,38 +160,38 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         return positionedImage.composited(over: background)
     }
 
-    private func configureDevice(_ device: AVCaptureDevice, for profile: CaptureProfile) -> Int32 {
+    private func configureDevice(_ device: AVCaptureDevice) -> Int32 {
         do {
             try device.lockForConfiguration()
 
-            if let preferredFormat = preferredFormat(for: device, profile: profile) {
+            if let preferredFormat = preferredFormat(for: device) {
                 device.activeFormat = preferredFormat
             }
 
-            let resolvedFps = supportedFps(for: device.activeFormat, preferred: profile.targetFps)
-                ?? profile.targetFps
+            let resolvedFps = supportedFps(for: device.activeFormat, preferred: Self.targetFps)
+                ?? Self.targetFps
             let frameDuration = CMTime(value: 1, timescale: resolvedFps)
             device.activeVideoMinFrameDuration = frameDuration
             device.activeVideoMaxFrameDuration = frameDuration
             device.unlockForConfiguration()
 
-            if resolvedFps != profile.targetFps {
-                print("[camera] \(profile.label) \(profile.targetFps)fps unsupported, falling back to \(resolvedFps)fps")
+            if resolvedFps != Self.targetFps {
+                print("[camera] \(Self.profileLabel) \(Self.targetFps)fps unsupported, falling back to \(resolvedFps)fps")
             }
 
             return resolvedFps
         } catch {
             print("[camera] failed to configure camera format: \(error)")
-            return profile.targetFps
+            return Self.targetFps
         }
     }
 
-    private func preferredFormat(for device: AVCaptureDevice, profile: CaptureProfile) -> AVCaptureDevice.Format? {
-        let targetSize = profile.outputSize
+    private func preferredFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let targetSize = Self.outputSize
         let targetWidth = Int32(targetSize.width)
         let targetHeight = Int32(targetSize.height)
         let targetArea = Int64(targetWidth * targetHeight)
-        let targetFps = Double(profile.targetFps)
+        let targetFps = Double(Self.targetFps)
 
         return device.formats
             .compactMap { format -> (AVCaptureDevice.Format, Int64, Double)? in

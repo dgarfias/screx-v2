@@ -4,7 +4,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -237,10 +236,6 @@ impl AudioBackend for PulseAudioBackend {
             try_null_sink_mic()
         })?;
         Ok(Box::new(sink))
-    }
-
-    fn destroy_mic(&mut self) {
-        // Sinks are cleaned up when the Box<dyn MicSink> is dropped.
     }
 }
 

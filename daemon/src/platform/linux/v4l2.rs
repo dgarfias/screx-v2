@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::camera::{CameraBackend, CameraConfig};
+use crate::camera::CameraBackend;
 
 const VIDEO_DEVICE: &str = "/dev/video10";
 const CARD_LABEL: &str = "Screx Camera";

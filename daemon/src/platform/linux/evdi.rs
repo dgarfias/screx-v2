@@ -1,7 +1,6 @@
 use std::os::raw::{c_int, c_uint, c_void};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};

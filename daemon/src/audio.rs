@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use opus_decoder::OpusDecoder;
 
 use crate::stream_server::{AudioSender, SharedState};
 
@@ -15,6 +14,9 @@ pub const SAMPLES_PER_CHUNK: usize = (SAMPLE_RATE / 1000 * CHUNK_DURATION_MS) as
 pub const BYTES_PER_CHUNK: usize = SAMPLES_PER_CHUNK * CHANNELS as usize * 2;
 pub const MIC_RATE: u32 = 48000;
 const MIC_MAX_FRAME: usize = 5760;
+/// Opus recommends a worst-case output buffer of 4000 bytes for any encode
+/// call regardless of bitrate/complexity.
+const OPUS_MAX_PACKET: usize = 4000;
 
 /// Platform-specific audio backend.
 pub trait AudioBackend: Send {
@@ -22,7 +24,6 @@ pub trait AudioBackend: Send {
     fn destroy_sink(&mut self);
     fn run_loopback(&mut self, stop: &AtomicBool, on_chunk: &mut dyn FnMut(&[u8])) -> Result<()>;
     fn create_mic(&mut self) -> Result<Box<dyn MicSink>>;
-    fn destroy_mic(&mut self);
 }
 
 /// Sink for decoded microphone PCM.
@@ -32,74 +33,25 @@ pub trait MicSink: Send {
 
 /// Create the platform audio backend.
 pub fn create_audio_backend() -> Box<dyn AudioBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::platform::linux::pulse::PulseAudioBackend::new())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Box::new(crate::platform::windows::wasapi::WasapiBackend::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::platform::macos::audio::MacAudioBackend::new())
-    }
+    Box::new(crate::platform::linux::pulse::PulseAudioBackend::new())
 }
 
 /// Cheap capability probe: is virtual-microphone forwarding likely to work
 /// right now? Linux: PipeWire/PulseAudio mic support is always available
-/// when the daemon can run at all. Windows: requires the VB-CABLE driver.
+/// when the daemon can run at all.
 pub fn probe_mic_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        true
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::probe_mic_available()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Mic forwarding is deferred — needs a third-party virtual audio
-        // driver on macOS (no built-in equivalent to PulseAudio null-sinks).
-        false
-    }
+    true
 }
 
 /// Cheap capability probe: is speaker/system-audio forwarding likely to
-/// work right now? Linux: always available (PulseAudio null-sink). Windows:
-/// requires the Steam Streaming Speakers endpoint.
+/// work right now? Linux: always available (PulseAudio null-sink).
 pub fn probe_speaker_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        true
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::probe_speaker_available()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // ScreenCaptureKit system-audio capture (M3) — verified end-to-end
-        // via the `macos_audio_smoke` test in platform/macos/audio.rs.
-        true
-    }
+    true
 }
 
 /// Remove any leftover audio state from a previous crash.
 pub fn cleanup_stale_modules() {
-    #[cfg(target_os = "linux")]
-    {
-        crate::platform::linux::pulse::cleanup_stale_modules();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::cleanup_stale_audio_endpoints();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Nothing to clean up yet.
-    }
+    crate::platform::linux::pulse::cleanup_stale_modules();
 }
 
 /// Create the virtual speaker sink.
@@ -121,8 +73,8 @@ pub fn remove_virtual_sink(_module_id: u32) {
 pub fn create_virtual_mic() -> Result<MicWriter> {
     let mut backend = create_audio_backend();
     let sink = backend.create_mic()?;
-    let decoder =
-        OpusDecoder::new(MIC_RATE, 1).map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
+    let decoder = opus::Decoder::new(MIC_RATE, opus::Channels::Mono)
+        .map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
     Ok(MicWriter {
         decoder,
         sink,
@@ -172,9 +124,34 @@ pub fn run_audio_capture(
         let session_key = &shared.session_key;
         let udp_source = &shared.udp_source;
         let client_addr = &shared.client_addr;
-        let usb_active = &shared.usb_active;
-        let usb_sender = &shared.usb_sender;
         let start_time = shared.start_time;
+
+        // Opus encoder for this capture session, plus its reusable scratch
+        // buffers — created once here (not per 10 ms chunk) to avoid
+        // allocating on the hot path.
+        let mut encoder = match opus::Encoder::new(
+            SAMPLE_RATE,
+            opus::Channels::Stereo,
+            opus::Application::Audio,
+        ) {
+            Ok(enc) => enc,
+            Err(e) => {
+                eprintln!("[audio] opus encoder init failed: {e:?}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        if let Err(e) = encoder.set_bitrate(opus::Bitrate::Bits(128_000)) {
+            eprintln!("[audio] opus set_bitrate failed: {e:?}");
+        }
+        if let Err(e) = encoder.set_inband_fec(false) {
+            eprintln!("[audio] opus set_inband_fec failed: {e:?}");
+        }
+        if let Err(e) = encoder.set_dtx(false) {
+            eprintln!("[audio] opus set_dtx failed: {e:?}");
+        }
+        let mut pcm_scratch = vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize];
+        let mut opus_out = vec![0u8; OPUS_MAX_PACKET];
 
         let mut on_chunk = |chunk: &[u8]| {
             if chunk.len() != BYTES_PER_CHUNK {
@@ -182,17 +159,21 @@ pub fn run_audio_capture(
             }
             let ts = start_time.elapsed().as_millis() as u32;
 
-            if usb_active.load(Ordering::Relaxed) {
-                let mut usb = usb_sender.lock().unwrap();
-                if let Some(ref mut tcp) = *usb {
-                    if let Err(e) = tcp.send_audio(chunk, ts) {
-                        eprintln!("[audio] USB send error: {e}");
-                        drop(usb);
-                        usb_active.store(false, Ordering::SeqCst);
-                    }
+            // `chunk` is little-endian i16 PCM with no alignment guarantee —
+            // widen it into the i16 scratch buffer sample by sample rather
+            // than transmuting the byte slice.
+            for (dst, src) in pcm_scratch.iter_mut().zip(chunk.chunks_exact(2)) {
+                *dst = i16::from_le_bytes([src[0], src[1]]);
+            }
+
+            let len = match encoder.encode(&pcm_scratch, &mut opus_out) {
+                Ok(len) => len,
+                Err(e) => {
+                    eprintln!("[audio] opus encode error: {e:?}");
                     return;
                 }
-            }
+            };
+            let payload = &opus_out[..len];
 
             let current_session_key = *session_key.lock().unwrap();
             if current_session_key != active_session_key {
@@ -206,7 +187,7 @@ pub fn run_audio_capture(
             }
 
             if let Some(addr) = *client_addr.lock().unwrap() {
-                if let Err(e) = sender.send_audio(chunk, addr, ts) {
+                if let Err(e) = sender.send_audio(payload, addr, ts) {
                     eprintln!("[audio] send error: {e}");
                 }
             }
@@ -259,7 +240,7 @@ pub fn run_audio_capture(
 // ---------------------------------------------------------------------------
 
 pub struct MicWriter {
-    decoder: OpusDecoder,
+    decoder: opus::Decoder,
     sink: Box<dyn MicSink>,
     pcm_buf: Vec<i16>,
 }

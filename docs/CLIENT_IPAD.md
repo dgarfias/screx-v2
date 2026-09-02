@@ -1,10 +1,8 @@
 # iPad Client
 
-Native iPadOS app that connects to a Screx daemon - [Linux](DAEMON_LINUX.md),
-[Windows](DAEMON_WINDOWS.md), or [macOS](DAEMON_MACOS.md). Decodes the video/audio
-stream and forwards touch, keyboard, mouse, controller, microphone, and camera input back to the
-host. Peripheral controls are gated by the capabilities advertised by the daemon; the macOS daemon,
-for example, reports camera, microphone, and gamepad forwarding as unavailable. Source lives in
+Native iPadOS app that connects to the [Linux Screx daemon](DAEMON_LINUX.md). Decodes the
+video/audio stream and forwards touch, keyboard, mouse, microphone, and camera input back to the
+host. Peripheral controls are gated by the capabilities advertised by the daemon. Source lives in
 `client/ipad`.
 
 ## Requirements
@@ -18,10 +16,13 @@ for example, reports camera, microphone, and gamepad forwarding as unavailable. 
 
 Resolved automatically by Xcode via Swift Package Manager — no manual install step:
 
-- [`swift-opus`](https://github.com/alta/swift-opus) — Opus encode/decode for microphone forwarding
+- [`swift-opus`](https://github.com/alta/swift-opus) — Opus encode for microphone forwarding and
+  Opus decode for speaker playback
 
 Everything else is a first-party Apple framework (AVFoundation, VideoToolbox, CryptoKit, Network,
-CoreImage, GameController) with no additional package manager setup required.
+CoreImage, GameController) with no additional package manager setup required. `GameController` is
+used only for external mouse/trackpad capture (`GCMouse`, `GCEventViewController`), not for
+controller passthrough.
 
 ## Build
 
@@ -45,8 +46,8 @@ The app requests these on first use:
 
 ## Use
 
-See [README.md](../README.md#use) for the end-to-end connect flow (network vs. USB, PIN pairing,
-enabling the virtual display).
+See [README.md](../README.md#use) for the end-to-end connect flow (PIN pairing, enabling the
+virtual display).
 
 Before connecting, tap **Stream Settings** to choose the resolution, framerate, codec, and bitrate
 for the next session. These settings are validated against the daemon's advertised capabilities and

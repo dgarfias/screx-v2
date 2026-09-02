@@ -1,60 +1,38 @@
 # Screx
 
-Screx turns a Linux, Windows, or macOS machine into a low-latency remote display host for iPad and desktop clients.
+Screx turns a Linux machine into a low-latency remote display host for the native iPad client.
 
-You run a daemon that creates a virtual monitor, then connect from either the iPad app or the desktop client over Wi-Fi (or USB, for the iPad app). Input and peripheral forwarding depends on the client, daemon platform, and installed host drivers.
+You run a daemon that creates a virtual monitor, then connect from the iPad app over Wi-Fi. Input
+and peripheral forwarding depends on the installed host drivers.
 
 For implementation details and protocol documentation, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Daemon comparison
+## Daemon
 
-| Feature | Linux daemon | Windows daemon | macOS daemon |
-|---|---|---|---|
-| Virtual display and capture | Yes | Yes | Yes |
-| USB transport for iPad | Yes | Yes | Yes |
-| Keyboard and mouse | Yes | Yes | Yes |
-| Touch input | Yes | Yes | Yes, translated to pointer and scroll gestures |
-| Game controllers | Yes | Yes | No |
-| Client speaker audio | Yes | Yes | Yes |
-| Client microphone | Yes | Yes | No |
-| Client camera | Yes | Yes | No |
+The Linux daemon creates a virtual display and captures, encodes, and streams it to the client. It
+also:
 
-See the [Linux](docs/DAEMON_LINUX.md), [Windows](docs/DAEMON_WINDOWS.md), and [macOS](docs/DAEMON_MACOS.md) daemon guides for setup requirements.
+- injects touch, keyboard, and mouse input
+- exposes a virtual microphone and webcam
+- forwards client speaker audio
 
-## Client comparison
+See [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md) for build and run instructions.
 
-| Feature | Native iPad client | Desktop client |
-|---|---|---|
-| USB transport | Yes | No |
-| Touch forwarding | Yes | No |
-| Mouse forwarding | Yes | Yes |
-| Keyboard forwarding | Yes, software and external | Focused application input |
-| Game controller forwarding | Yes | No |
-| Speaker playback | Yes | Yes |
-| Microphone forwarding | Yes | Yes |
-| Camera forwarding | Yes | Yes |
+## Client
 
-## Daemons
+The native iPad app connects to the daemon, decodes the video/audio stream, and forwards touch,
+keyboard, mouse, microphone, and camera input back to the host.
 
-- [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md) — build and run the Linux daemon
-- [`docs/DAEMON_WINDOWS.md`](docs/DAEMON_WINDOWS.md) — build and run the Windows daemon
-- [`docs/DAEMON_MACOS.md`](docs/DAEMON_MACOS.md) — build and run the macOS daemon
-
-## Clients
-
-- [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md) — build and run the native iPad app (`client/ipad`)
-- [`docs/CLIENT_DESKTOP.md`](docs/CLIENT_DESKTOP.md) — build and run the desktop client for macOS, Windows, and Linux (`client/desktop`)
-
-Either client works over the network with any daemon platform. USB transport is available only to the iPad client.
+See [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md) — build and run the native iPad app (`client/ipad`)
 
 ## Use
 
-1. Start the daemon (Linux, Windows, or macOS).
-2. Open Screx on the iPad or launch the desktop client on macOS, Windows, or Linux.
-3. Choose one transport:
-   - **Network**: enter the host/IP and tap `Connect`
-   - **USB** (iPad only): tap `Connect via USB`
-4. If it is the first network connection, enter the PIN shown by the daemon.
-5. On Linux hosts, enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
+1. Start the daemon.
+2. Open Screx on the iPad.
+3. Enter the host/IP and tap `Connect`.
+4. If it is the first connection, enter the PIN shown by the daemon.
+5. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
 
-The clients remember recent and pinned network targets, and stream settings (resolution, framerate, codec, and bitrate) are chosen from the connect screen before connecting. In-session controls expose keyboard, audio, camera, controller, and connection features supported by the active client and daemon.
+The client remembers recent and pinned network targets, and stream settings (resolution, framerate,
+codec, and bitrate) are chosen from the connect screen before connecting. In-session controls expose
+keyboard, audio, camera, and connection features supported by the daemon.

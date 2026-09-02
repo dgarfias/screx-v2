@@ -5,16 +5,11 @@ edition = "2021"
 description = "Low-latency screen streaming daemon for Screx V2"
 license = "MIT"
 
-[lib]
-name = "screx_vcam"
-path = "src/platform/windows/vcam_filter/lib.rs"
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 anyhow = "1"
-opus-decoder = "0.1"
-ffmpeg-next = "8"
-ffmpeg-sys-next = "8"
+opus = "0.3"
+ffmpeg-next = "9"
+ffmpeg-sys-next = "9"
 libc = "0.2"
 reed-solomon-erasure = "6"
 ring = "0.17"
@@ -23,72 +18,5 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 clap = { version = "4.6.0", features = ["derive"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-core = "0.58"
-windows = { version = "0.58", features = [
-  "implement",
-  "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D",
-  "Win32_Graphics_Direct3D11", "Win32_Graphics_Gdi", "Win32_Devices_DeviceAndDriverInstallation",
-  "Win32_Devices_Display", "Win32_System_Registry",
-  "Win32_UI_Input_Pointer", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging",
-  "Win32_UI_Shell_PropertiesSystem",
-  "Win32_Media_Audio", "Win32_Media_DirectShow", "Win32_Media_KernelStreaming",
-  "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_SystemInformation",
-  "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_System_IO",
-  "Win32_System_Memory",
-]}
-socket2 = { version = "0.5", features = ["all"] }
-dirs = "5"
-vigem-client = "0.1"
-plist = "1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-core-media = "0.3"
-objc2-core-video = { version = "0.3", features = ["objc2-io-surface"] }
-objc2-screen-capture-kit = "0.3"
-block2 = "0.6"
-core-foundation = "0.10"
-# "highsierra" feature gate is required to get CGEvent::new_scroll_event
-# (the non-variadic CGEventCreateScrollWheelEvent2 wrapper) compiled into the
-# crate at all — used by platform/macos/input.rs for two-finger-scroll/wheel
-# injection. No new crate added, just a feature flag on the existing one.
-core-graphics = { version = "0.25", features = ["highsierra"] }
-# Added for the macOS virtual-display and zero-copy capture path:
-# objc2-core-graphics carries CGDirectDisplay/CGError APIs used to configure
-# the virtual monitor; objc2-io-surface carries surfaces delivered by SCK;
-# objc2-core-foundation for CFDictionary/CFBoolean/CGSize plumbing shared
-# with those APIs; dispatch2 to create the serial dispatch queues
-# CGVirtualDisplayDescriptor and SCStream want. All four were already
-# transitively resolved via objc2-screen-capture-kit, so this adds no new
-# crates to the dependency graph, only direct access to ones already there.
-objc2-core-graphics = { version = "0.3", features = ["objc2-io-surface"] }
-objc2-io-surface = "0.3"
-objc2-core-foundation = "0.3"
-dispatch2 = "0.3"
-# Added in M3 for the ScreenCaptureKit audio capture path (see
-# platform/macos/audio.rs): AudioBufferList/AudioBuffer/AudioStreamBasicDescription
-# and the kAudioFormatFlag* constants used to interpret the Float32 PCM
-# CMSampleBuffers SCStream's `.audio` output delivers. Already resolved
-# transitively via objc2-core-media, so this adds no new crate to the
-# dependency graph, only direct access to types already there.
-objc2-core-audio-types = "0.3"
-objc2-core-audio = "0.3"
-# Menu bar status item (see platform/macos/statusbar.rs): NSStatusBar/
-# NSStatusItem/NSMenu/NSMenuItem for the status bar UI itself, NSApplication
-# for the run loop and accessory activation policy, NSImage for the status
-# icon. Not feature-restricted (like objc2-screen-capture-kit above) since
-# this crate's own "default" feature already enables the ~full AppKit
-# surface; a narrower explicit list buys nothing here.
-objc2-app-kit = "0.3"
-
 [build-dependencies]
 cc = "1"
-
-# Embeds assets/AppIcon.png (see build.rs's embed_windows_icon) as the
-# screx.exe icon resource — mirrors client/desktop/Cargo.toml's identical
-# section.
-[target.'cfg(windows)'.build-dependencies]
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
-winresource = "0.1"

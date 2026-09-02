@@ -27,9 +27,6 @@ final class StreamClient {
     var sessionKey: SymmetricKey?
     var sendPliRequest: (() -> Void)?
 
-    /// When true, suppresses the data timeout (e.g. USB is active and no network data is expected)
-    var suppressTimeout = false
-
     private static let headerLen = 18
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
@@ -173,9 +170,7 @@ final class StreamClient {
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            if self.suppressTimeout {
-                self.lastInboundTime = CACurrentMediaTime()
-            } else if CACurrentMediaTime() - self.lastInboundTime >= Self.dataTimeout {
+            if CACurrentMediaTime() - self.lastInboundTime >= Self.dataTimeout {
                 self.handleTimeout()
             }
         }
@@ -189,10 +184,6 @@ final class StreamClient {
 
     private func handleTimeout() {
         guard connection != nil else { return }
-        if suppressTimeout {
-            lastInboundTime = CACurrentMediaTime()
-            return
-        }
         log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
         print("[stream] data timeout — daemon appears gone")
         disconnect()
@@ -340,7 +331,7 @@ final class StreamClient {
     private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
                                    payload: Data, actualLen: Int, timestampMs: UInt32) {
         if totalData == 1 {
-            audioPlayer.enqueueAudio(payload.prefix(actualLen), timestampMs: timestampMs)
+            audioPlayer.enqueueOpus(payload.prefix(actualLen), timestampMs: timestampMs)
             return
         }
 
@@ -349,8 +340,8 @@ final class StreamClient {
         assembly.addChunk(index: chunkIdx, payload: payload, actualLen: actualLen)
 
         if assembly.isComplete {
-            if let pcm = assembly.reassemble() {
-                audioPlayer.enqueueAudio(pcm, timestampMs: timestampMs)
+            if let opusPacket = assembly.reassemble() {
+                audioPlayer.enqueueOpus(opusPacket, timestampMs: timestampMs)
             }
             audioReassembly.removeValue(forKey: frameId)
         }

@@ -30,66 +30,6 @@ pub enum MouseEvent {
     Scroll { dy: i16 },
 }
 
-/// Gamepad button bits (same layout as Linux evdev mapping used by iPad).
-pub const GPAD_BTN_SOUTH: u16 = 0x0001;
-pub const GPAD_BTN_EAST: u16 = 0x0002;
-pub const GPAD_BTN_WEST: u16 = 0x0004;
-pub const GPAD_BTN_NORTH: u16 = 0x0008;
-pub const GPAD_BTN_TL: u16 = 0x0010;
-pub const GPAD_BTN_TR: u16 = 0x0020;
-pub const GPAD_BTN_THUMBL: u16 = 0x0040;
-pub const GPAD_BTN_THUMBR: u16 = 0x0080;
-pub const GPAD_BTN_SELECT: u16 = 0x0100;
-pub const GPAD_BTN_START: u16 = 0x0200;
-pub const GPAD_BTN_MODE: u16 = 0x0400;
-
-/// Normalized gamepad state.
-#[derive(Debug, Clone, Copy)]
-pub struct GamepadState {
-    pub buttons: u16,
-    pub lx: i16,
-    pub ly: i16,
-    pub rx: i16,
-    pub ry: i16,
-    pub lt: u16,
-    pub rt: u16,
-    pub hat_x: i8,
-    pub hat_y: i8,
-}
-
-/// Cheap capability probe for virtual gamepad passthrough. Returns the max
-/// number of simultaneous controllers supported, or `None` if this daemon
-/// can't do gamepad passthrough at all right now.
-pub fn probe_gamepad_max_controllers() -> Option<u8> {
-    #[cfg(target_os = "linux")]
-    {
-        // uinput gamepad creation only fails if /dev/uinput isn't openable;
-        // treat presence of the device node as the probe (mirrors
-        // `VirtualGamepad::new` in platform::linux::uinput). The Linux
-        // backend keys pads in a HashMap with no fixed cap; 4 matches the
-        // controller_id range (0..4) the rest of the protocol assumes (see
-        // the disconnect cleanup loop in main.rs).
-        if std::path::Path::new("/dev/uinput").exists() {
-            Some(4)
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if crate::platform::windows::vigem::probe_available() {
-            Some(4)
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // No gamepad passthrough backend on macOS.
-        None
-    }
-}
-
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
     /// Tells the backend the current session's stream resolution and, where
@@ -128,9 +68,6 @@ pub trait InputBackend: Send {
     fn key_text_with_modifiers(&mut self, text: &str, modifiers: u8) -> anyhow::Result<()>;
     fn key_raw_hid(&mut self, usage: u8, pressed: bool) -> anyhow::Result<()>;
     fn mouse(&mut self, ev: MouseEvent) -> anyhow::Result<()>;
-    fn gamepad_attach(&mut self, id: u8) -> anyhow::Result<()>;
-    fn gamepad_detach(&mut self, id: u8);
-    fn gamepad_state(&mut self, id: u8, st: &GamepadState) -> anyhow::Result<()>;
 }
 
 /// Event types the keyboard worker can execute.

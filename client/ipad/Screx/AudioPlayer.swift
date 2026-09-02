@@ -1,5 +1,6 @@
 import AVFoundation
 import QuartzCore
+import Opus
 import os
 
 final class AudioPlayer {
@@ -7,6 +8,31 @@ final class AudioPlayer {
     private var sourceNode: AVAudioSourceNode?
     private let avSync: AVSyncState
     private(set) var isOutputEnabled = true
+
+    // The UDP audio payload is a raw Opus packet (48kHz, 2ch, 10ms/480-sample frames,
+    // interleaved). The decoder is created lazily since its init can throw and we'd
+    // rather stay silent than crash the app if it ever fails. `opusDecodeBuffer` is
+    // preallocated once and reused for every packet (this runs ~100x/sec); its capacity
+    // of 5760 frames (120ms) is generous headroom over the 480-frame packets we actually
+    // expect, so an unexpectedly larger frame from the daemon can never overflow it.
+    private static let opusFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 48000,
+        channels: 2,
+        interleaved: true
+    )!
+    private static let opusDecodeBufferCapacity: AVAudioFrameCount = 5760 // 120ms at 48kHz
+
+    private lazy var opusDecoder: Opus.Decoder? = {
+        do {
+            return try Opus.Decoder(format: Self.opusFormat, application: .audio)
+        } catch {
+            print("[audio] Opus decoder init failed, audio will stay silent: \(error)")
+            return nil
+        }
+    }()
+    private lazy var opusDecodeBuffer: AVAudioPCMBuffer? =
+        AVAudioPCMBuffer(pcmFormat: Self.opusFormat, frameCapacity: Self.opusDecodeBufferCapacity)
 
     // NOTE: The ideal implementation here is a lock-free SPSC ring using
     // atomics for head (render thread) and tail (network thread). Adding
@@ -91,12 +117,7 @@ final class AudioPlayer {
     init(avSync: AVSyncState) {
         self.avSync = avSync
 
-        let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: 48000,
-            channels: 2,
-            interleaved: true
-        )!
+        let format = Self.opusFormat
 
         let node = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
             guard let self else { return noErr }
@@ -175,18 +196,42 @@ final class AudioPlayer {
         }
     }
 
-    func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
+    /// Decodes one Opus packet (the raw UDP audio payload — see `opusFormat` above) into
+    /// the preallocated `opusDecodeBuffer`, then feeds the resulting interleaved s16 PCM
+    /// bytes into the same ring-write + drift-correction path that always operated on
+    /// PCM. Decode failures are logged and the packet is dropped; they never crash or
+    /// stall the engine.
+    func enqueueOpus(_ packet: Data, timestampMs: UInt32 = 0) {
         guard isOutputEnabled else { return }
+        guard !packet.isEmpty else { return }
+        guard let opusDecoder, let opusDecodeBuffer else { return }
+
+        do {
+            try packet.withUnsafeBytes { raw in
+                let input = raw.bindMemory(to: UInt8.self)
+                try opusDecoder.decode(input, to: opusDecodeBuffer)
+            }
+        } catch {
+            print("[audio] Opus decode failed, dropping packet: \(error)")
+            return
+        }
+
+        guard opusDecodeBuffer.frameLength > 0, let channelData = opusDecodeBuffer.int16ChannelData else { return }
+        let byteCount = Int(opusDecodeBuffer.frameLength) * 2 * 2 // frames * 2 channels * 2 bytes/sample
+
         if avSync.consumeGapResume() {
             lock.withLock {
                 ringClear()
             }
+            // Deliberately not resetting the Opus decoder's internal state on a gap
+            // resume: a stale state only degrades the first frame or two after the gap,
+            // and Opus self-recovers within a few frames on its own — not worth adding
+            // an extra throwing call here for that brief imperfection.
         }
 
         lock.withLock {
-            data.withUnsafeBytes { raw in
-                guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                if !ringWrite(ptr, count: raw.count) {
+            channelData[0].withMemoryRebound(to: UInt8.self, capacity: byteCount) { ptr in
+                if !ringWrite(ptr, count: byteCount) {
                     droppedPacketCount += 1
                 }
             }

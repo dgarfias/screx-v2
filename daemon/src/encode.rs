@@ -1363,7 +1363,7 @@ impl HwEncoder {
                 }
             }
 
-            let mut ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+            let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             #[cfg(target_os = "macos")]
             if ret < 0 && matches!(kind, HwKind::VideoToolbox) {
                 eprintln!(

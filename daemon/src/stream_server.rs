@@ -12,14 +12,13 @@ use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter, CameraConfig};
 use crate::encode::{EncodedAccessUnit, EncoderBackend, VideoCodec};
 use crate::input::{
-    parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, GamepadState,
-    InputBackend, KeyboardWorker,
+    parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, InputBackend,
+    KeyboardWorker,
 };
 use crate::platform::net::{
     build_pktinfo_cmsg, send_to_from, sendmmsg_batch, udp_source_for_local_ip, PktinfoCmsg,
     UdpSource,
 };
-use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 18;
@@ -32,7 +31,6 @@ const MIC_MAGIC: &[u8] = b"MIC";
 const MOUSE_MAGIC: &[u8] = b"MOUSE";
 const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
 const PERIPH_MAGIC: &[u8] = b"PERIPH";
-const GPAD_MAGIC: &[u8] = b"GPAD";
 const SPEAKER_MAGIC: &[u8] = b"SPKR";
 const MICCFG_MAGIC: &[u8] = b"MICCFG";
 const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
@@ -46,12 +44,14 @@ const CAPS_VERSION: u8 = 1;
 const CAPS_TAG_CAMERA: u8 = 0x01;
 const CAPS_TAG_MICROPHONE: u8 = 0x02;
 const CAPS_TAG_SPEAKER: u8 = 0x03;
-const CAPS_TAG_GAMEPAD: u8 = 0x04;
+// 0x04 (GAMEPAD) is retired: this daemon does not do controller passthrough.
+// The tag value stays reserved — clients skip tags they don't recognize, so
+// reusing it for something else would silently misparse on older clients.
 const CAPS_TAG_CODECS: u8 = 0x05;
 const CAPS_TAG_MAX_RESOLUTION: u8 = 0x06;
 const CAPS_TAG_MAX_FRAMERATE: u8 = 0x07;
 const CAPS_TAG_BITRATE_RANGE: u8 = 0x08;
-const CAPS_ENTRY_COUNT: u8 = 8;
+const CAPS_ENTRY_COUNT: u8 = 7;
 
 const STNG_TAG_RESOLUTION: u8 = 0x01;
 const STNG_TAG_FRAMERATE: u8 = 0x02;
@@ -238,8 +238,6 @@ pub struct SharedState {
     pub capture_start: Arc<AtomicBool>,
     pub capture_start_signal: Arc<(Mutex<bool>, Condvar)>,
     pub capture_stop_flag: Arc<AtomicBool>,
-    pub usb_sender: Mutex<Option<TcpFramedSender>>,
-    pub usb_active: AtomicBool,
     pub input_backend: Arc<Mutex<dyn InputBackend>>,
     pub keyboard_worker: Mutex<Option<KeyboardWorker>>,
     pub audio_notify: Arc<Condvar>,
@@ -277,11 +275,6 @@ pub struct SharedState {
     pub max_height: u32,
     pub max_fps: u32,
     pub bitrate_max_bps: u32,
-    /// USB-transport bitrate ceiling (`--max-bitrate-usb`), advertised in
-    /// `CAPS` and enforced when clamping `STNG` instead of `bitrate_max_bps`
-    /// for sessions negotiated over USB — USB links have far more headroom
-    /// than typical networks (see `ControlTransport`).
-    pub bitrate_max_usb_bps: u32,
     pub encoder_backend: EncoderBackend,
     /// Settings parsed out of a client's `STNG` control message, consumed
     /// once by the capture thread at the start of the next session (see
@@ -300,7 +293,6 @@ impl SharedState {
         max_height: u32,
         max_fps: u32,
         bitrate_max_bps: u32,
-        bitrate_max_usb_bps: u32,
         encoder_backend: EncoderBackend,
     ) -> Self {
         Self {
@@ -310,8 +302,6 @@ impl SharedState {
             capture_start: Arc::new(AtomicBool::new(false)),
             capture_start_signal: Arc::new((Mutex::new(false), Condvar::new())),
             capture_stop_flag: Arc::new(AtomicBool::new(false)),
-            usb_sender: Mutex::new(None),
-            usb_active: AtomicBool::new(false),
             input_backend,
             keyboard_worker: Mutex::new(None),
             audio_notify: Arc::new(Condvar::new()),
@@ -341,7 +331,6 @@ impl SharedState {
             max_height,
             max_fps,
             bitrate_max_bps,
-            bitrate_max_usb_bps,
             encoder_backend,
             pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
             start_time: Instant::now(),
@@ -407,34 +396,6 @@ impl SharedState {
 // format; both clients implement it independently from scratch.
 // ---------------------------------------------------------------------------
 
-/// Which control channel a `CAPS`/`STNG` exchange is happening over. USB has
-/// far more bitrate headroom than a typical network link (even the slowest
-/// iPads' USB 2.0 connection is ~480 Mbps line rate), so the daemon
-/// advertises — and enforces — a different bitrate ceiling per transport.
-/// Resolution/fps ceilings are shared across both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlTransport {
-    Network,
-    Usb,
-}
-
-impl ControlTransport {
-    /// The bitrate ceiling that applies to this transport, per `SharedState`.
-    fn bitrate_ceiling(self, shared: &SharedState) -> u32 {
-        match self {
-            ControlTransport::Network => shared.bitrate_max_bps,
-            ControlTransport::Usb => shared.bitrate_max_usb_bps,
-        }
-    }
-
-    fn log_label(self) -> &'static str {
-        match self {
-            ControlTransport::Network => "network",
-            ControlTransport::Usb => "usb",
-        }
-    }
-}
-
 /// What this daemon can actually do right now, not just "compiled in."
 /// Rebuilt fresh for every `CAPS` message (see `build_caps_message`) rather
 /// than cached, since e.g. plugging in a driver after the daemon started
@@ -444,8 +405,6 @@ pub struct DaemonCapabilities {
     pub camera: bool,
     pub microphone: bool,
     pub speaker: bool,
-    /// `None` = unsupported, `Some(n)` = max simultaneous controllers.
-    pub gamepad: Option<u8>,
     pub codecs: Vec<VideoCodec>,
     pub max_width: u32,
     pub max_height: u32,
@@ -481,7 +440,6 @@ pub fn probe_capabilities(
         camera: crate::camera::probe_camera_available(),
         microphone: crate::audio::probe_mic_available(),
         speaker: crate::audio::probe_speaker_available(),
-        gamepad: crate::input::probe_gamepad_max_controllers(),
         codecs: crate::encode::probe_available_codecs(encoder_backend),
         max_width,
         max_height,
@@ -500,16 +458,13 @@ fn push_tlv_entry(msg: &mut Vec<u8>, tag: u8, value: &[u8]) {
 /// Build a `CAPS` control message frame body advertising what this daemon
 /// can do right now. Re-probes capabilities on every call (see
 /// `probe_capabilities`) rather than reading a cached value, so it's cheap
-/// by design — callers (pairing.rs, usb.rs) call this once per connection,
-/// passing the `ControlTransport` the connection arrived on so the
-/// advertised BITRATE_RANGE matches the ceiling that will actually be
-/// enforced for that transport.
-pub fn build_caps_message(shared: &SharedState, transport: ControlTransport) -> Vec<u8> {
+/// by design — the caller (pairing.rs) calls this once per connection.
+pub fn build_caps_message(shared: &SharedState) -> Vec<u8> {
     let caps = probe_capabilities(
         shared.max_width,
         shared.max_height,
         shared.max_fps,
-        transport.bitrate_ceiling(shared),
+        shared.bitrate_max_bps,
         shared.encoder_backend,
     );
 
@@ -521,16 +476,6 @@ pub fn build_caps_message(shared: &SharedState, transport: ControlTransport) -> 
     push_tlv_entry(&mut msg, CAPS_TAG_CAMERA, &[caps.camera as u8]);
     push_tlv_entry(&mut msg, CAPS_TAG_MICROPHONE, &[caps.microphone as u8]);
     push_tlv_entry(&mut msg, CAPS_TAG_SPEAKER, &[caps.speaker as u8]);
-
-    let (gamepad_available, gamepad_max) = match caps.gamepad {
-        Some(max) => (1u8, max),
-        None => (0u8, 0u8),
-    };
-    push_tlv_entry(
-        &mut msg,
-        CAPS_TAG_GAMEPAD,
-        &[gamepad_available, gamepad_max],
-    );
 
     let mut codecs_value = Vec::with_capacity(1 + caps.codecs.len());
     codecs_value.push(caps.codecs.len() as u8);
@@ -626,14 +571,8 @@ fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
 /// Clamp everything the client asked for against `DaemonCapabilities` —
 /// never trust the client's numbers directly. Logs a warning whenever a
 /// clamp changes what was requested, so operators can debug "why did my
-/// requested 4K60 get downgraded." `transport` selects which bitrate
-/// ceiling applies (USB sessions get the higher `--max-bitrate-usb`
-/// ceiling); resolution/fps/codec ceilings are shared across transports.
-fn clamp_requested_settings(
-    shared: &SharedState,
-    mut req: RequestedSettings,
-    transport: ControlTransport,
-) -> RequestedSettings {
+/// requested 4K60 get downgraded."
+fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) -> RequestedSettings {
     if let (Some(w), Some(h)) = (req.width, req.height) {
         let clamped_w = clamp_u32(w, STNG_RESOLUTION_FLOOR_W, shared.max_width);
         let clamped_h = clamp_u32(h, STNG_RESOLUTION_FLOOR_H, shared.max_height);
@@ -665,12 +604,11 @@ fn clamp_requested_settings(
     }
 
     if let Some(bitrate) = req.bitrate_bps {
-        let ceiling = transport.bitrate_ceiling(shared);
+        let ceiling = shared.bitrate_max_bps;
         let clamped = clamp_u32(bitrate, STNG_BITRATE_FLOOR_BPS, ceiling);
         if clamped != bitrate {
             println!(
-                "[control] STNG requested bitrate {bitrate} clamped to {clamped} ({} ceiling {ceiling})",
-                transport.log_label()
+                "[control] STNG requested bitrate {bitrate} clamped to {clamped} (ceiling {ceiling})"
             );
         }
         req.bitrate_bps = Some(clamped);
@@ -681,9 +619,8 @@ fn clamp_requested_settings(
 
 /// Handle an inbound `STNG` control message: parse, clamp, and hand off to
 /// the capture thread via the `pending_settings` condvar for the *next*
-/// session it starts (see main.rs's capture loop). `transport` selects the
-/// bitrate ceiling used for clamping — see `clamp_requested_settings`.
-fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8], transport: ControlTransport) {
+/// session it starts (see main.rs's capture loop).
+fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
     let Some(parsed) = parse_stng_body(body) else {
         eprintln!(
             "[control] malformed STNG message ({} bytes), ignoring",
@@ -692,7 +629,7 @@ fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8], transport: C
         return;
     };
 
-    let clamped = clamp_requested_settings(shared, parsed, transport);
+    let clamped = clamp_requested_settings(shared, parsed);
     println!("[control] received STNG, will apply to next session: {clamped:?}");
 
     let (lock, cvar) = &*shared.pending_settings;
@@ -805,11 +742,7 @@ pub fn handle_periph_packet_data(_shared: &Arc<SharedState>, data: &[u8]) {
     }
 }
 
-pub fn handle_control_message_data(
-    shared: &Arc<SharedState>,
-    ctrl: &[u8],
-    transport: ControlTransport,
-) {
+pub fn handle_control_message_data(shared: &Arc<SharedState>, ctrl: &[u8]) {
     if ctrl.starts_with(PLI_MAGIC) {
         shared.note_pli();
         shared.force_idr.store(true, Ordering::Relaxed);
@@ -820,7 +753,7 @@ pub fn handle_control_message_data(
     }
 
     if ctrl.starts_with(STNG_MAGIC) {
-        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..], transport);
+        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..]);
         return;
     }
 
@@ -915,13 +848,10 @@ pub fn handle_control_message_data(
     if ctrl.starts_with(PERIPH_MAGIC) && ctrl.len() > PERIPH_MAGIC.len() {
         let periph_data = &ctrl[PERIPH_MAGIC.len()..];
         handle_periph_packet_data(shared, periph_data);
-        return;
     }
 
-    if ctrl.starts_with(GPAD_MAGIC) && ctrl.len() > GPAD_MAGIC.len() {
-        let gamepad_data = &ctrl[GPAD_MAGIC.len()..];
-        handle_gamepad_packet_data(shared, gamepad_data);
-    }
+    // Anything else — including a `GPAD` packet from a client that still
+    // does controller passthrough — falls through here and is ignored.
 }
 
 pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
@@ -977,87 +907,6 @@ pub fn disable_virtual_mic(shared: &Arc<SharedState>) {
     *mic = None;
 }
 
-const GPAD_DETACHED: u8 = 0x00;
-const GPAD_ATTACHED: u8 = 0x01;
-const GPAD_STATE: u8 = 0x02;
-
-pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
-    if data.len() < 2 {
-        return;
-    }
-
-    let controller_id = data[0];
-    let msg_type = data[1];
-
-    match msg_type {
-        GPAD_ATTACHED => {
-            if let Ok(mut backend) = shared.input_backend.lock() {
-                if let Err(e) = backend.gamepad_attach(controller_id) {
-                    eprintln!(
-                        "[gamepad] failed to create virtual gamepad {}: {e}",
-                        controller_id + 1
-                    );
-                } else {
-                    println!(
-                        "[gamepad] controller {} attached — virtual gamepad created",
-                        controller_id + 1
-                    );
-                }
-            }
-        }
-        GPAD_DETACHED => {
-            if let Ok(mut backend) = shared.input_backend.lock() {
-                backend.gamepad_detach(controller_id);
-                println!(
-                    "[gamepad] controller {} detached — virtual gamepad destroyed",
-                    controller_id + 1
-                );
-            }
-        }
-        GPAD_STATE if data.len() >= 18 => {
-            let buttons_mask = u16::from_be_bytes([data[2], data[3]]);
-            let lx = i16::from_be_bytes([data[4], data[5]]);
-            let ly = i16::from_be_bytes([data[6], data[7]]);
-            let rx = i16::from_be_bytes([data[8], data[9]]);
-            let ry = i16::from_be_bytes([data[10], data[11]]);
-            let lt = u16::from_be_bytes([data[12], data[13]]);
-            let rt = u16::from_be_bytes([data[14], data[15]]);
-            let hat_x = data[16] as i8;
-            let hat_y = data[17] as i8;
-
-            crate::vlog!(
-                "[gamepad] recv state controller={} buttons=0x{:x} lx={} ly={} rx={} ry={} lt={} rt={} hat=({}, {})",
-                controller_id + 1,
-                buttons_mask,
-                lx,
-                ly,
-                rx,
-                ry,
-                lt,
-                rt,
-                hat_x,
-                hat_y
-            );
-
-            if let Ok(mut backend) = shared.input_backend.lock() {
-                let state = GamepadState {
-                    buttons: buttons_mask,
-                    lx,
-                    ly,
-                    rx,
-                    ry,
-                    lt,
-                    rt,
-                    hat_x,
-                    hat_y,
-                };
-                let _ = backend.gamepad_state(controller_id, &state);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
     if !shared.is_current_network_session(session_id) {
         return;
@@ -1072,9 +921,7 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
         .store(false, Ordering::SeqCst);
     shared.network_session_busy.store(false, Ordering::SeqCst);
 
-    if !shared.usb_active.load(Ordering::Relaxed)
-        && shared.has_active_client.swap(false, Ordering::SeqCst)
-    {
+    if shared.has_active_client.swap(false, Ordering::SeqCst) {
         shared.audio_notify.notify_all();
         shared.reset_stream_tuning();
         let shared_lc = Arc::clone(shared);
@@ -1756,18 +1603,21 @@ impl AudioSender {
         self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
+    /// `payload` is one Opus packet (see `audio::run_audio_capture`). Chunking
+    /// is kept size-agnostic even though an Opus frame always fits in one
+    /// datagram, so the client's reassembly path stays valid either way.
     pub fn send_audio(
         &mut self,
-        pcm: &[u8],
+        payload: &[u8],
         client_addr: SocketAddr,
         timestamp_ms: u32,
     ) -> Result<()> {
-        let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+        let data_count = payload.len().div_ceil(CHUNK_PAYLOAD);
 
         for i in 0..data_count {
             let start = i * CHUNK_PAYLOAD;
-            let end = (start + CHUNK_PAYLOAD).min(pcm.len());
-            let chunk = &pcm[start..end];
+            let end = (start + CHUNK_PAYLOAD).min(payload.len());
+            let chunk = &payload[start..end];
             let payload_len = (end - start) as u16;
 
             let header = build_header(

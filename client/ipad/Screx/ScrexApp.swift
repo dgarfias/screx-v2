@@ -81,9 +81,6 @@ private func formatByteRate(_ bytesPerSecond: Double) -> String {
     return "\(formatter.string(fromByteCount: Int64(bytesPerSecond.rounded())))/s"
 }
 
-private let networkCameraCompressionQuality: CGFloat = 0.4
-private let usbCameraCompressionQuality: CGFloat = 0.7
-
 struct RecentConnection: Codable, Identifiable, Equatable {
     let host: String
     let port: UInt16
@@ -126,7 +123,6 @@ struct RecentConnection: Codable, Identifiable, Equatable {
 enum ConnectionTransport: String {
     case none = ""
     case network = "Network"
-    case usb = "USB"
 }
 
 enum ConnectionHealthState: String {
@@ -405,7 +401,7 @@ final class ScrexRootViewController: GCEventViewController {
     }
 
     override var prefersPointerLocked: Bool {
-        model.physicalMouseConnected || model.physicalControllerConnectedCount > 0
+        model.physicalMouseConnected
     }
 
     override var prefersStatusBarHidden: Bool {
@@ -427,17 +423,10 @@ final class ScrexRootViewController: GCEventViewController {
                 self?.updatePhysicalMouseCapture()
             }
             .store(in: &cancellables)
-
-        model.$physicalControllerConnectedCount
-            .removeDuplicates()
-            .sink { [weak self] _ in
-                self?.updatePhysicalMouseCapture()
-            }
-            .store(in: &cancellables)
     }
 
     private func updatePhysicalMouseCapture() {
-        let captureActive = model.physicalMouseConnected || model.physicalControllerConnectedCount > 0
+        let captureActive = model.physicalMouseConnected
         controllerUserInteractionEnabled = !captureActive
         if captureActive {
             _ = captureView.becomeFirstResponder()
@@ -514,7 +503,6 @@ final class StreamViewModel: ObservableObject {
 
     private var stream: StreamClient?
     private var networkControl: NetworkControlClient?
-    private var usbListener: USBListener?
     private var pairingService: PairingService?
     private var pendingPinCompletion: ((String) -> Void)?
     private var sessionKey: SymmetricKey?
@@ -523,9 +511,6 @@ final class StreamViewModel: ObservableObject {
         self.audioPlayer = AudioPlayer(avSync: avSync)
     }
     private var servicesStarted = false
-    private var usbConnected = false
-    @Published var isCharging = false
-    @Published var isUSBListening = false
     private var camFrameId: UInt32 = 0
 
     private var lastNetEndpoint: NWEndpoint?
@@ -544,12 +529,8 @@ final class StreamViewModel: ObservableObject {
 
     @Published var physicalMouseConnected = false
     @Published var physicalKeyboardConnected = false
-    @Published var physicalControllerConnectedCount = 0
-    @Published private(set) var isControllerPassthroughEnabled = true
     private var mouseObservers: [Any] = []
     private var keyboardObservers: [Any] = []
-    private var controllerObservers: [Any] = []
-    private var controllerSlots: [ObjectIdentifier: UInt8] = [:]
     private var physicalMouseButtonMask: UInt8 = 0
     private var physicalMouseScrollAccumulator: Float = 0
 
@@ -847,7 +828,6 @@ final class StreamViewModel: ObservableObject {
         connectionHealth = state
         activeTransport = transport
         self.transport = transport.rawValue
-        syncCameraCompressionQuality()
         status = detail ?? defaultDetail(for: state)
         isConnected = state.isConnected
         isConnecting = state.isConnecting
@@ -902,11 +882,7 @@ final class StreamViewModel: ObservableObject {
 
     private func sendSpeakerTransportState(isEnabled: Bool) {
         guard activeTransport != .none else { return }
-        if activeTransport == .usb {
-            usbListener?.sendSpeakerState(isEnabled: isEnabled)
-        } else {
-            networkControl?.sendSpeakerState(isEnabled: isEnabled)
-        }
+        networkControl?.sendSpeakerState(isEnabled: isEnabled)
     }
 
     private func syncSpeakerPassthroughState() {
@@ -915,7 +891,7 @@ final class StreamViewModel: ObservableObject {
 
     // MARK: - Capability negotiation
 
-    /// Called once a session is up (network `.sessionEstablished`, or USB `onConnected`).
+    /// Called once a session is up (network `.sessionEstablished`).
     /// Starts the ~2s "assume legacy daemon" fallback timer and clears any capabilities
     /// left over from a previous session. If a real `CAPS` message arrives first,
     /// `handleDaemonCapabilities` cancels this timer.
@@ -959,19 +935,14 @@ final class StreamViewModel: ObservableObject {
     }
 
     /// Fails the in-progress connection because the daemon's advertised capabilities
-    /// don't satisfy the user's configured stream settings. Tears down whichever
-    /// transport is active — mirroring the abrupt teardown `usb.onDisconnected` performs
-    /// (stream, network control, USB listener, decoder/audio/camera/mic/peripheral state,
-    /// and capability-negotiation state) — then reports the failure through the same
+    /// don't satisfy the user's configured stream settings. Tears down the active
+    /// session (stream, network control, decoder/audio/camera/mic/peripheral state, and
+    /// capability-negotiation state) then reports the failure through the same
     /// `applyConnectionHealth(.connectionError, ...)` surface every other connection
-    /// failure uses, so the UI shows it identically. Safe to call regardless of which
-    /// transport (or none) is actually active: every teardown call here is nil-safe.
+    /// failure uses, so the UI shows it identically. Safe to call regardless of whether a
+    /// session is actually active: every teardown call here is nil-safe.
     private func failConnection(detail: String) {
         log("failConnection: \(detail)")
-        usbConnected = false
-        isUSBListening = false
-        usbListener?.stop()
-        usbListener = nil
         stream?.onEvent = nil
         stream?.onDisconnect = nil
         stream?.disconnect()
@@ -990,14 +961,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func sendStreamSettingsTransportState(_ settings: StreamSettings) {
-        // Keyed off usbConnected rather than activeTransport: the latter is only set via
-        // applyConnectionHealth, which may not have run yet when CAPS arrives right after
-        // the USB session comes up.
-        if usbConnected {
-            usbListener?.sendStreamSettings(settings)
-        } else {
-            networkControl?.sendStreamSettings(settings)
-        }
+        networkControl?.sendStreamSettings(settings)
     }
 
     /// Clears capability-negotiation state on disconnect so a fresh connection starts
@@ -1011,7 +975,7 @@ final class StreamViewModel: ObservableObject {
 
     func handleAppDidEnterBackground() {
         log("sceneDidEnterBackground")
-        guard activeTransport != .none || isConnecting || isUSBListening || pairingService != nil else { return }
+        guard activeTransport != .none || isConnecting || pairingService != nil else { return }
         disconnect(detail: "Screx disconnected when the app entered the background. Reconnect to continue.")
     }
 
@@ -1019,9 +983,7 @@ final class StreamViewModel: ObservableObject {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
-        startBatteryMonitoring()
         startTrafficMonitoring()
-        syncCameraCompressionQuality()
         if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
@@ -1052,130 +1014,6 @@ final class StreamViewModel: ObservableObject {
         sessionDisplayName = hostname
     }
 
-    private func syncCameraCompressionQuality() {
-        let isUSBTransport = activeTransport == .usb
-        cameraCapture.compressionQuality = isUSBTransport
-            ? usbCameraCompressionQuality
-            : networkCameraCompressionQuality
-        cameraCapture.captureProfile = isUSBTransport ? .usb : .network
-    }
-
-    private func startBatteryMonitoring() {
-        UIDevice.current.isBatteryMonitoringEnabled = true
-        updateChargingState()
-        NotificationCenter.default.addObserver(
-            forName: UIDevice.batteryStateDidChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.updateChargingState()
-        }
-    }
-
-    private func updateChargingState() {
-        let state = UIDevice.current.batteryState
-        isCharging = state == .charging || state == .full
-    }
-
-    func connectUSB() {
-        if isUSBListening {
-            cancelUSBListening()
-            return
-        }
-        guard !isConnecting && !isConnected else { return }
-
-        isUSBListening = true
-        applyConnectionHealth(.connecting, detail: "Listening for USB connection.", transport: .usb)
-
-        let usb = USBListener(decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
-        self.usbListener = usb
-        self.sessionDisplayName = "USB device"
-        _ = self.trafficCounter.readAndReset()
-
-        usb.onEvent = { [weak self] event in
-            Task { @MainActor in
-                guard let self else { return }
-                self.log("usb event: \(String(describing: event))")
-                switch event {
-                case .listenerReady:
-                    if self.isUSBListening && !self.usbConnected {
-                        self.applyConnectionHealth(.connecting, detail: "USB listener is ready. Waiting for the daemon.", transport: .usb)
-                    }
-                case .listenerFailed(let message):
-                    self.isUSBListening = false
-                    self.applyConnectionFailure("USB listener failed: \(message)", transport: .none)
-                case .connected:
-                    self.applyConnectionHealth(.waitingForVideo, detail: "USB connected. Waiting for video.", transport: .usb)
-                case .firstFrame:
-                    self.applyConnectionHealth(.streaming, transport: .usb)
-                    if let endpoint = self.lastNetEndpoint {
-                        let target = self.endpointHostAndPort(endpoint, fallbackHost: self.lastNetName ?? "")
-                        self.manualHost = formatEndpointInput(host: target.host, port: target.port)
-                    }
-                }
-            }
-        }
-        usb.onTraffic = { [weak self] rxBytes, txBytes in
-            self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
-        }
-        usb.onHostname = { [weak self] hostname in
-            Task { @MainActor in
-                self?.updateSessionHostname(hostname)
-            }
-        }
-        usb.onCapabilities = { [weak self] capabilities in
-            Task { @MainActor in
-                self?.handleDaemonCapabilities(capabilities)
-            }
-        }
-        usb.onConnected = { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.log("usb connected")
-                self.usbConnected = true
-                self.isUSBListening = false
-                self.stream?.suppressTimeout = true
-                self.decoder.setSuspended(false)
-                self.beginCapabilityNegotiation(transport: .usb)
-                self.syncSpeakerPassthroughState()
-                self.audioPlayer.start()
-                self.startPeripheralMonitoring()
-            }
-        }
-        usb.onDisconnected = { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.log("usb disconnected")
-                self.usbConnected = false
-                self.isUSBListening = false
-                self.usbListener?.stop()
-                self.usbListener = nil
-                self.stream?.suppressTimeout = false
-                self.stream?.onEvent = nil
-                self.stream?.onDisconnect = nil
-                self.stream?.disconnect()
-                self.stream = nil
-                self.closeNetworkControl(gracefully: false)
-                self.decoder.setSuspended(false)
-                self.audioPlayer.stop()
-                self.micCapture.stop()
-                self.cameraCapture.stop()
-                self.stopPeripheralMonitoring()
-                self.resetCapabilityNegotiation()
-                self.applyConnectionHealth(.connectionError, detail: "USB disconnected. \(self.disconnectedPrompt())", transport: .none)
-            }
-        }
-        usb.start()
-    }
-
-    private func cancelUSBListening() {
-        usbListener?.stop()
-        usbListener = nil
-        isUSBListening = false
-        usbConnected = false
-        applyConnectionHealth(.idle, detail: disconnectedPrompt())
-    }
-
     func connectManual() {
         guard !isConnecting else {
             log("connectManual() ignored while already connecting")
@@ -1203,7 +1041,7 @@ final class StreamViewModel: ObservableObject {
     func clearRecentConnections() {
         recentConnections = pinnedConnections
         persistRecentConnections()
-        if !isConnected && !isConnecting && !usbConnected {
+        if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
@@ -1215,7 +1053,7 @@ final class StreamViewModel: ObservableObject {
             lastNetEndpoint = nil
             lastNetName = nil
         }
-        if !isConnected && !isConnecting && !usbConnected {
+        if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
@@ -1244,13 +1082,13 @@ final class StreamViewModel: ObservableObject {
         )
         persistRecentConnections()
 
-        if !isConnected && !isConnecting && !usbConnected {
+        if !isConnected && !isConnecting {
             applyConnectionHealth(.idle, detail: disconnectedPrompt())
         }
     }
 
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
-        log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting) usbConnected=\(usbConnected)")
+        log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting)")
         // Detach old stream's callbacks so stale async events can't interfere
         stream?.onEvent = nil
         stream?.onDisconnect = nil
@@ -1299,9 +1137,7 @@ final class StreamViewModel: ObservableObject {
                         guard self.networkControl === control else { return }
                         self.log("NetworkControlClient onDisconnect")
                         self.networkControl = nil
-                        if !self.usbConnected {
-                            self.handleStreamLost()
-                        }
+                        self.handleStreamLost()
                     }
                 }
                 self.networkControl = control
@@ -1377,9 +1213,7 @@ final class StreamViewModel: ObservableObject {
 
     private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey, controlClient: NetworkControlClient) {
         log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
-        if !usbConnected {
-            applyConnectionHealth(.waitingForVideo, detail: "Waiting for video from \(name).", transport: .network)
-        }
+        applyConnectionHealth(.waitingForVideo, detail: "Waiting for video from \(name).", transport: .network)
 
         decoder.hasReportedFirstFrame = false
 
@@ -1398,32 +1232,30 @@ final class StreamViewModel: ObservableObject {
                 guard let self, let client else { return }
                 guard self.stream === client else { return }
                 self.log("StreamClient event: \(String(describing: event))")
-                if !self.usbConnected {
-                    switch event {
-                    case .readyToRegister:
-                        self.applyConnectionHealth(.waitingForVideo, detail: "Connected. Registering for network video.", transport: .network)
-                    case .waiting(let message):
-                        let normalized = message.lowercased()
-                        if normalized.contains("refused") || normalized.contains("timed out") || normalized.contains("timeout") {
-                            self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
-                        } else {
-                            self.applyConnectionHealth(.waitingForVideo, detail: "Waiting for video. \(message)", transport: .network)
-                        }
-                    case .connectionFailed(let message):
+                switch event {
+                case .readyToRegister:
+                    self.applyConnectionHealth(.waitingForVideo, detail: "Connected. Registering for network video.", transport: .network)
+                case .waiting(let message):
+                    let normalized = message.lowercased()
+                    if normalized.contains("refused") || normalized.contains("timed out") || normalized.contains("timeout") {
                         self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
-                    case .receiveError(let message):
-                        self.applyConnectionFailure("Receive error: \(message)", transport: .none)
-                    case .timedOut:
-                        self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
-                    case .firstFrame:
-                        let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
-                        self.applyConnectionHealth(.streaming, transport: .network)
-                        self.manualHost = formatEndpointInput(host: target.host, port: target.port)
-                        let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
-                        self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)
-                        self.audioPlayer.start()
-                        self.startPeripheralMonitoring()
+                    } else {
+                        self.applyConnectionHealth(.waitingForVideo, detail: "Waiting for video. \(message)", transport: .network)
                     }
+                case .connectionFailed(let message):
+                    self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
+                case .receiveError(let message):
+                    self.applyConnectionFailure("Receive error: \(message)", transport: .none)
+                case .timedOut:
+                    self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
+                case .firstFrame:
+                    let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
+                    self.applyConnectionHealth(.streaming, transport: .network)
+                    self.manualHost = formatEndpointInput(host: target.host, port: target.port)
+                    let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
+                    self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)
+                    self.audioPlayer.start()
+                    self.startPeripheralMonitoring()
                 }
             }
         }
@@ -1433,9 +1265,7 @@ final class StreamViewModel: ObservableObject {
                 guard self.stream === client else { return }
                 self.log("StreamClient onDisconnect")
                 self.stream = nil
-                if !self.usbConnected {
-                    self.handleStreamLost()
-                }
+                self.handleStreamLost()
             }
         }
         client.connect()
@@ -1485,10 +1315,6 @@ final class StreamViewModel: ObservableObject {
         closeNetworkControl(gracefully: true)
         pairingService?.cancel()
         pairingService = nil
-        usbListener?.stop()
-        usbListener = nil
-        usbConnected = false
-        isUSBListening = false
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
@@ -1518,19 +1344,11 @@ final class StreamViewModel: ObservableObject {
     }
 
     func sendTouch(_ data: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendTouch(data)
-        } else if let control = networkControl {
-            control.sendTouch(data)
-        }
+        networkControl?.sendTouch(data)
     }
 
     func sendKey(_ keyData: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendKey(keyData)
-        } else if let control = networkControl {
-            control.sendKey(keyData)
-        }
+        networkControl?.sendKey(keyData)
     }
 
     /// Builds a "text insert" key packet: type 0x01 + UTF-8 bytes
@@ -1560,35 +1378,15 @@ final class StreamViewModel: ObservableObject {
     // MARK: - Physical Mouse/Keyboard
 
     func sendMouse(_ mouseData: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendMouse(mouseData)
-        } else if let control = networkControl {
-            control.sendMouse(mouseData)
-        }
+        networkControl?.sendMouse(mouseData)
     }
 
     func sendRawKey(_ keyData: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendRawKey(keyData)
-        } else if let control = networkControl {
-            control.sendRawKey(keyData)
-        }
+        networkControl?.sendRawKey(keyData)
     }
 
     func sendPeripheral(_ periphData: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendPeripheral(periphData)
-        } else if let control = networkControl {
-            control.sendPeripheral(periphData)
-        }
-    }
-
-    func sendGamepad(_ gamepadData: Data) {
-        if usbConnected, let usb = usbListener {
-            usb.sendGamepad(gamepadData)
-        } else if let control = networkControl {
-            control.sendGamepad(gamepadData)
-        }
+        networkControl?.sendPeripheral(periphData)
     }
 
     // MARK: - Peripheral Monitoring (GCMouse / GCKeyboard)
@@ -1602,7 +1400,6 @@ final class StreamViewModel: ObservableObject {
         if let kb = GCKeyboard.coalesced {
             attachKeyboard(kb)
         }
-        refreshControllerPassthrough()
 
         let mc = NotificationCenter.default.addObserver(
             forName: .GCMouseDidConnect, object: nil, queue: .main
@@ -1628,33 +1425,17 @@ final class StreamViewModel: ObservableObject {
             guard let self else { return }
             Task { @MainActor in self.detachKeyboard() }
         }
-        let cc = NotificationCenter.default.addObserver(
-            forName: .GCControllerDidConnect, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, let controller = note.object as? GCController else { return }
-            Task { @MainActor in self.attachController(controller) }
-        }
-        let cd = NotificationCenter.default.addObserver(
-            forName: .GCControllerDidDisconnect, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, let controller = note.object as? GCController else { return }
-            Task { @MainActor in self.detachController(controller) }
-        }
         mouseObservers = [mc, md]
         keyboardObservers = [kc, kd]
-        controllerObservers = [cc, cd]
     }
 
     func stopPeripheralMonitoring() {
         for obs in mouseObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in keyboardObservers { NotificationCenter.default.removeObserver(obs) }
-        for obs in controllerObservers { NotificationCenter.default.removeObserver(obs) }
         mouseObservers.removeAll()
         keyboardObservers.removeAll()
-        controllerObservers.removeAll()
         detachMouse()
         detachKeyboard()
-        detachAllControllers()
     }
 
     private func attachMouse(_ mouse: GCMouse) {
@@ -1779,190 +1560,6 @@ final class StreamViewModel: ObservableObject {
         print("[periph] keyboard detached")
     }
 
-    private func attachController(_ controller: GCController) {
-        guard isControllerPassthroughEnabled else {
-            print("[gamepad] controller passthrough disabled, ignoring attach")
-            return
-        }
-        let id = ObjectIdentifier(controller)
-        guard controllerSlots[id] == nil else { return }
-        guard controller.extendedGamepad != nil || controller.microGamepad != nil else {
-            print("[gamepad] unsupported controller profile ignored")
-            return
-        }
-
-        guard let slot = nextAvailableControllerSlot() else {
-            print("[gamepad] no free virtual gamepad slot (max 4)")
-            return
-        }
-
-        controllerSlots[id] = slot
-        physicalControllerConnectedCount = controllerSlots.count
-        sendGamepad(Data([slot, 0x01])) // ATTACHED
-
-        if let gamepad = controller.extendedGamepad {
-            gamepad.valueChangedHandler = { [weak self, weak controller] gamepad, _ in
-                guard let self, let controller else { return }
-                Task { @MainActor in self.sendExtendedGamepadState(controller: controller, gamepad: gamepad) }
-            }
-            sendExtendedGamepadState(controller: controller, gamepad: gamepad)
-            print("[gamepad] controller attached in slot \(slot + 1) (extended)")
-        } else if let gamepad = controller.microGamepad {
-            gamepad.valueChangedHandler = { [weak self, weak controller] gamepad, _ in
-                guard let self, let controller else { return }
-                Task { @MainActor in self.sendMicroGamepadState(controller: controller, gamepad: gamepad) }
-            }
-            sendMicroGamepadState(controller: controller, gamepad: gamepad)
-            print("[gamepad] controller attached in slot \(slot + 1) (micro)")
-        }
-    }
-
-    private func detachController(_ controller: GCController) {
-        let id = ObjectIdentifier(controller)
-        guard let slot = controllerSlots.removeValue(forKey: id) else { return }
-
-        controller.extendedGamepad?.valueChangedHandler = nil
-        controller.microGamepad?.valueChangedHandler = nil
-
-        sendGamepad(Data([slot, 0x00])) // DETACHED
-        physicalControllerConnectedCount = controllerSlots.count
-        print("[gamepad] controller detached from slot \(slot + 1)")
-    }
-
-    private func detachAllControllers() {
-        for controller in GCController.controllers() {
-            controller.extendedGamepad?.valueChangedHandler = nil
-            controller.microGamepad?.valueChangedHandler = nil
-        }
-        for slot in controllerSlots.values {
-            sendGamepad(Data([slot, 0x00]))
-        }
-        controllerSlots.removeAll()
-        physicalControllerConnectedCount = 0
-    }
-
-    private func refreshControllerPassthrough() {
-        if isControllerPassthroughEnabled {
-            for controller in GCController.controllers() {
-                attachController(controller)
-            }
-        } else {
-            detachAllControllers()
-        }
-    }
-
-    private func nextAvailableControllerSlot() -> UInt8? {
-        let used = Set(controllerSlots.values)
-        for slot in 0..<4 {
-            let candidate = UInt8(slot)
-            if !used.contains(candidate) {
-                return candidate
-            }
-        }
-        return nil
-    }
-
-    private func sendExtendedGamepadState(controller: GCController, gamepad: GCExtendedGamepad) {
-        let id = ObjectIdentifier(controller)
-        guard let slot = controllerSlots[id] else { return }
-
-        var buttons: UInt16 = 0
-        if gamepad.buttonA.isPressed { buttons |= 0x0001 }
-        if gamepad.buttonB.isPressed { buttons |= 0x0002 }
-        if gamepad.buttonX.isPressed { buttons |= 0x0004 }
-        if gamepad.buttonY.isPressed { buttons |= 0x0008 }
-        if gamepad.leftShoulder.isPressed { buttons |= 0x0010 }
-        if gamepad.rightShoulder.isPressed { buttons |= 0x0020 }
-        if gamepad.leftThumbstickButton?.isPressed == true { buttons |= 0x0040 }
-        if gamepad.rightThumbstickButton?.isPressed == true { buttons |= 0x0080 }
-        if gamepad.buttonOptions?.isPressed == true { buttons |= 0x0100 }
-        if gamepad.buttonMenu.isPressed { buttons |= 0x0200 }
-        if gamepad.buttonHome?.isPressed == true { buttons |= 0x0400 }
-
-        let hatX: Int8 = gamepad.dpad.left.isPressed ? -1 : (gamepad.dpad.right.isPressed ? 1 : 0)
-        let hatY: Int8 = gamepad.dpad.up.isPressed ? -1 : (gamepad.dpad.down.isPressed ? 1 : 0)
-
-        print("[gamepad] send extended state slot=\(slot + 1) buttons=0x\(String(buttons, radix: 16)) lx=\(gamepad.leftThumbstick.xAxis.value) ly=\(gamepad.leftThumbstick.yAxis.value) rx=\(gamepad.rightThumbstick.xAxis.value) ry=\(gamepad.rightThumbstick.yAxis.value) lt=\(gamepad.leftTrigger.value) rt=\(gamepad.rightTrigger.value) hat=(\(hatX),\(hatY))")
-
-        sendGamepadState(
-            slot: slot,
-            buttons: buttons,
-            lx: gamepad.leftThumbstick.xAxis.value,
-            ly: -gamepad.leftThumbstick.yAxis.value,
-            rx: gamepad.rightThumbstick.xAxis.value,
-            ry: -gamepad.rightThumbstick.yAxis.value,
-            lt: gamepad.leftTrigger.value,
-            rt: gamepad.rightTrigger.value,
-            hatX: hatX,
-            hatY: hatY
-        )
-    }
-
-    private func sendMicroGamepadState(controller: GCController, gamepad: GCMicroGamepad) {
-        let id = ObjectIdentifier(controller)
-        guard let slot = controllerSlots[id] else { return }
-
-        var buttons: UInt16 = 0
-        if gamepad.buttonA.isPressed { buttons |= 0x0001 }
-        if gamepad.buttonX.isPressed { buttons |= 0x0004 }
-        if gamepad.buttonMenu.isPressed { buttons |= 0x0200 }
-
-        let hatX: Int8 = gamepad.dpad.left.isPressed ? -1 : (gamepad.dpad.right.isPressed ? 1 : 0)
-        let hatY: Int8 = gamepad.dpad.up.isPressed ? -1 : (gamepad.dpad.down.isPressed ? 1 : 0)
-
-        print("[gamepad] send micro state slot=\(slot + 1) buttons=0x\(String(buttons, radix: 16)) hat=(\(hatX),\(hatY))")
-
-        sendGamepadState(
-            slot: slot,
-            buttons: buttons,
-            lx: 0,
-            ly: 0,
-            rx: 0,
-            ry: 0,
-            lt: 0,
-            rt: 0,
-            hatX: hatX,
-            hatY: hatY
-        )
-    }
-
-    private func sendGamepadState(
-        slot: UInt8,
-        buttons: UInt16,
-        lx: Float,
-        ly: Float,
-        rx: Float,
-        ry: Float,
-        lt: Float,
-        rt: Float,
-        hatX: Int8,
-        hatY: Int8
-    ) {
-        var data = Data([slot, 0x02]) // STATE
-        withUnsafeBytes(of: buttons.bigEndian) { data.append(contentsOf: $0) }
-        appendGamepadAxis(&data, lx)
-        appendGamepadAxis(&data, ly)
-        appendGamepadAxis(&data, rx)
-        appendGamepadAxis(&data, ry)
-        appendGamepadTrigger(&data, lt)
-        appendGamepadTrigger(&data, rt)
-        data.append(UInt8(bitPattern: hatX))
-        data.append(UInt8(bitPattern: hatY))
-        sendGamepad(data)
-    }
-
-    private func appendGamepadAxis(_ data: inout Data, _ value: Float) {
-        let clamped = max(-1.0, min(1.0, value))
-        let scaled = Int16(clamping: Int((clamped * 32767.0).rounded())).bigEndian
-        withUnsafeBytes(of: scaled) { data.append(contentsOf: $0) }
-    }
-
-    private func appendGamepadTrigger(_ data: inout Data, _ value: Float) {
-        let clamped = max(0.0, min(1.0, value))
-        let scaled = UInt16((clamped * 1023.0).rounded()).bigEndian
-        withUnsafeBytes(of: scaled) { data.append(contentsOf: $0) }
-    }
-
     // MARK: - Camera
 
     /// True while `daemonCapabilities` is nil (pre-CAPS state, treat everything as
@@ -1980,11 +1577,7 @@ final class StreamViewModel: ObservableObject {
                 guard let self else { return }
                 let fid = self.camFrameId
                 self.camFrameId = self.camFrameId &+ 1
-                if self.usbConnected, let usb = self.usbListener {
-                    usb.sendCameraFrame(jpeg, frameId: fid)
-                } else if let stream = self.stream {
-                    stream.sendCameraFrame(jpeg, frameId: fid)
-                }
+                self.stream?.sendCameraFrame(jpeg, frameId: fid)
             }
             cameraCapture.start()
         }
@@ -1993,24 +1586,15 @@ final class StreamViewModel: ObservableObject {
 
     /// Tells the daemon to create the virtual webcam with our capture profile.
     private func sendCameraEnable() {
-        let profile: CameraCapture.CaptureProfile = activeTransport == .usb ? .usb : .network
-        let width = UInt16(profile.outputSize.width)
-        let height = UInt16(profile.outputSize.height)
-        let fps = UInt16(profile.targetFps)
-        if activeTransport == .usb {
-            usbListener?.sendCameraConfig(width: width, height: height, fps: fps)
-        } else {
-            networkControl?.sendCameraConfig(width: width, height: height, fps: fps)
-        }
+        let width = UInt16(CameraCapture.outputSize.width)
+        let height = UInt16(CameraCapture.outputSize.height)
+        let fps = UInt16(CameraCapture.targetFps)
+        networkControl?.sendCameraConfig(width: width, height: height, fps: fps)
     }
 
     /// Tells the daemon to destroy the virtual webcam.
     private func sendCameraDisable() {
-        if activeTransport == .usb {
-            usbListener?.sendCameraConfig(width: 0, height: 0, fps: 0)
-        } else {
-            networkControl?.sendCameraConfig(width: 0, height: 0, fps: 0)
-        }
+        networkControl?.sendCameraConfig(width: 0, height: 0, fps: 0)
     }
 
     var isCameraActive: Bool { cameraCapture.isRunning }
@@ -2050,11 +1634,7 @@ final class StreamViewModel: ObservableObject {
                 withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
                 packet.append(opusData)
 
-                if self.usbConnected, let usb = self.usbListener {
-                    usb.sendMicPacket(packet)
-                } else if let stream = self.stream {
-                    stream.sendMicPacket(packet)
-                }
+                self.stream?.sendMicPacket(packet)
             }
             micCapture.start()
             if speakerWasEnabled {
@@ -2078,23 +1658,15 @@ final class StreamViewModel: ObservableObject {
 
     /// Tells the daemon to create the virtual microphone device.
     private func sendMicEnable() {
-        if activeTransport == .usb {
-            usbListener?.sendMicState(isEnabled: true)
-        } else {
-            networkControl?.sendMicState(isEnabled: true)
-        }
+        networkControl?.sendMicState(isEnabled: true)
     }
 
     /// Tells the daemon to destroy the virtual microphone device.
     private func sendMicDisable() {
-        if activeTransport == .usb {
-            usbListener?.sendMicState(isEnabled: false)
-        } else {
-            networkControl?.sendMicState(isEnabled: false)
-        }
+        networkControl?.sendMicState(isEnabled: false)
     }
 
-    // MARK: - Speakers / Controllers
+    // MARK: - Speakers
 
     /// True while `daemonCapabilities` is nil (pre-CAPS state) or once `CAPS` reports
     /// speaker/system-audio support.
@@ -2109,20 +1681,6 @@ final class StreamViewModel: ObservableObject {
     }
 
     var isSpeakerActive: Bool { audioPlayer.isOutputEnabled }
-
-    /// True while `daemonCapabilities` is nil (pre-CAPS state) or once `CAPS` reports a
-    /// non-nil `gamepadMaxControllers` (nil there means gamepad passthrough is
-    /// unsupported by this daemon).
-    var isControllerAvailable: Bool {
-        guard let daemonCapabilities else { return true }
-        return daemonCapabilities.gamepadMaxControllers != nil
-    }
-
-    func toggleControllerPassthrough() {
-        guard isControllerAvailable else { return }
-        isControllerPassthroughEnabled.toggle()
-        refreshControllerPassthrough()
-    }
 }
 
 enum ToolbarOrientation: String {
@@ -2201,45 +1759,13 @@ struct ContentView: View {
                                     ? "Pairing…"
                                     : model.connectionHealth == .waitingForVideo && model.transport == ConnectionTransport.network.rawValue
                                         ? "Waiting…"
-                                        : model.isConnecting && !model.isUSBListening
+                                        : model.isConnecting
                                             ? "Connecting…"
                                             : "Connect"
                             ) { model.connectManual() }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
-
-                        HStack(spacing: 6) {
-                            Rectangle()
-                                .frame(height: 1)
-                                .foregroundStyle(Color(.separator))
-                            Text("or")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Rectangle()
-                                .frame(height: 1)
-                                .foregroundStyle(Color(.separator))
-                        }
-                        .padding(.vertical, 2)
-
-                        Button {
-                            model.connectUSB()
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "cable.connector")
-                                Text(
-                                    model.isUSBListening
-                                        ? "Cancel USB"
-                                        : model.connectionHealth == .waitingForVideo && model.transport == ConnectionTransport.usb.rawValue
-                                            ? "Waiting for Video…"
-                                            : "Connect via USB"
-                                )
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(model.isUSBListening ? .red : .green)
-                        .disabled(!model.isUSBListening && (!model.isCharging || model.isConnecting))
 
                         Button {
                             showStreamSettings = true
@@ -2508,18 +2034,6 @@ struct ContentView: View {
                 }
 
                 if isToolbarExpanded {
-                    toolbarButton(
-                        icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
-                        active: model.isControllerPassthroughEnabled,
-                        color: !model.isControllerAvailable ? .gray : (model.isControllerPassthroughEnabled ? .green : .white)
-                    ) {
-                        if model.isControllerAvailable {
-                            model.toggleControllerPassthrough()
-                        } else {
-                            showToolbarMessage("Gamepad passthrough not supported by this daemon")
-                        }
-                    }
-
                     toolbarButton(
                         icon: model.isCameraActive
                             ? (model.isCameraFront ? "arrow.triangle.2.circlepath.camera.fill" : "video.fill")

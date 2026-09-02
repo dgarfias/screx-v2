@@ -2,37 +2,30 @@
 
 ## Overview
 
-Screx is a remote display system built around a virtual monitor on a host machine (Linux,
-Windows, or macOS) and custom low-latency clients on iPad and desktop (macOS/Windows/Linux).
+Screx is a remote display system built around a virtual monitor on a Linux host machine and a
+custom low-latency client on iPad.
 
 At a high level:
 
-- the daemon creates a virtual display (EVDI on Linux, a DXGI-duplicated virtual monitor via a
-  third-party driver on Windows, a private `CGVirtualDisplay` on macOS)
+- the daemon creates a virtual display (EVDI on Linux)
 - the host compositor renders to that virtual display
 - the daemon captures, encodes, and streams video/audio to the client
-- clients send back their supported input, peripheral, and session-control messages; the daemon
+- the client sends back its supported input, peripheral, and session-control messages; the daemon
   advertises which optional host features are available
 
-The daemon binary and wire protocol are the same across host platforms — see
-[DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
-[DAEMON_MACOS.md](DAEMON_MACOS.md) for platform-specific build/run/driver details. Every daemon
-platform works over the network with either client - see [CLIENT_IPAD.md](CLIENT_IPAD.md) and
-[CLIENT_DESKTOP.md](CLIENT_DESKTOP.md).
+See [DAEMON_LINUX.md](DAEMON_LINUX.md) for build/run/driver details and
+[CLIENT_IPAD.md](CLIENT_IPAD.md) for the client.
 
-The system supports two transports:
+The system is network-only:
 
-- **Network**
-  - UDP for media
-  - encrypted TCP for pairing and control
-- **USB** (iPad client only)
-  - framed TCP over `iproxy` (Linux/macOS) / Apple Mobile Device Service (Windows)
+- UDP for media
+- encrypted TCP for pairing and control
 
 ## High-Level Data Flow
 
 ```text
 Host desktop/compositor
-    -> virtual monitor (EVDI / DXGI duplication / CGVirtualDisplay)
+    -> virtual monitor (EVDI)
     -> capture
     -> encode
     -> transport
@@ -41,13 +34,11 @@ Host desktop/compositor
 Client input/peripherals
     -> control transport
     -> daemon
-    -> uinput+PipeWire+v4l2loopback (Linux) / SendInput+WASAPI+DirectShow+ViGEmBus (Windows) /
-       CGEventPost+ScreenCaptureKit (macOS)
+    -> uinput+PipeWire+v4l2loopback
 ```
 
-Pointer model differs per client: the iPad sends **relative** deltas under pointer lock when an
-external mouse/trackpad is attached (touch stays absolute), while the desktop client always sends
-**absolute** positions.
+The iPad sends **relative** pointer deltas under pointer lock when an external mouse/trackpad is
+attached; touch stays absolute.
 
 ## Main Components
 
@@ -60,7 +51,6 @@ Key files:
 - `daemon/src/encode.rs`
 - `daemon/src/stream_server.rs`
 - `daemon/src/pairing.rs`
-- `daemon/src/usb.rs`
 - `daemon/src/audio.rs`
 - `daemon/src/camera.rs`
 - `daemon/src/input.rs`
@@ -70,36 +60,18 @@ Responsibilities:
 - create and manage the virtual display
 - capture frames from it
 - encode H.264/H.265
-- stream media over network or USB
+- stream media over the network
 - manage pairing and session keys
-- parse touch/keyboard/mouse/controller input messages
-- expose optional virtual microphone, webcam, speaker, and gamepad devices where the platform
-  backend and required drivers support them
+- parse touch/keyboard/mouse input messages
+- expose optional virtual microphone, webcam, and speaker devices where required drivers are
+  available
 
-### Daemon (platform backends)
+### Daemon (platform backend)
 
-Platform-specific implementations live behind the `crate::platform` module
-(`daemon/src/platform/mod.rs`), selected at compile time:
+Platform-specific implementation lives in `daemon/src/platform/linux/` — EVDI virtual display,
+`uinput` virtual input devices, PipeWire/PulseAudio, `v4l2loopback` webcam.
 
-- `daemon/src/platform/linux/` — EVDI virtual display, `uinput` virtual input devices,
-  PipeWire/PulseAudio, `v4l2loopback` webcam, `idevice_id`/`iproxy` for USB
-- `daemon/src/platform/windows/` — DXGI Desktop Duplication + a third-party Indirect Display
-  Driver for the virtual monitor (`display.rs`), `SendInput`-based input (`input.rs`), WASAPI +
-  "Steam Streaming Speakers" for audio (`wasapi.rs`, `audio_driver.rs`), a DirectShow capture
-  filter DLL for the virtual webcam (`vcam.rs`, `vcam_filter/lib.rs`), ViGEmBus for virtual Xbox
-  360 gamepads (`vigem.rs`), and native usbmuxd-protocol speech to Apple Mobile Device Service for
-  USB detection (`usbmux.rs`)
-- `daemon/src/platform/macos/` — a private `CGVirtualDisplay` for the virtual monitor, captured via
-  a screen-only ScreenCaptureKit stream (`display.rs`) as native IOSurface-backed `420v`
-  CVPixelBuffers. The original ScreenCaptureKit CVPixelBuffer is retained and submitted directly to
-  VideoToolbox through FFmpeg's `AV_PIX_FMT_VIDEOTOOLBOX` path without a CPU pixel copy; IOSurface
-  rewrapping is only a fallback when an original CVPixelBuffer is unavailable. The backend also
-  provides `CGEventPost`-based input (`input.rs`), a ScreenCaptureKit audio-only stream for speaker
-  capture (`audio.rs`), and
-  `idevice_id`/`iproxy` (macOS ships `usbmuxd` natively) for USB detection (`usbmux.rs`)
-
-See [DAEMON_LINUX.md](DAEMON_LINUX.md), [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md), and
-[DAEMON_MACOS.md](DAEMON_MACOS.md) for the dependencies and drivers each backend needs.
+See [DAEMON_LINUX.md](DAEMON_LINUX.md) for the dependencies and drivers the backend needs.
 
 ### iPad app
 
@@ -109,7 +81,6 @@ Key files:
 - `client/ipad/Screx/PairingService.swift`
 - `client/ipad/Screx/NetworkControlClient.swift`
 - `client/ipad/Screx/StreamClient.swift`
-- `client/ipad/Screx/USBListener.swift`
 - `client/ipad/Screx/Decoder.swift`
 - `client/ipad/Screx/DisplayView.swift`
 - `client/ipad/Screx/AudioPlayer.swift`
@@ -119,11 +90,10 @@ Key files:
 
 Responsibilities:
 
-- manual connection UI for network and USB
+- manual connection UI
 - PIN pairing flow
 - capability negotiation (`CAPS`/`STNG`) with the daemon
 - network media receive path
-- USB media receive path
 - low-latency video decode and display
 - local audio playback
 - input forwarding
@@ -131,59 +101,20 @@ Responsibilities:
 - connection-health UI and session state
 - Stream Settings sheet for choosing resolution, framerate, codec, and bitrate before connecting
 
-### Desktop client
-
-Key files:
-
-- `client/desktop/src/main.rs`, `backend.rs`, `app_state.rs`
-- `client/desktop/src/decoder.rs`, `video_surface.rs`
-- `client/desktop/src/input.rs`, `keyboard_grab.rs`
-- `client/desktop/src/audio_player.rs`, `mic_capture.rs`
-- `client/desktop/src/webcam_capture.rs`
-- `client/desktop/qml/Main.qml`
-
-Responsibilities (network transport only — no USB support):
-
-- connection UI (Qt Quick/QML) driving a Rust backend
-- PIN pairing flow
-- capability negotiation (`CAPS`/`STNG`) with the daemon
-- Stream Settings UI for choosing resolution, framerate, codec, and bitrate before connecting
-- network media receive path, with hardware-accelerated decode/display where available (VA-API on
-  Linux, D3D11VA on Windows, VideoToolbox and Metal on macOS)
-- local audio playback and microphone capture
-- mouse and focused-window keyboard forwarding; OS-level keyboard grabbing is not currently wired
-- webcam forwarding via `nokhwa`
-
 ## Transport Model
-
-### Network mode
 
 - Pairing and control use a persistent TCP connection.
 - Media uses UDP.
 - Video and audio are sent daemon -> client over UDP.
 - Mic and camera data are sent client -> daemon over UDP.
-- Touch/keyboard/mouse/controller/peripheral state travel over encrypted TCP control.
+- Touch/keyboard/mouse/peripheral state travel over encrypted TCP control.
 
 Why:
 
 - UDP avoids head-of-line blocking for media.
 - TCP control gives reliable ordering for input/state messages.
 
-### USB mode
-
-- The daemon uses `idevice_id` and `iproxy`.
-- The iPad opens a local TCP listener.
-- The daemon connects through `iproxy`.
-- Video, audio, and control all use framed TCP messages over that USB tunnel.
-
-Why:
-
-- USB avoids Wi‑Fi jitter and loss.
-- One reliable framed stream is simple and effective for local tethered use.
-
 ## Connection Lifecycle
-
-### Network session
 
 1. Client opens TCP to daemon.
 2. Pairing or reconnect handshake runs.
@@ -192,15 +123,6 @@ Why:
 5. Client opens UDP path and starts sending encrypted register packets.
 6. Daemon authenticates first UDP packets and starts media.
 7. First decoded frame on the client moves session into streaming state.
-
-### USB session
-
-1. iPad enters `Connect via USB` listening mode.
-2. Daemon detects the connected iPadOS device and starts `iproxy`.
-3. Daemon connects to the app listener over forwarded TCP.
-4. iPad sends `READY`.
-5. Daemon activates USB transport.
-6. Daemon starts media/control over framed TCP.
 
 ## Pairing Protocol
 
@@ -277,7 +199,7 @@ Notes:
 
 - video is split into chunks of 1400 bytes
 - optional Reed-Solomon parity is added for video
-- audio is small enough to go without FEC
+- audio is small enough to go without FEC; the Opus payload is a single packet per 10 ms frame
 - client-to-daemon media packets prepend a 4-byte sequence number before encrypted payload
 - the iPad retains incomplete video assemblies for 100 ms, then reconstructs recoverable frames
   from parity or discards them and requests recovery
@@ -300,63 +222,22 @@ Control payloads include messages such as:
 - `MOUSE`
 - `RAWKEY`
 - `PERIPH`
-- `GPAD`
 - `SPKR`
 - `HOST<hostname>`
 - `CAPS` (daemon -> client, capability negotiation)
 - `STNG` (client -> daemon, capability negotiation)
 - `DISCONNECT`
 
-`PLI` requests an IDR and raises a capture-refresh signal. Linux and macOS use that signal to obtain
-or resend a frame, allowing a static desktop such as a ScreenCaptureKit stream with no new frame to
-answer the recovery request. Windows already emits its cached frame periodically.
-
-### USB Transport (TCP)
-
-Each framed USB message is:
-
-| Field | Size | Description |
-|---|---|---|
-| `length` | u32 BE | Payload length |
-| `type` | u8 | `0x01` video, `0x02` audio, `0x03` control |
-| `payload` | variable | Type-specific bytes |
-
-#### USB video payload
-
-`type(1) + is_idr(1) + codec_id(1) + timestamp_ms(4) + annex_b`
-
-#### USB audio payload
-
-`type(1) + timestamp_ms(4) + pcm`
-
-#### USB control payload
-
-ASCII prefix plus message body, for example:
-
-- `READY`
-- `PLI`
-- `SPKR<1-byte-flag>`
-- `HOST<hostname>`
-- `CAPS...` (daemon -> client, capability negotiation)
-- `STNG...` (client -> daemon, capability negotiation)
-- `TOUCH...`
-- `KEY...`
-- `MOUSE...`
-- `RAWKEY...`
-- `PERIPH...`
-- `GPAD...`
-- `CAM...`
-- `MIC...`
+`PLI` requests an IDR and raises a capture-refresh signal, letting the daemon obtain or resend a
+frame to answer the recovery request.
 
 ## Capability Negotiation
 
-Right after the daemon sends `HOST<hostname>` on the control channel — network TCP control and USB
-control alike — it sends `CAPS` with the results of inexpensive availability probes. Later device
-or session initialization may still fail. The client replies with `STNG`, proposing session
-settings within the bounds `CAPS` advertised. Both messages travel inside
-the same control framing already used for `HOST` (network: AES-GCM control frame via
-`send_control_frame`; USB: `type = 0x03` control payload) — there is no new transport, socket, or
-crypto involved.
+Right after the daemon sends `HOST<hostname>` on the control channel, it sends `CAPS` with the
+results of inexpensive availability probes. Later device or session initialization may still fail.
+The client replies with `STNG`, proposing session settings within the bounds `CAPS` advertised.
+Both messages travel inside the same control framing already used for `HOST` (AES-GCM control
+frame via `send_control_frame`) — there is no new transport, socket, or crypto involved.
 
 Both messages share one TLV envelope: a 4-byte ASCII magic, a version byte, an entry count, then that
 many `tag(u8) + length(u16 BE) + value` entries. **A parser that doesn't recognize a tag reads the
@@ -382,17 +263,16 @@ initialization cannot fail.
 | `0x01` | CAMERA | `available(u8 0/1)` | Virtual webcam availability probe result |
 | `0x02` | MICROPHONE | `available(u8 0/1)` | Virtual microphone availability probe result |
 | `0x03` | SPEAKER | `available(u8 0/1)` | Speaker/system-audio availability probe result |
-| `0x04` | GAMEPAD | `available(u8 0/1)` + `max_controllers(u8)` | Gamepad availability probe result and simultaneous-controller limit |
 | `0x05` | CODECS | `count(u8)` + `count` bytes of codec id (`0x00`=H.264, `0x01`=H.265) | Codec IDs for which the selected backend has a matching FFmpeg encoder registered; hardware or session initialization may still fail when streaming starts |
 | `0x06` | MAX_RESOLUTION | `width(u16 BE)` + `height(u16 BE)` | Upper bound the client may request |
 | `0x07` | MAX_FRAMERATE | `fps(u8)` | Upper bound the client may request |
 | `0x08` | BITRATE_RANGE | `min_bps(u32 BE)` + `max_bps(u32 BE)` | Bounds the client may request |
 
-`BITRATE_RANGE`'s `max_bps` reflects the ceiling for whichever transport `CAPS` was sent over —
-the daemon advertises a higher value on USB (`--max-bitrate-usb`, default `100M`) than on network
-(`--max-bitrate`, default `20M`), since USB links have far more headroom than typical networks. A
-client that reconnects over a different transport should expect a different `BITRATE_RANGE` and
-re-validate against it. `MAX_RESOLUTION`/`MAX_FRAMERATE` ceilings are shared across transports.
+Tag `0x04` is retired and reserved. The remaining tags keep their existing numbers (`0x01`, `0x02`,
+`0x03`, `0x05`–`0x08`) and are not renumbered, since unknown tags are skipped by the TLV parser.
+
+`BITRATE_RANGE`'s `max_bps` reflects the daemon's single bitrate ceiling (`--max-bitrate`, default
+`20M`).
 
 ### `STNG` (client -> daemon)
 
@@ -432,9 +312,7 @@ clients:
 
 - resolution clamps to `[640x360, --max-width x --max-height]`
 - framerate clamps to `[15, --max-framerate]`
-- bitrate clamps to `[500 Kbps, --max-bitrate]` for sessions negotiated over the network transport,
-  or `[500 Kbps, --max-bitrate-usb]` for sessions negotiated over USB — whichever ceiling matches
-  the transport the `STNG` message arrived on
+- bitrate clamps to `[500 Kbps, --max-bitrate]`
 - a requested codec not in the daemon's advertised `CODECS` falls back to the daemon's default codec
 
 ### Backward compatibility
@@ -449,17 +327,11 @@ clients:
 
 ### Camera forwarding
 
-#### Network camera
-
 Camera frames use:
 
 `"CAM" + frame_id(u32 BE) + chunk_idx(u16 BE) + total_chunks(u16 BE) + jpeg_chunk`
 
 The daemon reassembles the JPEG and writes it to the virtual webcam.
-
-#### USB camera
-
-USB camera uses the same chunk layout as the network camera payload after the `"CAM"` prefix, but wrapped inside USB TCP control frames.
 
 ### Microphone forwarding
 
@@ -511,37 +383,33 @@ External keyboard HID-like packets use `"RAWKEY"`.
 
 `"PERIPH"` notifies mouse and keyboard presence.
 
-### Game controllers
-
-`"GPAD"` handles controller attach/detach/state updates.
-
 ## Audio / Camera / Speaker Model
 
 ### Speakers
 
-- Linux creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`; Windows
-  installs/enables the "Steam Streaming Speakers" device and loopback-captures it via WASAPI;
-  macOS uses a ScreenCaptureKit audio-only stream (`capturesAudio`, 48 kHz stereo), requires a
-  settable mute control on the default output, follows default-device changes, and restores prior
-  mute state when forwarding stops
-- audio is sent to the client
-- the `SPKR` control message starts or stops the platform speaker-forwarding path: it
-  attaches/detaches the virtual sink where one exists, or starts/stops ScreenCaptureKit capture and
-  local-output muting on macOS
+- Linux creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`
+- captured audio is encoded with libopus: 48 kHz, 2 channels, 10 ms frames (480 samples per
+  channel), `Application::Audio`, 128 kbps, no inband FEC, no DTX
+- the Opus packet is sent to the client as the UDP audio payload; the packet header (`flags` bit 1
+  audio marker, timestamp, AES-GCM encryption) is unchanged — only the payload bytes are Opus
+  instead of raw PCM
+- the client decodes with `swift-opus` into 48 kHz stereo interleaved s16 and feeds the existing PCM
+  jitter-buffer/drift-correction ring
+- there is no negotiation and no `CAPS` tag for this — audio is always Opus
+- the `SPKR` control message starts or stops the speaker-forwarding path: it attaches/detaches the
+  virtual sink
 
 ### Microphone
 
 - the client captures microphone audio and encodes it as Opus
-- on Linux the daemon decodes and exposes a virtual microphone source via PipeWire/PulseAudio; on
-  Windows it decodes into VB-Audio VB-CABLE's input; on macOS this is deferred (no built-in
-  equivalent to a PulseAudio null-sink) and `CAPS` honestly reports it unavailable
+- the daemon decodes and exposes a virtual microphone source via PipeWire/PulseAudio
+- the daemon uses one Rust crate (`opus` 0.3, wrapping libopus) for both speaker encode and
+  microphone decode
 
 ### Camera
 
 - the client captures camera frames as JPEG
-- on Linux the daemon writes them into a `v4l2loopback` webcam device; on Windows it writes them
-  into a shared-memory buffer read by a registered DirectShow capture filter (`screx_vcam.dll`); on
-  macOS this is deferred and `CAPS` honestly reports it unavailable
+- the daemon writes them into a `v4l2loopback` webcam device
 
 ## Connection Health Model
 
@@ -561,52 +429,17 @@ These states are driven by transport events instead of only raw status strings.
 
 ## Virtual Devices
 
-### Linux
-
 The daemon may create:
 
 - EVDI virtual display
 - `uinput` virtual touchscreen
 - `uinput` virtual keyboard
 - `uinput` virtual mouse
-- up to 4 `uinput` virtual gamepads
 - `v4l2loopback` virtual webcam
 - PipeWire / PulseAudio virtual sink for client speakers
 - PipeWire virtual source for client microphone
 
-### Windows
-
-The daemon may create/enable:
-
-- a virtual display devnode bound to a third-party Indirect Display Driver
-- a DirectShow virtual webcam filter (`screx_vcam.dll`, registered under
-  `CLSID_VideoInputDeviceCategory`)
-- up to 4 virtual Xbox 360 gamepads via ViGEmBus
-- a "Steam Streaming Speakers" devnode for client speaker output
-- input injection via `SendInput` (no persistent device object)
-
-Microphone forwarding on Windows relies on the separately-installed VB-Audio VB-CABLE rather than
-a daemon-managed device — see [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md).
-
-### macOS
-
-The daemon may create/enable:
-
-- a private `CGVirtualDisplay` virtual monitor, captured via a screen-only ScreenCaptureKit stream
-- the macOS host cursor included by ScreenCaptureKit in the captured stream
-- input injection via `CGEventPost` (no persistent device object)
-- a ScreenCaptureKit audio-only stream for client speaker output
-
-Camera and microphone forwarding are deferred on macOS (no virtual camera/mic design has landed
-yet), and gamepad passthrough has no macOS equivalent to ViGEmBus or `uinput` — `CAPS` reports all
-three as unavailable so clients hide those controls. See
-[DAEMON_MACOS.md](DAEMON_MACOS.md) for the required TCC permissions and other platform notes.
-
 ## Notes on Compatibility
 
-- Network mode is the main path for pairing and remote use.
-- USB mode (iPad only) is lower-latency and more stable when tethered.
-- The Linux virtual webcam uses `v4l2loopback`; some applications behave differently depending on `exclusive_caps` mode. See the v4l2loopback troubleshooting notes in the ArchWiki for compatibility context: [ArchWiki: v4l2loopback Troubleshooting](https://wiki.archlinux.org/title/V4l2loopback#Troubleshooting).
-- See [DAEMON_WINDOWS.md](DAEMON_WINDOWS.md) for the Windows-specific drivers required and their compatibility notes.
-- See [DAEMON_MACOS.md](DAEMON_MACOS.md) for the macOS-specific TCC permissions, the private-API
-  caveat, and other compatibility notes.
+- Network mode is the only path for pairing and remote use.
+- The virtual webcam uses `v4l2loopback`; some applications behave differently depending on `exclusive_caps` mode. See the v4l2loopback troubleshooting notes in the ArchWiki for compatibility context: [ArchWiki: v4l2loopback Troubleshooting](https://wiki.archlinux.org/title/V4l2loopback#Troubleshooting).

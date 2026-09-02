@@ -8,7 +8,6 @@ mod logging;
 mod pairing;
 mod platform;
 mod stream_server;
-mod usb;
 
 use std::fs;
 use std::net::UdpSocket;
@@ -72,11 +71,6 @@ struct Cli {
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
     max_bitrate: u32,
 
-    /// Maximum video bitrate clients may request over USB (ceiling; USB
-    /// links have far more headroom than typical networks)
-    #[arg(long = "max-bitrate-usb", default_value = "100M", value_parser = parse_bitrate)]
-    max_bitrate_usb: u32,
-
     /// UDP/TCP streaming port
     #[arg(short, long, default_value_t = 9000)]
     port: u16,
@@ -92,14 +86,6 @@ struct Cli {
     /// Enable detailed diagnostic logs
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
-
-    /// Network only — disable USB transport
-    #[arg(long, default_value_t = false, conflicts_with = "usb_only")]
-    network_only: bool,
-
-    /// USB only — disable network pairing and UDP streaming
-    #[arg(long, default_value_t = false, conflicts_with = "network_only")]
-    usb_only: bool,
 
     /// Disable v4l2loopback exclusive capture caps for better app compatibility
     #[arg(long, default_value_t = false)]
@@ -125,7 +111,6 @@ struct AppConfig {
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
-    bitrate_usb_max_bps: u32,
     stream_port: u16,
     camera_exclusive_caps: bool,
 }
@@ -146,7 +131,6 @@ impl AppConfig {
             fps: cli.max_framerate,
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.max_bitrate,
-            bitrate_usb_max_bps: cli.max_bitrate_usb,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
@@ -158,17 +142,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose);
 
-    #[cfg(target_os = "macos")]
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!(
-            "[main] refusing to run as root — CGVirtualDisplay, ScreenCaptureKit, and \
-             CGEventPost all require the logged-in user's WindowServer session and per-user TCC \
-             grants, which sudo/root does not have. Run this binary directly as your normal user \
-             (no sudo)."
-        );
-        std::process::exit(1);
-    }
-
     match &cli.command {
         Some(Commands::Unpair { device_id }) => {
             return pairing::run_unpair(device_id.as_deref());
@@ -177,15 +150,7 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::from_cli(&cli);
-    let transport_mode = if cli.network_only {
-        "network-only"
-    } else if cli.usb_only {
-        "usb-only"
-    } else {
-        "network + usb"
-    };
     println!("screx v2 config: {config:?}");
-    println!("[main] transport mode: {transport_mode}");
     if cli.verbose {
         println!("[main] verbose logging enabled");
     }
@@ -202,43 +167,16 @@ async fn main() -> Result<()> {
         config.encoder_backend,
     );
     println!("[main] daemon capabilities: {startup_capabilities:?}");
-    println!(
-        "[main] USB bitrate ceiling: {} bps (network ceiling: {} bps)",
-        config.bitrate_usb_max_bps, config.bitrate_bps
-    );
 
     let stop = Arc::new(AtomicBool::new(false));
 
     let input_backend: Arc<Mutex<dyn crate::input::InputBackend>> = {
-        #[cfg(target_os = "linux")]
-        {
-            let backend =
-                crate::platform::linux::uinput::LinuxInput::new(config.width, config.height)
-                    .map_err(|e| {
-                        eprintln!("[main] input backend failed (input disabled): {e:#}");
-                        e
-                    })?;
-            Arc::new(Mutex::new(backend))
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let backend =
-                crate::platform::windows::input::WindowsInput::new(config.width, config.height)
-                    .map_err(|e| {
-                        eprintln!("[main] input backend failed (input disabled): {e:#}");
-                        e
-                    })?;
-            Arc::new(Mutex::new(backend))
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let backend = crate::platform::macos::input::MacInput::new(config.width, config.height)
-                .map_err(|e| {
-                    eprintln!("[main] input backend failed (input disabled): {e:#}");
-                    e
-                })?;
-            Arc::new(Mutex::new(backend))
-        }
+        let backend = crate::platform::linux::uinput::LinuxInput::new(config.width, config.height)
+            .map_err(|e| {
+                eprintln!("[main] input backend failed (input disabled): {e:#}");
+                e
+            })?;
+        Arc::new(Mutex::new(backend))
     };
 
     let shared = Arc::new(stream_server::SharedState::new(
@@ -249,7 +187,6 @@ async fn main() -> Result<()> {
         config.height,
         config.fps,
         config.bitrate_bps,
-        config.bitrate_usb_max_bps,
         config.encoder_backend,
     ));
 
@@ -267,38 +204,31 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // Pairing state + TCP handshake server (not needed in USB-only mode)
+    // Pairing state + TCP handshake server
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
     let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let mut pairing_thread = None;
 
-    if !cli.usb_only {
+    let pairing_thread = {
         let ps = Arc::clone(&pairing_state);
         let sr = Arc::clone(&session_rx);
         let pairing_shared = Arc::clone(&shared);
         let pairing_stop = Arc::clone(&stop);
         let port = config.stream_port;
-        pairing_thread = Some(
-            thread::Builder::new()
-                .name("pairing".into())
-                .spawn(move || {
-                    if let Err(e) =
-                        pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
-                    {
-                        eprintln!("[pairing] server error: {e:#}");
-                    }
-                })
-                .context("failed to spawn pairing thread")?,
-        );
-    } else {
-        println!("[main] USB-only mode — network pairing disabled");
-    }
+        thread::Builder::new()
+            .name("pairing".into())
+            .spawn(move || {
+                if let Err(e) =
+                    pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
+                {
+                    eprintln!("[pairing] server error: {e:#}");
+                }
+            })
+            .context("failed to spawn pairing thread")?
+    };
 
     // Clean up stale audio modules from a previous crash
     audio::cleanup_stale_modules();
-    #[cfg(target_os = "windows")]
-    crate::platform::windows::vcam::cleanup_stale_registration();
 
     // -----------------------------------------------------------------------
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
@@ -329,13 +259,6 @@ async fn main() -> Result<()> {
             }
             *shared_d.mic_writer.lock().unwrap() = None;
 
-            // Input backend cleanup (mouse, gamepads)
-            if let Ok(mut backend) = shared_d.input_backend.lock() {
-                for id in 0..4 {
-                    backend.gamepad_detach(id);
-                }
-            }
-
             // Reset audio output flag first so the WASAPI loopback thread stops
             // before the Steam Streaming Speakers devnode is disabled.
             shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
@@ -360,31 +283,28 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Client manager thread (not needed in USB-only mode)
+    // Client manager thread
     // -----------------------------------------------------------------------
 
-    let mut client_thread = None;
-    if !cli.usb_only {
+    let client_thread = {
         let client_socket = socket.try_clone().context("clone socket for client mgr")?;
         let client_shared = Arc::clone(&shared);
         let client_stop = Arc::clone(&stop);
         let client_session_rx = Arc::clone(&session_rx);
-        client_thread = Some(
-            thread::Builder::new()
-                .name("client-mgr".into())
-                .spawn(move || {
-                    if let Err(e) = stream_server::run_client_manager(
-                        client_socket,
-                        client_shared,
-                        client_stop,
-                        client_session_rx,
-                    ) {
-                        eprintln!("[client] manager error: {e:#}");
-                    }
-                })
-                .context("failed to spawn client manager thread")?,
-        );
-    }
+        thread::Builder::new()
+            .name("client-mgr".into())
+            .spawn(move || {
+                if let Err(e) = stream_server::run_client_manager(
+                    client_socket,
+                    client_shared,
+                    client_stop,
+                    client_session_rx,
+                ) {
+                    eprintln!("[client] manager error: {e:#}");
+                }
+            })
+            .context("failed to spawn client manager thread")?
+    };
 
     // -----------------------------------------------------------------------
     // Capture + encode + send thread
@@ -676,40 +596,9 @@ async fn main() -> Result<()> {
                                         dump_au_remaining -= 1;
                                     }
                                 }
-                                let use_usb = session_shared.usb_active.load(Ordering::Relaxed);
-                                let udp_addr = if !use_usb {
-                                    *session_shared.client_addr.lock().unwrap()
-                                } else {
-                                    None
-                                };
+                                let udp_addr = *session_shared.client_addr.lock().unwrap();
 
                                 for au in &aus {
-                                    if use_usb {
-                                        let mut usb = session_shared.usb_sender.lock().unwrap();
-                                        if let Some(ref mut tcp) = *usb {
-                                            match tcp.send_video(
-                                                &*au.annex_b,
-                                                au.is_idr,
-                                                ts,
-                                                codec_id,
-                                            ) {
-                                                Ok(()) => {
-                                                    session_shared.bytes_tx.fetch_add(
-                                                        au.annex_b.len() as u64,
-                                                        Ordering::Relaxed,
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[pipeline] USB send error: {e:#}");
-                                                    drop(usb);
-                                                    session_shared
-                                                        .usb_active
-                                                        .store(false, Ordering::SeqCst);
-                                                }
-                                            }
-                                            continue;
-                                        }
-                                    }
                                     if let Some(addr) = udp_addr {
                                         match sender.send_frame(au, addr, ts, codec_id, tuning) {
                                             Ok(bytes) => {
@@ -756,26 +645,6 @@ async fn main() -> Result<()> {
         .context("failed to spawn capture thread")?;
 
     // -----------------------------------------------------------------------
-    // USB transport thread (not needed in network-only mode)
-    // -----------------------------------------------------------------------
-
-    let mut usb_thread = None;
-    if !cli.network_only {
-        let usb_shared = Arc::clone(&shared);
-        let usb_stop = Arc::clone(&stop);
-        usb_thread = Some(
-            thread::Builder::new()
-                .name("usb".into())
-                .spawn(move || {
-                    usb::run_usb_transport(usb_shared, usb_stop);
-                })
-                .context("failed to spawn USB transport thread")?,
-        );
-    } else {
-        println!("[main] network-only mode — USB transport disabled");
-    }
-
-    // -----------------------------------------------------------------------
     // Audio capture thread (runs continuously, but only captures when sink exists)
     // -----------------------------------------------------------------------
 
@@ -795,7 +664,6 @@ async fn main() -> Result<()> {
     // Wait for shutdown, then clean up
     // -----------------------------------------------------------------------
 
-    let status_shared = Arc::clone(&shared);
     let do_shutdown = move || {
         stop.store(true, Ordering::SeqCst);
         shared.capture_stop_flag.store(true, Ordering::SeqCst);
@@ -817,35 +685,15 @@ async fn main() -> Result<()> {
         if let Err(err) = audio_thread.join() {
             eprintln!("[audio] thread join failed: {err:?}");
         }
-        if let Some(thread) = usb_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = client_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = pairing_thread {
-            let _ = thread.join();
-        }
+        let _ = client_thread.join();
+        let _ = pairing_thread.join();
 
         println!("screx cleanup complete, exiting");
     };
 
-    #[cfg(target_os = "macos")]
-    {
-        // Blocks for the remaining life of the process, pumping the AppKit
-        // main run loop that services the menu bar status item; calls
-        // `do_shutdown` once and exits the process when Quit is chosen or
-        // SIGINT/SIGTERM arrives. Never returns.
-        crate::platform::macos::statusbar::run(status_shared, do_shutdown);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = status_shared;
-        tokio::signal::ctrl_c().await?;
-        println!("\nshutdown requested (ctrl-c)");
-        do_shutdown();
-    }
+    tokio::signal::ctrl_c().await?;
+    println!("\nshutdown requested (ctrl-c)");
+    do_shutdown();
 
     Ok(())
 }

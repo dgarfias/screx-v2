@@ -298,12 +298,6 @@ final class NetworkControlClient {
         sendFrame(payload, label: "periph")
     }
 
-    func sendGamepad(_ gamepadData: Data) {
-        var payload = Data("GPAD".utf8)
-        payload.append(gamepadData)
-        sendFrame(payload, label: "gpad")
-    }
-
     /// Sends client-proposed stream settings (resolution/fps/codec/bitrate) to the
     /// daemon in response to a `CAPS` message, per the capability-negotiation protocol.
     func sendStreamSettings(_ settings: StreamSettings) {
