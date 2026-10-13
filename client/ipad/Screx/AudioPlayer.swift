@@ -1,5 +1,6 @@
 import AVFoundation
 import QuartzCore
+import Opus
 import os
 
 final class AudioPlayer {
@@ -27,12 +28,16 @@ final class AudioPlayer {
 
     // 48kHz stereo s16le = 192000 bytes/sec = 192 bytes/ms
     private static let bytesPerMs = 192
-    // Target buffer: ~30ms of audio for jitter absorption
-    private static let targetBufferMs = 30
+    // Target buffer: ~50ms of audio for jitter absorption. iOS render is 10ms,
+    // so this is a 5-buffer budget — deep enough to ride over a video burst
+    // (an IDR can momentarily queue a few ms of audio behind it on the shared
+    // socket) without adding perceptible latency. Moonlight/Parsec target
+    // roughly this range rather than a minimal 1-2 buffer.
+    private static let targetBufferMs = 50
     private static let targetBufferBytes = targetBufferMs * bytesPerMs
     // Drift thresholds (ms) before corrective action
     private static let driftDropThresholdMs: Int32 = -40
-    private static let driftTrimThresholdMs: Int32 = 60
+    private static let driftTrimThresholdMs: Int32 = 90
 
     // Standing-latency trim: underruns ratchet the ring depth up (silence is
     // played, then the late audio arrives and queues behind), and timestamp
@@ -91,12 +96,7 @@ final class AudioPlayer {
     init(avSync: AVSyncState) {
         self.avSync = avSync
 
-        let format = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: 48000,
-            channels: 2,
-            interleaved: true
-        )!
+        let format = Self.pcmFormat
 
         let node = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
             guard let self else { return noErr }
@@ -175,8 +175,62 @@ final class AudioPlayer {
         }
     }
 
+    // Speaker audio arrives as Opus (48 kHz stereo, 10 ms packets) when the daemon
+    // honors `StreamSettings.featureOpusAudio`, and as raw s16le PCM otherwise (older
+    // daemons, USB). The decoder is created lazily; if it fails to initialize, Opus
+    // packets are dropped rather than crashing. The decode buffer is reused for every
+    // packet; 5760 frames (120 ms) is far more than the 480-frame packets expected.
+    private static let pcmFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 48000,
+        channels: 2,
+        interleaved: true
+    )!
+    private static let opusDecodeCapacity: AVAudioFrameCount = 5760
+
+    private lazy var opusDecoder: Opus.Decoder? = {
+        do {
+            return try Opus.Decoder(format: Self.pcmFormat, application: .audio)
+        } catch {
+            print("[audio] Opus decoder init failed, Opus audio will be dropped: \(error)")
+            return nil
+        }
+    }()
+    private lazy var opusDecodeBuffer: AVAudioPCMBuffer? =
+        AVAudioPCMBuffer(pcmFormat: Self.pcmFormat, frameCapacity: Self.opusDecodeCapacity)
+
+    /// Decodes one Opus packet and feeds the PCM into the jitter buffer.
+    func enqueueOpus(_ packet: Data, timestampMs: UInt32 = 0) {
+        guard isOutputEnabled, !packet.isEmpty else { return }
+        guard let opusDecoder, let opusDecodeBuffer else { return }
+
+        do {
+            try packet.withUnsafeBytes { raw in
+                try opusDecoder.decode(raw.bindMemory(to: UInt8.self), to: opusDecodeBuffer)
+            }
+        } catch {
+            print("[audio] Opus decode failed, dropping packet: \(error)")
+            return
+        }
+
+        guard opusDecodeBuffer.frameLength > 0,
+              let channelData = opusDecodeBuffer.int16ChannelData else { return }
+        let byteCount = Int(opusDecodeBuffer.frameLength) * 2 * 2 // frames * channels * bytes
+        channelData[0].withMemoryRebound(to: UInt8.self, capacity: byteCount) { ptr in
+            enqueuePCM(ptr, count: byteCount, timestampMs: timestampMs)
+        }
+    }
+
+    /// Feeds raw interleaved s16le stereo PCM into the jitter buffer.
     func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
         guard isOutputEnabled else { return }
+        data.withUnsafeBytes { raw in
+            guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            enqueuePCM(ptr, count: raw.count, timestampMs: timestampMs)
+        }
+    }
+
+    private func enqueuePCM(_ ptr: UnsafePointer<UInt8>, count: Int, timestampMs: UInt32) {
         if avSync.consumeGapResume() {
             lock.withLock {
                 ringClear()
@@ -184,22 +238,29 @@ final class AudioPlayer {
         }
 
         lock.withLock {
-            data.withUnsafeBytes { raw in
-                guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                if !ringWrite(ptr, count: raw.count) {
-                    droppedPacketCount += 1
-                }
+            if !ringWrite(ptr, count: count) {
+                droppedPacketCount += 1
             }
 
             if avSync.isValid {
                 let expectedTs = avSync.expectedDaemonTimeNow()
                 let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
 
+                // Negative drift = this audio segment's nominal time is behind
+                // the video clock. That is normal after any arrival burst or
+                // pause (PacketAudio/tsched, IDR encodes) and is NOT a reason
+                // to throw audio away — the jitter buffer absorbs it. Only
+                // clip at extreme lateness (>100ms, ~10 full packets) and even
+                // then never drop more than half the ring, so a transient can
+                // never punch a hole in playback.
                 if drift < Self.driftDropThresholdMs {
-                    let dropBytes = min(ringCount, Int(-drift) * Self.bytesPerMs)
-                    let aligned = (dropBytes / 4) * 4
-                    if aligned > 0 {
-                        ringDiscard(aligned)
+                    let lateMs = Int(-drift)
+                    if lateMs > 100 && ringCount > 0 {
+                        let dropBytes = min(ringCount / 2, lateMs * Self.bytesPerMs)
+                        let aligned = (dropBytes / 4) * 4
+                        if aligned > 0 {
+                            ringDiscard(aligned)
+                        }
                     }
                 } else if drift > Self.driftTrimThresholdMs {
                     let excess = ringCount - Self.targetBufferBytes

@@ -57,6 +57,17 @@ const STNG_TAG_RESOLUTION: u8 = 0x01;
 const STNG_TAG_FRAMERATE: u8 = 0x02;
 const STNG_TAG_CODEC: u8 = 0x03;
 const STNG_TAG_BITRATE: u8 = 0x04;
+/// Bitmask of optional client features (`u8`). Older daemons skip it as an
+/// unknown tag; older clients never send it, so every bit defaults to off.
+const STNG_TAG_CLIENT_FEATURES: u8 = 0x05;
+/// Client can reassemble video frames whose FEC is split into several
+/// Reed-Solomon blocks (frames over 255 data+parity shards; see
+/// `fec_block_count`). Without it such frames are sent with no parity.
+pub const CLIENT_FEATURE_MULTIBLOCK_FEC: u8 = 0x01;
+/// Client decodes Opus speaker audio (audio packets with
+/// `AUDIO_CODEC_OPUS` in the header's codec byte). Without it the network
+/// path sends raw s16le PCM, as before. USB audio is always PCM.
+pub const CLIENT_FEATURE_OPUS_AUDIO: u8 = 0x02;
 
 /// Validation/clamping bounds for client-proposed `STNG` settings (see the
 /// plan's "Validation/clamping bounds" section). The bitrate floor is fixed,
@@ -72,6 +83,19 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FEC_SHARDS: usize = 127;
+/// Reed-Solomon over GF(2^8) allows at most 255 data+parity shards per block.
+const MAX_SHARDS_PER_FEC_BLOCK: usize = 255;
+/// The iPad client rejects frames with more shards than this.
+const MAX_SHARDS_PER_FRAME: usize = 4096;
+/// Frames with more datagrams than this are paced across part of the frame
+/// interval instead of being sent as one burst.
+const PACING_THRESHOLD_SHARDS: usize = 48;
+/// Datagrams sent per paced batch.
+const PACING_BATCH_SIZE: usize = 8;
+/// Fraction of the frame interval a large frame is spread across. Leaves the
+/// rest of the interval for the next frame's capture/encode.
+const PACING_SPREAD_NUM: u64 = 1;
+const PACING_SPREAD_DEN: u64 = 2;
 const MAX_PACKET_LEN: usize = HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN;
 const IDR_FEC_PERCENT: usize = 10;
 const PFRAME_FEC_PERCENT: usize = 5;
@@ -267,6 +291,8 @@ pub struct SharedState {
     pub bytes_tx: AtomicU64,
     pub bytes_rx: AtomicU64,
     pub audio_output_enabled: AtomicBool,
+    /// `CLIENT_FEATURE_*` bits of the current session's client.
+    pub client_features: std::sync::atomic::AtomicU8,
     pub audio_module_id: Mutex<u32>,
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
@@ -342,6 +368,7 @@ impl SharedState {
             bytes_tx: AtomicU64::new(0),
             bytes_rx: AtomicU64::new(0),
             audio_output_enabled: AtomicBool::new(false),
+            client_features: std::sync::atomic::AtomicU8::new(0),
             audio_module_id: Mutex::new(0),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
@@ -479,6 +506,8 @@ pub struct RequestedSettings {
     pub fps: Option<u32>,
     pub codec: Option<VideoCodec>,
     pub bitrate_bps: Option<u32>,
+    /// `CLIENT_FEATURE_*` bits the client advertised (0 when omitted).
+    pub client_features: u8,
 }
 
 /// Cheap, real probes (not just "compiled in") for what this daemon can
@@ -627,6 +656,9 @@ fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
                 settings.bitrate_bps =
                     Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
             }
+            STNG_TAG_CLIENT_FEATURES if len == 1 => {
+                settings.client_features = value[0];
+            }
             // Unknown tag, or a known tag with an unexpected length: `offset`
             // has already advanced past the value, so parsing just continues
             // with the next entry.
@@ -709,6 +741,9 @@ fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8], transport: C
     let clamped = clamp_requested_settings(shared, parsed, transport);
     println!("[control] received STNG, will apply to next session: {clamped:?}");
 
+    shared
+        .client_features
+        .store(clamped.client_features, Ordering::SeqCst);
     let (lock, cvar) = &*shared.pending_settings;
     *lock.lock().unwrap() = Some(clamped);
     cvar.notify_all();
@@ -759,6 +794,10 @@ pub fn disable_camera(shared: &Arc<SharedState>) {
 
 pub const FLAG_IDR: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
+/// Codec byte of audio packets: raw 48 kHz stereo s16le PCM.
+pub const AUDIO_CODEC_PCM: u8 = 0x00;
+/// Codec byte of audio packets: one 10 ms 48 kHz stereo Opus packet.
+pub const AUDIO_CODEC_OPUS: u8 = 0x02;
 
 /// 18-byte packet header (14 original + 4 byte timestamp_ms)
 /// Byte 11 = codec_id: 0x00=H.264, 0x01=H.265
@@ -1507,6 +1546,10 @@ pub struct UdpSender {
     source: Option<UdpSource>,
     cmsg_buf: Option<PktinfoCmsg>,
     log_sent_aus: bool,
+    /// Wire time one frame is allotted, used to pace large frames.
+    frame_interval: Duration,
+    /// Whether the session's client advertised `CLIENT_FEATURE_MULTIBLOCK_FEC`.
+    multiblock_fec: bool,
 }
 
 impl UdpSender {
@@ -1525,6 +1568,8 @@ impl UdpSender {
             source: None,
             cmsg_buf: None,
             log_sent_aus: std::env::var_os("SCREX_LOG_SENT_AUS").is_some(),
+            frame_interval: Duration::from_micros(1_000_000 / 60),
+            multiblock_fec: false,
         }
     }
 
@@ -1535,6 +1580,44 @@ impl UdpSender {
     pub fn set_source(&mut self, source: Option<UdpSource>) {
         self.source = source;
         self.cmsg_buf = source.map(build_pktinfo_cmsg);
+    }
+
+    /// Per-session parameters: the negotiated framerate (for pacing) and the
+    /// client's `CLIENT_FEATURE_*` bits.
+    pub fn set_session(&mut self, fps: u32, client_features: u8) {
+        self.frame_interval = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
+        self.multiblock_fec = client_features & CLIENT_FEATURE_MULTIBLOCK_FEC != 0;
+    }
+
+    /// How many parity shards to actually send for a frame. Frames that fit
+    /// in one Reed-Solomon block keep the legacy behavior. Larger frames
+    /// (typically keyframes) are split into several blocks when the client
+    /// supports it; otherwise they go out without parity, as before.
+    fn parity_shards_for(&self, data_count: usize, wanted_parity: usize) -> usize {
+        if wanted_parity == 0 {
+            return 0;
+        }
+        let single_block = wanted_parity.min(MAX_FEC_SHARDS);
+        if data_count + single_block <= MAX_SHARDS_PER_FEC_BLOCK {
+            return single_block;
+        }
+        if !self.multiblock_fec {
+            return 0;
+        }
+        // Every block needs at least one parity shard; raising the parity
+        // count can raise the block count, so settle on a fixed point.
+        let mut parity = wanted_parity.min(data_count);
+        loop {
+            let blocks = fec_block_count(data_count, parity);
+            if parity >= blocks {
+                break;
+            }
+            parity = blocks;
+        }
+        if data_count + parity > MAX_SHARDS_PER_FRAME {
+            return 0;
+        }
+        parity
     }
 
     pub fn send_frame(
@@ -1568,18 +1651,16 @@ impl UdpSender {
             tuning.pframe_fec_percent
         };
 
-        let parity_count = if data_count <= 1 || parity_percent == 0 {
+        let wanted_parity = if data_count <= 1 || parity_percent == 0 {
             0
         } else {
             data_count
                 .saturating_mul(parity_percent)
                 .div_ceil(100)
                 .max(1)
-                .min(MAX_FEC_SHARDS)
         };
-
-        let use_fec = parity_count > 0 && (data_count + parity_count) <= 255;
-        let actual_parity = if use_fec { parity_count } else { 0 };
+        let actual_parity = self.parity_shards_for(data_count, wanted_parity);
+        let fec_blocks = fec_block_count(data_count, actual_parity);
         let total_shards = data_count + actual_parity;
         self.ensure_packet_capacity(total_shards);
 
@@ -1600,35 +1681,46 @@ impl UdpSender {
             }
         }
 
-        // Generate parity shards
+        // Generate parity shards, one Reed-Solomon block at a time. Frames
+        // that fit in 255 shards are a single block, exactly as before.
         if actual_parity > 0 {
-            for i in data_count..total_shards {
-                self.shard_pool[i].fill(0);
-            }
-            if self.rs_cache.len() >= MAX_RS_CACHE_ENTRIES {
-                self.rs_cache.clear();
-            }
-            let rs = match self.rs_cache.entry((data_count, actual_parity)) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let rs = ReedSolomon::new(data_count, actual_parity)
-                        .map_err(|e| anyhow::anyhow!("RS init: {e:?}"))?;
-                    entry.insert(rs)
+            let (data_shards, parity_shards) =
+                self.shard_pool[..total_shards].split_at_mut(data_count);
+            for block in 0..fec_blocks {
+                let (data_start, block_data) = fec_block_range(data_count, fec_blocks, block);
+                let (parity_start, block_parity) =
+                    fec_block_range(actual_parity, fec_blocks, block);
+                if self.rs_cache.len() >= MAX_RS_CACHE_ENTRIES {
+                    self.rs_cache.clear();
                 }
-            };
-            rs.encode(&mut self.shard_pool[..total_shards])
+                let rs = match self.rs_cache.entry((block_data, block_parity)) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let rs = ReedSolomon::new(block_data, block_parity)
+                            .map_err(|e| anyhow::anyhow!("RS init: {e:?}"))?;
+                        entry.insert(rs)
+                    }
+                };
+                rs.encode_sep(
+                    &data_shards[data_start..data_start + block_data],
+                    &mut parity_shards[parity_start..parity_start + block_parity],
+                )
                 .map_err(|e| anyhow::anyhow!("RS encode: {e:?}"))?;
+            }
         }
 
         let flags = if is_idr { FLAG_IDR } else { 0 };
 
         for idx in 0..total_shards {
+            // Data shards go out at their real length (only the last one is
+            // short); the receiver zero-pads before FEC recovery. Parity
+            // shards are always full-size.
             let actual_payload_len = if idx < data_count {
                 let start = idx * CHUNK_PAYLOAD;
                 let end = (start + CHUNK_PAYLOAD).min(payload.len());
-                (end - start) as u16
+                end - start
             } else {
-                CHUNK_PAYLOAD as u16
+                CHUNK_PAYLOAD
             };
 
             let header = build_header(
@@ -1638,13 +1730,13 @@ impl UdpSender {
                 actual_parity as u16,
                 flags,
                 codec_id,
-                actual_payload_len,
+                actual_payload_len as u16,
                 timestamp_ms,
             );
 
             self.packet_pool[idx][..HEADER_LEN].copy_from_slice(&header);
-            self.packet_pool[idx][HEADER_LEN..HEADER_LEN + CHUNK_PAYLOAD]
-                .copy_from_slice(&self.shard_pool[idx]);
+            self.packet_pool[idx][HEADER_LEN..HEADER_LEN + actual_payload_len]
+                .copy_from_slice(&self.shard_pool[idx][..actual_payload_len]);
 
             self.packet_lens[idx] = if let Some(ref cipher) = self.cipher {
                 let nonce = crate::crypto::nonce_server(self.frame_id, idx as u16, flags);
@@ -1652,11 +1744,11 @@ impl UdpSender {
                     &nonce,
                     &header,
                     &mut self.packet_pool[idx][HEADER_LEN..],
-                    CHUNK_PAYLOAD,
+                    actual_payload_len,
                 );
                 HEADER_LEN + enc_len
             } else {
-                HEADER_LEN + CHUNK_PAYLOAD
+                HEADER_LEN + actual_payload_len
             };
         }
 
@@ -1692,8 +1784,30 @@ impl UdpSender {
         let mut sent = 0;
         let mut frame_bytes = 0_u64;
 
+        // Typical P-frames go out in one burst. Large frames (keyframes,
+        // scene changes) are spread evenly across part of the frame interval
+        // in small batches: a few hundred back-to-back datagrams overflow
+        // Wi-Fi access point queues and get dropped, and they also hold up
+        // the audio packets that share this socket.
+        let paced = total_shards > PACING_THRESHOLD_SHARDS;
+        let batch_size = if paced {
+            PACING_BATCH_SIZE
+        } else {
+            SENDMMSG_BATCH_SIZE
+        };
+        let pacing_start = Instant::now();
+        let pacing_window = self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
+
         while sent < total_shards {
-            let end = (sent + SENDMMSG_BATCH_SIZE).min(total_shards);
+            if paced && sent > 0 {
+                // Release batch k at k/n of the window. Falling behind (slow
+                // send, long sleep) just sends the next batch immediately.
+                let due = pacing_window.mul_f64(sent as f64 / total_shards as f64);
+                if let Some(wait) = due.checked_sub(pacing_start.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
+            let end = (sent + batch_size).min(total_shards);
             let batch: Vec<&[u8]> = (sent..end)
                 .map(|idx| &self.packet_pool[idx][..self.packet_lens[idx]])
                 .collect();
@@ -1730,6 +1844,26 @@ impl UdpSender {
 
         Ok(frame_bytes)
     }
+}
+
+/// Number of Reed-Solomon blocks a frame's shards are split into. Must match
+/// the iPad client's `FrameAssembly` layout exactly. A frame that fits in 255
+/// shards is one block; otherwise blocks hold at most 254 shards on average,
+/// so the uneven split in `fec_block_range` never exceeds 255 in any block.
+pub fn fec_block_count(data_shards: usize, parity_shards: usize) -> usize {
+    if parity_shards == 0 || data_shards + parity_shards <= MAX_SHARDS_PER_FEC_BLOCK {
+        1
+    } else {
+        (data_shards + parity_shards).div_ceil(MAX_SHARDS_PER_FEC_BLOCK - 1)
+    }
+}
+
+/// `(start, len)` of block `index` when `total` shards are split as evenly as
+/// possible into `blocks` contiguous blocks (earlier blocks get the extras).
+pub fn fec_block_range(total: usize, blocks: usize, index: usize) -> (usize, usize) {
+    let base = total / blocks;
+    let extra = total % blocks;
+    (index * base + index.min(extra), base + usize::from(index < extra))
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,11 +1904,14 @@ impl AudioSender {
         self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
+    /// Send one audio payload (`codec_id` is `AUDIO_CODEC_PCM` or
+    /// `AUDIO_CODEC_OPUS`).
     pub fn send_audio(
         &mut self,
         pcm: &[u8],
         client_addr: SocketAddr,
         timestamp_ms: u32,
+        codec_id: u8,
     ) -> Result<()> {
         let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
@@ -1790,7 +1927,7 @@ impl AudioSender {
                 data_count as u16,
                 0,
                 FLAG_AUDIO,
-                0,
+                codec_id,
                 payload_len,
                 timestamp_ms,
             );
@@ -1826,5 +1963,78 @@ impl AudioSender {
 
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fec_layout_tests {
+    use super::*;
+
+    #[test]
+    fn single_block_when_it_fits() {
+        assert_eq!(fec_block_count(200, 20), 1);
+        assert_eq!(fec_block_count(235, 20), 1);
+        assert_eq!(fec_block_count(400, 0), 1);
+    }
+
+    #[test]
+    fn every_block_fits_rs_limits() {
+        for data in 2..2000 {
+            for percent in [5usize, 10, 14, 18] {
+                let parity = (data * percent).div_ceil(100).max(1).min(data);
+                let blocks = fec_block_count(data, parity);
+                if data + parity <= MAX_SHARDS_PER_FEC_BLOCK {
+                    assert_eq!(blocks, 1);
+                }
+                let parity = parity.max(blocks);
+                let blocks = fec_block_count(data, parity);
+                let mut data_total = 0;
+                let mut parity_total = 0;
+                for b in 0..blocks {
+                    let (ds, dl) = fec_block_range(data, blocks, b);
+                    let (ps, pl) = fec_block_range(parity, blocks, b);
+                    assert_eq!(ds, data_total);
+                    assert_eq!(ps, parity_total);
+                    assert!(dl >= 1 && pl >= 1, "data={data} parity={parity} block={b}");
+                    assert!(dl + pl <= MAX_SHARDS_PER_FEC_BLOCK, "data={data} parity={parity}");
+                    data_total += dl;
+                    parity_total += pl;
+                }
+                assert_eq!((data_total, parity_total), (data, parity));
+            }
+        }
+    }
+
+    #[test]
+    fn multiblock_encode_recovers_per_block() {
+        let data = 400;
+        let parity = 40;
+        let blocks = fec_block_count(data, parity);
+        assert!(blocks > 1);
+        let mut shards: Vec<Vec<u8>> = (0..data + parity)
+            .map(|i| if i < data { (0..64).map(|j| (i * 31 + j) as u8).collect() } else { vec![0; 64] })
+            .collect();
+        let original = shards.clone();
+        let (data_shards, parity_shards) = shards.split_at_mut(data);
+        for b in 0..blocks {
+            let (ds, dl) = fec_block_range(data, blocks, b);
+            let (ps, pl) = fec_block_range(parity, blocks, b);
+            ReedSolomon::new(dl, pl)
+                .unwrap()
+                .encode_sep(&data_shards[ds..ds + dl], &mut parity_shards[ps..ps + pl])
+                .unwrap();
+        }
+        // Lose one data shard per block, recover each block independently.
+        for b in 0..blocks {
+            let (ds, dl) = fec_block_range(data, blocks, b);
+            let (ps, pl) = fec_block_range(parity, blocks, b);
+            let mut block: Vec<Option<Vec<u8>>> = (ds..ds + dl)
+                .chain(data + ps..data + ps + pl)
+                .map(|i| Some(shards[i].clone()))
+                .collect();
+            block[dl / 2] = None;
+            ReedSolomon::new(dl, pl).unwrap().reconstruct(&mut block).unwrap();
+            assert_eq!(block[dl / 2].as_ref().unwrap(), &original[ds + dl / 2]);
+        }
     }
 }

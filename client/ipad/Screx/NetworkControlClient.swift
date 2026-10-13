@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import CryptoKit
+import QuartzCore
 
 final class NetworkControlClient {
     private let connection: NWConnection
@@ -13,18 +14,29 @@ final class NetworkControlClient {
     private static let cameraCfgMagic = Data("CAMCFG".utf8)
     private static let hostnameMagic = Data("HOST".utf8)
     private static let capsMagic = Data("CAPS".utf8)
+    private static let pingMagic = Data("PING".utf8)
     private static let maxControlFrame = 65536
+
+    /// Latency diagnostics: a `PING` round trip every second on the control
+    /// channel, averaged into an on-screen RTT + jitter reading.
+    private static let pingInterval: TimeInterval = 1.0
+    private static let maxLatencySamples = 8
 
     private var sendSeq: UInt32 = 0
     private var isClosed = false
     private var recvBuffer = Data()
     private var readOffset = 0
     private static let recvBufferCompactThreshold = 64 * 1024
+    private var pingTimer: DispatchSourceTimer?
+    private var pendingPingSentAt: TimeInterval?
+    private var latencySamples: [Double] = []
 
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var onHostname: ((String) -> Void)?
     var onCapabilities: ((DaemonCapabilities) -> Void)?
+    /// (rttMs, jitterMs) of the control-channel latency probe.
+    var onLatency: ((Double, Double) -> Void)?
 
     init(connection: NWConnection, sessionKey: SymmetricKey) {
         self.connection = connection
@@ -50,13 +62,40 @@ final class NetworkControlClient {
                 break
             }
         }
+        startPingLoop()
         receiveLoop()
+    }
+
+    /// Unidirectional, encrypt-and-send latency probe. The daemon echoes the
+    /// payload back on the same control channel; `handleInboundPayload`
+    /// times the round trip.
+    private func startPingLoop() {
+        pingTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.pingInterval, repeating: Self.pingInterval)
+        timer.setEventHandler { [weak self] in
+            self?.sendPing()
+        }
+        timer.resume()
+        pingTimer = timer
+    }
+
+    private func sendPing() {
+        queue.async { [weak self] in
+            guard let self, !self.isClosed else { return }
+            self.pendingPingSentAt = CACurrentMediaTime()
+            self.sendFrame(Self.pingMagic, label: "ping")
+        }
     }
 
     func disconnect() {
         queue.async { [weak self] in
             guard let self, !self.isClosed else { return }
             self.isClosed = true
+            self.pingTimer?.cancel()
+            self.pingTimer = nil
+            self.pendingPingSentAt = nil
+            self.latencySamples.removeAll()
             self.connection.cancel()
         }
     }
@@ -67,11 +106,16 @@ final class NetworkControlClient {
             guard let frame = self.makeFrame(Self.disconnectMagic, label: "disconnect") else {
                 self.log("graceful disconnect frame build failed, cancelling")
                 self.isClosed = true
+                self.pingTimer?.cancel()
+                self.pingTimer = nil
                 self.connection.cancel()
                 return
             }
 
             self.isClosed = true
+            self.pingTimer?.cancel()
+            self.pingTimer = nil
+            self.pendingPingSentAt = nil
             self.log("sending graceful disconnect")
             self.connection.send(content: frame, completion: .contentProcessed { error in
                 if let error {
@@ -181,7 +225,21 @@ final class NetworkControlClient {
     }
 
     private func handleInboundPayload(_ payload: Data) {
-        if payload.starts(with: Self.hostnameMagic) {
+        if payload == Self.pingMagic {
+            queue.async { [weak self] in
+                guard let self, let sentAt = self.pendingPingSentAt else { return }
+                self.pendingPingSentAt = nil
+                let rttMs = (CACurrentMediaTime() - sentAt) * 1000.0
+                self.latencySamples.append(rttMs)
+                if self.latencySamples.count > Self.maxLatencySamples {
+                    self.latencySamples.removeFirst(self.latencySamples.count - Self.maxLatencySamples)
+                }
+                let pairs = zip(self.latencySamples, self.latencySamples.dropFirst())
+                let deltaSum = pairs.reduce(0.0) { $0 + abs($1.1 - $1.0) }
+                let jitterMs = deltaSum / Double(max(1, self.latencySamples.count - 1))
+                self.onLatency?(rttMs, jitterMs)
+            }
+        } else if payload.starts(with: Self.hostnameMagic) {
             let hostData = payload.dropFirst(Self.hostnameMagic.count)
             let hostname = String(decoding: hostData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !hostname.isEmpty else { return }

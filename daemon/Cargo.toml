@@ -13,8 +13,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1"
 opus-decoder = "0.1"
-ffmpeg-next = "8"
-ffmpeg-sys-next = "8"
+opus = "0.3"
+ffmpeg-next = "9"
+ffmpeg-sys-next = "9"
 libc = "0.2"
 reed-solomon-erasure = "6"
 ring = "0.17"

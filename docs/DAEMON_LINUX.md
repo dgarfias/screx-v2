@@ -13,7 +13,7 @@ Source lives in `daemon/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protoc
 # Build
 sudo pacman -S --needed \
   rust pkgconf clang \
-  ffmpeg libva mesa \
+  ffmpeg libva mesa opus \
   linux-headers
 
 # Runtime
@@ -37,7 +37,7 @@ yay -S evdi-git
 sudo apt-get install -y \
   cargo pkg-config clang \
   libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev \
-  libva-dev mesa-va-drivers va-driver-all \
+  libva-dev mesa-va-drivers va-driver-all libopus-dev \
   linux-headers-$(uname -r)
 
 # Runtime
@@ -102,6 +102,7 @@ sudo ./target/release/screx unpair --all
 | `-H, --max-height` | `2160` | Maximum display height clients may request (also the default when a client doesn't ask) |
 | `-f, --max-framerate` | `60` | Maximum framerate clients may request (also the default when a client doesn't ask) |
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
+| `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--no-intra-refresh` to keep legacy periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
 | `--max-bitrate-usb` | `100M` | Maximum encoder bitrate USB-connected clients may request (ceiling; USB links have far more headroom than typical networks) |
 | `-p, --port` | `9000` | UDP/TCP streaming port |

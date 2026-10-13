@@ -269,15 +269,26 @@ Each UDP packet starts with an 18-byte header:
 | `total_data` | u16 BE | Number of data chunks |
 | `total_parity` | u16 BE | Number of parity chunks |
 | `flags` | u8 | Bit 0 = IDR, Bit 1 = audio |
-| `codec_id` | u8 | `0x00` = H.264, `0x01` = H.265 |
+| `codec_id` | u8 | Video: `0x00` = H.264, `0x01` = H.265. Audio: `0x00` = s16le PCM, `0x02` = Opus |
 | `payload_len` | u16 BE | Payload size |
 | `timestamp_ms` | u32 BE | Daemon timestamp |
 
 Notes:
 
-- video is split into chunks of 1400 bytes
+- video is split into chunks of 1400 bytes; every data chunk except a frame's last is full-size,
+  and parity chunks are always full-size (receivers zero-pad short chunks before FEC recovery)
 - optional Reed-Solomon parity is added for video
-- audio is small enough to go without FEC
+- a frame that fits in 255 data+parity chunks is one Reed-Solomon block. Larger frames (usually
+  keyframes) are split into `n = ceil((total_data + total_parity) / 254)` blocks when the client
+  advertised multi-block FEC in `STNG` (`CLIENT_FEATURES` bit `0x01`); otherwise they are sent
+  without parity. Data chunks `0..total_data` and parity chunks `total_data..` are each divided
+  into `n` contiguous runs as evenly as possible (earlier blocks take the extra chunk), and block
+  `b`'s parity protects only block `b`'s data
+- frames larger than 48 chunks are paced: sent in batches of 8 spread across half the frame
+  interval rather than as one burst
+- audio is small enough to go without FEC. Speaker audio is one 10 ms chunk per frame_id: 48 kHz
+  stereo Opus at 128 kbps when the client advertised `CLIENT_FEATURES` bit `0x02`, otherwise raw
+  s16le PCM (USB audio is always PCM)
 - client-to-daemon media packets prepend a 4-byte sequence number before encrypted payload
 - the iPad retains incomplete video assemblies for 100 ms, then reconstructs recoverable frames
   from parity or discards them and requests recovery
@@ -410,6 +421,7 @@ v1 tags:
 | `0x02` | FRAMERATE | `fps(u8)` |
 | `0x03` | CODEC | `codec_id(u8)` (`0x00`=H.264, `0x01`=H.265) |
 | `0x04` | BITRATE | `bps(u32 BE)` |
+| `0x05` | CLIENT_FEATURES | `bits(u8)`: `0x01` = can reassemble multi-block FEC frames; `0x02` = decodes Opus speaker audio |
 
 An omitted tag means "use the daemon's default for that field." `entry_count = 0` is valid and means
 "everything default, just connect" — the client should still send the message in that case rather

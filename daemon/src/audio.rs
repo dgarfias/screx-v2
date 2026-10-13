@@ -15,6 +15,52 @@ pub const SAMPLES_PER_CHUNK: usize = (SAMPLE_RATE / 1000 * CHUNK_DURATION_MS) as
 pub const BYTES_PER_CHUNK: usize = SAMPLES_PER_CHUNK * CHANNELS as usize * 2;
 pub const MIC_RATE: u32 = 48000;
 const MIC_MAX_FRAME: usize = 5760;
+/// How far the audio sample clock may drift from the wall clock before it is
+/// re-anchored (see `run_audio_capture`).
+const AUDIO_CLOCK_REANCHOR_MS: u32 = 200;
+/// Speaker audio Opus bitrate (48 kHz stereo, 10 ms frames).
+const OPUS_SPEAKER_BITRATE: i32 = 128_000;
+/// libopus' recommended worst-case output buffer for one encode call.
+const OPUS_MAX_PACKET: usize = 4000;
+
+/// Speaker-audio Opus encoder plus its reusable scratch buffers.
+struct SpeakerOpus {
+    encoder: opus::Encoder,
+    pcm: Vec<i16>,
+    out: Vec<u8>,
+}
+
+impl SpeakerOpus {
+    fn new() -> Result<Self> {
+        let mut encoder =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::Audio)
+                .map_err(|e| anyhow::anyhow!("opus encoder init: {e:?}"))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(OPUS_SPEAKER_BITRATE))
+            .map_err(|e| anyhow::anyhow!("opus set_bitrate: {e:?}"))?;
+        // No in-band FEC: the iPad decoder can't use it. No DTX: the client's
+        // jitter buffer expects a packet every 10 ms.
+        let _ = encoder.set_inband_fec(false);
+        let _ = encoder.set_dtx(false);
+        Ok(Self {
+            encoder,
+            pcm: vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize],
+            out: vec![0u8; OPUS_MAX_PACKET],
+        })
+    }
+
+    /// Encode one 10 ms chunk of little-endian s16 stereo PCM.
+    fn encode(&mut self, chunk: &[u8]) -> Result<&[u8]> {
+        for (dst, src) in self.pcm.iter_mut().zip(chunk.chunks_exact(2)) {
+            *dst = i16::from_le_bytes([src[0], src[1]]);
+        }
+        let len = self
+            .encoder
+            .encode(&self.pcm, &mut self.out)
+            .map_err(|e| anyhow::anyhow!("opus encode: {e:?}"))?;
+        Ok(&self.out[..len])
+    }
+}
 
 /// Platform-specific audio backend.
 pub trait AudioBackend: Send {
@@ -176,11 +222,41 @@ pub fn run_audio_capture(
         let usb_sender = &shared.usb_sender;
         let start_time = shared.start_time;
 
+        // Monotonic sample clock in the same epoch as the video timestamps.
+        // PulseAudio (tsched) can hand over several 10 ms chunks at once, and
+        // stamping each with the wall clock produces a staircase of identical
+        // timestamps that the iPad's A/V sync misreads as drift, discarding
+        // ring data (audible crackle at IDR times). Advance 10 ms per chunk
+        // instead, re-anchoring to the wall clock only if the two diverge by
+        // more than AUDIO_CLOCK_REANCHOR_MS (capture stall or restart).
+        let mut sample_clock_ms: Option<u32> = None;
+
+        // Created once per capture session, not per chunk. If libopus fails
+        // to initialize, the network path falls back to PCM.
+        let mut speaker_opus = match SpeakerOpus::new() {
+            Ok(opus) => Some(opus),
+            Err(e) => {
+                eprintln!("[audio] {e:#}; sending PCM");
+                None
+            }
+        };
+        let client_features = &shared.client_features;
+
         let mut on_chunk = |chunk: &[u8]| {
             if chunk.len() != BYTES_PER_CHUNK {
                 return;
             }
-            let ts = start_time.elapsed().as_millis() as u32;
+            let wall_ms = start_time.elapsed().as_millis() as u32;
+            let ts = match sample_clock_ms {
+                Some(clock)
+                    if (wall_ms.wrapping_sub(clock) as i32).unsigned_abs()
+                        <= AUDIO_CLOCK_REANCHOR_MS =>
+                {
+                    clock
+                }
+                _ => wall_ms,
+            };
+            sample_clock_ms = Some(ts.wrapping_add(CHUNK_DURATION_MS));
 
             if usb_active.load(Ordering::Relaxed) {
                 let mut usb = usb_sender.lock().unwrap();
@@ -206,8 +282,17 @@ pub fn run_audio_capture(
             }
 
             if let Some(addr) = *client_addr.lock().unwrap() {
-                if let Err(e) = sender.send_audio(chunk, addr, ts) {
-                    eprintln!("[audio] send error: {e}");
+                let wants_opus = client_features.load(Ordering::Relaxed)
+                    & crate::stream_server::CLIENT_FEATURE_OPUS_AUDIO
+                    != 0;
+                let result = match speaker_opus.as_mut().filter(|_| wants_opus) {
+                    Some(opus) => opus.encode(chunk).and_then(|packet| {
+                        sender.send_audio(packet, addr, ts, crate::stream_server::AUDIO_CODEC_OPUS)
+                    }),
+                    None => sender.send_audio(chunk, addr, ts, crate::stream_server::AUDIO_CODEC_PCM),
+                };
+                if let Err(e) = result {
+                    eprintln!("[audio] send error: {e:#}");
                 }
             }
         };
@@ -274,5 +359,28 @@ impl MicWriter {
             .map_err(|e| anyhow::anyhow!("opus decode: {e:?}"))?;
         self.sink.write_pcm(&self.pcm_buf[..samples]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_opus_encodes_10ms_chunks_that_decode_to_480_frames() {
+        let mut opus = SpeakerOpus::new().unwrap();
+        let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+        let mut chunk = vec![0u8; BYTES_PER_CHUNK];
+        for (i, sample) in chunk.chunks_exact_mut(2).enumerate() {
+            let v = ((i as f32 * 0.05).sin() * 8000.0) as i16;
+            sample.copy_from_slice(&v.to_le_bytes());
+        }
+        let mut pcm = vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize];
+        for _ in 0..5 {
+            let packet = opus.encode(&chunk).unwrap().to_vec();
+            assert!(packet.len() < 1400, "fits in one UDP chunk");
+            let frames = decoder.decode(&packet, &mut pcm, false).unwrap();
+            assert_eq!(frames, SAMPLES_PER_CHUNK);
+        }
     }
 }

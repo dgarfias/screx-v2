@@ -67,6 +67,13 @@ struct Cli {
     #[arg(short, long, default_value_t = 90)]
     keyframe: u32,
 
+    /// Replace periodic IDR keyframes with rolling intra-refresh where the
+    /// encoder supports it (software H.264 and NVENC); full IDRs are then
+    /// emitted only when a client requests one. Pass --no-intra-refresh to
+    /// keep the legacy periodic keyframes.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    intra_refresh: bool,
+
     /// Maximum encoder bitrate a session may negotiate (e.g. 20000000, 20M,
     /// 500K; ceiling, not a fixed value — see --max-width)
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
@@ -126,6 +133,7 @@ struct AppConfig {
     gop: u32,
     bitrate_bps: u32,
     bitrate_usb_max_bps: u32,
+    intra_refresh: bool,
     stream_port: u16,
     camera_exclusive_caps: bool,
 }
@@ -147,6 +155,7 @@ impl AppConfig {
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.max_bitrate,
             bitrate_usb_max_bps: cli.max_bitrate_usb,
+            intra_refresh: cli.intra_refresh,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
         }
@@ -524,6 +533,7 @@ async fn main() -> Result<()> {
                     height: session_height,
                     backend: config.encoder_backend,
                     codec: session_codec,
+                    intra_refresh: config.intra_refresh,
                 };
 
                 // Create encoder fresh for each session
@@ -544,6 +554,13 @@ async fn main() -> Result<()> {
                 // Pin the UDP source address to the IP the client dialed
                 // (multi-homed hosts may otherwise reply from another IP).
                 sender.set_source(*capture_shared.udp_source.lock().unwrap());
+                let client_features = requested.as_ref().map_or(0, |r| r.client_features);
+                sender.set_session(session_fps, client_features);
+                // Clients that never send STNG (older builds) get no optional
+                // features, even if a previous session's client had them.
+                capture_shared
+                    .client_features
+                    .store(client_features, Ordering::SeqCst);
 
                 println!("[capture] attaching display backend");
                 if let Err(e) = display.attach(capture::DisplayMode {

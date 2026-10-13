@@ -41,6 +41,11 @@ pub struct EncoderConfig {
     pub height: u32,
     pub backend: EncoderBackend,
     pub codec: VideoCodec,
+    /// Replace periodic full IDR keyframes with rolling intra-refresh where the
+    /// encoder supports it (software H.264, NVENC). Spreads the keyframe cost
+    /// across frames instead of spiking the pipeline every GOP; full IDRs are
+    /// then emitted only when the client explicitly requests one (PLI).
+    pub intra_refresh: bool,
 }
 
 /// Owned reference to an encoded packet's underlying AVBuffer.
@@ -253,6 +258,9 @@ pub struct Encoder {
     frame_count: u64,
     last_idr_at: Instant,
     max_idr_interval: Duration,
+    /// A client keyframe request (PLI) not yet answered. Requests that arrive
+    /// inside `MIN_PLI_IDR_INTERVAL` wait here instead of being dropped.
+    pending_pli: bool,
     stats_start: Instant,
     stats_encoded: u64,
     stats_bytes: u64,
@@ -268,7 +276,9 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_secs(3);
+    /// Minimum spacing between PLI-triggered IDRs. The client already limits
+    /// PLIs to one per second; this only guards against PLI storms.
+    const MIN_PLI_IDR_INTERVAL: Duration = Duration::from_secs(1);
 
     pub fn codec(&self) -> VideoCodec {
         self.config.codec
@@ -408,6 +418,7 @@ impl Encoder {
             frame_count: 0,
             last_idr_at: Instant::now(),
             max_idr_interval: Duration::from_secs(5),
+            pending_pli: false,
             stats_start: Instant::now(),
             stats_encoded: 0,
             stats_bytes: 0,
@@ -457,10 +468,23 @@ impl Encoder {
             };
         }
 
-        let pli_idr = force_idr && self.last_idr_at.elapsed() >= Self::MIN_PLI_IDR_INTERVAL;
-        let is_idr = pli_idr
-            || self.frame_count % u64::from(self.config.gop.max(1)) == 0
-            || self.last_idr_at.elapsed() >= self.max_idr_interval;
+        self.pending_pli |= force_idr;
+        let pli_idr = self.pending_pli && self.last_idr_at.elapsed() >= Self::MIN_PLI_IDR_INTERVAL;
+        let intra_idr_supported = match &mut self.inner {
+            ActiveEncoder::HwAccel(enc) => enc.supports_intra_refresh(),
+            ActiveEncoder::Software(enc) => enc.supports_intra_refresh(),
+        };
+        let intra_refresh_active = self.config.intra_refresh && intra_idr_supported;
+        let is_idr = if intra_refresh_active {
+            // Rolling intra-refresh replaces periodic IDRs; only an explicit
+            // request (PLI / reconnect) forces a full IDR, so the pipeline
+            // never takes a recurring keyframe spike.
+            pli_idr
+        } else {
+            pli_idr
+                || self.frame_count % u64::from(self.config.gop.max(1)) == 0
+                || self.last_idr_at.elapsed() >= self.max_idr_interval
+        };
 
         let aus = match &mut self.inner {
             ActiveEncoder::HwAccel(enc) => enc.push_frame(frame, is_idr)?,
@@ -498,6 +522,7 @@ impl Encoder {
 
         if is_idr && !aus.is_empty() {
             self.last_idr_at = Instant::now();
+            self.pending_pli = false;
         }
 
         self.frame_count += 1;
@@ -944,11 +969,164 @@ unsafe fn copy_iosurface_nv12_to_yuv420p(
     Ok(())
 }
 
+/// BGRA -> NV12/YUV420P conversion split into horizontal bands, each with
+/// its own swscale context, converted in parallel. A single swscale context
+/// runs on one core (~9 ms per 4K frame on a Ryzen 7 5850U, over half the
+/// 60 fps budget); `sws_scale_frame`'s own threading would first copy the
+/// non-refcounted capture buffer. There is no vertical scaling, so bands
+/// with even row counts convert independently: NV12 output is identical to
+/// a single context; YUV420P chroma may differ by 1 on each band's last row.
+struct BandedScaler {
+    /// (first row, row count, context) per band, top to bottom.
+    bands: Vec<(i32, i32, *mut ffi::SwsContext)>,
+    /// Destination planes after the first are vertically subsampled by 2.
+    dst_planes: usize,
+}
+
+/// Raw pointers handed to a band worker thread. Each band touches a
+/// disjoint range of rows in every plane.
+struct BandJob {
+    sws: *mut ffi::SwsContext,
+    src: *const u8,
+    src_stride: i32,
+    dst: [*mut u8; 3],
+    dst_stride: [i32; 3],
+    rows: i32,
+}
+
+unsafe impl Send for BandJob {}
+
+impl BandJob {
+    unsafe fn run(&self) {
+        unsafe {
+            let src = [self.src, ptr::null(), ptr::null(), ptr::null()];
+            let src_stride = [self.src_stride, 0, 0, 0];
+            let dst = [self.dst[0], self.dst[1], self.dst[2], ptr::null_mut()];
+            let dst_stride = [self.dst_stride[0], self.dst_stride[1], self.dst_stride[2], 0];
+            ffi::sws_scale(
+                self.sws,
+                src.as_ptr(),
+                src_stride.as_ptr(),
+                0,
+                self.rows,
+                dst.as_ptr(),
+                dst_stride.as_ptr(),
+            );
+        }
+    }
+}
+
+impl BandedScaler {
+    /// Smallest band worth a thread of its own.
+    const MIN_BAND_ROWS: i32 = 256;
+    const MAX_BANDS: i32 = 4;
+
+    fn new(width: i32, height: i32, dst_format: ffi::AVPixelFormat) -> Option<Self> {
+        let dst_planes = match dst_format {
+            ffi::AVPixelFormat::AV_PIX_FMT_NV12 => 2,
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV420P => 3,
+            _ => return None,
+        };
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as i32;
+        let band_count = (height / Self::MIN_BAND_ROWS)
+            .min(cores / 2)
+            .clamp(1, Self::MAX_BANDS);
+        // Even band heights keep each band's chroma rows self-contained.
+        let band_rows = (height / band_count) & !1;
+
+        let mut scaler = Self {
+            bands: Vec::with_capacity(band_count as usize),
+            dst_planes,
+        };
+        for band in 0..band_count {
+            let first_row = band * band_rows;
+            let rows = if band == band_count - 1 {
+                height - first_row
+            } else {
+                band_rows
+            };
+            let sws = unsafe {
+                ffi::sws_getContext(
+                    width,
+                    rows,
+                    ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                    width,
+                    rows,
+                    dst_format,
+                    1, // SWS_FAST_BILINEAR
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if sws.is_null() {
+                return None; // Drop frees the bands created so far
+            }
+            scaler.bands.push((first_row, rows, sws));
+        }
+        Some(scaler)
+    }
+
+    /// Same contract as `sws_scale` over the whole frame: one packed BGRA
+    /// source plane, `dst_planes` destination planes.
+    unsafe fn scale(
+        &self,
+        src: *const *const u8,
+        src_stride: *const i32,
+        dst: *const *mut u8,
+        dst_stride: *const i32,
+    ) {
+        unsafe {
+            let jobs: Vec<BandJob> = self
+                .bands
+                .iter()
+                .map(|&(first_row, rows, sws)| {
+                    let src_plane_stride = *src_stride;
+                    let mut job = BandJob {
+                        sws,
+                        src: (*src).offset(first_row as isize * src_plane_stride as isize),
+                        src_stride: src_plane_stride,
+                        dst: [ptr::null_mut(); 3],
+                        dst_stride: [0; 3],
+                        rows,
+                    };
+                    for plane in 0..self.dst_planes {
+                        let stride = *dst_stride.add(plane);
+                        let plane_row = if plane == 0 { first_row } else { first_row / 2 };
+                        job.dst[plane] = (*dst.add(plane)).offset(plane_row as isize * stride as isize);
+                        job.dst_stride[plane] = stride;
+                    }
+                    job
+                })
+                .collect();
+
+            let mut jobs = jobs;
+            let Some(last) = jobs.pop() else {
+                return;
+            };
+            std::thread::scope(|scope| {
+                for job in jobs {
+                    scope.spawn(move || unsafe { job.run() });
+                }
+                last.run();
+            });
+        }
+    }
+}
+
+impl Drop for BandedScaler {
+    fn drop(&mut self) {
+        for &(_, _, sws) in &self.bands {
+            unsafe { ffi::sws_freeContext(sws) };
+        }
+    }
+}
+
 struct HwEncoder {
     kind: HwKind,
     ctx: *mut ffi::AVCodecContext,
     hw_device_ctx: *mut ffi::AVBufferRef,
-    sws: *mut ffi::SwsContext,
+    sws: BandedScaler,
     sw_bgra: *mut ffi::AVFrame,
     sw_nv12: *mut ffi::AVFrame,
     hw_frame: *mut ffi::AVFrame,
@@ -971,6 +1149,13 @@ unsafe impl Send for HwEncoder {}
 enum VaapiHevcMode {
     Bitrate,
     Cqp(i64),
+}
+
+/// Whether the given encoder exposes FFmpeg's `intra-refresh` private option.
+/// Verified against FFmpeg 9: NVENC (H.264/H.265) exposes it; VA-API and
+/// VideoToolbox do not, so those keep periodic full IDRs.
+fn hw_supports_intra_refresh(kind: HwKind) -> bool {
+    matches!(kind, HwKind::Nvenc)
 }
 
 fn vaapi_hevc_qp(config: &EncoderConfig) -> i64 {
@@ -1013,6 +1198,10 @@ impl HwEncoder {
             }
         }
         Ok(())
+    }
+
+    fn supports_intra_refresh(&self) -> bool {
+        hw_supports_intra_refresh(self.kind)
     }
 
     #[cfg(target_os = "linux")]
@@ -1186,6 +1375,8 @@ impl HwEncoder {
         #[cfg(not(target_os = "macos"))]
         let uses_external_frames = false;
 
+        let use_intra_refresh = config.intra_refresh && hw_supports_intra_refresh(kind);
+
         unsafe {
             let codec_cstr = std::ffi::CString::new(codec_name).unwrap();
             let codec = ffi::avcodec_find_encoder_by_name(codec_cstr.as_ptr());
@@ -1269,7 +1460,11 @@ impl HwEncoder {
                 num: config.fps.max(1) as i32,
                 den: 1,
             };
-            (*ctx).gop_size = config.gop as i32;
+            (*ctx).gop_size = if use_intra_refresh {
+                10_000
+            } else {
+                config.gop as i32
+            };
             (*ctx).max_b_frames = 0;
             #[cfg(target_os = "macos")]
             if matches!(kind, HwKind::VideoToolbox) {
@@ -1323,6 +1518,15 @@ impl HwEncoder {
                     let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
                     let one = std::ffi::CString::new("1").unwrap();
                     ffi::av_opt_set((*ctx).priv_data, zerolatency.as_ptr(), one.as_ptr(), 0);
+                    if use_intra_refresh {
+                        let intra_refresh = std::ffi::CString::new("intra-refresh").unwrap();
+                        ffi::av_opt_set(
+                            (*ctx).priv_data,
+                            intra_refresh.as_ptr(),
+                            one.as_ptr(),
+                            0,
+                        );
+                    }
                 }
                 #[cfg(target_os = "windows")]
                 HwKind::Amf => {
@@ -1391,23 +1595,13 @@ impl HwEncoder {
 
             ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
 
-            let sws = ffi::sws_getContext(
-                width,
-                height,
-                ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                width,
-                height,
-                ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-                1, // SWS_FAST_BILINEAR
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null(),
-            );
-            if sws.is_null() {
+            let Some(sws) =
+                BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_NV12)
+            else {
                 ffi::av_buffer_unref(&mut hw_device_ctx);
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 bail!("failed to create swscale context");
-            }
+            };
 
             let sw_bgra = ffi::av_frame_alloc();
             if sw_bgra.is_null() {
@@ -1452,8 +1646,8 @@ impl HwEncoder {
             };
 
             println!(
-                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={}",
-                width, height, config.fps, config.bitrate_bps, config.gop
+                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={} intra_refresh={}",
+                width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
 
             Ok(Self {
@@ -1501,12 +1695,9 @@ impl HwEncoder {
             (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
 
             if mapped >= 0 {
-                ffi::sws_scale(
-                    self.sws,
+                self.sws.scale(
                     (*self.sw_bgra).data.as_ptr() as *const *const u8,
                     (*self.sw_bgra).linesize.as_ptr(),
-                    0,
-                    self.height,
                     (*self.mapped_frame).data.as_mut_ptr(),
                     (*self.mapped_frame).linesize.as_mut_ptr(),
                 );
@@ -1537,12 +1728,9 @@ impl HwEncoder {
                 ffi::av_frame_unref(self.mapped_frame);
                 ffi::av_frame_unref(self.hw_frame);
 
-                ffi::sws_scale(
-                    self.sws,
+                self.sws.scale(
                     (*self.sw_bgra).data.as_ptr() as *const *const u8,
                     (*self.sw_bgra).linesize.as_ptr(),
-                    0,
-                    self.height,
                     (*self.sw_nv12).data.as_mut_ptr(),
                     (*self.sw_nv12).linesize.as_mut_ptr(),
                 );
@@ -1689,12 +1877,9 @@ impl HwEncoder {
                     let converted = false;
 
                     if !converted {
-                        ffi::sws_scale(
-                            self.sws,
+                        self.sws.scale(
                             (*self.sw_bgra).data.as_ptr() as *const *const u8,
                             (*self.sw_bgra).linesize.as_ptr(),
-                            0,
-                            self.height,
                             (*self.sw_nv12).data.as_mut_ptr(),
                             (*self.sw_nv12).linesize.as_mut_ptr(),
                         );
@@ -1790,9 +1975,6 @@ impl Drop for HwEncoder {
             if !self.sw_bgra.is_null() {
                 ffi::av_frame_free(&mut self.sw_bgra);
             }
-            if !self.sws.is_null() {
-                ffi::sws_freeContext(self.sws);
-            }
             if !self.ctx.is_null() {
                 ffi::avcodec_free_context(&mut self.ctx);
             }
@@ -1809,13 +1991,14 @@ impl Drop for HwEncoder {
 
 struct SwEncoder {
     ctx: *mut ffi::AVCodecContext,
-    sws: *mut ffi::SwsContext,
+    sws: BandedScaler,
     sw_bgra: *mut ffi::AVFrame,
     sw_yuv: *mut ffi::AVFrame,
     pkt: *mut ffi::AVPacket,
     height: i32,
     frame_index: u64,
     fps: u32,
+    codec: VideoCodec,
     extradata: Vec<u8>,
 }
 
@@ -1835,20 +2018,29 @@ impl SwEncoder {
         Ok(())
     }
 
+    fn supports_intra_refresh(&self) -> bool {
+        self.codec == VideoCodec::H264
+    }
+
     fn new(config: &EncoderConfig) -> Result<Self> {
         let width = config.width as i32;
         let height = config.height as i32;
 
+        let use_intra_refresh = config.intra_refresh && config.codec == VideoCodec::H264;
+
         let (enc_name, opts): (&str, Vec<(&str, &str)>) = match config.codec {
-            VideoCodec::H264 => (
-                "libx264",
-                vec![
+            VideoCodec::H264 => {
+                let mut opts = vec![
                     ("preset", "ultrafast"),
                     ("tune", "zerolatency"),
                     ("forced-idr", "1"),
                     ("profile", "baseline"),
-                ],
-            ),
+                ];
+                if use_intra_refresh {
+                    opts.push(("intra-refresh", "1"));
+                }
+                ("libx264", opts)
+            }
             VideoCodec::H265 => (
                 "libx265",
                 vec![
@@ -1884,7 +2076,13 @@ impl SwEncoder {
             (*ctx).bit_rate = config.bitrate_bps as i64;
             (*ctx).rc_max_rate = config.bitrate_bps as i64;
             (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
-            (*ctx).gop_size = config.gop as i32;
+            // Intra-refresh replaces periodic IDRs with a rolling intra column,
+            // so a near-infinite GOP is safe (full IDRs are only PLI-triggered).
+            (*ctx).gop_size = if use_intra_refresh {
+                10_000
+            } else {
+                config.gop as i32
+            };
             (*ctx).max_b_frames = 0;
             (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
             (*ctx).thread_count = 1;
@@ -1909,22 +2107,12 @@ impl SwEncoder {
                 Vec::new()
             };
 
-            let sws = ffi::sws_getContext(
-                width,
-                height,
-                ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
-                width,
-                height,
-                ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-                1, // SWS_FAST_BILINEAR
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null(),
-            );
-            if sws.is_null() {
+            let Some(sws) =
+                BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_YUV420P)
+            else {
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 bail!("failed to create swscale context");
-            }
+            };
 
             let sw_bgra = ffi::av_frame_alloc();
             if sw_bgra.is_null() {
@@ -1953,8 +2141,8 @@ impl SwEncoder {
             }
 
             println!(
-                "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={}",
-                width, height, config.fps, config.bitrate_bps, config.gop
+                "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={} intra_refresh={}",
+                width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
 
             Ok(Self {
@@ -1966,6 +2154,7 @@ impl SwEncoder {
                 height,
                 frame_index: 0,
                 fps: config.fps.max(1),
+                codec: config.codec,
                 extradata,
             })
         }
@@ -1987,12 +2176,9 @@ impl SwEncoder {
             match frame.format {
                 CapturePixelFormat::Bgra => {
                     (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
-                    ffi::sws_scale(
-                        self.sws,
+                    self.sws.scale(
                         (*self.sw_bgra).data.as_ptr() as *const *const u8,
                         (*self.sw_bgra).linesize.as_ptr(),
-                        0,
-                        self.height,
                         (*self.sw_yuv).data.as_mut_ptr(),
                         (*self.sw_yuv).linesize.as_mut_ptr(),
                     );
@@ -2118,9 +2304,6 @@ impl Drop for SwEncoder {
             if !self.sw_bgra.is_null() {
                 ffi::av_frame_free(&mut self.sw_bgra);
             }
-            if !self.sws.is_null() {
-                ffi::sws_freeContext(self.sws);
-            }
             if !self.ctx.is_null() {
                 ffi::avcodec_free_context(&mut self.ctx);
             }
@@ -2172,6 +2355,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
         let mut encoder = Encoder::new(config).expect("VideoToolbox encoder should construct");
         let data = vec![128u8; width as usize * height as usize * 3 / 2];
@@ -2208,6 +2392,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
 
         let mut encoder = Encoder::new(config).expect("VideoToolbox encoder should construct");
@@ -2260,6 +2445,7 @@ mod videotoolbox_smoke_test {
             height,
             backend: EncoderBackend::VideoToolbox,
             codec: VideoCodec::H264,
+            intra_refresh: false,
         };
 
         // Per-frame pseudo-random noise (changes every frame, seeded by frame
@@ -2314,5 +2500,134 @@ mod videotoolbox_smoke_test {
             high > low,
             "expected reconfigure_bitrate to a much higher bitrate to produce more encoded bytes over 15 frames (low={low}, high={high})"
         );
+    }
+}
+
+#[cfg(test)]
+mod banded_scaler_tests {
+    use super::*;
+
+    fn test_pattern(width: usize, height: usize) -> Vec<u8> {
+        let mut bgra = vec![0u8; width * height * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            let (x, y) = (i % width, i / width);
+            px[0] = (x * 7 + y * 3) as u8;
+            px[1] = (x ^ y) as u8;
+            px[2] = (y * 5 + (x >> 2)) as u8;
+            px[3] = 255;
+        }
+        bgra
+    }
+
+    /// Converts with one full-frame context and with `BandedScaler`, and
+    /// returns the per-plane outputs of both.
+    fn convert_both(width: i32, height: i32, format: ffi::AVPixelFormat) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let bgra = test_pattern(width as usize, height as usize);
+        let planes = if format == ffi::AVPixelFormat::AV_PIX_FMT_NV12 { 2 } else { 3 };
+        let strides: Vec<i32> = (0..planes)
+            .map(|p| match (planes, p) {
+                (_, 0) => width,
+                (2, _) => width,
+                _ => width / 2,
+            })
+            .collect();
+        let plane_rows = |p: usize| if p == 0 { height } else { height / 2 };
+        let alloc = || -> Vec<Vec<u8>> {
+            (0..planes)
+                .map(|p| vec![0u8; (strides[p] * plane_rows(p)) as usize])
+                .collect()
+        };
+        let src = [bgra.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+        let src_stride = [width * 4, 0, 0, 0];
+        let mut dst_stride = [0i32; 4];
+        dst_stride[..planes].copy_from_slice(&strides);
+
+        let mut reference = alloc();
+        let mut banded = alloc();
+        unsafe {
+            let sws = ffi::sws_getContext(
+                width, height, ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+                width, height, format,
+                1, ptr::null_mut(), ptr::null_mut(), ptr::null(),
+            );
+            assert!(!sws.is_null());
+            let mut dst = [ptr::null_mut::<u8>(); 4];
+            for p in 0..planes {
+                dst[p] = reference[p].as_mut_ptr();
+            }
+            ffi::sws_scale(sws, src.as_ptr(), src_stride.as_ptr(), 0, height, dst.as_ptr(), dst_stride.as_ptr());
+            ffi::sws_freeContext(sws);
+
+            let scaler = BandedScaler::new(width, height, format).expect("banded scaler");
+            for p in 0..planes {
+                dst[p] = banded[p].as_mut_ptr();
+            }
+            scaler.scale(src.as_ptr(), src_stride.as_ptr(), dst.as_ptr(), dst_stride.as_ptr());
+        }
+        (reference, banded)
+    }
+
+    #[test]
+    fn banded_nv12_matches_single_context() {
+        for (w, h) in [(1920, 1080), (1280, 720), (2732, 2048), (640, 360)] {
+            let (reference, banded) = convert_both(w, h, ffi::AVPixelFormat::AV_PIX_FMT_NV12);
+            assert!(reference == banded, "NV12 mismatch at {w}x{h}");
+        }
+    }
+
+    /// swscale's YUV420P path clamps its vertical chroma filter at a band's
+    /// last row, so the chroma row at each band boundary may differ by 1.
+    #[test]
+    fn banded_yuv420p_within_one_at_band_edges() {
+        let (w, h) = (1920, 1080);
+        let (reference, banded) = convert_both(w, h, ffi::AVPixelFormat::AV_PIX_FMT_YUV420P);
+        assert!(reference[0] == banded[0], "luma must match exactly");
+        let scaler = BandedScaler::new(w, h, ffi::AVPixelFormat::AV_PIX_FMT_YUV420P).unwrap();
+        let edge_rows: Vec<usize> = scaler.bands[..scaler.bands.len() - 1]
+            .iter()
+            .map(|&(first, rows, _)| ((first + rows) / 2 - 1) as usize)
+            .collect();
+        for p in 1..3 {
+            for (i, (&a, &b)) in reference[p].iter().zip(&banded[p]).enumerate() {
+                if a != b {
+                    assert!(edge_rows.contains(&(i / (w as usize / 2))), "plane {p} differs off a band edge");
+                    assert!((a as i32 - b as i32).abs() <= 1, "plane {p} differs by more than 1");
+                }
+            }
+        }
+    }
+
+    /// Timing only; run with `cargo test --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn banded_scaler_speed_4k() {
+        let (w, h) = (3840, 2160);
+        let bgra = test_pattern(w as usize, h as usize);
+        let mut y = vec![0u8; (w * h) as usize];
+        let mut uv = vec![0u8; (w * h / 2) as usize];
+        let src = [bgra.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+        let src_stride = [w * 4, 0, 0, 0];
+        let dst = [y.as_mut_ptr(), uv.as_mut_ptr(), ptr::null_mut(), ptr::null_mut()];
+        let dst_stride = [w, w, 0, 0];
+        unsafe {
+            let single = ffi::sws_getContext(
+                w, h, ffi::AVPixelFormat::AV_PIX_FMT_BGRA, w, h, ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                1, ptr::null_mut(), ptr::null_mut(), ptr::null(),
+            );
+            let banded = BandedScaler::new(w, h, ffi::AVPixelFormat::AV_PIX_FMT_NV12).unwrap();
+            let iterations = 60;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                ffi::sws_scale(single, src.as_ptr(), src_stride.as_ptr(), 0, h, dst.as_ptr(), dst_stride.as_ptr());
+            }
+            let single_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                banded.scale(src.as_ptr(), src_stride.as_ptr(), dst.as_ptr(), dst_stride.as_ptr());
+            }
+            let banded_ms = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+            ffi::sws_freeContext(single);
+            println!("4K BGRA->NV12: single={single_ms:.2} ms banded({} bands)={banded_ms:.2} ms", banded.bands.len());
+        }
     }
 }

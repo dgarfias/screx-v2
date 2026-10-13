@@ -34,10 +34,17 @@ final class StreamClient {
     static let chunkPayload = 1400
     private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
-    private static let frameTimeout: TimeInterval = 0.100
+    /// How long an incomplete frame may sit before we give up on it. Only a
+    /// loss-recovery deadline (complete frames deliver immediately), so it is
+    /// not a steady-state latency cost. 100 ms is six frames at 60 fps;
+    /// 50 ms (~3 frames) recovers sooner on loss while staying far above
+    /// Wi-Fi reorder jitter. Moonlight uses a ~10 ms reorder window.
+    private static let frameTimeout: TimeInterval = 0.050
     private static let dataTimeout: TimeInterval = 5.0
 
     private static let flagAudio: UInt8 = 0x02
+    /// Header codec byte of an Opus audio packet (raw PCM is 0x00).
+    private static let audioCodecOpus: UInt8 = 0x02
 
     private var reassembly: [UInt32: FrameAssembly] = [:]
     private var audioReassembly: [UInt32: AudioAssembly] = [:]
@@ -289,7 +296,8 @@ final class StreamClient {
             }
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
                               totalData: Int(totalData), payload: payload,
-                              actualLen: Int(payloadLen), timestampMs: timestampMs)
+                              actualLen: Int(payloadLen), timestampMs: timestampMs,
+                              isOpus: codecId == Self.audioCodecOpus)
             return
         }
 
@@ -299,8 +307,7 @@ final class StreamClient {
               shardCount <= 4096,
               Int(chunkIdx) < shardCount,
               Int(payloadLen) <= Self.chunkPayload,
-              Int(payloadLen) <= payload.count,
-              totalParity == 0 || shardCount <= 255 else {
+              Int(payloadLen) <= payload.count else {
             log("ignoring invalid video shard metadata for frameId=\(frameId)")
             return
         }
@@ -318,13 +325,17 @@ final class StreamClient {
             }
             assembly = existing
         } else {
-            assembly = FrameAssembly(
+            guard let created = FrameAssembly(
                 totalData: Int(totalData),
                 totalParity: Int(totalParity),
                 isIdr: isIdr,
                 createdAt: CACurrentMediaTime(),
                 timestampMs: timestampMs
-            )
+            ) else {
+                log("ignoring invalid FEC layout for frameId=\(frameId)")
+                return
+            }
+            assembly = created
         }
         reassembly[frameId] = assembly
 
@@ -338,9 +349,18 @@ final class StreamClient {
     }
 
     private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
-                                   payload: Data, actualLen: Int, timestampMs: UInt32) {
+                                   payload: Data, actualLen: Int, timestampMs: UInt32,
+                                   isOpus: Bool) {
+        let enqueue: (Data) -> Void = { [audioPlayer] data in
+            if isOpus {
+                audioPlayer.enqueueOpus(data, timestampMs: timestampMs)
+            } else {
+                audioPlayer.enqueueAudio(data, timestampMs: timestampMs)
+            }
+        }
+
         if totalData == 1 {
-            audioPlayer.enqueueAudio(payload.prefix(actualLen), timestampMs: timestampMs)
+            enqueue(payload.prefix(actualLen))
             return
         }
 
@@ -349,8 +369,8 @@ final class StreamClient {
         assembly.addChunk(index: chunkIdx, payload: payload, actualLen: actualLen)
 
         if assembly.isComplete {
-            if let pcm = assembly.reassemble() {
-                audioPlayer.enqueueAudio(pcm, timestampMs: timestampMs)
+            if let audio = assembly.reassemble() {
+                enqueue(audio)
             }
             audioReassembly.removeValue(forKey: frameId)
         }
@@ -494,6 +514,29 @@ final class StreamClient {
     }
 }
 
+/// Reed-Solomon block layout shared with the daemon (`fec_block_count` /
+/// `fec_block_range` in daemon/src/stream_server.rs) — the two must stay identical.
+/// A frame that fits in 255 data+parity shards is a single block. Larger frames
+/// (sent only to clients that advertise `StreamSettings.featureMultiblockFEC`) are
+/// split into contiguous blocks: data shards `0..<totalData` and parity shards
+/// `totalData..<totalShards` are each divided as evenly as possible, earlier blocks
+/// taking the extras, and block `b` protects its own data range with its own parity.
+enum FECBlockLayout {
+    static let maxShardsPerBlock = 255
+
+    static func blockCount(data: Int, parity: Int) -> Int {
+        if parity == 0 || data + parity <= maxShardsPerBlock { return 1 }
+        return (data + parity + maxShardsPerBlock - 2) / (maxShardsPerBlock - 1)
+    }
+
+    static func range(total: Int, blocks: Int, index: Int) -> Range<Int> {
+        let base = total / blocks
+        let extra = total % blocks
+        let start = index * base + min(index, extra)
+        return start..<(start + base + (index < extra ? 1 : 0))
+    }
+}
+
 private final class FrameAssembly {
     let totalData: Int
     let totalParity: Int
@@ -502,112 +545,122 @@ private final class FrameAssembly {
     let createdAt: TimeInterval
     let timestampMs: UInt32
 
-    private var receivedShards: [Int: Data]
-    private var actualLengths: [Int: Int]
-    private var receivedCount: Int = 0
+    private let blockCount: Int
+    private let dataRanges: [Range<Int>]
+    private let parityRanges: [Range<Int>]
+    /// FEC block of each shard index.
+    private let blockOfShard: [Int]
 
-    init(totalData: Int, totalParity: Int, isIdr: Bool, createdAt: TimeInterval, timestampMs: UInt32 = 0) {
+    private var shards: [Data?]
+    private var actualLengths: [Int?]
+    private var dataReceived: [Int]
+    private var shardsReceived: [Int]
+    private var readyBlocks = 0
+
+    /// Nil when the shard counts can't form a valid block layout.
+    init?(totalData: Int, totalParity: Int, isIdr: Bool, createdAt: TimeInterval, timestampMs: UInt32 = 0) {
+        let blocks = FECBlockLayout.blockCount(data: totalData, parity: totalParity)
+        guard totalData >= blocks else { return nil }
+
         self.totalData = totalData
         self.totalParity = totalParity
         self.totalShards = totalData + totalParity
         self.isIdr = isIdr
         self.createdAt = createdAt
         self.timestampMs = timestampMs
-        self.receivedShards = [:]
-        self.actualLengths = [:]
+        let dataRanges = (0..<blocks).map { FECBlockLayout.range(total: totalData, blocks: blocks, index: $0) }
+        let parityRanges = (0..<blocks).map { FECBlockLayout.range(total: totalParity, blocks: blocks, index: $0) }
+        var blockOfShard = [Int](repeating: 0, count: totalData + totalParity)
+        for block in 0..<blocks {
+            for i in dataRanges[block] { blockOfShard[i] = block }
+            for i in parityRanges[block] { blockOfShard[totalData + i] = block }
+        }
+        self.blockCount = blocks
+        self.dataRanges = dataRanges
+        self.parityRanges = parityRanges
+        self.blockOfShard = blockOfShard
+        self.shards = Array(repeating: nil, count: totalData + totalParity)
+        self.actualLengths = Array(repeating: nil, count: totalData + totalParity)
+        self.dataReceived = Array(repeating: 0, count: blocks)
+        self.shardsReceived = Array(repeating: 0, count: blocks)
+    }
+
+    /// A block is decodable once it has all its data shards, or (with parity) at least
+    /// as many shards as it has data shards.
+    private func blockIsReady(_ block: Int) -> Bool {
+        let needed = dataRanges[block].count
+        return dataReceived[block] == needed || shardsReceived[block] >= needed
     }
 
     func addChunk(index: Int, payload: Data, actualLen: Int) {
-        guard receivedShards[index] == nil else { return }
-        receivedShards[index] = payload
+        guard shards[index] == nil else { return }
+        shards[index] = payload
         actualLengths[index] = actualLen
-        receivedCount += 1
+
+        let block = blockOfShard[index]
+        let wasReady = blockIsReady(block)
+        if index < totalData { dataReceived[block] += 1 }
+        shardsReceived[block] += 1
+        if !wasReady && blockIsReady(block) { readyBlocks += 1 }
     }
 
-    var isComplete: Bool {
-        if totalParity == 0 {
-            return receivedCount >= totalData
-        }
-        // All data shards present — no FEC needed
-        let hasAllData = (0..<totalData).allSatisfy { receivedShards[$0] != nil }
-        if hasAllData { return true }
-        // Enough shards for FEC recovery
-        return receivedCount >= totalData
-    }
+    var isComplete: Bool { readyBlocks == blockCount }
 
-    var canRecover: Bool {
-        return receivedCount >= totalData
-    }
+    var canRecover: Bool { isComplete }
 
     func reassemble() -> Data? {
-        let hasAllData = (0..<totalData).allSatisfy { receivedShards[$0] != nil }
+        guard isComplete else { return nil }
 
-        if hasAllData {
-            return assembleFromDataShards()
+        for block in 0..<blockCount where dataReceived[block] < dataRanges[block].count {
+            guard recoverBlock(block) else { return nil }
         }
 
-        if totalParity > 0 && receivedCount >= totalData {
-            return recoverAndAssemble()
-        }
-
-        return nil
-    }
-
-    private func assembleFromDataShards() -> Data {
         var totalSize = 0
         for i in 0..<totalData {
-            let shard = receivedShards[i]!
-            totalSize += actualLengths[i] ?? shard.count
+            totalSize += actualLengths[i] ?? StreamClient.chunkPayload
         }
         var result = Data(capacity: totalSize)
         for i in 0..<totalData {
-            let shard = receivedShards[i]!
-            let actualLen = actualLengths[i] ?? shard.count
+            guard let shard = shards[i] else { return nil }
+            let actualLen = min(actualLengths[i] ?? shard.count, shard.count)
             if actualLen == shard.count {
                 result.append(shard)
             } else {
-                result.append(shard[..<actualLen])
+                result.append(shard.prefix(actualLen))
             }
         }
         return result
     }
 
-    private func recoverAndAssemble() -> Data? {
+    /// Runs Reed-Solomon recovery for one block and stores the recovered data shards.
+    private func recoverBlock(_ block: Int) -> Bool {
         let shardSize = StreamClient.chunkPayload
+        let dataRange = dataRanges[block]
+        let parityRange = parityRanges[block]
+        let indices = Array(dataRange) + parityRange.map { totalData + $0 }
 
-        var shards: [Data?] = Array(repeating: nil, count: totalShards)
-        for (idx, data) in receivedShards {
-            if data.count == shardSize {
-                shards[idx] = data
-            } else if data.count < shardSize {
+        var blockShards: [Data?] = indices.map { index -> Data? in
+            guard let data = shards[index] else { return nil }
+            if data.count == shardSize { return data }
+            if data.count < shardSize {
                 var padded = data
                 padded.append(Data(count: shardSize - data.count))
-                shards[idx] = padded
-            } else {
-                shards[idx] = data[..<shardSize]
+                return padded
             }
+            return data.prefix(shardSize)
         }
 
-        guard ReedSolomonDecoder.recover(shards: &shards, dataCount: totalData, parityCount: totalParity) else {
-            return nil
+        guard ReedSolomonDecoder.recover(shards: &blockShards,
+                                         dataCount: dataRange.count,
+                                         parityCount: parityRange.count) else {
+            return false
         }
 
-        var totalSize = 0
-        for i in 0..<totalData {
-            guard shards[i] != nil else { return nil }
-            totalSize += actualLengths[i] ?? shardSize
+        for (offset, index) in dataRange.enumerated() where shards[index] == nil {
+            guard let recovered = blockShards[offset] else { return false }
+            shards[index] = recovered
         }
-        var result = Data(capacity: totalSize)
-        for i in 0..<totalData {
-            let shard = shards[i]!
-            let actualLen = actualLengths[i] ?? shard.count
-            if actualLen == shard.count {
-                result.append(shard)
-            } else {
-                result.append(shard[..<actualLen])
-            }
-        }
-        return result
+        return true
     }
 }
 

@@ -24,15 +24,15 @@ final class VideoDecoder {
     private var naluCount = 0
 
     private var framesReceived: UInt64 = 0
-    private var framesDisplayed: UInt64 = 0
+    private var framesEnqueued: UInt64 = 0
+    private var framesDropped: UInt64 = 0
     private var statsWindowStart = CACurrentMediaTime()
 
     private let renderQueue = DispatchQueue(label: "screx.render", qos: .userInteractive)
-    private var naluBuf = [UInt8]()
+    /// Slice NAL ranges of the access unit being parsed; reused across frames.
+    private var vclRanges: [Range<Int>] = []
 
     var sendPliRequest: (() -> Void)?
-    private var lastBackpressureFlushTime: TimeInterval = 0
-    private static let backpressureFlushInterval: TimeInterval = 1.0
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -73,6 +73,7 @@ final class VideoDecoder {
 
     private func parseNALUnits(_ bytes: UnsafePointer<UInt8>, count: Int) {
         var i = 0
+        vclRanges.removeAll(keepingCapacity: true)
 
         while i < count {
             var startCodeLen = 0
@@ -101,20 +102,41 @@ final class VideoDecoder {
 
             naluCount += 1
 
+            let isVCL: Bool
             switch codec {
             case .h264:
-                handleH264Nalu(bytes: bytes, naluStart: naluStart, naluEnd: naluEnd, length: length)
+                isVCL = handleH264Nalu(bytes: bytes, naluStart: naluStart, naluEnd: naluEnd, length: length)
             case .h265:
-                handleH265Nalu(bytes: bytes, naluStart: naluStart, naluEnd: naluEnd, length: length)
+                isVCL = handleH265Nalu(bytes: bytes, naluStart: naluStart, naluEnd: naluEnd, length: length)
+            }
+            if isVCL {
+                vclRanges.append(naluStart..<naluEnd)
             }
 
             i = naluEnd
         }
+
+        if !vclRanges.isEmpty {
+            enqueueAccessUnit(bytes: bytes, ranges: vclRanges)
+        }
+    }
+
+    /// Stores a parameter set, returning true only if it differs from the stored one.
+    /// Every keyframe repeats SPS/PPS(/VPS); rebuilding the format description each
+    /// time would make the display layer treat every keyframe as a format change.
+    private static func storeParameterSet(_ stored: inout Data?, bytes: UnsafePointer<UInt8>, range: Range<Int>) -> Bool {
+        let incoming = UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count)
+        if let existing = stored, existing.elementsEqual(incoming) {
+            return false
+        }
+        stored = Data(buffer: incoming)
+        return true
     }
 
     // MARK: - H.264
 
-    private func handleH264Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) {
+    /// Returns true for a slice NAL that belongs in the access unit's sample buffer.
+    private func handleH264Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) -> Bool {
         let naluType = bytes[naluStart] & 0x1F
 
         if naluCount <= 5 {
@@ -123,17 +145,19 @@ final class VideoDecoder {
 
         switch naluType {
         case 7:
-            sps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
-            tryBuildH264FormatDescription()
-        case 8:
-            pps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
-            tryBuildH264FormatDescription()
-        case 1, 5:
-            if formatDescription != nil {
-                enqueueSlice(bytes: bytes, offset: naluStart, length: length)
+            if Self.storeParameterSet(&sps, bytes: bytes, range: naluStart..<naluEnd) {
+                tryBuildH264FormatDescription()
             }
+            return false
+        case 8:
+            if Self.storeParameterSet(&pps, bytes: bytes, range: naluStart..<naluEnd) {
+                tryBuildH264FormatDescription()
+            }
+            return false
+        case 1, 5:
+            return formatDescription != nil
         default:
-            break
+            return false
         }
     }
 
@@ -173,8 +197,9 @@ final class VideoDecoder {
 
     // MARK: - H.265
 
-    private func handleH265Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) {
-        guard length >= 2 else { return }
+    /// Returns true for a slice NAL that belongs in the access unit's sample buffer.
+    private func handleH265Nalu(bytes: UnsafePointer<UInt8>, naluStart: Int, naluEnd: Int, length: Int) -> Bool {
+        guard length >= 2 else { return false }
         let naluType = (bytes[naluStart] >> 1) & 0x3F
 
         if naluCount <= 5 {
@@ -183,20 +208,24 @@ final class VideoDecoder {
 
         switch naluType {
         case 32: // VPS
-            vps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
-            tryBuildH265FormatDescription()
-        case 33: // SPS
-            sps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
-            tryBuildH265FormatDescription()
-        case 34: // PPS
-            pps = Data(bytes: bytes + naluStart, count: naluEnd - naluStart)
-            tryBuildH265FormatDescription()
-        case 0...9, 16...21:
-            if formatDescription != nil {
-                enqueueSlice(bytes: bytes, offset: naluStart, length: length)
+            if Self.storeParameterSet(&vps, bytes: bytes, range: naluStart..<naluEnd) {
+                tryBuildH265FormatDescription()
             }
+            return false
+        case 33: // SPS
+            if Self.storeParameterSet(&sps, bytes: bytes, range: naluStart..<naluEnd) {
+                tryBuildH265FormatDescription()
+            }
+            return false
+        case 34: // PPS
+            if Self.storeParameterSet(&pps, bytes: bytes, range: naluStart..<naluEnd) {
+                tryBuildH265FormatDescription()
+            }
+            return false
+        case 0...9, 16...21:
+            return formatDescription != nil
         default:
-            break
+            return false
         }
     }
 
@@ -238,52 +267,50 @@ final class VideoDecoder {
         }
     }
 
-    // MARK: - Shared slice enqueueing
+    // MARK: - Access unit enqueueing
 
-    private func enqueueSlice(bytes: UnsafePointer<UInt8>, offset: Int, length: Int) {
+    /// Packs every slice NAL of one access unit into a single AVCC-framed sample
+    /// buffer (4-byte big-endian length prefixes), written straight into the
+    /// CMBlockBuffer's memory. One sample per frame: a multi-slice frame enqueued as
+    /// separate display-immediately samples would present partial pictures.
+    private func enqueueAccessUnit(bytes: UnsafePointer<UInt8>, ranges: [Range<Int>]) {
         guard let formatDescription else { return }
 
-        let totalLen = 4 + length
+        let totalLen = ranges.reduce(0) { $0 + 4 + $1.count }
 
-        if naluBuf.count < totalLen {
-            naluBuf = [UInt8](repeating: 0, count: max(totalLen, naluBuf.count * 2))
+        var blockBufferOut: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: totalLen,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: totalLen,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &blockBufferOut
+        ) == kCMBlockBufferNoErr, let blockBuffer = blockBufferOut else { return }
+
+        var dataPointerOut: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: nil,
+            dataPointerOut: &dataPointerOut
+        ) == kCMBlockBufferNoErr, let dataPointer = dataPointerOut else { return }
+
+        let dst = UnsafeMutableRawPointer(dataPointer).assumingMemoryBound(to: UInt8.self)
+        var offset = 0
+        for range in ranges {
+            let len32 = UInt32(range.count)
+            dst[offset] = UInt8((len32 >> 24) & 0xFF)
+            dst[offset + 1] = UInt8((len32 >> 16) & 0xFF)
+            dst[offset + 2] = UInt8((len32 >> 8) & 0xFF)
+            dst[offset + 3] = UInt8(len32 & 0xFF)
+            (dst + offset + 4).update(from: bytes + range.lowerBound, count: range.count)
+            offset += 4 + range.count
         }
-
-        let len32 = UInt32(length)
-        naluBuf[0] = UInt8((len32 >> 24) & 0xFF)
-        naluBuf[1] = UInt8((len32 >> 16) & 0xFF)
-        naluBuf[2] = UInt8((len32 >> 8) & 0xFF)
-        naluBuf[3] = UInt8(len32 & 0xFF)
-
-        naluBuf.withUnsafeMutableBufferPointer { dst in
-            (dst.baseAddress! + 4).update(from: bytes + offset, count: length)
-        }
-
-        var blockBuffer: CMBlockBuffer?
-        naluBuf.withUnsafeBufferPointer { bufPtr in
-            let ptr = bufPtr.baseAddress!
-            CMBlockBufferCreateWithMemoryBlock(
-                allocator: kCFAllocatorDefault,
-                memoryBlock: nil,
-                blockLength: totalLen,
-                blockAllocator: kCFAllocatorDefault,
-                customBlockSource: nil,
-                offsetToData: 0,
-                dataLength: totalLen,
-                flags: 0,
-                blockBufferOut: &blockBuffer
-            )
-            if let bb = blockBuffer {
-                CMBlockBufferReplaceDataBytes(
-                    with: ptr,
-                    blockBuffer: bb,
-                    offsetIntoDestination: 0,
-                    dataLength: totalLen
-                )
-            }
-        }
-
-        guard let blockBuffer else { return }
 
         var sampleBuffer: CMSampleBuffer?
         var sampleSize = totalLen
@@ -321,25 +348,30 @@ final class VideoDecoder {
             }
 
             if !self.displayLayer.isReadyForMoreMediaData {
-                let now = CACurrentMediaTime()
-                if now - self.lastBackpressureFlushTime > Self.backpressureFlushInterval {
-                    self.lastBackpressureFlushTime = now
-                    self.displayLayer.flush()
-                    self.sendPliRequest?()
-                }
+                // The display layer is backed up (decode/present can't keep up).
+                // Drop the stale backlog and enqueue the freshest frame instead
+                // of letting display latency ratchet up. This is NOT loss —
+                // there is no reorder/loss evidence — so we deliberately do not
+                // request a keyframe here (Moonlight/Parsec: no buffer, drop
+                // stale, present newest). PLI is only for confirmed frame_id
+                // gaps in StreamClient.
+                self.framesDropped += 1
+                self.displayLayer.flush()
             }
 
             self.displayLayer.enqueue(sampleBuffer)
-            self.framesDisplayed += 1
+            self.framesEnqueued += 1
 
             let now = CACurrentMediaTime()
             let elapsed = now - self.statsWindowStart
             if elapsed >= 2.0 {
                 let recvFps = Double(self.framesReceived) / elapsed
-                let dispFps = Double(self.framesDisplayed) / elapsed
-                print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) display_fps=\(String(format: "%.1f", dispFps))")
+                let enqFps = Double(self.framesEnqueued) / elapsed
+                let dropFps = Double(self.framesDropped) / elapsed
+                print("[decoder] recv_fps=\(String(format: "%.1f", recvFps)) enq_fps=\(String(format: "%.1f", enqFps)) drop_fps=\(String(format: "%.1f", dropFps))")
                 self.framesReceived = 0
-                self.framesDisplayed = 0
+                self.framesEnqueued = 0
+                self.framesDropped = 0
                 self.statsWindowStart = now
             }
         }

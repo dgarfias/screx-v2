@@ -73,15 +73,24 @@ impl TcpFramedSender {
     fn new(stream: Box<dyn ReadWriteStream>) -> Result<Self> {
         Ok(Self {
             stream,
-            write_buf: Vec::with_capacity(256 * 1024),
+            write_buf: Vec::with_capacity(1024),
         })
     }
 
+    /// Writes header + payload with `writev`, without first copying a whole
+    /// (possibly multi-megabyte) video frame into a scratch buffer.
     fn write_all_vectored(&mut self, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
-        self.write_buf.clear();
-        self.write_buf.extend_from_slice(header);
-        self.write_buf.extend_from_slice(payload);
-        self.stream.write_all(&self.write_buf)
+        let mut slices = [std::io::IoSlice::new(header), std::io::IoSlice::new(payload)];
+        let mut remaining: &mut [std::io::IoSlice<'_>] = &mut slices;
+        while !remaining.is_empty() {
+            match self.stream.write_vectored(remaining) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => std::io::IoSlice::advance_slices(&mut remaining, written),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     pub fn send_video(
@@ -417,5 +426,33 @@ fn read_control_loop(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn vectored_video_frame_arrives_intact() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7) as u8).collect();
+        let expected = payload.clone();
+        let reader = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            conn.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            conn.read_exact(&mut body).unwrap();
+            body
+        });
+        let stream: Box<dyn ReadWriteStream> = Box::new(TcpStream::connect(addr).unwrap());
+        let mut sender = TcpFramedSender::new(stream).unwrap();
+        sender.send_video(&payload, true, 1234, 0x01).unwrap();
+        let body = reader.join().unwrap();
+        assert_eq!(&body[..7], &[MSG_VIDEO, 1, 0x01, 0, 0, 0x04, 0xD2]);
+        assert!(body[7..] == expected[..]);
     }
 }

@@ -225,7 +225,8 @@ final class USBListener {
                 let o = msgData.startIndex + 3
                 let tsMs: UInt32 = UInt32(msgData[o]) << 24 | UInt32(msgData[o+1]) << 16
                                  | UInt32(msgData[o+2]) << 8 | UInt32(msgData[o+3])
-                let annexB = Data(msgData.dropFirst(7))
+                // A Data slice (no copy); the decoder only reads it via withUnsafeBytes.
+                let annexB = msgData.dropFirst(7)
                 avSync.updateVideo(timestamp: tsMs)
                 decoder.decodeAccessUnit(annexB)
 

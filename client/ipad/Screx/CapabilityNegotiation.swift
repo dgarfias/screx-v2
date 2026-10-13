@@ -231,6 +231,16 @@ struct StreamSettings: Equatable {
     private static let tagFramerate: UInt8 = 0x02
     private static let tagCodec: UInt8 = 0x03
     private static let tagBitrate: UInt8 = 0x04
+    /// Bitmask of optional client features (`u8`), always sent. Older daemons skip it as
+    /// an unknown tag.
+    private static let tagClientFeatures: UInt8 = 0x05
+
+    /// This client reassembles video frames whose FEC is split into several Reed-Solomon
+    /// blocks (see `FrameAssembly` in StreamClient.swift).
+    static let featureMultiblockFEC: UInt8 = 0x01
+    /// This client decodes Opus speaker audio (see `AudioPlayer.enqueueOpus`).
+    static let featureOpusAudio: UInt8 = 0x02
+    private static let clientFeatures: UInt8 = featureMultiblockFEC | featureOpusAudio
 
     init(width: Int? = nil, height: Int? = nil, fps: Int? = nil, codecId: UInt8? = nil, bitrateBps: UInt32? = nil) {
         self.width = width
@@ -244,7 +254,7 @@ struct StreamSettings: Equatable {
     /// encrypted-frame envelope on the network path or the `msgControl` byte on the USB
     /// path, is added by the caller exactly like it is for every other control message).
     /// A settings value with every field nil still produces a valid message with
-    /// `entry_count = 0`, meaning "everything default, just connect."
+    /// `entry_count = 1` (just the client-features tag), meaning "everything default, just connect."
     func encode() -> Data {
         var entries: [(tag: UInt8, value: Data)] = []
 
@@ -268,6 +278,8 @@ struct StreamSettings: Equatable {
             withUnsafeBytes(of: bitrateBps.bigEndian) { value.append(contentsOf: $0) }
             entries.append((Self.tagBitrate, value))
         }
+
+        entries.append((Self.tagClientFeatures, Data([Self.clientFeatures])))
 
         var payload = Self.magic
         payload.append(Self.version)
