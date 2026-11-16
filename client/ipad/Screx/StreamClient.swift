@@ -27,12 +27,8 @@ final class StreamClient {
     var sessionKey: SymmetricKey?
     var sendPliRequest: (() -> Void)?
 
-    /// When true, suppresses the data timeout (e.g. USB is active and no network data is expected)
-    var suppressTimeout = false
-
     private static let headerLen = 18
     static let chunkPayload = 1400
-    private static let registerMagic = Data("SCREX".utf8)
     private static let keepaliveInterval: TimeInterval = 2.0
     /// How long an incomplete frame may sit before we give up on it. Only a
     /// loss-recovery deadline (complete frames deliver immediately), so it is
@@ -43,8 +39,6 @@ final class StreamClient {
     private static let dataTimeout: TimeInterval = 5.0
 
     private static let flagAudio: UInt8 = 0x02
-    /// Header codec byte of an Opus audio packet (raw PCM is 0x00).
-    private static let audioCodecOpus: UInt8 = 0x02
 
     private var reassembly: [UInt32: FrameAssembly] = [:]
     private var audioReassembly: [UInt32: AudioAssembly] = [:]
@@ -54,7 +48,6 @@ final class StreamClient {
     private var dataTimeoutTimer: DispatchSourceTimer?
     private var lastPliTime: TimeInterval = 0
     private static let pliMinInterval: TimeInterval = 1.0
-    private static let pliMagic = Data("PLI".utf8)
     private var sendSeq: UInt32 = 0
     private var registerSendCount = 0
     private var receiveCount = 0
@@ -123,7 +116,7 @@ final class StreamClient {
     private func sendRegister(_ conn: NWConnection) {
         registerSendCount += 1
         log("sendRegister() #\(registerSendCount)")
-        encryptAndSend(Self.registerMagic, conn: conn, label: "register")
+        encryptAndSend(Data([ScrexMessage.Udp.keepalive]), conn: conn, label: "register")
     }
 
     /// Encrypt plaintext with session key, prepend 4-byte seq_num, send over UDP.
@@ -180,9 +173,7 @@ final class StreamClient {
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            if self.suppressTimeout {
-                self.lastInboundTime = CACurrentMediaTime()
-            } else if CACurrentMediaTime() - self.lastInboundTime >= Self.dataTimeout {
+            if CACurrentMediaTime() - self.lastInboundTime >= Self.dataTimeout {
                 self.handleTimeout()
             }
         }
@@ -196,10 +187,6 @@ final class StreamClient {
 
     private func handleTimeout() {
         guard connection != nil else { return }
-        if suppressTimeout {
-            lastInboundTime = CACurrentMediaTime()
-            return
-        }
         log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
         print("[stream] data timeout — daemon appears gone")
         disconnect()
@@ -296,8 +283,7 @@ final class StreamClient {
             }
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
                               totalData: Int(totalData), payload: payload,
-                              actualLen: Int(payloadLen), timestampMs: timestampMs,
-                              isOpus: codecId == Self.audioCodecOpus)
+                              actualLen: Int(payloadLen), timestampMs: timestampMs)
             return
         }
 
@@ -349,14 +335,9 @@ final class StreamClient {
     }
 
     private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
-                                   payload: Data, actualLen: Int, timestampMs: UInt32,
-                                   isOpus: Bool) {
+                                   payload: Data, actualLen: Int, timestampMs: UInt32) {
         let enqueue: (Data) -> Void = { [audioPlayer] data in
-            if isOpus {
-                audioPlayer.enqueueOpus(data, timestampMs: timestampMs)
-            } else {
-                audioPlayer.enqueueAudio(data, timestampMs: timestampMs)
-            }
+            audioPlayer.enqueueOpus(data, timestampMs: timestampMs)
         }
 
         if totalData == 1 {
@@ -445,19 +426,7 @@ final class StreamClient {
         let now = CACurrentMediaTime()
         guard now - lastPliTime >= Self.pliMinInterval else { return }
         lastPliTime = now
-        if let sendPliRequest {
-            sendPliRequest()
-            return
-        }
-        guard let conn = connection else { return }
-        encryptAndSend(Self.pliMagic, conn: conn, label: "PLI")
-    }
-
-    func sendTouch(_ contactData: Data) {
-        guard let conn = connection else { return }
-        var packet = Data("TOUCH".utf8)
-        packet.append(contactData)
-        encryptAndSend(packet, conn: conn, label: "touch")
+        sendPliRequest?()
     }
 
     func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
@@ -468,57 +437,32 @@ final class StreamClient {
         for i in 0..<totalChunks {
             let start = i * chunkSize
             let end = min(start + chunkSize, jpeg.count)
-            let chunk = jpeg.subdata(in: start..<end)
 
-            var packet = Data("CAM".utf8)
+            var packet = Data([ScrexMessage.Udp.camera])
             withUnsafeBytes(of: frameId.bigEndian) { packet.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(i).bigEndian) { packet.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(totalChunks).bigEndian) { packet.append(contentsOf: $0) }
-            packet.append(chunk)
+            packet.append(jpeg.subdata(in: start..<end))
 
             encryptAndSend(packet, conn: conn, label: "cam")
         }
     }
 
-    func sendKey(_ keyData: Data) {
+    /// Sends one mic Opus packet. `seq` counts mic packets only, so the daemon can
+    /// detect lost ones and conceal them.
+    func sendMicPacket(_ opus: Data, seq: UInt32) {
         guard let conn = connection else { return }
-        var packet = Data("KEY".utf8)
-        packet.append(keyData)
-        encryptAndSend(packet, conn: conn, label: "key")
-    }
-
-    func sendMicPacket(_ packet: Data) {
-        guard let conn = connection else { return }
+        var packet = Data([ScrexMessage.Udp.mic])
+        withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
+        packet.append(opus)
         encryptAndSend(packet, conn: conn, label: "mic")
-    }
-
-    func sendMouse(_ mouseData: Data) {
-        guard let conn = connection else { return }
-        var packet = Data("MOUSE".utf8)
-        packet.append(mouseData)
-        encryptAndSend(packet, conn: conn, label: "mouse")
-    }
-
-    func sendRawKey(_ keyData: Data) {
-        guard let conn = connection else { return }
-        var packet = Data("RAWKEY".utf8)
-        packet.append(keyData)
-        encryptAndSend(packet, conn: conn, label: "rawkey")
-    }
-
-    func sendPeripheral(_ periphData: Data) {
-        guard let conn = connection else { return }
-        var packet = Data("PERIPH".utf8)
-        packet.append(periphData)
-        encryptAndSend(packet, conn: conn, label: "periph")
     }
 }
 
 /// Reed-Solomon block layout shared with the daemon (`fec_block_count` /
 /// `fec_block_range` in daemon/src/stream_server.rs) — the two must stay identical.
 /// A frame that fits in 255 data+parity shards is a single block. Larger frames
-/// (sent only to clients that advertise `StreamSettings.featureMultiblockFEC`) are
-/// split into contiguous blocks: data shards `0..<totalData` and parity shards
+/// are split into contiguous blocks: data shards `0..<totalData` and parity shards
 /// `totalData..<totalShards` are each divided as evenly as possible, earlier blocks
 /// taking the extras, and block `b` protects its own data range with its own parity.
 enum FECBlockLayout {

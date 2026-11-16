@@ -7,10 +7,10 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::input::{
-    GamepadState, InputBackend, KeyboardEvent, MouseEvent, TouchContact, GPAD_BTN_EAST,
-    GPAD_BTN_MODE, GPAD_BTN_NORTH, GPAD_BTN_SELECT, GPAD_BTN_SOUTH, GPAD_BTN_START,
-    GPAD_BTN_THUMBL, GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, GPAD_BTN_WEST, SPECIAL_BACKSPACE,
-    TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
+    GamepadState, InputBackend, MouseEvent, TouchContact, GPAD_BTN_EAST, GPAD_BTN_MODE,
+    GPAD_BTN_NORTH, GPAD_BTN_SELECT, GPAD_BTN_SOUTH, GPAD_BTN_START, GPAD_BTN_THUMBL,
+    GPAD_BTN_THUMBR, GPAD_BTN_TL, GPAD_BTN_TR, GPAD_BTN_WEST, SPECIAL_BACKSPACE, TOUCH_DOWN,
+    TOUCH_MOVE, TOUCH_UP,
 };
 use crate::input::{
     KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_A, KEY_APOSTROPHE,
@@ -196,8 +196,11 @@ pub struct LinuxInput {
     keyboard: Option<VirtualKeyboard>,
     mouse: Option<VirtualMouse>,
     gamepads: std::collections::HashMap<u8, VirtualGamepad>,
+    /// evdev codes of raw keys currently held down, so they can be released
+    /// if the keyboard detaches or the session ends mid-press.
+    held_keys: std::collections::HashSet<u16>,
     /// Negotiated per-session stream resolution, in wire coordinate space.
-    /// `None` until the first `set_target_rect` call. The virtual
+    /// `None` until the first `set_stream_size` call. The virtual
     /// touchscreen itself is created once at startup sized to the CLI/config
     /// ceiling (recreating it per session would re-trigger the ~800ms
     /// gsettings output-mapping sleep and device churn in GNOME), so when
@@ -219,19 +222,19 @@ impl LinuxInput {
             keyboard,
             mouse: None,
             gamepads: std::collections::HashMap::new(),
+            held_keys: std::collections::HashSet::new(),
             session_size: None,
         })
     }
 }
 
 impl InputBackend for LinuxInput {
-    fn set_target_rect(&mut self, _left: i32, _top: i32, width: u32, height: u32) {
-        // left/top are ignored here: the gsettings tablet->EVDI-output
-        // mapping (see `map_to_output`) already confines the fixed-size
-        // virtual touchscreen to the captured output, so there is no
-        // desktop-absolute offset to apply. What changes per session is the
-        // *resolution* touch coordinates are expressed in on the wire, which
-        // we need in order to scale them onto the touchscreen's ABS range.
+    fn set_stream_size(&mut self, width: u32, height: u32) {
+        // The gsettings tablet->EVDI-output mapping (see `map_to_output`)
+        // confines the fixed-size virtual touchscreen to the captured
+        // output. What changes per session is the resolution touch
+        // coordinates are expressed in on the wire, which we need in order
+        // to scale them onto the touchscreen's ABS range.
         if let Some(ref ts) = self.touch {
             println!(
                 "[touch] session stream resolution {width}x{height}, tablet ABS range {}x{}",
@@ -287,9 +290,29 @@ impl InputBackend for LinuxInput {
             if let Some(code) = crate::input::hid_to_evdev(u16::from(usage)) {
                 kb.key_event(code, if pressed { 1 } else { 0 });
                 kb.syn();
+                if pressed {
+                    self.held_keys.insert(code);
+                } else {
+                    self.held_keys.remove(&code);
+                }
             }
         }
         Ok(())
+    }
+
+    fn release_keys(&mut self) {
+        if let Some(ref mut kb) = self.keyboard {
+            for code in self.held_keys.drain() {
+                kb.key_event(code, 0);
+            }
+            kb.syn();
+        }
+    }
+
+    fn release_mouse_buttons(&mut self) {
+        if let Some(ref mut mouse) = self.mouse {
+            mouse.release_all_buttons();
+        }
     }
 
     fn mouse(&mut self, ev: MouseEvent) -> Result<()> {

@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 // Touch event types matching iPad protocol
@@ -61,66 +60,25 @@ pub struct GamepadState {
 /// number of simultaneous controllers supported, or `None` if this daemon
 /// can't do gamepad passthrough at all right now.
 pub fn probe_gamepad_max_controllers() -> Option<u8> {
-    #[cfg(target_os = "linux")]
-    {
-        // uinput gamepad creation only fails if /dev/uinput isn't openable;
-        // treat presence of the device node as the probe (mirrors
-        // `VirtualGamepad::new` in platform::linux::uinput). The Linux
-        // backend keys pads in a HashMap with no fixed cap; 4 matches the
-        // controller_id range (0..4) the rest of the protocol assumes (see
-        // the disconnect cleanup loop in main.rs).
-        if std::path::Path::new("/dev/uinput").exists() {
-            Some(4)
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if crate::platform::windows::vigem::probe_available() {
-            Some(4)
-        } else {
-            None
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // No gamepad passthrough backend on macOS.
+    // uinput gamepad creation only fails if /dev/uinput isn't openable;
+    // treat presence of the device node as the probe (mirrors
+    // `VirtualGamepad::new` in platform::linux::uinput). The Linux
+    // backend keys pads in a HashMap with no fixed cap; 4 matches the
+    // controller_id range (0..4) the rest of the protocol assumes (see
+    // the disconnect cleanup loop in main.rs).
+    if std::path::Path::new("/dev/uinput").exists() {
+        Some(4)
+    } else {
         None
     }
 }
 
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
-    /// Tells the backend the current session's stream resolution and, where
-    /// meaningful, where the captured output sits on screen — (left, top,
-    /// width, height). Wire touch/mouse coordinates are always 0..width/
-    /// 0..height in *negotiated session stream* space, which can differ from
-    /// the backend's underlying input device geometry (e.g. a client
-    /// requesting 1920x1080 while the daemon's virtual devices are sized to
-    /// a larger startup ceiling). Windows injects via absolute
-    /// virtual-desktop coordinates, so it uses (left, top, width, height) to
-    /// translate frame-local coordinates onto the desktop. Linux ignores
-    /// left/top (its virtual touchscreen is a fixed-size device that
-    /// gsettings maps directly onto the captured EVDI output, so there is no
-    /// desktop-absolute translation to do) and instead scales incoming
-    /// coordinates from session-resolution space onto its fixed-size virtual
-    /// touchscreen's ABS range.
-    fn set_target_rect(&mut self, _left: i32, _top: i32, _width: u32, _height: u32) {}
-
-    /// Reports the captured output's actual on-screen size, for backends
-    /// where that can differ from the session/stream resolution passed to
-    /// `set_target_rect` — currently only macOS: WindowServer can silently
-    /// substitute a persisted display-mode preference for a virtual
-    /// display's requested mode (e.g. asking for 1280x800 but the display
-    /// coming online at 1024x768), so the desktop rect the OS actually
-    /// gives the display can be smaller/larger than the negotiated stream
-    /// resolution wire coordinates are expressed in. A backend that
-    /// implements this scales incoming wire coordinates by
-    /// `output_size / stream_size` before translating them onto the
-    /// desktop; the default no-op is correct for backends where the two are
-    /// always equal (Linux, Windows).
-    fn set_output_size(&mut self, _width: u32, _height: u32) {}
+    /// Tells the backend the current session's stream resolution. Wire
+    /// touch/mouse coordinates are 0..width/0..height in negotiated stream
+    /// space; the backend scales them onto its fixed-size virtual devices.
+    fn set_stream_size(&mut self, width: u32, height: u32);
 
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;
     fn key_text(&mut self, text: &str) -> anyhow::Result<()>;
@@ -128,6 +86,10 @@ pub trait InputBackend: Send {
     fn key_text_with_modifiers(&mut self, text: &str, modifiers: u8) -> anyhow::Result<()>;
     fn key_raw_hid(&mut self, usage: u8, pressed: bool) -> anyhow::Result<()>;
     fn mouse(&mut self, ev: MouseEvent) -> anyhow::Result<()>;
+    /// Release any mouse buttons still held down.
+    fn release_mouse_buttons(&mut self);
+    /// Release any raw keys still held down.
+    fn release_keys(&mut self);
     fn gamepad_attach(&mut self, id: u8) -> anyhow::Result<()>;
     fn gamepad_detach(&mut self, id: u8);
     fn gamepad_state(&mut self, id: u8, st: &GamepadState) -> anyhow::Result<()>;
@@ -138,9 +100,20 @@ pub trait InputBackend: Send {
 pub enum KeyboardEvent {
     Text(String),
     Special(u8),
-    Combo { mods: u8, text: String },
-    SpecialCombo { mods: u8, code: u8 },
-    Raw { usage: u16, state: i32 },
+    Combo {
+        mods: u8,
+        text: String,
+    },
+    SpecialCombo {
+        mods: u8,
+        code: u8,
+    },
+    Raw {
+        usage: u16,
+        state: i32,
+    },
+    /// Release every key still held down (keyboard detached / session ended).
+    ReleaseAll,
 }
 
 /// Owned handle to a background thread that executes keyboard events.
@@ -191,6 +164,7 @@ fn dispatch_event<B: InputBackend + ?Sized>(backend: &mut B, event: &KeyboardEve
         KeyboardEvent::Raw { usage, state } => {
             let _ = backend.key_raw_hid(*usage as u8, *state != 0);
         }
+        KeyboardEvent::ReleaseAll => backend.release_keys(),
     }
 }
 
@@ -486,6 +460,3 @@ pub fn hid_to_evdev(hid: u16) -> Option<u16> {
         _ => None,
     }
 }
-
-/// Global flag used by `stream_server` to decide whether direct mouse control is active.
-pub static DIRECT_MOUSE_ENABLED: AtomicBool = AtomicBool::new(false);

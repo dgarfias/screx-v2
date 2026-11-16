@@ -53,8 +53,8 @@ final class PairingService {
 
     func pair(host: String, port: UInt16) {
         let deviceId = Self.getOrCreateDeviceId()
-        let candidateKeys = KeychainHelper.loadCandidateKeys(host: host, port: port)
-        log("starting pair(host=\(host), port=\(port)) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) candidateKeys=\(candidateKeys.count)")
+        let hasPairingKeys = KeychainHelper.hasPairingKeys()
+        log("starting pair(host=\(host), port=\(port)) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) hasPairingKeys=\(hasPairingKeys)")
 
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
@@ -69,9 +69,9 @@ final class PairingService {
             switch state {
             case .ready:
                 self.cancelConnectTimeout()
-                if let firstKey = candidateKeys.first {
+                if hasPairingKeys {
                     self.log("tcp ready, trying reconnect HELLO flow")
-                    self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId, candidateKeys: candidateKeys)
+                    self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId)
                 } else {
                     self.log("tcp ready, using first-time PAIR flow")
                     self.sendPairRequest(conn: conn, host: host, port: port, deviceId: deviceId)
@@ -148,9 +148,7 @@ final class PairingService {
         deviceId: Data,
         keyPair: Curve25519.KeyAgreement.PrivateKey
     ) {
-        // Response is either:
-        // SCREX_PIN(10) + server_pubkey(32) = 42 bytes (new pairing)
-        // SCREX_OK(10) + server_pubkey(32) + hmac(32) = 74 bytes (already paired)
+        // Response: SCREX_PIN(10) + server_pubkey(32) = 42 bytes
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
 
@@ -189,45 +187,6 @@ final class PairingService {
                 self.emitResult(.pinRequired { [weak self] pin in
                     self?.sendPinAnswer(conn: conn, host: host, port: port, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
                 })
-            } else if magic == Self.magicOK {
-                // Already paired — daemon recognized us
-                guard data.count >= 10 + Self.pubkeyLen + Self.hmacLen else {
-                    self.emitResult(.error("Invalid OK response"))
-                    return
-                }
-                let serverPubKey = data.subdata(in: 10..<(10 + Self.pubkeyLen))
-                let serverHmac = data.subdata(in: (10 + Self.pubkeyLen)..<(10 + Self.pubkeyLen + Self.hmacLen))
-
-                guard let ecdhSecret = ScrexCrypto.ecdh(privateKey: keyPair, publicKeyBytes: serverPubKey) else {
-                    self.emitResult(.error("ECDH failed"))
-                    return
-                }
-
-                guard let pairingKey = KeychainHelper.loadPairingKey(forHost: host, port: port) else {
-                    self.emitResult(.error("Pairing key missing"))
-                    return
-                }
-
-                var ikm = pairingKey
-                ikm.append(ecdhSecret)
-                let sessionKeyData = ScrexCrypto.hkdfSHA256Bytes(
-                    ikm: ikm,
-                    salt: Data("screx-reconnect-salt".utf8),
-                    info: Data("screx-session".utf8)
-                )
-                let sessionKey = SymmetricKey(data: sessionKeyData)
-                self.log("received reconnect OK, derived session key and validating server HMAC")
-
-                let expectedHmac = ScrexCrypto.hmacSHA256(key: sessionKeyData, data: Data("server-verify".utf8))
-                guard expectedHmac == serverHmac else {
-                    self.emitResult(.rejected(reason: "Server verification failed"))
-                    return
-                }
-
-                self.log("reconnect HELLO flow complete, session established")
-                conn.stateUpdateHandler = nil
-                self.connection = nil
-                self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
             } else {
                 self.emitResult(.error("Unexpected response from daemon"))
             }
@@ -298,23 +257,14 @@ final class PairingService {
                 return
             }
 
-            // New daemons: SCREX_OK(10) + daemon_device_id(16) + session_salt(32) + hmac(32) = 90
-            // Old daemons: SCREX_OK(10) + session_salt(32) + hmac(32) = 74
-            let daemonDeviceId: Data?
-            let sessionSalt: Data
-            let serverHmac: Data
-            if data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen {
-                daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
-                sessionSalt = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
-                serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
-            } else if data.count >= 10 + Self.nonceLen + Self.hmacLen {
-                daemonDeviceId = nil
-                sessionSalt = data.subdata(in: 10..<(10 + Self.nonceLen))
-                serverHmac = data.subdata(in: (10 + Self.nonceLen)..<(10 + Self.nonceLen + Self.hmacLen))
-            } else {
+            // SCREX_OK(10) + daemon_device_id(16) + session_salt(32) + hmac(32) = 90
+            guard data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen else {
                 self.emitResult(.error("Invalid OK response"))
                 return
             }
+            let daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
+            let sessionSalt = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
+            let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
 
             // Derive pairing key
             var ikm = ecdhSecret
@@ -325,12 +275,8 @@ final class PairingService {
                 info: Data("screx-pairing".utf8)
             )
 
-            // Store pairing key by daemon identity (new daemons) or host:port (legacy fallback).
-            if let daemonDeviceId = daemonDeviceId {
-                KeychainHelper.storePairingKey(pairingKey, daemonId: daemonDeviceId)
-            } else {
-                KeychainHelper.storePairingKey(pairingKey, forHost: host, port: port)
-            }
+            // Store the pairing key by daemon identity so IP changes don't break pairing.
+            KeychainHelper.storePairingKey(pairingKey, daemonId: daemonDeviceId)
 
             // Derive session key
             let sessionKeyData = ScrexCrypto.hkdfSHA256Bytes(
@@ -357,10 +303,10 @@ final class PairingService {
 
     // MARK: - Reconnection (SCREX_HELLO flow)
 
-    private func sendHello(conn: NWConnection, host: String, port: UInt16, deviceId: Data, candidateKeys: [Data]) {
+    private func sendHello(conn: NWConnection, host: String, port: UInt16, deviceId: Data) {
         var clientNonce = Data(count: Self.nonceLen)
         _ = clientNonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, Self.nonceLen, $0.baseAddress!) }
-        log("sending HELLO: host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) candidateKeys=\(candidateKeys.count)")
+        log("sending HELLO: host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined())")
 
         var packet = Self.magicHello
         packet.append(deviceId)
@@ -373,11 +319,11 @@ final class PairingService {
                 return
             }
             self.log("HELLO sent (\(packet.count) bytes), waiting for hello response")
-            self.waitForHelloResponse(conn: conn, host: host, port: port, candidateKeys: candidateKeys, clientNonce: clientNonce)
+            self.waitForHelloResponse(conn: conn, host: host, port: port, clientNonce: clientNonce)
         })
     }
 
-    private func waitForHelloResponse(conn: NWConnection, host: String, port: UInt16, candidateKeys: [Data], clientNonce: Data) {
+    private func waitForHelloResponse(conn: NWConnection, host: String, port: UInt16, clientNonce: Data) {
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
 
@@ -398,7 +344,6 @@ final class PairingService {
 
             if data.count >= Self.magicReject.count && data.prefix(Self.magicReject.count) == Self.magicReject {
                 self.log("daemon rejected HELLO — stale key, switching to PAIR flow")
-                KeychainHelper.deletePairingKey(forHost: host, port: port)
                 self.sendPairRequest(conn: conn, host: host, port: port, deviceId: Self.getOrCreateDeviceId())
                 return
             }
@@ -408,55 +353,37 @@ final class PairingService {
                 return
             }
 
-            // New daemons: SCREX_OK(10) + daemon_device_id(16) + server_nonce(32) + hmac(32) = 90
-            // Old daemons: SCREX_OK(10) + server_nonce(32) + hmac(32) = 74
-            let daemonDeviceId: Data?
-            let serverNonce: Data
-            let serverHmac: Data
-            if data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen {
-                daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
-                serverNonce = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
-                serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
-            } else if data.count >= 10 + Self.nonceLen + Self.hmacLen {
-                daemonDeviceId = nil
-                serverNonce = data.subdata(in: 10..<(10 + Self.nonceLen))
-                serverHmac = data.subdata(in: (10 + Self.nonceLen)..<(10 + Self.nonceLen + Self.hmacLen))
-            } else {
+            // SCREX_OK(10) + daemon_device_id(16) + server_nonce(32) + hmac(32) = 90
+            guard data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen else {
                 self.emitResult(.error("Invalid OK response"))
                 return
             }
+            let daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
+            let serverNonce = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
+            let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
 
             var salt = clientNonce
             salt.append(serverNonce)
 
-            // Try every candidate key. This makes reconnect work even when the
-            // daemon's IP address changes, because the correct key is found by
-            // verifying the HMAC rather than by host:port lookup.
-            guard let (matchedKey, sessionKeyData) = candidateKeys.lazy.compactMap({ key -> (Data, Data)? in
+            // The reply names the daemon, so load the key stored for it. No key, or one
+            // that doesn't verify (the daemon was reset), means pairing again.
+            let sessionKeyData = KeychainHelper.loadPairingKey(daemonId: daemonDeviceId).flatMap { key -> Data? in
                 let derived = ScrexCrypto.hkdfSHA256Bytes(
                     ikm: key,
                     salt: salt,
                     info: Data("screx-session".utf8)
                 )
                 let expectedHmac = ScrexCrypto.hmacSHA256(key: derived, data: Data("server-verify".utf8))
-                if expectedHmac == serverHmac {
-                    return (key, derived)
-                }
-                return nil
-            }).first else {
-                self.log("no stored key verified daemon HMAC — re-pairing")
-                KeychainHelper.deletePairingKey(forHost: host, port: port)
+                return expectedHmac == serverHmac ? derived : nil
+            }
+            guard let sessionKeyData else {
+                self.log("no valid stored key for this daemon — re-pairing")
                 self.sendPairRequest(conn: conn, host: host, port: port, deviceId: Self.getOrCreateDeviceId())
                 return
             }
 
             self.log("HELLO response validated, session established")
             let sessionKey = SymmetricKey(data: sessionKeyData)
-
-            // Remember this daemon by identity (new daemons) or host:port (legacy).
-            if let daemonDeviceId = daemonDeviceId {
-                KeychainHelper.storePairingKey(matchedKey, daemonId: daemonDeviceId)
-            }
 
             conn.stateUpdateHandler = nil
             self.connection = nil
@@ -511,35 +438,11 @@ final class PairingService {
 enum KeychainHelper {
     private static let servicePrefix = "com.screx.pairing."
     private static let knownDaemonIdsKey = "screx_known_daemon_ids"
-    private static func serviceName(host: String, port: UInt16) -> String {
-        servicePrefix + formatEndpointInput(host: host, port: port)
-    }
     private static func daemonServiceName(daemonId: Data) -> String {
         servicePrefix + "daemon." + daemonId.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Legacy host-based storage. Kept for migration; new keys are stored by daemon ID.
-    static func storePairingKey(_ key: Data, forHost host: String, port: UInt16) {
-        let service = serviceName(host: host, port: port)
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-        ]
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status != errSecSuccess {
-            print("[keychain] legacy store failed: \(status)")
-        }
-    }
-
-    /// Preferred storage by daemon identity so IP changes do not break pairing.
+    /// Keys are stored by daemon identity so IP changes do not break pairing.
     static func storePairingKey(_ key: Data, daemonId: Data) {
         let service = daemonServiceName(daemonId: daemonId)
         let deleteQuery: [String: Any] = [
@@ -562,24 +465,6 @@ enum KeychainHelper {
         }
     }
 
-    static func loadPairingKey(forHost host: String, port: UInt16) -> Data? {
-        let services = [serviceName(host: host, port: port), servicePrefix + host]
-        for service in services {
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-                kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
-            ]
-            var result: AnyObject?
-            let status = SecItemCopyMatching(query as CFDictionary, &result)
-            if status == errSecSuccess {
-                return result as? Data
-            }
-        }
-        return nil
-    }
-
     static func loadPairingKey(daemonId: Data) -> Data? {
         let service = daemonServiceName(daemonId: daemonId)
         let query: [String: Any] = [
@@ -596,29 +481,9 @@ enum KeychainHelper {
         return nil
     }
 
-    /// Returns every stored key that might unlock a HELLO response from this daemon.
-    /// Includes legacy host-based keys and all daemon-identity keys.
-    static func loadCandidateKeys(host: String, port: UInt16) -> [Data] {
-        var keys: [Data] = []
-        if let legacy = loadPairingKey(forHost: host, port: port) {
-            keys.append(legacy)
-        }
-        for id in knownDaemonIds() {
-            if let idData = hexDecode(id), let key = loadPairingKey(daemonId: idData) {
-                keys.append(key)
-            }
-        }
-        return keys
-    }
-
-    static func deletePairingKey(forHost host: String, port: UInt16) {
-        for service in [serviceName(host: host, port: port), servicePrefix + host] {
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: service,
-            ]
-            SecItemDelete(query as CFDictionary)
-        }
+    /// Whether this device has paired with any daemon (decides HELLO vs PAIR).
+    static func hasPairingKeys() -> Bool {
+        !knownDaemonIds().isEmpty
     }
 
     static func deletePairingKey(daemonId: Data) {
@@ -651,17 +516,5 @@ enum KeychainHelper {
         var ids = knownDaemonIds()
         ids.removeAll { $0 == hex }
         UserDefaults.standard.set(ids, forKey: knownDaemonIdsKey)
-    }
-
-    private static func hexDecode(_ hex: String) -> Data? {
-        guard hex.count % 2 == 0 else { return nil }
-        var data = Data(capacity: hex.count / 2)
-        for i in stride(from: 0, to: hex.count, by: 2) {
-            let start = hex.index(hex.startIndex, offsetBy: i)
-            let end = hex.index(start, offsetBy: 2)
-            guard let byte = UInt8(hex[start..<end], radix: 16) else { return nil }
-            data.append(byte)
-        }
-        return data
     }
 }

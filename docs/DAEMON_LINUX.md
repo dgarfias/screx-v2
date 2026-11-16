@@ -1,7 +1,7 @@
 # Linux Daemon
 
 Creates a virtual monitor via EVDI, captures and encodes it, and streams it over the network to the
-[iPad app](CLIENT_IPAD.md) or [desktop client](CLIENT_DESKTOP.md), or over USB to the iPad app. Also injects
+[iPad app](CLIENT_IPAD.md). Also injects
 touch/keyboard/mouse/controller input and exposes virtual microphone, webcam, and speaker devices.
 Source lives in `daemon/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol.
 
@@ -21,8 +21,6 @@ sudo pacman -S --needed \
   libpulse \
   pipewire-pulse \
   pipewire \
-  libimobiledevice \
-  libusbmuxd \
   v4l2loopback-dkms \
   systemd
 
@@ -45,8 +43,6 @@ sudo apt-get install -y \
   pulseaudio-utils \
   pipewire-pulse \
   pipewire-bin \
-  libimobiledevice-utils \
-  libusbmuxd-tools \
   v4l2loopback-dkms \
   evdi-dkms libevdi1 \
   udev
@@ -78,11 +74,8 @@ sudo ./target/release/screx -w 1920 -H 1080 -f 60 -e vaapi -c h264
 # H.265 with NVENC, 10 Mbps bitrate ceiling
 sudo ./target/release/screx --codec h265 --backend nvenc --max-bitrate 10M
 
-# Network only
-sudo ./target/release/screx --network-only
-
-# USB only
-sudo ./target/release/screx --usb-only
+# No audio forwarding and no controllers
+sudo ./target/release/screx --no-speaker --no-gamepad
 
 # Try the virtual webcam without exclusive caps
 sudo ./target/release/screx --no-camera-exclusive-caps
@@ -104,32 +97,49 @@ sudo ./target/release/screx unpair --all
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
 | `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--no-intra-refresh` to keep legacy periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
-| `--max-bitrate-usb` | `100M` | Maximum encoder bitrate USB-connected clients may request (ceiling; USB links have far more headroom than typical networks) |
 | `-p, --port` | `9000` | UDP/TCP streaming port |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
 | `-v, --verbose` | off | Detailed diagnostic logs |
-| `--network-only` | off | Disable USB transport |
-| `--usb-only` | off | Disable network pairing and UDP streaming |
 | `--no-camera-exclusive-caps` | off | Disable v4l2loopback exclusive capture caps for better app compatibility |
+| `--no-speaker` | off | Disable forwarding host audio to the iPad |
+| `--no-mic` | off | Disable the virtual microphone fed by the iPad mic |
+| `--no-camera` | off | Disable the virtual webcam fed by the iPad camera |
+| `--no-gamepad` | off | Disable game controller passthrough |
 
-`--max-width`/`--max-height`/`--max-framerate`/`--max-bitrate`/`--max-bitrate-usb` are per-daemon
+`--max-width`/`--max-height`/`--max-framerate`/`--max-bitrate` are per-daemon
 ceilings and defaults, not fixed values every session gets: connecting clients may propose any
 resolution, framerate, codec, or bitrate at or below these bounds during connection, and the
-daemon starts that session with the negotiated values. `--max-bitrate-usb` applies only to
-sessions negotiated over the USB transport; all other ceilings are shared across transports. See
+daemon starts that session with the negotiated values. See
 [ARCHITECTURE.md](ARCHITECTURE.md#capability-negotiation) for the negotiation protocol.
+
+`--no-speaker`/`--no-mic`/`--no-camera`/`--no-gamepad` switch off optional features. The daemon
+reports them as unavailable to the iPad, which greys out the matching controls, and ignores any
+request to turn them on.
 
 ## Use
 
 1. Start the daemon.
-2. Open Screx on the iPad or launch the desktop client.
-3. Choose one transport:
-   - **Network**: enter the host/IP and tap `Connect`
-   - **USB** (iPad only): tap `Connect via USB`
-4. If it is the first network connection, enter the PIN shown by the daemon.
-5. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already
+2. Open Screx on the iPad, enter the host/IP, and tap `Connect`.
+3. If it is the first connection, enter the PIN shown by the daemon.
+4. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already
    active.
+
+### Black screen on GNOME 51 (mutter 51)
+
+mutter 51 picks a 10-bit (AR30) framebuffer for EVDI outputs, which EVDI can't display, so the
+iPad stays black. The journal shows `Page flip failed: drmModeAtomicCommit: Invalid argument` from
+gnome-shell, and with DRM debug enabled the kernel logs `invalid pixel format AR30`. See
+[mutter#5100](https://gitlab.gnome.org/GNOME/mutter/-/work_items/5100) and
+[evdi#597](https://github.com/DisplayLink/evdi/issues/597). Until a fixed mutter ships, work around
+it and reboot:
+
+```bash
+echo 'MUTTER_DEBUG_USE_FBOS=0' | sudo tee /etc/environment.d/90-mutter-evdi.conf
+```
+
+If that isn't enough, `MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE=primary-gpu-cpu` is the other reported
+workaround.
 
 The virtual webcam uses `v4l2loopback`; some applications behave differently depending on
 `exclusive_caps` mode — see the

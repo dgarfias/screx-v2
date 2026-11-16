@@ -1,4 +1,0 @@
-[env]
-# Work around audiopus_sys bundled opus CMakeLists.txt requiring CMake < 3.5
-# which newer CMake versions reject by default.
-CMAKE_POLICY_VERSION_MINIMUM = "3.5"

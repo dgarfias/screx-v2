@@ -175,9 +175,7 @@ final class AudioPlayer {
         }
     }
 
-    // Speaker audio arrives as Opus (48 kHz stereo, 10 ms packets) when the daemon
-    // honors `StreamSettings.featureOpusAudio`, and as raw s16le PCM otherwise (older
-    // daemons, USB). The decoder is created lazily; if it fails to initialize, Opus
+    // Speaker audio always arrives as Opus (48 kHz stereo, 10 ms packets). The decoder is created lazily; if it fails to initialize, Opus
     // packets are dropped rather than crashing. The decode buffer is reused for every
     // packet; 5760 frames (120 ms) is far more than the 480-frame packets expected.
     private static let pcmFormat = AVAudioFormat(
@@ -218,15 +216,6 @@ final class AudioPlayer {
         let byteCount = Int(opusDecodeBuffer.frameLength) * 2 * 2 // frames * channels * bytes
         channelData[0].withMemoryRebound(to: UInt8.self, capacity: byteCount) { ptr in
             enqueuePCM(ptr, count: byteCount, timestampMs: timestampMs)
-        }
-    }
-
-    /// Feeds raw interleaved s16le stereo PCM into the jitter buffer.
-    func enqueueAudio(_ data: Data, timestampMs: UInt32 = 0) {
-        guard isOutputEnabled else { return }
-        data.withUnsafeBytes { raw in
-            guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            enqueuePCM(ptr, count: raw.count, timestampMs: timestampMs)
         }
     }
 

@@ -20,76 +20,24 @@ pub trait CameraBackend: Send {
 /// `CamWriter::new` fail later) — this is just "the underlying driver is
 /// present," not a guarantee.
 pub fn probe_camera_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // Mirrors the modprobe check in `platform::linux::v4l2::ensure_v4l2loopback`
-        // without actually loading the module: available if it's already
-        // loaded, or if modprobe could load it on demand.
-        if std::path::Path::new("/sys/module/v4l2loopback").exists() {
-            return true;
-        }
-        std::process::Command::new("modinfo")
-            .arg("v4l2loopback")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
+    // Mirrors the modprobe check in `platform::linux::v4l2::ensure_v4l2loopback`
+    // without actually loading the module: available if it's already
+    // loaded, or if modprobe could load it on demand.
+    if std::path::Path::new("/sys/module/v4l2loopback").exists() {
+        return true;
     }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::vcam::probe_camera_available()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Virtual camera forwarding is deferred on macOS.
-        false
-    }
+    std::process::Command::new("modinfo")
+        .arg("v4l2loopback")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Create a platform camera backend.
 pub fn create_camera_backend(exclusive_caps: bool) -> Box<dyn CameraBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::platform::linux::v4l2::V4l2Camera::new(
-            exclusive_caps,
-        ))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = exclusive_caps;
-        Box::new(crate::platform::windows::vcam::WindowsCamera::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = exclusive_caps;
-        Box::new(MacCameraStub::new())
-    }
-}
-
-/// Stub camera backend — real virtual-camera forwarding on macOS is
-/// deferred (no design work has landed yet); `probe_camera_available()`
-/// honestly reports `false` so this backend should never actually be
-/// invoked in practice.
-#[cfg(target_os = "macos")]
-struct MacCameraStub;
-
-#[cfg(target_os = "macos")]
-impl MacCameraStub {
-    fn new() -> Self {
-        Self
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl CameraBackend for MacCameraStub {
-    fn start(&mut self, _w: u32, _h: u32, _fps: u32) -> Result<()> {
-        anyhow::bail!("camera forwarding not implemented on macOS yet")
-    }
-
-    fn write_jpeg(&mut self, _jpeg: &[u8]) -> Result<()> {
-        anyhow::bail!("camera forwarding not implemented on macOS yet")
-    }
-
-    fn stop(&mut self) {}
+    Box::new(crate::platform::linux::v4l2::V4l2Camera::new(
+        exclusive_caps,
+    ))
 }
 
 /// Convenience writer used by `stream_server`.

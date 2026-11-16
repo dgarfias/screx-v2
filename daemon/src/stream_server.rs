@@ -19,64 +19,18 @@ use crate::platform::net::{
     build_pktinfo_cmsg, send_to_from, sendmmsg_batch, udp_source_for_local_ip, PktinfoCmsg,
     UdpSource,
 };
-use crate::usb::TcpFramedSender;
 
 const CHUNK_PAYLOAD: usize = 1400;
 const HEADER_LEN: usize = 18;
-const REGISTER_MAGIC: &[u8] = b"SCREX";
-const PLI_MAGIC: &[u8] = b"PLI";
-const TOUCH_MAGIC: &[u8] = b"TOUCH";
-const KEY_MAGIC: &[u8] = b"KEY";
-const CAM_MAGIC: &[u8] = b"CAM";
-const MIC_MAGIC: &[u8] = b"MIC";
-const MOUSE_MAGIC: &[u8] = b"MOUSE";
-const RAWKEY_MAGIC: &[u8] = b"RAWKEY";
-const PERIPH_MAGIC: &[u8] = b"PERIPH";
-const GPAD_MAGIC: &[u8] = b"GPAD";
-const SPEAKER_MAGIC: &[u8] = b"SPKR";
-const MICCFG_MAGIC: &[u8] = b"MICCFG";
-const CAMCFG_MAGIC: &[u8] = b"CAMCFG";
-const STNG_MAGIC: &[u8] = b"STNG";
+use crate::protocol;
 
-// Capability-negotiation wire format (daemon -> client `CAPS`, client ->
-// daemon `STNG`). See docs/ARCHITECTURE.md "Capability Negotiation" for the
-// canonical spec both clients implement independently.
-const CAPS_MAGIC: &[u8] = b"CAPS";
-const CAPS_VERSION: u8 = 1;
-const CAPS_TAG_CAMERA: u8 = 0x01;
-const CAPS_TAG_MICROPHONE: u8 = 0x02;
-const CAPS_TAG_SPEAKER: u8 = 0x03;
-const CAPS_TAG_GAMEPAD: u8 = 0x04;
-const CAPS_TAG_CODECS: u8 = 0x05;
-const CAPS_TAG_MAX_RESOLUTION: u8 = 0x06;
-const CAPS_TAG_MAX_FRAMERATE: u8 = 0x07;
-const CAPS_TAG_BITRATE_RANGE: u8 = 0x08;
-const CAPS_ENTRY_COUNT: u8 = 8;
-
-const STNG_TAG_RESOLUTION: u8 = 0x01;
-const STNG_TAG_FRAMERATE: u8 = 0x02;
-const STNG_TAG_CODEC: u8 = 0x03;
-const STNG_TAG_BITRATE: u8 = 0x04;
-/// Bitmask of optional client features (`u8`). Older daemons skip it as an
-/// unknown tag; older clients never send it, so every bit defaults to off.
-const STNG_TAG_CLIENT_FEATURES: u8 = 0x05;
-/// Client can reassemble video frames whose FEC is split into several
-/// Reed-Solomon blocks (frames over 255 data+parity shards; see
-/// `fec_block_count`). Without it such frames are sent with no parity.
-pub const CLIENT_FEATURE_MULTIBLOCK_FEC: u8 = 0x01;
-/// Client decodes Opus speaker audio (audio packets with
-/// `AUDIO_CODEC_OPUS` in the header's codec byte). Without it the network
-/// path sends raw s16le PCM, as before. USB audio is always PCM.
-pub const CLIENT_FEATURE_OPUS_AUDIO: u8 = 0x02;
-
-/// Validation/clamping bounds for client-proposed `STNG` settings (see the
-/// plan's "Validation/clamping bounds" section). The bitrate floor is fixed,
-/// not operator-configurable; the ceilings come from the daemon's
-/// `--max-*` CLI flags, stored on `SharedState`.
-const STNG_RESOLUTION_FLOOR_W: u32 = 640;
-const STNG_RESOLUTION_FLOOR_H: u32 = 360;
-const STNG_FPS_FLOOR: u32 = 15;
-const STNG_BITRATE_FLOOR_BPS: u32 = 500_000;
+/// Validation/clamping bounds for client-proposed `SETTINGS`. The bitrate
+/// floor is fixed, not operator-configurable; the ceilings come from the
+/// daemon's `--max-*` CLI flags, stored on `SharedState`.
+const SETTINGS_RESOLUTION_FLOOR_W: u32 = 640;
+const SETTINGS_RESOLUTION_FLOOR_H: u32 = 360;
+const SETTINGS_FPS_FLOOR: u32 = 15;
+const SETTINGS_BITRATE_FLOOR_BPS: u32 = 500_000;
 
 const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -165,9 +119,8 @@ impl AdaptiveStreamState {
         self.last_adjust_at = Instant::now();
     }
 
-    /// Rebaseline the adaptive bitrate loop around a new base (e.g. a
-    /// client-negotiated `STNG` bitrate, or the CLI default restored when a
-    /// session ends). The adaptive loop in `adjust()` throttles up/down from
+    /// Rebaseline the adaptive bitrate loop around a new base (the
+    /// client-negotiated `SETTINGS` bitrate). The adaptive loop in `adjust()` throttles up/down from
     /// `base_bitrate_bps`, so changing it without also resetting the current
     /// value would leave the stream ramping from the old client's bitrate.
     fn set_base(&mut self, base_bitrate_bps: u32) {
@@ -255,16 +208,6 @@ impl AdaptiveStreamState {
     }
 }
 
-/// Active pairing attempt to surface in the macOS menu-bar UI. Set while a
-/// client is running the PIN flow; cleared when it resolves. Only read by
-/// the macOS status bar; a harmless no-op field elsewhere.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct PairingPrompt {
-    pub ip: String,
-    pub pin: String,
-}
-
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
     pub force_idr: AtomicBool,
@@ -272,8 +215,6 @@ pub struct SharedState {
     pub capture_start: Arc<AtomicBool>,
     pub capture_start_signal: Arc<(Mutex<bool>, Condvar)>,
     pub capture_stop_flag: Arc<AtomicBool>,
-    pub usb_sender: Mutex<Option<TcpFramedSender>>,
-    pub usb_active: AtomicBool,
     pub input_backend: Arc<Mutex<dyn InputBackend>>,
     pub keyboard_worker: Mutex<Option<KeyboardWorker>>,
     pub audio_notify: Arc<Condvar>,
@@ -285,14 +226,7 @@ pub struct SharedState {
     pub on_client_connected: Mutex<Option<LifecycleCallback>>,
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
-    /// Cumulative wire bytes sent to / received from the client. Used only
-    /// for the macOS menu bar's live throughput display (see
-    /// `platform::macos::statusbar`); harmless no-op bookkeeping elsewhere.
-    pub bytes_tx: AtomicU64,
-    pub bytes_rx: AtomicU64,
     pub audio_output_enabled: AtomicBool,
-    /// `CLIENT_FEATURE_*` bits of the current session's client.
-    pub client_features: std::sync::atomic::AtomicU8,
     pub audio_module_id: Mutex<u32>,
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
@@ -303,31 +237,23 @@ pub struct SharedState {
     pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
     /// Local source IP/interface pinned for daemon→client UDP (from TCP handshake)
     pub udp_source: Mutex<Option<UdpSource>>,
-    /// Ceilings advertised in `CAPS` and enforced when clamping `STNG`
+    /// Ceilings advertised in `CAPS` and enforced when clamping `SETTINGS`
     /// requests — 1:1 with the daemon operator's `--max-width`/
     /// `--max-height`/`--max-framerate`/`--max-bitrate` CLI flags. These
-    /// double as the session defaults used when a client never sends
-    /// `STNG` (or a tag within it), matching today's "one fixed config for
-    /// every session" behavior for old clients.
+    /// double as the session defaults for any field `SETTINGS` leaves at "default".
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
     pub bitrate_max_bps: u32,
-    /// USB-transport bitrate ceiling (`--max-bitrate-usb`), advertised in
-    /// `CAPS` and enforced when clamping `STNG` instead of `bitrate_max_bps`
-    /// for sessions negotiated over USB — USB links have far more headroom
-    /// than typical networks (see `ControlTransport`).
-    pub bitrate_max_usb_bps: u32,
     pub encoder_backend: EncoderBackend,
-    /// Settings parsed out of a client's `STNG` control message, consumed
+    /// Operator-disabled optional features.
+    pub features: FeatureToggles,
+    /// Settings parsed out of a client's `SETTINGS` control message, consumed
     /// once by the capture thread at the start of the next session (see
-    /// `main.rs`'s capture loop). `None` means "no STNG received yet for
-    /// the pending session" — the capture thread waits briefly on the
-    /// condvar before falling back to the CLI/max defaults.
+    /// `main.rs`'s capture loop). `None` means "no SETTINGS received yet for
+    /// the pending session" — the capture thread waits on the condvar until
+    /// one arrives.
     pub pending_settings: Arc<(Mutex<Option<RequestedSettings>>, Condvar)>,
-    /// Active pairing attempt to surface in the macOS menu-bar UI. See
-    /// `PairingPrompt`.
-    pub pairing_prompt: Mutex<Option<PairingPrompt>>,
 }
 
 impl SharedState {
@@ -339,8 +265,8 @@ impl SharedState {
         max_height: u32,
         max_fps: u32,
         bitrate_max_bps: u32,
-        bitrate_max_usb_bps: u32,
         encoder_backend: EncoderBackend,
+        features: FeatureToggles,
     ) -> Self {
         Self {
             client_addr: Mutex::new(None),
@@ -349,8 +275,6 @@ impl SharedState {
             capture_start: Arc::new(AtomicBool::new(false)),
             capture_start_signal: Arc::new((Mutex::new(false), Condvar::new())),
             capture_stop_flag: Arc::new(AtomicBool::new(false)),
-            usb_sender: Mutex::new(None),
-            usb_active: AtomicBool::new(false),
             input_backend,
             keyboard_worker: Mutex::new(None),
             audio_notify: Arc::new(Condvar::new()),
@@ -365,10 +289,7 @@ impl SharedState {
             on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
-            bytes_tx: AtomicU64::new(0),
-            bytes_rx: AtomicU64::new(0),
             audio_output_enabled: AtomicBool::new(false),
-            client_features: std::sync::atomic::AtomicU8::new(0),
             audio_module_id: Mutex::new(0),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
@@ -381,11 +302,10 @@ impl SharedState {
             max_height,
             max_fps,
             bitrate_max_bps,
-            bitrate_max_usb_bps,
             encoder_backend,
+            features,
             pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
             start_time: Instant::now(),
-            pairing_prompt: Mutex::new(None),
         }
     }
 
@@ -430,10 +350,8 @@ impl SharedState {
         self.adaptive_stream.lock().unwrap().reset();
     }
 
-    /// Rebaseline the adaptive bitrate loop, e.g. to a client-negotiated
-    /// `STNG` bitrate at session start, or back to the CLI default when a
-    /// session ends so the next (possibly old-client) session isn't stuck
-    /// on the previous client's negotiated bitrate.
+    /// Rebaseline the adaptive bitrate loop to the client-negotiated `SETTINGS`
+    /// bitrate at session start.
     pub fn set_base_bitrate(&self, base_bitrate_bps: u32) {
         self.adaptive_stream
             .lock()
@@ -443,37 +361,21 @@ impl SharedState {
 }
 
 // ---------------------------------------------------------------------------
-// Capability negotiation — `CAPS` (daemon -> client) and `STNG` (client ->
-// daemon). See docs/ARCHITECTURE.md "Capability Negotiation" for the wire
-// format; both clients implement it independently from scratch.
+// Capability negotiation — `CAPS` (daemon -> client) and `SETTINGS` (client
+// -> daemon). See docs/ARCHITECTURE.md "Capability Negotiation" for the
+// fixed wire layouts.
 // ---------------------------------------------------------------------------
 
-/// Which control channel a `CAPS`/`STNG` exchange is happening over. USB has
-/// far more bitrate headroom than a typical network link (even the slowest
-/// iPads' USB 2.0 connection is ~480 Mbps line rate), so the daemon
-/// advertises — and enforces — a different bitrate ceiling per transport.
-/// Resolution/fps ceilings are shared across both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlTransport {
-    Network,
-    Usb,
-}
-
-impl ControlTransport {
-    /// The bitrate ceiling that applies to this transport, per `SharedState`.
-    fn bitrate_ceiling(self, shared: &SharedState) -> u32 {
-        match self {
-            ControlTransport::Network => shared.bitrate_max_bps,
-            ControlTransport::Usb => shared.bitrate_max_usb_bps,
-        }
-    }
-
-    fn log_label(self) -> &'static str {
-        match self {
-            ControlTransport::Network => "network",
-            ControlTransport::Usb => "usb",
-        }
-    }
+/// Optional host features the operator can switch off from the command line
+/// (`--no-speaker`, `--no-mic`, `--no-camera`, `--no-gamepad`). A disabled
+/// feature is advertised as unavailable in `CAPS` and its enable requests are
+/// ignored.
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureToggles {
+    pub speaker: bool,
+    pub microphone: bool,
+    pub camera: bool,
+    pub gamepad: bool,
 }
 
 /// What this daemon can actually do right now, not just "compiled in."
@@ -495,10 +397,11 @@ pub struct DaemonCapabilities {
     pub bitrate_max_bps: u32,
 }
 
-/// Client-proposed stream settings parsed out of `STNG`, already clamped
+/// Client-proposed stream settings parsed out of `SETTINGS`, already clamped
 /// against `DaemonCapabilities`. `None` fields mean "use the daemon's own
-/// default for that field" — either because the client omitted the tag, or
-/// because what it asked for wasn't usable (unsupported codec, etc).
+/// default for that field" — either because the client sent the "default"
+/// value (0, or `CODEC_DEFAULT`), or because what it asked for wasn't usable
+/// (unsupported codec).
 #[derive(Debug, Clone, Default)]
 pub struct RequestedSettings {
     pub width: Option<u32>,
@@ -506,8 +409,6 @@ pub struct RequestedSettings {
     pub fps: Option<u32>,
     pub codec: Option<VideoCodec>,
     pub bitrate_bps: Option<u32>,
-    /// `CLIENT_FEATURE_*` bits the client advertised (0 when omitted).
-    pub client_features: u8,
 }
 
 /// Cheap, real probes (not just "compiled in") for what this daemon can
@@ -519,85 +420,63 @@ pub fn probe_capabilities(
     max_fps: u32,
     bitrate_max_bps: u32,
     encoder_backend: EncoderBackend,
+    features: FeatureToggles,
 ) -> DaemonCapabilities {
     DaemonCapabilities {
-        camera: crate::camera::probe_camera_available(),
-        microphone: crate::audio::probe_mic_available(),
-        speaker: crate::audio::probe_speaker_available(),
-        gamepad: crate::input::probe_gamepad_max_controllers(),
+        camera: features.camera && crate::camera::probe_camera_available(),
+        microphone: features.microphone && crate::audio::probe_mic_available(),
+        speaker: features.speaker && crate::audio::probe_speaker_available(),
+        gamepad: if features.gamepad {
+            crate::input::probe_gamepad_max_controllers()
+        } else {
+            None
+        },
         codecs: crate::encode::probe_available_codecs(encoder_backend),
         max_width,
         max_height,
         max_fps,
-        bitrate_min_bps: STNG_BITRATE_FLOOR_BPS,
+        bitrate_min_bps: SETTINGS_BITRATE_FLOOR_BPS,
         bitrate_max_bps,
     }
 }
 
-fn push_tlv_entry(msg: &mut Vec<u8>, tag: u8, value: &[u8]) {
-    msg.push(tag);
-    msg.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    msg.extend_from_slice(value);
-}
-
-/// Build a `CAPS` control message frame body advertising what this daemon
-/// can do right now. Re-probes capabilities on every call (see
-/// `probe_capabilities`) rather than reading a cached value, so it's cheap
-/// by design — callers (pairing.rs, usb.rs) call this once per connection,
-/// passing the `ControlTransport` the connection arrived on so the
-/// advertised BITRATE_RANGE matches the ceiling that will actually be
-/// enforced for that transport.
-pub fn build_caps_message(shared: &SharedState, transport: ControlTransport) -> Vec<u8> {
+/// Build the `CAPS` control message advertising what this daemon can do
+/// right now, plus its host name. Re-probes capabilities on every call (see
+/// `probe_capabilities`) rather than reading a cached value — pairing.rs
+/// calls this once per connection.
+///
+/// Layout after the type byte: `camera(u8) mic(u8) speaker(u8)
+/// gamepad_max(u8, 0 = unsupported) codecs(u8 bitmask, bit n = codec id n)
+/// max_width(u16) max_height(u16) max_fps(u8) bitrate_min(u32)
+/// bitrate_max(u32) hostname(UTF-8, rest of message)`. Integers are big-endian.
+pub fn build_caps_message(shared: &SharedState) -> Vec<u8> {
     let caps = probe_capabilities(
         shared.max_width,
         shared.max_height,
         shared.max_fps,
-        transport.bitrate_ceiling(shared),
+        shared.bitrate_max_bps,
         shared.encoder_backend,
+        shared.features,
     );
+    let hostname = crate::platform::shim::hostname().unwrap_or_default();
 
-    let mut msg = Vec::with_capacity(64);
-    msg.extend_from_slice(CAPS_MAGIC);
-    msg.push(CAPS_VERSION);
-    msg.push(CAPS_ENTRY_COUNT);
-
-    push_tlv_entry(&mut msg, CAPS_TAG_CAMERA, &[caps.camera as u8]);
-    push_tlv_entry(&mut msg, CAPS_TAG_MICROPHONE, &[caps.microphone as u8]);
-    push_tlv_entry(&mut msg, CAPS_TAG_SPEAKER, &[caps.speaker as u8]);
-
-    let (gamepad_available, gamepad_max) = match caps.gamepad {
-        Some(max) => (1u8, max),
-        None => (0u8, 0u8),
-    };
-    push_tlv_entry(
-        &mut msg,
-        CAPS_TAG_GAMEPAD,
-        &[gamepad_available, gamepad_max],
+    let mut msg = Vec::with_capacity(22 + hostname.len());
+    msg.push(protocol::daemon::CAPS);
+    msg.push(caps.camera as u8);
+    msg.push(caps.microphone as u8);
+    msg.push(caps.speaker as u8);
+    msg.push(caps.gamepad.unwrap_or(0));
+    msg.push(
+        caps.codecs
+            .iter()
+            .fold(0u8, |mask, codec| mask | (1 << codec.transport_id())),
     );
-
-    let mut codecs_value = Vec::with_capacity(1 + caps.codecs.len());
-    codecs_value.push(caps.codecs.len() as u8);
-    codecs_value.extend(caps.codecs.iter().map(|c| c.transport_id()));
-    push_tlv_entry(&mut msg, CAPS_TAG_CODECS, &codecs_value);
-
-    let mut resolution_value = Vec::with_capacity(4);
-    resolution_value
-        .extend_from_slice(&(caps.max_width.min(u32::from(u16::MAX)) as u16).to_be_bytes());
-    resolution_value
-        .extend_from_slice(&(caps.max_height.min(u32::from(u16::MAX)) as u16).to_be_bytes());
-    push_tlv_entry(&mut msg, CAPS_TAG_MAX_RESOLUTION, &resolution_value);
-
-    push_tlv_entry(
-        &mut msg,
-        CAPS_TAG_MAX_FRAMERATE,
-        &[caps.max_fps.min(255) as u8],
-    );
-
-    let mut bitrate_value = Vec::with_capacity(8);
-    bitrate_value.extend_from_slice(&caps.bitrate_min_bps.to_be_bytes());
-    bitrate_value.extend_from_slice(&caps.bitrate_max_bps.to_be_bytes());
-    push_tlv_entry(&mut msg, CAPS_TAG_BITRATE_RANGE, &bitrate_value);
-
+    msg.extend_from_slice(&(caps.max_width.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+    msg.extend_from_slice(&(caps.max_height.min(u32::from(u16::MAX)) as u16).to_be_bytes());
+    msg.push(caps.max_fps.min(255) as u8);
+    msg.extend_from_slice(&caps.bitrate_min_bps.to_be_bytes());
+    msg.extend_from_slice(&caps.bitrate_max_bps.to_be_bytes());
+    msg.extend_from_slice(hostname.as_bytes());
     msg
 }
 
@@ -608,94 +487,62 @@ fn clamp_u32(value: u32, floor: u32, ceiling: u32) -> u32 {
     value.clamp(floor, ceiling.max(floor))
 }
 
-/// Parse an `STNG` message body (everything after the `"STNG"` magic:
-/// version + entry_count + entries) into a `RequestedSettings`. Unknown tags
-/// — or a known tag with an unexpected length — are skipped via their
-/// declared length rather than treated as a parse failure, so a future v2
-/// tag doesn't break this parser. Returns `None` only if the body is too
-/// short to contain a header at all (malformed message, not just unknown
-/// tags).
-fn parse_stng_body(body: &[u8]) -> Option<RequestedSettings> {
-    if body.len() < 2 {
+/// Length of a `SETTINGS` body (after the type byte).
+const SETTINGS_BODY_LEN: usize = 10;
+
+/// Parse a `SETTINGS` body: `width(u16) height(u16) fps(u8) codec(u8)
+/// bitrate(u32)`, big-endian. A zero (or `CODEC_DEFAULT` for the codec)
+/// means "use the daemon's default" for that field.
+fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
+    if body.len() != SETTINGS_BODY_LEN {
         return None;
     }
-    let _version = body[0];
-    let entry_count = body[1] as usize;
-    let mut offset = 2usize;
-    let mut settings = RequestedSettings::default();
-
-    for _ in 0..entry_count {
-        if offset + 3 > body.len() {
-            break; // truncated entry header; stop parsing what we have
-        }
-        let tag = body[offset];
-        let len = u16::from_be_bytes([body[offset + 1], body[offset + 2]]) as usize;
-        offset += 3;
-        if offset + len > body.len() {
-            break; // truncated value; stop parsing what we have
-        }
-        let value = &body[offset..offset + len];
-        offset += len;
-
-        match tag {
-            STNG_TAG_RESOLUTION if len == 4 => {
-                settings.width = Some(u16::from_be_bytes([value[0], value[1]]) as u32);
-                settings.height = Some(u16::from_be_bytes([value[2], value[3]]) as u32);
+    let width = u32::from(u16::from_be_bytes([body[0], body[1]]));
+    let height = u32::from(u16::from_be_bytes([body[2], body[3]]));
+    let fps = u32::from(body[4]);
+    let bitrate = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+    let nonzero = |v: u32| (v != 0).then_some(v);
+    let (width, height) = if width != 0 && height != 0 {
+        (Some(width), Some(height))
+    } else {
+        (None, None)
+    };
+    Some(RequestedSettings {
+        width,
+        height,
+        fps: nonzero(fps),
+        codec: match body[5] {
+            protocol::CODEC_H264 => Some(VideoCodec::H264),
+            protocol::CODEC_H265 => Some(VideoCodec::H265),
+            protocol::CODEC_DEFAULT => None,
+            other => {
+                eprintln!("[control] unknown codec id 0x{other:02x} in SETTINGS, using default");
+                None
             }
-            STNG_TAG_FRAMERATE if len == 1 => {
-                settings.fps = Some(value[0] as u32);
-            }
-            STNG_TAG_CODEC if len == 1 => {
-                settings.codec = match value[0] {
-                    0x00 => Some(VideoCodec::H264),
-                    0x01 => Some(VideoCodec::H265),
-                    _ => None, // invalid codec id -> daemon default
-                };
-            }
-            STNG_TAG_BITRATE if len == 4 => {
-                settings.bitrate_bps =
-                    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
-            }
-            STNG_TAG_CLIENT_FEATURES if len == 1 => {
-                settings.client_features = value[0];
-            }
-            // Unknown tag, or a known tag with an unexpected length: `offset`
-            // has already advanced past the value, so parsing just continues
-            // with the next entry.
-            _ => {}
-        }
-    }
-
-    Some(settings)
+        },
+        bitrate_bps: nonzero(bitrate),
+    })
 }
 
 /// Clamp everything the client asked for against `DaemonCapabilities` —
 /// never trust the client's numbers directly. Logs a warning whenever a
 /// clamp changes what was requested, so operators can debug "why did my
-/// requested 4K60 get downgraded." `transport` selects which bitrate
-/// ceiling applies (USB sessions get the higher `--max-bitrate-usb`
-/// ceiling); resolution/fps/codec ceilings are shared across transports.
-fn clamp_requested_settings(
-    shared: &SharedState,
-    mut req: RequestedSettings,
-    transport: ControlTransport,
-) -> RequestedSettings {
+/// requested 4K60 get downgraded."
+fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) -> RequestedSettings {
     if let (Some(w), Some(h)) = (req.width, req.height) {
-        let clamped_w = clamp_u32(w, STNG_RESOLUTION_FLOOR_W, shared.max_width);
-        let clamped_h = clamp_u32(h, STNG_RESOLUTION_FLOOR_H, shared.max_height);
+        let clamped_w = clamp_u32(w, SETTINGS_RESOLUTION_FLOOR_W, shared.max_width);
+        let clamped_h = clamp_u32(h, SETTINGS_RESOLUTION_FLOOR_H, shared.max_height);
         if clamped_w != w || clamped_h != h {
-            println!(
-                "[control] STNG requested resolution {w}x{h} clamped to {clamped_w}x{clamped_h}"
-            );
+            println!("[control] requested resolution {w}x{h} clamped to {clamped_w}x{clamped_h}");
         }
         req.width = Some(clamped_w);
         req.height = Some(clamped_h);
     }
 
     if let Some(fps) = req.fps {
-        let clamped = clamp_u32(fps, STNG_FPS_FLOOR, shared.max_fps);
+        let clamped = clamp_u32(fps, SETTINGS_FPS_FLOOR, shared.max_fps);
         if clamped != fps {
-            println!("[control] STNG requested framerate {fps} clamped to {clamped}");
+            println!("[control] requested framerate {fps} clamped to {clamped}");
         }
         req.fps = Some(clamped);
     }
@@ -704,19 +551,18 @@ fn clamp_requested_settings(
         let available = crate::encode::probe_available_codecs(shared.encoder_backend);
         if !available.contains(&codec) {
             println!(
-                "[control] STNG requested codec {codec:?} not available on this daemon, falling back to default"
+                "[control] requested codec {codec:?} not available on this daemon, falling back to default"
             );
             req.codec = None;
         }
     }
 
     if let Some(bitrate) = req.bitrate_bps {
-        let ceiling = transport.bitrate_ceiling(shared);
-        let clamped = clamp_u32(bitrate, STNG_BITRATE_FLOOR_BPS, ceiling);
+        let ceiling = shared.bitrate_max_bps;
+        let clamped = clamp_u32(bitrate, SETTINGS_BITRATE_FLOOR_BPS, ceiling);
         if clamped != bitrate {
             println!(
-                "[control] STNG requested bitrate {bitrate} clamped to {clamped} ({} ceiling {ceiling})",
-                transport.log_label()
+                "[control] requested bitrate {bitrate} clamped to {clamped} (ceiling {ceiling})"
             );
         }
         req.bitrate_bps = Some(clamped);
@@ -725,25 +571,21 @@ fn clamp_requested_settings(
     req
 }
 
-/// Handle an inbound `STNG` control message: parse, clamp, and hand off to
+/// Handle an inbound `SETTINGS` control message: parse, clamp, and hand off to
 /// the capture thread via the `pending_settings` condvar for the *next*
-/// session it starts (see main.rs's capture loop). `transport` selects the
-/// bitrate ceiling used for clamping — see `clamp_requested_settings`.
-fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8], transport: ControlTransport) {
-    let Some(parsed) = parse_stng_body(body) else {
+/// session it starts (see main.rs's capture loop).
+fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
+    let Some(parsed) = parse_settings_body(body) else {
         eprintln!(
-            "[control] malformed STNG message ({} bytes), ignoring",
+            "[control] malformed SETTINGS message ({} bytes), ignoring",
             body.len()
         );
         return;
     };
 
-    let clamped = clamp_requested_settings(shared, parsed, transport);
-    println!("[control] received STNG, will apply to next session: {clamped:?}");
+    let clamped = clamp_requested_settings(shared, parsed);
+    println!("[control] received SETTINGS, will apply to next session: {clamped:?}");
 
-    shared
-        .client_features
-        .store(clamped.client_features, Ordering::SeqCst);
     let (lock, cvar) = &*shared.pending_settings;
     *lock.lock().unwrap() = Some(clamped);
     cvar.notify_all();
@@ -794,10 +636,6 @@ pub fn disable_camera(shared: &Arc<SharedState>) {
 
 pub const FLAG_IDR: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
-/// Codec byte of audio packets: raw 48 kHz stereo s16le PCM.
-pub const AUDIO_CODEC_PCM: u8 = 0x00;
-/// Codec byte of audio packets: one 10 ms 48 kHz stereo Opus packet.
-pub const AUDIO_CODEC_OPUS: u8 = 0x02;
 
 /// 18-byte packet header (14 original + 4 byte timestamp_ms)
 /// Byte 11 = codec_id: 0x00=H.264, 0x01=H.265
@@ -832,7 +670,7 @@ const PERIPH_KEYBOARD: u8 = 0x02;
 const PERIPH_ATTACHED: u8 = 0x01;
 const PERIPH_DETACHED: u8 = 0x00;
 
-pub fn handle_periph_packet_data(_shared: &Arc<SharedState>, data: &[u8]) {
+pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
     if data.len() < 2 {
         return;
     }
@@ -841,139 +679,130 @@ pub fn handle_periph_packet_data(_shared: &Arc<SharedState>, data: &[u8]) {
 
     match (device_type, state) {
         (PERIPH_MOUSE, PERIPH_ATTACHED) => {
-            crate::input::DIRECT_MOUSE_ENABLED.store(true, Ordering::SeqCst);
             println!("[periph] physical mouse attached");
         }
         (PERIPH_MOUSE, PERIPH_DETACHED) => {
-            crate::input::DIRECT_MOUSE_ENABLED.store(false, Ordering::SeqCst);
-            println!("[periph] physical mouse detached");
+            // A mouse unplugged mid-drag never sends its button-up; release
+            // every button so nothing stays held on the host.
+            if let Ok(mut backend) = shared.input_backend.lock() {
+                backend.release_mouse_buttons();
+            }
+            println!("[periph] physical mouse detached, buttons released");
         }
         (PERIPH_KEYBOARD, PERIPH_ATTACHED) => {
             println!("[periph] physical keyboard attached");
         }
         (PERIPH_KEYBOARD, PERIPH_DETACHED) => {
-            println!("[periph] physical keyboard detached");
+            // Same for keys: go through the keyboard worker so the release
+            // lands after any key events still queued ahead of it.
+            if let Some(ref worker) = *shared.keyboard_worker.lock().unwrap() {
+                worker.send(crate::input::KeyboardEvent::ReleaseAll);
+            }
+            println!("[periph] physical keyboard detached, keys released");
         }
         _ => {}
     }
 }
 
-pub fn handle_control_message_data(
-    shared: &Arc<SharedState>,
-    ctrl: &[u8],
-    transport: ControlTransport,
-) {
-    if ctrl.starts_with(PLI_MAGIC) {
-        shared.note_pli();
-        shared.force_idr.store(true, Ordering::Relaxed);
-        if let Some(ref refresh) = *shared.force_refresh_handle.lock().unwrap() {
-            refresh.store(true, Ordering::Relaxed);
-        }
+/// Dispatch one decrypted client -> daemon control message (`type(u8) +
+/// body`). `PING` and `DISCONNECT` are handled by the control loop in
+/// pairing.rs before this is called.
+pub fn handle_control_message_data(shared: &Arc<SharedState>, msg: &[u8]) {
+    let Some((&msg_type, body)) = msg.split_first() else {
         return;
-    }
+    };
+    use protocol::client;
 
-    if ctrl.starts_with(STNG_MAGIC) {
-        apply_requested_settings(shared, &ctrl[STNG_MAGIC.len()..], transport);
-        return;
-    }
-
-    if ctrl.starts_with(SPEAKER_MAGIC) && ctrl.len() == SPEAKER_MAGIC.len() + 1 {
-        let enabled = ctrl[SPEAKER_MAGIC.len()] != 0;
-        if enabled {
-            println!("[audio] client enabled speaker passthrough");
-            // Create the sink BEFORE setting the flag so the audio capture
-            // thread never sees "enabled" without a ready PulseAudio sink.
-            ensure_virtual_sink(shared);
-            shared.audio_output_enabled.store(true, Ordering::SeqCst);
-        } else {
-            println!("[audio] client disabled speaker passthrough");
-            // Clear the flag BEFORE removing the sink so the capture thread
-            // stops trying to read from the monitor source.
-            shared.audio_output_enabled.store(false, Ordering::SeqCst);
-            disable_virtual_sink(shared);
-        }
-        shared.audio_notify.notify_all();
-        return;
-    }
-
-    if ctrl.starts_with(MICCFG_MAGIC) && ctrl.len() == MICCFG_MAGIC.len() + 1 {
-        let enabled = ctrl[MICCFG_MAGIC.len()] != 0;
-        if enabled {
-            enable_virtual_mic(shared);
-        } else {
-            disable_virtual_mic(shared);
-        }
-        return;
-    }
-
-    if ctrl.starts_with(CAMCFG_MAGIC) && ctrl.len() == CAMCFG_MAGIC.len() + 6 {
-        let off = CAMCFG_MAGIC.len();
-        let width = u16::from_be_bytes([ctrl[off], ctrl[off + 1]]) as u32;
-        let height = u16::from_be_bytes([ctrl[off + 2], ctrl[off + 3]]) as u32;
-        let fps = u16::from_be_bytes([ctrl[off + 4], ctrl[off + 5]]) as u32;
-        if width > 0 && height > 0 && fps > 0 {
-            enable_camera(shared, CameraConfig { width, height, fps });
-        } else {
-            disable_camera(shared);
-        }
-        return;
-    }
-
-    if ctrl.starts_with(TOUCH_MAGIC) && ctrl.len() > TOUCH_MAGIC.len() {
-        let touch_data = &ctrl[TOUCH_MAGIC.len()..];
-        let contacts = parse_touch_packet(touch_data);
-        if let Ok(mut backend) = shared.input_backend.lock() {
-            let _ = backend.touch(&contacts);
-        }
-        return;
-    }
-
-    if ctrl.starts_with(KEY_MAGIC) && ctrl.len() > KEY_MAGIC.len() {
-        let key_data = &ctrl[KEY_MAGIC.len()..];
-        if let Some(event) = parse_key_event(key_data) {
-            let worker = shared.keyboard_worker.lock().unwrap();
-            if let Some(ref w) = *worker {
-                w.send(event);
-            } else {
-                eprintln!("[control] KEY packet dropped: no input backend available");
+    match msg_type {
+        client::PLI => {
+            shared.note_pli();
+            shared.force_idr.store(true, Ordering::Relaxed);
+            if let Some(ref refresh) = *shared.force_refresh_handle.lock().unwrap() {
+                refresh.store(true, Ordering::Relaxed);
             }
         }
-        return;
-    }
-
-    if ctrl.starts_with(MOUSE_MAGIC) && ctrl.len() > MOUSE_MAGIC.len() {
-        let mouse_data = &ctrl[MOUSE_MAGIC.len()..];
-        if let Some(ev) = parse_mouse_packet(mouse_data) {
-            crate::input::DIRECT_MOUSE_ENABLED.store(true, Ordering::SeqCst);
+        client::SETTINGS => apply_requested_settings(shared, body),
+        client::SPEAKER if body.len() == 1 => {
+            let enabled = body[0] != 0;
+            if enabled && !shared.features.speaker {
+                println!("[audio] ignoring speaker enable: disabled with --no-speaker");
+            } else if enabled {
+                println!("[audio] client enabled speaker passthrough");
+                // Create the sink BEFORE setting the flag so the audio capture
+                // thread never sees "enabled" without a ready PulseAudio sink.
+                ensure_virtual_sink(shared);
+                shared.audio_output_enabled.store(true, Ordering::SeqCst);
+            } else {
+                println!("[audio] client disabled speaker passthrough");
+                // Clear the flag BEFORE removing the sink so the capture thread
+                // stops trying to read from the monitor source.
+                shared.audio_output_enabled.store(false, Ordering::SeqCst);
+                disable_virtual_sink(shared);
+            }
+            shared.audio_notify.notify_all();
+        }
+        client::MIC if body.len() == 1 => {
+            let enabled = body[0] != 0;
+            if enabled && !shared.features.microphone {
+                println!("[mic] ignoring microphone enable: disabled with --no-mic");
+            } else if enabled {
+                enable_virtual_mic(shared);
+            } else {
+                disable_virtual_mic(shared);
+            }
+        }
+        client::CAMERA if body.len() == 6 => {
+            let width = u32::from(u16::from_be_bytes([body[0], body[1]]));
+            let height = u32::from(u16::from_be_bytes([body[2], body[3]]));
+            let fps = u32::from(u16::from_be_bytes([body[4], body[5]]));
+            let enabled = width > 0 && height > 0 && fps > 0;
+            if enabled && !shared.features.camera {
+                println!("[camera] ignoring camera enable: disabled with --no-camera");
+            } else if enabled {
+                enable_camera(shared, CameraConfig { width, height, fps });
+            } else {
+                disable_camera(shared);
+            }
+        }
+        client::TOUCH => {
+            let contacts = parse_touch_packet(body);
             if let Ok(mut backend) = shared.input_backend.lock() {
-                let _ = backend.mouse(ev);
+                let _ = backend.touch(&contacts);
             }
         }
-        return;
-    }
-
-    if ctrl.starts_with(RAWKEY_MAGIC) && ctrl.len() > RAWKEY_MAGIC.len() {
-        let rk_data = &ctrl[RAWKEY_MAGIC.len()..];
-        if let Some(event) = parse_rawkey_event(rk_data) {
-            let worker = shared.keyboard_worker.lock().unwrap();
-            if let Some(ref w) = *worker {
-                w.send(event);
+        client::KEY | client::RAWKEY => {
+            let event = if msg_type == client::KEY {
+                parse_key_event(body)
             } else {
-                eprintln!("[control] RAWKEY packet dropped: no input backend available");
+                parse_rawkey_event(body)
+            };
+            if let Some(event) = event {
+                if let Some(ref worker) = *shared.keyboard_worker.lock().unwrap() {
+                    worker.send(event);
+                } else {
+                    eprintln!("[control] key event dropped: no input backend available");
+                }
             }
         }
-        return;
-    }
-
-    if ctrl.starts_with(PERIPH_MAGIC) && ctrl.len() > PERIPH_MAGIC.len() {
-        let periph_data = &ctrl[PERIPH_MAGIC.len()..];
-        handle_periph_packet_data(shared, periph_data);
-        return;
-    }
-
-    if ctrl.starts_with(GPAD_MAGIC) && ctrl.len() > GPAD_MAGIC.len() {
-        let gamepad_data = &ctrl[GPAD_MAGIC.len()..];
-        handle_gamepad_packet_data(shared, gamepad_data);
+        client::MOUSE => {
+            if let Some(ev) = parse_mouse_packet(body) {
+                if let Ok(mut backend) = shared.input_backend.lock() {
+                    let _ = backend.mouse(ev);
+                }
+            }
+        }
+        client::PERIPH => handle_periph_packet_data(shared, body),
+        client::GAMEPAD => {
+            if shared.features.gamepad {
+                handle_gamepad_packet_data(shared, body);
+            }
+        }
+        _ => {
+            crate::vlog!(
+                "[control] ignoring unknown or malformed message type 0x{msg_type:02x} ({} bytes)",
+                body.len()
+            );
+        }
     }
 }
 
@@ -1125,9 +954,7 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
         .store(false, Ordering::SeqCst);
     shared.network_session_busy.store(false, Ordering::SeqCst);
 
-    if !shared.usb_active.load(Ordering::Relaxed)
-        && shared.has_active_client.swap(false, Ordering::SeqCst)
-    {
+    if shared.has_active_client.swap(false, Ordering::SeqCst) {
         shared.audio_notify.notify_all();
         shared.reset_stream_tuning();
         let shared_lc = Arc::clone(shared);
@@ -1234,7 +1061,6 @@ pub fn run_client_manager(
 
         match socket.recv_from(&mut recv_buf) {
             Ok((len, addr)) => {
-                shared.bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
                 recv_count = recv_count.wrapping_add(1);
                 if should_log_debug(recv_count) {
                     let registered_client = *shared.client_addr.lock().unwrap();
@@ -1415,30 +1241,31 @@ pub fn run_client_manager(
                 }
 
                 let pt_len = plaintext.len();
-
-                if pt_len >= REGISTER_MAGIC.len()
-                    && &plaintext[..REGISTER_MAGIC.len()] == REGISTER_MAGIC
-                {
-                    crate::vlog!("[client] keepalive/register received: from={addr} seq={seq_num} plaintext_len={pt_len}");
-                }
-
-                if pt_len > CAM_MAGIC.len() && &plaintext[..CAM_MAGIC.len()] == CAM_MAGIC {
-                    let cam_data = &plaintext[CAM_MAGIC.len()..];
-                    if let Some(jpeg) = cam_reassembler.feed(cam_data) {
-                        let mut cam = shared.cam_writer.lock().unwrap();
-                        if let Some(ref mut cw) = *cam {
-                            cw.write_frame(&jpeg);
+                match plaintext.split_first() {
+                    Some((&protocol::udp::KEEPALIVE, _)) => {
+                        crate::vlog!("[client] keepalive received: from={addr} seq={seq_num} plaintext_len={pt_len}");
+                    }
+                    Some((&protocol::udp::CAMERA, cam_data)) => {
+                        if let Some(jpeg) = cam_reassembler.feed(cam_data) {
+                            let mut cam = shared.cam_writer.lock().unwrap();
+                            if let Some(ref mut cw) = *cam {
+                                cw.write_frame(&jpeg);
+                            }
                         }
                     }
-                }
-
-                if pt_len > MIC_MAGIC.len() + 4 && &plaintext[..MIC_MAGIC.len()] == MIC_MAGIC {
-                    let opus_data = &plaintext[MIC_MAGIC.len() + 4..];
-                    let mut mic = shared.mic_writer.lock().unwrap();
-                    if let Some(ref mut mw) = *mic {
-                        if let Err(e) = mw.write_opus_packet(opus_data) {
-                            eprintln!("[mic] write error: {e}");
+                    Some((&protocol::udp::MIC, body)) if body.len() > 4 => {
+                        let mic_seq = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                        let mut mic = shared.mic_writer.lock().unwrap();
+                        if let Some(ref mut mw) = *mic {
+                            if let Err(e) = mw.write_opus_packet(mic_seq, &body[4..]) {
+                                eprintln!("[mic] write error: {e}");
+                            }
                         }
+                    }
+                    _ => {
+                        crate::vlog!(
+                            "[client] ignoring unknown udp payload from {addr} ({pt_len} bytes)"
+                        );
                     }
                 }
             }
@@ -1548,8 +1375,6 @@ pub struct UdpSender {
     log_sent_aus: bool,
     /// Wire time one frame is allotted, used to pace large frames.
     frame_interval: Duration,
-    /// Whether the session's client advertised `CLIENT_FEATURE_MULTIBLOCK_FEC`.
-    multiblock_fec: bool,
 }
 
 impl UdpSender {
@@ -1569,7 +1394,6 @@ impl UdpSender {
             cmsg_buf: None,
             log_sent_aus: std::env::var_os("SCREX_LOG_SENT_AUS").is_some(),
             frame_interval: Duration::from_micros(1_000_000 / 60),
-            multiblock_fec: false,
         }
     }
 
@@ -1582,17 +1406,14 @@ impl UdpSender {
         self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
-    /// Per-session parameters: the negotiated framerate (for pacing) and the
-    /// client's `CLIENT_FEATURE_*` bits.
-    pub fn set_session(&mut self, fps: u32, client_features: u8) {
+    /// Per-session parameters: the negotiated framerate (for pacing).
+    pub fn set_session(&mut self, fps: u32) {
         self.frame_interval = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
-        self.multiblock_fec = client_features & CLIENT_FEATURE_MULTIBLOCK_FEC != 0;
     }
 
     /// How many parity shards to actually send for a frame. Frames that fit
-    /// in one Reed-Solomon block keep the legacy behavior. Larger frames
-    /// (typically keyframes) are split into several blocks when the client
-    /// supports it; otherwise they go out without parity, as before.
+    /// in one Reed-Solomon block use a single block. Larger frames
+    /// (typically keyframes) are split into several blocks.
     fn parity_shards_for(&self, data_count: usize, wanted_parity: usize) -> usize {
         if wanted_parity == 0 {
             return 0;
@@ -1600,9 +1421,6 @@ impl UdpSender {
         let single_block = wanted_parity.min(MAX_FEC_SHARDS);
         if data_count + single_block <= MAX_SHARDS_PER_FEC_BLOCK {
             return single_block;
-        }
-        if !self.multiblock_fec {
-            return 0;
         }
         // Every block needs at least one parity shard; raising the parity
         // count can raise the block count, so settle on a fixed point.
@@ -1796,7 +1614,8 @@ impl UdpSender {
             SENDMMSG_BATCH_SIZE
         };
         let pacing_start = Instant::now();
-        let pacing_window = self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
+        let pacing_window =
+            self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
 
         while sent < total_shards {
             if paced && sent > 0 {
@@ -1863,7 +1682,10 @@ pub fn fec_block_count(data_shards: usize, parity_shards: usize) -> usize {
 pub fn fec_block_range(total: usize, blocks: usize, index: usize) -> (usize, usize) {
     let base = total / blocks;
     let extra = total % blocks;
-    (index * base + index.min(extra), base + usize::from(index < extra))
+    (
+        index * base + index.min(extra),
+        base + usize::from(index < extra),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,21 +1726,19 @@ impl AudioSender {
         self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
-    /// Send one audio payload (`codec_id` is `AUDIO_CODEC_PCM` or
-    /// `AUDIO_CODEC_OPUS`).
+    /// Send one Opus speaker-audio packet.
     pub fn send_audio(
         &mut self,
-        pcm: &[u8],
+        opus: &[u8],
         client_addr: SocketAddr,
         timestamp_ms: u32,
-        codec_id: u8,
     ) -> Result<()> {
-        let data_count = (pcm.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+        let data_count = (opus.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
         for i in 0..data_count {
             let start = i * CHUNK_PAYLOAD;
-            let end = (start + CHUNK_PAYLOAD).min(pcm.len());
-            let chunk = &pcm[start..end];
+            let end = (start + CHUNK_PAYLOAD).min(opus.len());
+            let chunk = &opus[start..end];
             let payload_len = (end - start) as u16;
 
             let header = build_header(
@@ -1927,7 +1747,7 @@ impl AudioSender {
                 data_count as u16,
                 0,
                 FLAG_AUDIO,
-                codec_id,
+                0, // codec byte is unused for audio (always Opus)
                 payload_len,
                 timestamp_ms,
             );
@@ -1996,7 +1816,10 @@ mod fec_layout_tests {
                     assert_eq!(ds, data_total);
                     assert_eq!(ps, parity_total);
                     assert!(dl >= 1 && pl >= 1, "data={data} parity={parity} block={b}");
-                    assert!(dl + pl <= MAX_SHARDS_PER_FEC_BLOCK, "data={data} parity={parity}");
+                    assert!(
+                        dl + pl <= MAX_SHARDS_PER_FEC_BLOCK,
+                        "data={data} parity={parity}"
+                    );
                     data_total += dl;
                     parity_total += pl;
                 }
@@ -2012,7 +1835,13 @@ mod fec_layout_tests {
         let blocks = fec_block_count(data, parity);
         assert!(blocks > 1);
         let mut shards: Vec<Vec<u8>> = (0..data + parity)
-            .map(|i| if i < data { (0..64).map(|j| (i * 31 + j) as u8).collect() } else { vec![0; 64] })
+            .map(|i| {
+                if i < data {
+                    (0..64).map(|j| (i * 31 + j) as u8).collect()
+                } else {
+                    vec![0; 64]
+                }
+            })
             .collect();
         let original = shards.clone();
         let (data_shards, parity_shards) = shards.split_at_mut(data);
@@ -2033,8 +1862,47 @@ mod fec_layout_tests {
                 .map(|i| Some(shards[i].clone()))
                 .collect();
             block[dl / 2] = None;
-            ReedSolomon::new(dl, pl).unwrap().reconstruct(&mut block).unwrap();
+            ReedSolomon::new(dl, pl)
+                .unwrap()
+                .reconstruct(&mut block)
+                .unwrap();
             assert_eq!(block[dl / 2].as_ref().unwrap(), &original[ds + dl / 2]);
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn parses_explicit_settings() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1920u16.to_be_bytes());
+        body.extend_from_slice(&1080u16.to_be_bytes());
+        body.push(60);
+        body.push(protocol::CODEC_H265);
+        body.extend_from_slice(&15_000_000u32.to_be_bytes());
+        let s = parse_settings_body(&body).unwrap();
+        assert_eq!((s.width, s.height), (Some(1920), Some(1080)));
+        assert_eq!(s.fps, Some(60));
+        assert_eq!(s.codec, Some(VideoCodec::H265));
+        assert_eq!(s.bitrate_bps, Some(15_000_000));
+    }
+
+    #[test]
+    fn zero_and_codec_default_mean_daemon_default() {
+        let mut body = vec![0u8; SETTINGS_BODY_LEN];
+        body[5] = protocol::CODEC_DEFAULT;
+        let s = parse_settings_body(&body).unwrap();
+        assert_eq!((s.width, s.height, s.fps), (None, None, None));
+        assert_eq!(s.codec, None);
+        assert_eq!(s.bitrate_bps, None);
+    }
+
+    #[test]
+    fn rejects_wrong_length() {
+        assert!(parse_settings_body(&[0u8; SETTINGS_BODY_LEN - 1]).is_none());
+        assert!(parse_settings_body(&[0u8; SETTINGS_BODY_LEN + 1]).is_none());
     }
 }

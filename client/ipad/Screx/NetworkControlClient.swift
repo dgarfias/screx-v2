@@ -8,16 +8,9 @@ final class NetworkControlClient {
     private let sessionKey: SymmetricKey
     private let queue = DispatchQueue(label: "screx.netcontrol", qos: .userInteractive)
     private let debugId = String(UUID().uuidString.prefix(6))
-    private static let disconnectMagic = Data("DISCONNECT".utf8)
-    private static let speakerMagic = Data("SPKR".utf8)
-    private static let micCfgMagic = Data("MICCFG".utf8)
-    private static let cameraCfgMagic = Data("CAMCFG".utf8)
-    private static let hostnameMagic = Data("HOST".utf8)
-    private static let capsMagic = Data("CAPS".utf8)
-    private static let pingMagic = Data("PING".utf8)
     private static let maxControlFrame = 65536
 
-    /// Latency diagnostics: a `PING` round trip every second on the control
+    /// Latency diagnostics: a `PING`/`PONG` round trip every second on the control
     /// channel, averaged into an on-screen RTT + jitter reading.
     private static let pingInterval: TimeInterval = 1.0
     private static let maxLatencySamples = 8
@@ -33,7 +26,6 @@ final class NetworkControlClient {
 
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
-    var onHostname: ((String) -> Void)?
     var onCapabilities: ((DaemonCapabilities) -> Void)?
     /// (rttMs, jitterMs) of the control-channel latency probe.
     var onLatency: ((Double, Double) -> Void)?
@@ -66,9 +58,8 @@ final class NetworkControlClient {
         receiveLoop()
     }
 
-    /// Unidirectional, encrypt-and-send latency probe. The daemon echoes the
-    /// payload back on the same control channel; `handleInboundPayload`
-    /// times the round trip.
+    /// Latency probe. The daemon answers each `PING` with a `PONG` on the same
+    /// control channel; `handleInboundPayload` times the round trip.
     private func startPingLoop() {
         pingTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -84,7 +75,7 @@ final class NetworkControlClient {
         queue.async { [weak self] in
             guard let self, !self.isClosed else { return }
             self.pendingPingSentAt = CACurrentMediaTime()
-            self.sendFrame(Self.pingMagic, label: "ping")
+            self.sendFrame(Data([ScrexMessage.Client.ping]), label: "ping")
         }
     }
 
@@ -103,7 +94,7 @@ final class NetworkControlClient {
     func disconnectGracefully() {
         queue.async { [weak self] in
             guard let self, !self.isClosed else { return }
-            guard let frame = self.makeFrame(Self.disconnectMagic, label: "disconnect") else {
+            guard let frame = self.makeFrame(Data([ScrexMessage.Client.disconnect]), label: "disconnect") else {
                 self.log("graceful disconnect frame build failed, cancelling")
                 self.isClosed = true
                 self.pingTimer?.cancel()
@@ -225,7 +216,10 @@ final class NetworkControlClient {
     }
 
     private func handleInboundPayload(_ payload: Data) {
-        if payload == Self.pingMagic {
+        guard let type = payload.first else { return }
+        let body = payload.dropFirst()
+        switch type {
+        case ScrexMessage.Daemon.pong:
             queue.async { [weak self] in
                 guard let self, let sentAt = self.pendingPingSentAt else { return }
                 self.pendingPingSentAt = nil
@@ -239,19 +233,14 @@ final class NetworkControlClient {
                 let jitterMs = deltaSum / Double(max(1, self.latencySamples.count - 1))
                 self.onLatency?(rttMs, jitterMs)
             }
-        } else if payload.starts(with: Self.hostnameMagic) {
-            let hostData = payload.dropFirst(Self.hostnameMagic.count)
-            let hostname = String(decoding: hostData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !hostname.isEmpty else { return }
-            onHostname?(hostname)
-        } else if payload.starts(with: Self.capsMagic) {
-            guard let capabilities = DaemonCapabilities.parse(payload) else {
+        case ScrexMessage.Daemon.caps:
+            guard let capabilities = DaemonCapabilities.parse(Data(body)) else {
                 log("failed to parse CAPS payload: \(payload.count) bytes")
                 return
             }
             onCapabilities?(capabilities)
-        } else {
-            log("unexpected inbound tcp control payload: \(payload.count) bytes")
+        default:
+            log("unexpected inbound tcp control message type 0x\(String(type, radix: 16)) (\(payload.count) bytes)")
         }
     }
 
@@ -299,72 +288,62 @@ final class NetworkControlClient {
         }
     }
 
+    /// Sends one `type(u8) + body` control message.
+    private func send(_ type: UInt8, _ body: Data = Data(), label: String) {
+        var payload = Data([type])
+        payload.append(body)
+        sendFrame(payload, label: label)
+    }
+
     func sendPli() {
-        sendFrame(Data("PLI".utf8), label: "PLI")
+        send(ScrexMessage.Client.pli, label: "PLI")
     }
 
     func sendSpeakerState(isEnabled: Bool) {
-        var payload = Self.speakerMagic
-        payload.append(isEnabled ? 1 : 0)
-        sendFrame(payload, label: isEnabled ? "speaker-on" : "speaker-off")
+        send(ScrexMessage.Client.speaker, Data([isEnabled ? 1 : 0]), label: isEnabled ? "speaker-on" : "speaker-off")
     }
 
     /// Tells the daemon to create or destroy the virtual microphone device.
     func sendMicState(isEnabled: Bool) {
-        var payload = Self.micCfgMagic
-        payload.append(isEnabled ? 1 : 0)
-        sendFrame(payload, label: isEnabled ? "mic-on" : "mic-off")
+        send(ScrexMessage.Client.mic, Data([isEnabled ? 1 : 0]), label: isEnabled ? "mic-on" : "mic-off")
     }
 
     /// Sends the camera configuration (width, height, fps) to the daemon so it
-    /// can create or reconfigure the virtual webcam device to match.
+    /// can create or reconfigure the virtual webcam device to match. All zero = off.
     func sendCameraConfig(width: UInt16, height: UInt16, fps: UInt16) {
-        var payload = Self.cameraCfgMagic
-        withUnsafeBytes(of: width.bigEndian) { payload.append(contentsOf: $0) }
-        withUnsafeBytes(of: height.bigEndian) { payload.append(contentsOf: $0) }
-        withUnsafeBytes(of: fps.bigEndian) { payload.append(contentsOf: $0) }
-        sendFrame(payload, label: "camcfg-\(width)x\(height)@\(fps)")
+        var body = Data()
+        withUnsafeBytes(of: width.bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: height.bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: fps.bigEndian) { body.append(contentsOf: $0) }
+        send(ScrexMessage.Client.camera, body, label: "camera-\(width)x\(height)@\(fps)")
     }
 
     func sendTouch(_ contactData: Data) {
-        var payload = Data("TOUCH".utf8)
-        payload.append(contactData)
-        sendFrame(payload, label: "touch")
+        send(ScrexMessage.Client.touch, contactData, label: "touch")
     }
 
     func sendKey(_ keyData: Data) {
-        var payload = Data("KEY".utf8)
-        payload.append(keyData)
-        sendFrame(payload, label: "key")
+        send(ScrexMessage.Client.key, keyData, label: "key")
     }
 
     func sendMouse(_ mouseData: Data) {
-        var payload = Data("MOUSE".utf8)
-        payload.append(mouseData)
-        sendFrame(payload, label: "mouse")
+        send(ScrexMessage.Client.mouse, mouseData, label: "mouse")
     }
 
     func sendRawKey(_ keyData: Data) {
-        var payload = Data("RAWKEY".utf8)
-        payload.append(keyData)
-        sendFrame(payload, label: "rawkey")
+        send(ScrexMessage.Client.rawKey, keyData, label: "rawkey")
     }
 
     func sendPeripheral(_ periphData: Data) {
-        var payload = Data("PERIPH".utf8)
-        payload.append(periphData)
-        sendFrame(payload, label: "periph")
+        send(ScrexMessage.Client.peripheral, periphData, label: "periph")
     }
 
     func sendGamepad(_ gamepadData: Data) {
-        var payload = Data("GPAD".utf8)
-        payload.append(gamepadData)
-        sendFrame(payload, label: "gpad")
+        send(ScrexMessage.Client.gamepad, gamepadData, label: "gamepad")
     }
 
-    /// Sends client-proposed stream settings (resolution/fps/codec/bitrate) to the
-    /// daemon in response to a `CAPS` message, per the capability-negotiation protocol.
+    /// Sends the stream settings to the daemon in reply to `CAPS`.
     func sendStreamSettings(_ settings: StreamSettings) {
-        sendFrame(settings.encode(), label: "stng")
+        send(ScrexMessage.Client.settings, settings.encode(), label: "settings")
     }
 }

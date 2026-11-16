@@ -15,6 +15,10 @@ pub const SAMPLES_PER_CHUNK: usize = (SAMPLE_RATE / 1000 * CHUNK_DURATION_MS) as
 pub const BYTES_PER_CHUNK: usize = SAMPLES_PER_CHUNK * CHANNELS as usize * 2;
 pub const MIC_RATE: u32 = 48000;
 const MIC_MAX_FRAME: usize = 5760;
+/// Longest run of lost mic packets that is filled with Opus packet-loss
+/// concealment. Longer gaps (a stall, or the client restarting its counter)
+/// are not worth synthesizing; decoding just resumes.
+const MIC_MAX_CONCEALED_PACKETS: u32 = 5;
 /// How far the audio sample clock may drift from the wall clock before it is
 /// re-anchored (see `run_audio_capture`).
 const AUDIO_CLOCK_REANCHOR_MS: u32 = 200;
@@ -32,9 +36,12 @@ struct SpeakerOpus {
 
 impl SpeakerOpus {
     fn new() -> Result<Self> {
-        let mut encoder =
-            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, opus::Application::Audio)
-                .map_err(|e| anyhow::anyhow!("opus encoder init: {e:?}"))?;
+        let mut encoder = opus::Encoder::new(
+            SAMPLE_RATE,
+            opus::Channels::Stereo,
+            opus::Application::Audio,
+        )
+        .map_err(|e| anyhow::anyhow!("opus encoder init: {e:?}"))?;
         encoder
             .set_bitrate(opus::Bitrate::Bits(OPUS_SPEAKER_BITRATE))
             .map_err(|e| anyhow::anyhow!("opus set_bitrate: {e:?}"))?;
@@ -78,74 +85,25 @@ pub trait MicSink: Send {
 
 /// Create the platform audio backend.
 pub fn create_audio_backend() -> Box<dyn AudioBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(crate::platform::linux::pulse::PulseAudioBackend::new())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Box::new(crate::platform::windows::wasapi::WasapiBackend::new())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(crate::platform::macos::audio::MacAudioBackend::new())
-    }
+    Box::new(crate::platform::linux::pulse::PulseAudioBackend::new())
 }
 
 /// Cheap capability probe: is virtual-microphone forwarding likely to work
 /// right now? Linux: PipeWire/PulseAudio mic support is always available
-/// when the daemon can run at all. Windows: requires the VB-CABLE driver.
+/// when the daemon can run at all.
 pub fn probe_mic_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        true
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::probe_mic_available()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Mic forwarding is deferred — needs a third-party virtual audio
-        // driver on macOS (no built-in equivalent to PulseAudio null-sinks).
-        false
-    }
+    true
 }
 
 /// Cheap capability probe: is speaker/system-audio forwarding likely to
-/// work right now? Linux: always available (PulseAudio null-sink). Windows:
-/// requires the Steam Streaming Speakers endpoint.
+/// work right now? Always available (PulseAudio null-sink).
 pub fn probe_speaker_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        true
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::probe_speaker_available()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // ScreenCaptureKit system-audio capture (M3) — verified end-to-end
-        // via the `macos_audio_smoke` test in platform/macos/audio.rs.
-        true
-    }
+    true
 }
 
 /// Remove any leftover audio state from a previous crash.
 pub fn cleanup_stale_modules() {
-    #[cfg(target_os = "linux")]
-    {
-        crate::platform::linux::pulse::cleanup_stale_modules();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::wasapi::cleanup_stale_audio_endpoints();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Nothing to clean up yet.
-    }
+    crate::platform::linux::pulse::cleanup_stale_modules();
 }
 
 /// Create the virtual speaker sink.
@@ -173,6 +131,7 @@ pub fn create_virtual_mic() -> Result<MicWriter> {
         decoder,
         sink,
         pcm_buf: vec![0i16; MIC_MAX_FRAME],
+        next_seq: None,
     })
 }
 
@@ -218,8 +177,6 @@ pub fn run_audio_capture(
         let session_key = &shared.session_key;
         let udp_source = &shared.udp_source;
         let client_addr = &shared.client_addr;
-        let usb_active = &shared.usb_active;
-        let usb_sender = &shared.usb_sender;
         let start_time = shared.start_time;
 
         // Monotonic sample clock in the same epoch as the video timestamps.
@@ -231,16 +188,15 @@ pub fn run_audio_capture(
         // more than AUDIO_CLOCK_REANCHOR_MS (capture stall or restart).
         let mut sample_clock_ms: Option<u32> = None;
 
-        // Created once per capture session, not per chunk. If libopus fails
-        // to initialize, the network path falls back to PCM.
+        // Created once per capture session, not per chunk.
         let mut speaker_opus = match SpeakerOpus::new() {
-            Ok(opus) => Some(opus),
+            Ok(opus) => opus,
             Err(e) => {
-                eprintln!("[audio] {e:#}; sending PCM");
-                None
+                eprintln!("[audio] {e:#}; speaker forwarding unavailable");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
         };
-        let client_features = &shared.client_features;
 
         let mut on_chunk = |chunk: &[u8]| {
             if chunk.len() != BYTES_PER_CHUNK {
@@ -258,18 +214,6 @@ pub fn run_audio_capture(
             };
             sample_clock_ms = Some(ts.wrapping_add(CHUNK_DURATION_MS));
 
-            if usb_active.load(Ordering::Relaxed) {
-                let mut usb = usb_sender.lock().unwrap();
-                if let Some(ref mut tcp) = *usb {
-                    if let Err(e) = tcp.send_audio(chunk, ts) {
-                        eprintln!("[audio] USB send error: {e}");
-                        drop(usb);
-                        usb_active.store(false, Ordering::SeqCst);
-                    }
-                    return;
-                }
-            }
-
             let current_session_key = *session_key.lock().unwrap();
             if current_session_key != active_session_key {
                 active_session_key = current_session_key;
@@ -282,15 +226,9 @@ pub fn run_audio_capture(
             }
 
             if let Some(addr) = *client_addr.lock().unwrap() {
-                let wants_opus = client_features.load(Ordering::Relaxed)
-                    & crate::stream_server::CLIENT_FEATURE_OPUS_AUDIO
-                    != 0;
-                let result = match speaker_opus.as_mut().filter(|_| wants_opus) {
-                    Some(opus) => opus.encode(chunk).and_then(|packet| {
-                        sender.send_audio(packet, addr, ts, crate::stream_server::AUDIO_CODEC_OPUS)
-                    }),
-                    None => sender.send_audio(chunk, addr, ts, crate::stream_server::AUDIO_CODEC_PCM),
-                };
+                let result = speaker_opus
+                    .encode(chunk)
+                    .and_then(|packet| sender.send_audio(packet, addr, ts));
                 if let Err(e) = result {
                     eprintln!("[audio] send error: {e:#}");
                 }
@@ -347,12 +285,36 @@ pub struct MicWriter {
     decoder: OpusDecoder,
     sink: Box<dyn MicSink>,
     pcm_buf: Vec<i16>,
+    /// Mic sequence number expected next; `None` until the first packet.
+    next_seq: Option<u32>,
 }
 
 unsafe impl Send for MicWriter {}
 
 impl MicWriter {
-    pub fn write_opus_packet(&mut self, opus_data: &[u8]) -> Result<()> {
+    /// Decode one mic packet. `seq` is the mic-only sequence number: missing
+    /// numbers mean lost packets, which are filled with Opus packet-loss
+    /// concealment so the virtual mic doesn't click or shorten. Packets
+    /// older than the last one decoded are dropped.
+    pub fn write_opus_packet(&mut self, seq: u32, opus_data: &[u8]) -> Result<()> {
+        if let Some(expected) = self.next_seq {
+            let gap = seq.wrapping_sub(expected);
+            if gap > u32::MAX / 2 {
+                return Ok(()); // late or duplicate packet
+            }
+            if gap > 0 && gap <= MIC_MAX_CONCEALED_PACKETS {
+                crate::vlog!("[mic] concealing {gap} lost packet(s) before seq {seq}");
+                for _ in 0..gap {
+                    self.decode_into_sink(&[])?;
+                }
+            }
+        }
+        self.next_seq = Some(seq.wrapping_add(1));
+        self.decode_into_sink(opus_data)
+    }
+
+    /// Decode `opus_data` (empty = conceal one lost packet) and write the PCM.
+    fn decode_into_sink(&mut self, opus_data: &[u8]) -> Result<()> {
         let samples = self
             .decoder
             .decode(opus_data, &mut self.pcm_buf, false)
@@ -365,6 +327,45 @@ impl MicWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records how many samples each `write_pcm` call delivered.
+    struct CountingSink(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+    impl MicSink for CountingSink {
+        fn write_pcm(&mut self, s16_mono_48k: &[i16]) {
+            self.0.lock().unwrap().push(s16_mono_48k.len());
+        }
+    }
+
+    #[test]
+    fn mic_gaps_are_concealed_and_late_packets_dropped() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mic = MicWriter {
+            decoder: OpusDecoder::new(MIC_RATE, 1).unwrap(),
+            sink: Box::new(CountingSink(writes.clone())),
+            pcm_buf: vec![0i16; MIC_MAX_FRAME],
+            next_seq: None,
+        };
+        let mut encoder =
+            opus::Encoder::new(MIC_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let pcm = vec![0i16; 960]; // 20 ms mono
+        let mut out = vec![0u8; OPUS_MAX_PACKET];
+        let mut packet = || {
+            let len = encoder.encode(&pcm, &mut out).unwrap();
+            out[..len].to_vec()
+        };
+
+        mic.write_opus_packet(10, &packet()).unwrap();
+        mic.write_opus_packet(11, &packet()).unwrap();
+        // 12 and 13 lost: two concealed frames, then 14 itself.
+        mic.write_opus_packet(14, &packet()).unwrap();
+        // A late copy of 12 is dropped.
+        mic.write_opus_packet(12, &packet()).unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 5);
+        assert!(writes.iter().all(|&n| n == 960), "{writes:?}");
+    }
 
     #[test]
     fn speaker_opus_encodes_10ms_chunks_that_decode_to_480_frames() {

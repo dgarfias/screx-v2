@@ -7,8 +7,8 @@ mod input;
 mod logging;
 mod pairing;
 mod platform;
+mod protocol;
 mod stream_server;
-mod usb;
 
 use std::fs;
 use std::net::UdpSocket;
@@ -47,8 +47,7 @@ struct Cli {
 
     /// Maximum virtual display width a session may negotiate (ceiling, not a
     /// fixed value — connecting clients may request anything at or below it
-    /// via `STNG`; old clients that never negotiate get this as their
-    /// session default)
+    /// via `SETTINGS`; also the default when `SETTINGS` omits the resolution)
     #[arg(short = 'w', long = "max-width", default_value_t = 3840)]
     max_width: u32,
 
@@ -79,11 +78,6 @@ struct Cli {
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
     max_bitrate: u32,
 
-    /// Maximum video bitrate clients may request over USB (ceiling; USB
-    /// links have far more headroom than typical networks)
-    #[arg(long = "max-bitrate-usb", default_value = "100M", value_parser = parse_bitrate)]
-    max_bitrate_usb: u32,
-
     /// UDP/TCP streaming port
     #[arg(short, long, default_value_t = 9000)]
     port: u16,
@@ -100,17 +94,25 @@ struct Cli {
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
 
-    /// Network only — disable USB transport
-    #[arg(long, default_value_t = false, conflicts_with = "usb_only")]
-    network_only: bool,
-
-    /// USB only — disable network pairing and UDP streaming
-    #[arg(long, default_value_t = false, conflicts_with = "network_only")]
-    usb_only: bool,
-
     /// Disable v4l2loopback exclusive capture caps for better app compatibility
     #[arg(long, default_value_t = false)]
     no_camera_exclusive_caps: bool,
+
+    /// Disable forwarding host audio to the iPad speaker
+    #[arg(long, default_value_t = false)]
+    no_speaker: bool,
+
+    /// Disable the virtual microphone fed by the iPad mic
+    #[arg(long, default_value_t = false)]
+    no_mic: bool,
+
+    /// Disable the virtual webcam fed by the iPad camera
+    #[arg(long, default_value_t = false)]
+    no_camera: bool,
+
+    /// Disable game controller passthrough
+    #[arg(long, default_value_t = false)]
+    no_gamepad: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -125,39 +127,42 @@ enum Commands {
 #[derive(Debug, Clone)]
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
-    capture_backend: capture::CaptureBackend,
     codec: encode::VideoCodec,
     width: u32,
     height: u32,
     fps: u32,
     gop: u32,
     bitrate_bps: u32,
-    bitrate_usb_max_bps: u32,
     intra_refresh: bool,
     stream_port: u16,
     camera_exclusive_caps: bool,
+    features: stream_server::FeatureToggles,
 }
 
 impl AppConfig {
     // `width`/`height`/`fps`/`bitrate_bps` here are sourced 1:1 from the
     // renamed `--max-*` CLI flags. They now mean "session ceiling" (per
     // `DaemonCapabilities`) *and* "session default when a client never
-    // negotiates via STNG" — the same field does both jobs, since an
+    // negotiates via SETTINGS" — the same field does both jobs, since an
     // un-negotiated session is defined as "get the daemon's max."
     fn from_cli(cli: &Cli) -> Self {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
-            capture_backend: capture::CaptureBackend::platform_default(),
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.max_width,
             height: cli.max_height,
             fps: cli.max_framerate,
             gop: cli.keyframe.max(10),
             bitrate_bps: cli.max_bitrate,
-            bitrate_usb_max_bps: cli.max_bitrate_usb,
             intra_refresh: cli.intra_refresh,
             stream_port: cli.port,
             camera_exclusive_caps: !cli.no_camera_exclusive_caps,
+            features: stream_server::FeatureToggles {
+                speaker: !cli.no_speaker,
+                microphone: !cli.no_mic,
+                camera: !cli.no_camera,
+                gamepad: !cli.no_gamepad,
+            },
         }
     }
 }
@@ -167,17 +172,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose);
 
-    #[cfg(target_os = "macos")]
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!(
-            "[main] refusing to run as root — CGVirtualDisplay, ScreenCaptureKit, and \
-             CGEventPost all require the logged-in user's WindowServer session and per-user TCC \
-             grants, which sudo/root does not have. Run this binary directly as your normal user \
-             (no sudo)."
-        );
-        std::process::exit(1);
-    }
-
     match &cli.command {
         Some(Commands::Unpair { device_id }) => {
             return pairing::run_unpair(device_id.as_deref());
@@ -186,15 +180,7 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::from_cli(&cli);
-    let transport_mode = if cli.network_only {
-        "network-only"
-    } else if cli.usb_only {
-        "usb-only"
-    } else {
-        "network + usb"
-    };
     println!("screx v2 config: {config:?}");
-    println!("[main] transport mode: {transport_mode}");
     if cli.verbose {
         println!("[main] verbose logging enabled");
     }
@@ -209,45 +195,19 @@ async fn main() -> Result<()> {
         config.fps,
         config.bitrate_bps,
         config.encoder_backend,
+        config.features,
     );
     println!("[main] daemon capabilities: {startup_capabilities:?}");
-    println!(
-        "[main] USB bitrate ceiling: {} bps (network ceiling: {} bps)",
-        config.bitrate_usb_max_bps, config.bitrate_bps
-    );
 
     let stop = Arc::new(AtomicBool::new(false));
 
     let input_backend: Arc<Mutex<dyn crate::input::InputBackend>> = {
-        #[cfg(target_os = "linux")]
-        {
-            let backend =
-                crate::platform::linux::uinput::LinuxInput::new(config.width, config.height)
-                    .map_err(|e| {
-                        eprintln!("[main] input backend failed (input disabled): {e:#}");
-                        e
-                    })?;
-            Arc::new(Mutex::new(backend))
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let backend =
-                crate::platform::windows::input::WindowsInput::new(config.width, config.height)
-                    .map_err(|e| {
-                        eprintln!("[main] input backend failed (input disabled): {e:#}");
-                        e
-                    })?;
-            Arc::new(Mutex::new(backend))
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let backend = crate::platform::macos::input::MacInput::new(config.width, config.height)
-                .map_err(|e| {
-                    eprintln!("[main] input backend failed (input disabled): {e:#}");
-                    e
-                })?;
-            Arc::new(Mutex::new(backend))
-        }
+        let backend = crate::platform::linux::uinput::LinuxInput::new(config.width, config.height)
+            .map_err(|e| {
+                eprintln!("[main] input backend failed (input disabled): {e:#}");
+                e
+            })?;
+        Arc::new(Mutex::new(backend))
     };
 
     let shared = Arc::new(stream_server::SharedState::new(
@@ -258,8 +218,8 @@ async fn main() -> Result<()> {
         config.height,
         config.fps,
         config.bitrate_bps,
-        config.bitrate_usb_max_bps,
         config.encoder_backend,
+        config.features,
     ));
 
     *shared.keyboard_worker.lock().unwrap() = Some(crate::input::KeyboardWorker::new(Arc::clone(
@@ -276,38 +236,31 @@ async fn main() -> Result<()> {
 
     println!("[main] UDP socket bound on port {}", config.stream_port);
 
-    // Pairing state + TCP handshake server (not needed in USB-only mode)
+    // Pairing state + TCP handshake server
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
     let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let mut pairing_thread = None;
 
-    if !cli.usb_only {
+    let pairing_thread = {
         let ps = Arc::clone(&pairing_state);
         let sr = Arc::clone(&session_rx);
         let pairing_shared = Arc::clone(&shared);
         let pairing_stop = Arc::clone(&stop);
         let port = config.stream_port;
-        pairing_thread = Some(
-            thread::Builder::new()
-                .name("pairing".into())
-                .spawn(move || {
-                    if let Err(e) =
-                        pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
-                    {
-                        eprintln!("[pairing] server error: {e:#}");
-                    }
-                })
-                .context("failed to spawn pairing thread")?,
-        );
-    } else {
-        println!("[main] USB-only mode — network pairing disabled");
-    }
+        thread::Builder::new()
+            .name("pairing".into())
+            .spawn(move || {
+                if let Err(e) =
+                    pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
+                {
+                    eprintln!("[pairing] server error: {e:#}");
+                }
+            })
+            .context("failed to spawn pairing thread")?
+    };
 
     // Clean up stale audio modules from a previous crash
     audio::cleanup_stale_modules();
-    #[cfg(target_os = "windows")]
-    crate::platform::windows::vcam::cleanup_stale_registration();
 
     // -----------------------------------------------------------------------
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
@@ -338,22 +291,26 @@ async fn main() -> Result<()> {
             }
             *shared_d.mic_writer.lock().unwrap() = None;
 
-            // Input backend cleanup (mouse, gamepads)
+            // Input backend cleanup: release anything still held so a
+            // dropped session can't leave a button or key stuck on the host,
+            // and remove virtual gamepads.
             if let Ok(mut backend) = shared_d.input_backend.lock() {
+                backend.release_mouse_buttons();
+                backend.release_keys();
                 for id in 0..4 {
                     backend.gamepad_detach(id);
                 }
             }
 
-            // Reset audio output flag first so the WASAPI loopback thread stops
-            // before the Steam Streaming Speakers devnode is disabled.
+            // Reset audio output flag first so the loopback capture stops
+            // before the virtual sink is removed.
             shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
 
             // Audio sink
             crate::stream_server::disable_virtual_sink(&shared_d);
 
-            // Discard any STNG left over from this connection so it can't
-            // leak into the next session (e.g. a client that sent STNG then
+            // Discard any SETTINGS left over from this connection so it can't
+            // leak into the next session (e.g. a client that sent SETTINGS then
             // aborted before ever starting to stream).
             {
                 let (lock, _) = &*shared_d.pending_settings;
@@ -369,31 +326,28 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Client manager thread (not needed in USB-only mode)
+    // Client manager thread
     // -----------------------------------------------------------------------
 
-    let mut client_thread = None;
-    if !cli.usb_only {
+    let client_thread = {
         let client_socket = socket.try_clone().context("clone socket for client mgr")?;
         let client_shared = Arc::clone(&shared);
         let client_stop = Arc::clone(&stop);
         let client_session_rx = Arc::clone(&session_rx);
-        client_thread = Some(
-            thread::Builder::new()
-                .name("client-mgr".into())
-                .spawn(move || {
-                    if let Err(e) = stream_server::run_client_manager(
-                        client_socket,
-                        client_shared,
-                        client_stop,
-                        client_session_rx,
-                    ) {
-                        eprintln!("[client] manager error: {e:#}");
-                    }
-                })
-                .context("failed to spawn client manager thread")?,
-        );
-    }
+        thread::Builder::new()
+            .name("client-mgr".into())
+            .spawn(move || {
+                if let Err(e) = stream_server::run_client_manager(
+                    client_socket,
+                    client_shared,
+                    client_stop,
+                    client_session_rx,
+                ) {
+                    eprintln!("[client] manager error: {e:#}");
+                }
+            })
+            .context("failed to spawn client manager thread")?
+    };
 
     // -----------------------------------------------------------------------
     // Capture + encode + send thread
@@ -406,12 +360,11 @@ async fn main() -> Result<()> {
     // per-session loop starts (see the "do NOT reconstruct it per session"
     // note on `capture_config` inside the loop). `config` itself is moved
     // into the capture thread closure so each session can merge in
-    // client-requested (STNG) settings over these CLI/max defaults.
+    // client-requested (SETTINGS) settings over these CLI/max defaults.
     let capture_config = capture::CaptureConfig {
         width: config.width,
         height: config.height,
         fps: config.fps,
-        backend: config.capture_backend,
     };
 
     let force_refresh = Arc::new(AtomicBool::new(false));
@@ -467,51 +420,48 @@ async fn main() -> Result<()> {
                 // Reset the stop flag for this capture session
                 capture_stop_flag.store(false, Ordering::SeqCst);
 
-                // Give a client that just received CAPS a short window to
-                // send STNG before this session's config is locked in. On
-                // the network path STNG normally arrives over the TCP
-                // control channel before the first authenticated UDP packet
-                // flips capture_start (stream_server.rs), so this usually
-                // returns instantly; the timeout is the compatibility path
-                // for old clients that never send STNG at all.
+                // Wait for the client's SETTINGS (sent in reply to CAPS over the
+                // TCP control channel). It can arrive slightly after the first
+                // UDP packet flips capture_start, so block until it does — or
+                // until the session/daemon stops.
                 let requested = {
                     let (lock, cvar) = &*capture_shared.pending_settings;
-                    let guard = lock.lock().unwrap();
-                    let (mut guard, _timeout) = cvar
-                        .wait_timeout_while(
-                            guard,
-                            std::time::Duration::from_millis(2000),
-                            |settings| settings.is_none(),
-                        )
-                        .unwrap();
-                    guard.take()
+                    let mut guard = lock.lock().unwrap();
+                    loop {
+                        if let Some(settings) = guard.take() {
+                            break Some(settings);
+                        }
+                        if capture_stop.load(Ordering::Relaxed)
+                            || capture_stop_flag.load(Ordering::Relaxed)
+                        {
+                            break None;
+                        }
+                        guard = cvar
+                            .wait_timeout(guard, std::time::Duration::from_millis(100))
+                            .unwrap()
+                            .0;
+                    }
+                };
+                let Some(requested) = requested else {
+                    println!("[capture] session ended before the client sent SETTINGS");
+                    capture_start.store(false, Ordering::Release);
+                    let (_, cvar) = &*capture_start_signal;
+                    cvar.notify_all();
+                    continue;
                 };
 
                 // Merge the (already-clamped) requested settings over the
-                // CLI/max defaults to get this session's actual config.
-                // Bitrate/resolution/fps/codec are the "full rebuild" case,
-                // but that's fine — Encoder::new and display.attach() are
-                // already fresh per session below.
-                let session_width = requested.as_ref().and_then(|r| r.width).unwrap_or(config.width);
-                let session_height = requested
-                    .as_ref()
-                    .and_then(|r| r.height)
-                    .unwrap_or(config.height);
-                let session_fps = requested.as_ref().and_then(|r| r.fps).unwrap_or(config.fps);
-                let session_codec = requested
-                    .as_ref()
-                    .and_then(|r| r.codec)
-                    .unwrap_or(config.codec);
-                let session_bitrate_bps = requested
-                    .as_ref()
-                    .and_then(|r| r.bitrate_bps)
-                    .unwrap_or(config.bitrate_bps);
+                // CLI/max defaults; a tag the client omitted means "use the
+                // daemon default" for that field.
+                let session_width = requested.width.unwrap_or(config.width);
+                let session_height = requested.height.unwrap_or(config.height);
+                let session_fps = requested.fps.unwrap_or(config.fps);
+                let session_codec = requested.codec.unwrap_or(config.codec);
+                let session_bitrate_bps = requested.bitrate_bps.unwrap_or(config.bitrate_bps);
 
-                if let Some(ref r) = requested {
-                    println!(
-                        "[capture] starting session with negotiated settings: {r:?} -> {session_width}x{session_height}@{session_fps} codec={session_codec:?} bitrate={session_bitrate_bps}"
-                    );
-                }
+                println!(
+                    "[capture] starting session with negotiated settings: {requested:?} -> {session_width}x{session_height}@{session_fps} codec={session_codec:?} bitrate={session_bitrate_bps}"
+                );
 
                 // Rebaseline the adaptive bitrate loop around this session's
                 // bitrate so it throttles up/down from the negotiated value
@@ -523,7 +473,6 @@ async fn main() -> Result<()> {
                     width: session_width,
                     height: session_height,
                     fps: session_fps,
-                    backend: config.capture_backend,
                 };
                 let enc_config = encode::EncoderConfig {
                     bitrate_bps: session_bitrate_bps,
@@ -554,13 +503,7 @@ async fn main() -> Result<()> {
                 // Pin the UDP source address to the IP the client dialed
                 // (multi-homed hosts may otherwise reply from another IP).
                 sender.set_source(*capture_shared.udp_source.lock().unwrap());
-                let client_features = requested.as_ref().map_or(0, |r| r.client_features);
-                sender.set_session(session_fps, client_features);
-                // Clients that never send STNG (older builds) get no optional
-                // features, even if a previous session's client had them.
-                capture_shared
-                    .client_features
-                    .store(client_features, Ordering::SeqCst);
+                sender.set_session(session_fps);
 
                 println!("[capture] attaching display backend");
                 if let Err(e) = display.attach(capture::DisplayMode {
@@ -569,7 +512,6 @@ async fn main() -> Result<()> {
                     fps: capture_config.fps,
                 }) {
                     eprintln!("[capture] display attach failed: {e:#}");
-                    capture_shared.set_base_bitrate(config.bitrate_bps);
                     capture_start.store(false, Ordering::Release);
                     let (_, cvar) = &*capture_start_signal;
                     cvar.notify_all();
@@ -577,39 +519,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Backends that inject via absolute screen coordinates (Windows,
-                // macOS) need to know where the captured output actually sits on
-                // the desktop; wire touch/mouse coordinates only carry
-                // frame-local 0..width/0..height values in the negotiated
-                // session resolution — NOT necessarily the output's real
-                // on-screen size (macOS: WindowServer can silently substitute a
-                // persisted display-mode preference for the virtual display's
-                // requested mode, so the live rect can come back smaller/larger
-                // than the session resolution). Prefer the backend's own notion
-                // of output placement (Windows/macOS); fall back to the session
-                // resolution at the origin otherwise — Linux ignores left/top
-                // and instead scales incoming coordinates onto its fixed-size
-                // virtual touchscreen, but still needs the session dims to do
-                // that.
-                //
-                // `set_output_size` reports the live rect's actual w/h (which
-                // can differ from the session dims on macOS); `set_target_rect`
-                // always carries the SESSION dims per the trait's documented
-                // contract (Linux needs those, Windows/macOS rect size ==
-                // session dims in the common case). MacInput is the only
-                // backend that keeps both around, to scale wire coordinates
-                // from session space onto the real output rect.
-                let (left, top, rect_width, rect_height) = display
-                    .output_rect()
-                    .unwrap_or((0, 0, capture_config.width, capture_config.height));
-                println!(
-                    "[capture] input target rect: left={left} top={top} width={rect_width} height={rect_height} \
-                     (session resolution {}x{})",
-                    capture_config.width, capture_config.height
-                );
                 if let Ok(mut backend) = capture_shared.input_backend.lock() {
-                    backend.set_output_size(rect_width, rect_height);
-                    backend.set_target_rect(left, top, capture_config.width, capture_config.height);
+                    backend.set_stream_size(capture_config.width, capture_config.height);
                 }
 
                 println!("[capture] starting display capture session");
@@ -693,50 +604,13 @@ async fn main() -> Result<()> {
                                         dump_au_remaining -= 1;
                                     }
                                 }
-                                let use_usb = session_shared.usb_active.load(Ordering::Relaxed);
-                                let udp_addr = if !use_usb {
-                                    *session_shared.client_addr.lock().unwrap()
-                                } else {
-                                    None
-                                };
-
-                                for au in &aus {
-                                    if use_usb {
-                                        let mut usb = session_shared.usb_sender.lock().unwrap();
-                                        if let Some(ref mut tcp) = *usb {
-                                            match tcp.send_video(
-                                                &*au.annex_b,
-                                                au.is_idr,
-                                                ts,
-                                                codec_id,
-                                            ) {
-                                                Ok(()) => {
-                                                    session_shared.bytes_tx.fetch_add(
-                                                        au.annex_b.len() as u64,
-                                                        Ordering::Relaxed,
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[pipeline] USB send error: {e:#}");
-                                                    drop(usb);
-                                                    session_shared
-                                                        .usb_active
-                                                        .store(false, Ordering::SeqCst);
-                                                }
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    if let Some(addr) = udp_addr {
-                                        match sender.send_frame(au, addr, ts, codec_id, tuning) {
-                                            Ok(bytes) => {
-                                                session_shared
-                                                    .bytes_tx
-                                                    .fetch_add(bytes, Ordering::Relaxed);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[pipeline] send error: {e:#}");
-                                            }
+                                let udp_addr = *session_shared.client_addr.lock().unwrap();
+                                if let Some(addr) = udp_addr {
+                                    for au in &aus {
+                                        if let Err(e) =
+                                            sender.send_frame(au, addr, ts, codec_id, tuning)
+                                        {
+                                            eprintln!("[pipeline] send error: {e:#}");
                                         }
                                     }
                                 }
@@ -754,12 +628,6 @@ async fn main() -> Result<()> {
 
                 let _ = watchdog.join();
 
-                // Restore the CLI/max default bitrate baseline so the next
-                // session — which may be an old client that never sends
-                // STNG — isn't stuck ramping from this session's negotiated
-                // bitrate.
-                capture_shared.set_base_bitrate(config.bitrate_bps);
-
                 println!("[capture] display session ended, waiting for next client...");
 
                 // Reset capture_start so we wait for the next client
@@ -771,26 +639,6 @@ async fn main() -> Result<()> {
             Ok(())
         })
         .context("failed to spawn capture thread")?;
-
-    // -----------------------------------------------------------------------
-    // USB transport thread (not needed in network-only mode)
-    // -----------------------------------------------------------------------
-
-    let mut usb_thread = None;
-    if !cli.network_only {
-        let usb_shared = Arc::clone(&shared);
-        let usb_stop = Arc::clone(&stop);
-        usb_thread = Some(
-            thread::Builder::new()
-                .name("usb".into())
-                .spawn(move || {
-                    usb::run_usb_transport(usb_shared, usb_stop);
-                })
-                .context("failed to spawn USB transport thread")?,
-        );
-    } else {
-        println!("[main] network-only mode — USB transport disabled");
-    }
 
     // -----------------------------------------------------------------------
     // Audio capture thread (runs continuously, but only captures when sink exists)
@@ -812,7 +660,6 @@ async fn main() -> Result<()> {
     // Wait for shutdown, then clean up
     // -----------------------------------------------------------------------
 
-    let status_shared = Arc::clone(&shared);
     let do_shutdown = move || {
         stop.store(true, Ordering::SeqCst);
         shared.capture_stop_flag.store(true, Ordering::SeqCst);
@@ -834,44 +681,20 @@ async fn main() -> Result<()> {
         if let Err(err) = audio_thread.join() {
             eprintln!("[audio] thread join failed: {err:?}");
         }
-        if let Some(thread) = usb_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = client_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = pairing_thread {
-            let _ = thread.join();
-        }
+        let _ = client_thread.join();
+        let _ = pairing_thread.join();
 
         println!("screx cleanup complete, exiting");
     };
 
-    #[cfg(target_os = "macos")]
-    {
-        // Blocks for the remaining life of the process, pumping the AppKit
-        // main run loop that services the menu bar status item; calls
-        // `do_shutdown` once and exits the process when Quit is chosen or
-        // SIGINT/SIGTERM arrives. Never returns.
-        crate::platform::macos::statusbar::run(status_shared, do_shutdown);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = status_shared;
-        tokio::signal::ctrl_c().await?;
-        println!("\nshutdown requested (ctrl-c)");
-        do_shutdown();
-    }
+    tokio::signal::ctrl_c().await?;
+    println!("\nshutdown requested (ctrl-c)");
+    do_shutdown();
 
     Ok(())
 }
 
 fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
-    if frame.format != capture::CapturePixelFormat::Bgra {
-        eprintln!("[capture] raw PPM dump only supports BGRA capture frames");
-        return;
-    }
     let path = std::env::temp_dir()
         .join(format!("screx-daemon-capture-{index:03}.ppm"))
         .to_string_lossy()

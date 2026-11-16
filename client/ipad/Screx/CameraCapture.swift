@@ -9,43 +9,11 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     enum CaptureProfile: Equatable {
         case network
-        case usb
 
-        var sessionPreset: AVCaptureSession.Preset {
-            switch self {
-            case .network:
-                return .hd1280x720
-            case .usb:
-                return .hd1920x1080
-            }
-        }
-
-        var outputSize: CGSize {
-            switch self {
-            case .network:
-                return CGSize(width: 1280, height: 720)
-            case .usb:
-                return CGSize(width: 1920, height: 1080)
-            }
-        }
-
-        var label: String {
-            switch self {
-            case .network:
-                return "720p"
-            case .usb:
-                return "1080p"
-            }
-        }
-
-        var targetFps: Int32 {
-            switch self {
-            case .network:
-                return 30
-            case .usb:
-                return 60
-            }
-        }
+        var sessionPreset: AVCaptureSession.Preset { .hd1280x720 }
+        var outputSize: CGSize { CGSize(width: 1280, height: 720) }
+        var label: String { "720p" }
+        var targetFps: Int32 { 30 }
     }
 
     private let session = AVCaptureSession()
@@ -56,14 +24,7 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private(set) var usingFront = false
     private var configuredFps: Int32 = CaptureProfile.network.targetFps
     var compressionQuality: CGFloat = CameraCapture.defaultCompressionQuality
-    var captureProfile: CaptureProfile = .network {
-        didSet {
-            guard captureProfile != oldValue, running else { return }
-            let front = usingFront
-            stop()
-            startSession(front: front)
-        }
-    }
+    let captureProfile: CaptureProfile = .network
 
     var onJPEG: ((Data) -> Void)?
 

@@ -1,60 +1,30 @@
 # Screx
 
-Screx turns a Linux, Windows, or macOS machine into a low-latency remote display host for iPad and desktop clients.
+Screx turns a Linux machine into a low-latency wireless display for an iPad.
 
-You run a daemon that creates a virtual monitor, then connect from either the iPad app or the desktop client over Wi-Fi (or USB, for the iPad app). Input and peripheral forwarding depends on the client, daemon platform, and installed host drivers.
+You run a daemon on the Linux host that creates a virtual monitor, then connect to it from the iPad app over Wi-Fi. The iPad forwards touch, keyboard, mouse, game controller, microphone, and camera input back to the host, and plays the host's audio.
 
 For implementation details and protocol documentation, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Daemon comparison
+## Components
 
-| Feature | Linux daemon | Windows daemon | macOS daemon |
-|---|---|---|---|
-| Virtual display and capture | Yes | Yes | Yes |
-| USB transport for iPad | Yes | Yes | Yes |
-| Keyboard and mouse | Yes | Yes | Yes |
-| Touch input | Yes | Yes | Yes, translated to pointer and scroll gestures |
-| Game controllers | Yes | Yes | No |
-| Client speaker audio | Yes | Yes | Yes |
-| Client microphone | Yes | Yes | No |
-| Client camera | Yes | Yes | No |
+- [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md): build and run the Linux daemon (`daemon/`)
+- [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md): build and run the iPad app (`client/ipad`)
 
-See the [Linux](docs/DAEMON_LINUX.md), [Windows](docs/DAEMON_WINDOWS.md), and [macOS](docs/DAEMON_MACOS.md) daemon guides for setup requirements.
+## Features
 
-## Client comparison
-
-| Feature | Native iPad client | Desktop client |
-|---|---|---|
-| USB transport | Yes | No |
-| Touch forwarding | Yes | No |
-| Mouse forwarding | Yes | Yes |
-| Keyboard forwarding | Yes, software and external | Focused application input |
-| Game controller forwarding | Yes | No |
-| Speaker playback | Yes | Yes |
-| Microphone forwarding | Yes | Yes |
-| Camera forwarding | Yes | Yes |
-
-## Daemons
-
-- [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md) — build and run the Linux daemon
-- [`docs/DAEMON_WINDOWS.md`](docs/DAEMON_WINDOWS.md) — build and run the Windows daemon
-- [`docs/DAEMON_MACOS.md`](docs/DAEMON_MACOS.md) — build and run the macOS daemon
-
-## Clients
-
-- [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md) — build and run the native iPad app (`client/ipad`)
-- [`docs/CLIENT_DESKTOP.md`](docs/CLIENT_DESKTOP.md) — build and run the desktop client for macOS, Windows, and Linux (`client/desktop`)
-
-Either client works over the network with any daemon platform. USB transport is available only to the iPad client.
+- Virtual display (EVDI) with H.264/H.265 hardware or software encoding
+- Touch, keyboard, and mouse input
+- Game controllers (up to 4, via `uinput`)
+- Host speaker audio played on the iPad
+- iPad microphone exposed as a virtual microphone on the host
+- iPad camera exposed as a virtual webcam (`v4l2loopback`) on the host
 
 ## Use
 
-1. Start the daemon (Linux, Windows, or macOS).
-2. Open Screx on the iPad or launch the desktop client on macOS, Windows, or Linux.
-3. Choose one transport:
-   - **Network**: enter the host/IP and tap `Connect`
-   - **USB** (iPad only): tap `Connect via USB`
-4. If it is the first network connection, enter the PIN shown by the daemon.
-5. On Linux hosts, enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
+1. Start the daemon on the Linux host.
+2. Open Screx on the iPad, enter the host/IP, and tap `Connect`.
+3. If it is the first connection, enter the PIN shown by the daemon.
+4. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already active.
 
-The clients remember recent and pinned network targets, and stream settings (resolution, framerate, codec, and bitrate) are chosen from the connect screen before connecting. In-session controls expose keyboard, audio, camera, controller, and connection features supported by the active client and daemon.
+The app remembers recent and pinned hosts. Pick the stream settings (resolution, framerate, codec, and bitrate) on the connect screen before connecting. While a session is running, you can turn the keyboard, audio, camera, controller, and connection features on or off.

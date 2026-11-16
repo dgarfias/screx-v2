@@ -13,7 +13,8 @@ use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
-use crate::platform::shim::{config_dir, hostname};
+use crate::platform::shim::config_dir;
+use crate::protocol;
 
 // Wire protocol magic bytes
 const MAGIC_PAIR: &[u8] = b"SCREX_PAIR"; // 10 bytes
@@ -200,12 +201,6 @@ fn rand_bytes_into(rng: &SystemRandom, buf: &mut [u8]) {
 const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
 const CONTROL_MAX_FRAME: usize = 65536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
-const CONTROL_DISCONNECT_MAGIC: &[u8] = b"DISCONNECT";
-const CONTROL_HOSTNAME_MAGIC: &[u8] = b"HOST";
-/// Latency probe: the client sends a short `PING` payload and measures the
-/// round trip of the identical payload echoed back. Only ever used while a
-/// session is active; it carries no data of its own.
-const CONTROL_PING_MAGIC: &[u8] = b"PING";
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.
@@ -228,8 +223,7 @@ pub fn run_pairing_server(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, addr)) => {
-                // On Windows, an accepted socket may inherit the listener's non-blocking
-                // flag. Handshake and control loops expect a blocking socket.
+                // Handshake and control loops expect a blocking socket.
                 stream.set_nonblocking(false).ok();
 
                 // Reject if a session is already active (single-client mode)
@@ -254,7 +248,7 @@ pub fn run_pairing_server(
                 stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
-                match handle_handshake(&mut stream, addr, &pairing, &shared) {
+                match handle_handshake(&mut stream, addr, &pairing) {
                     Ok(mut session) => {
                         session.session_id = reserved_session_id;
                         session.local_ip = stream.local_addr().ok().map(|a| a.ip());
@@ -306,7 +300,6 @@ fn handle_handshake(
     stream: &mut TcpStream,
     addr: std::net::SocketAddr,
     pairing: &Arc<Mutex<PairingState>>,
-    shared: &Arc<crate::stream_server::SharedState>,
 ) -> Result<SessionInfo> {
     // The handshake may require more than one round trip. If a client sends
     // HELLO with a stale/missing key, we send REJECT and keep the connection
@@ -323,9 +316,7 @@ fn handle_handshake(
 
         if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
             crate::vlog!("[pairing] handshake type=PAIR from {addr}");
-            let result = handle_pair_request(stream, addr, &header, pairing, &shared);
-            *shared.pairing_prompt.lock().unwrap() = None;
-            return result;
+            return handle_pair_request(stream, addr, &header, pairing);
         } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
             crate::vlog!("[pairing] handshake type=HELLO from {addr}");
             match handle_hello_request(stream, addr, &header, pairing)? {
@@ -346,7 +337,6 @@ fn handle_pair_request(
     addr: std::net::SocketAddr,
     header_buf: &[u8; 12],
     pairing: &Arc<Mutex<PairingState>>,
-    shared: &Arc<crate::stream_server::SharedState>,
 ) -> Result<SessionInfo> {
     // Already read 12 bytes; SCREX_PAIR is 10, so 2 bytes of device_id are in header_buf[10..12]
     // Read remaining: device_id(14 more) + client_pubkey(32) = 46 bytes
@@ -397,11 +387,6 @@ fn handle_pair_request(
     println!("║  Enter this PIN on your device       ║");
     println!("╚══════════════════════════════════════╝");
     println!();
-
-    *shared.pairing_prompt.lock().unwrap() = Some(crate::stream_server::PairingPrompt {
-        ip: addr.ip().to_string(),
-        pin: pin.clone(),
-    });
 
     // Send PIN_CHALLENGE: SCREX_PIN(10) + server_pubkey(32)
     let mut response = Vec::with_capacity(10 + PUBKEY_LEN);
@@ -588,19 +573,15 @@ fn run_control_loop(
 
     println!("[control] network control channel active");
 
-    if let Some(hostname) = hostname() {
-        let mut payload = Vec::with_capacity(CONTROL_HOSTNAME_MAGIC.len() + hostname.len());
-        payload.extend_from_slice(CONTROL_HOSTNAME_MAGIC);
-        payload.extend_from_slice(hostname.as_bytes());
-        if let Err(e) = send_control_frame(&mut stream, &cipher, &mut send_seq, &payload) {
-            eprintln!("[control] failed to send hostname: {e:#}");
-        }
+    // Settings are per session: drop anything a previous connection sent but
+    // never used (e.g. it disconnected before its video started), so the
+    // capture thread waits for this client's SETTINGS instead.
+    {
+        let (lock, _) = &*shared.pending_settings;
+        *lock.lock().unwrap() = None;
     }
 
-    let caps_payload = crate::stream_server::build_caps_message(
-        shared,
-        crate::stream_server::ControlTransport::Network,
-    );
+    let caps_payload = crate::stream_server::build_caps_message(shared);
     if let Err(e) = send_control_frame(&mut stream, &cipher, &mut send_seq, &caps_payload) {
         eprintln!("[control] failed to send capabilities: {e:#}");
     }
@@ -664,23 +645,26 @@ fn run_control_loop(
             }
         };
 
-        if plaintext == CONTROL_DISCONNECT_MAGIC {
-            println!("[control] graceful disconnect requested by client");
-            break;
+        match plaintext.first().copied() {
+            Some(protocol::client::DISCONNECT) => {
+                println!("[control] graceful disconnect requested by client");
+                break;
+            }
+            Some(protocol::client::PING) => {
+                // Latency probe: answer immediately so the client can measure
+                // control-channel RTT/jitter.
+                send_control_frame(
+                    &mut stream,
+                    &cipher,
+                    &mut send_seq,
+                    &[protocol::daemon::PONG],
+                )?;
+                continue;
+            }
+            _ => {}
         }
 
-        if plaintext == CONTROL_PING_MAGIC {
-            // Echo the ping payload back so the client can measure RTT/jitter
-            // on the control plane.
-            send_control_frame(&mut stream, &cipher, &mut send_seq, &plaintext)?;
-            continue;
-        }
-
-        crate::stream_server::handle_control_message_data(
-            shared,
-            plaintext,
-            crate::stream_server::ControlTransport::Network,
-        );
+        crate::stream_server::handle_control_message_data(shared, plaintext);
     }
 
     crate::stream_server::drop_network_client(shared, session_id);

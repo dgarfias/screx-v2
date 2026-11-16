@@ -1,20 +1,13 @@
 import Foundation
 
-/// Capability negotiation wire format shared by the network control path
-/// (`NetworkControlClient`) and the USB control path (`USBListener`).
-///
-/// This is a from-scratch Swift reimplementation of the TLV format documented in
-/// docs/ARCHITECTURE.md ("Capability Negotiation") — there is no shared protocol
-/// crate between the daemon and the clients, so this must match the daemon's Rust
-/// implementation byte-for-byte. See that doc (and the capability-negotiation plan,
-/// Part 0) before changing anything here.
+/// Capability negotiation messages carried on the control channel
+/// (`NetworkControlClient`). Fixed layouts, big-endian; must match the daemon's
+/// `build_caps_message` / `parse_settings_body` in daemon/src/stream_server.rs.
 
-/// What the daemon says it can do, parsed from a `CAPS` message.
-///
-/// `CAPS` wire format: `"CAPS"(4 bytes ASCII) + version(u8) + entry_count(u8) + entries`,
-/// where each entry is `tag(u8) + length(u16 BE) + value(length bytes)`. A parser that
-/// sees a tag it doesn't recognize skips it by its declared length and continues — it
-/// never hard-fails on an unknown tag, so future tag additions stay backward compatible.
+/// What the daemon says it can do, parsed from a `CAPS` message body (after the type byte):
+/// `camera(u8) mic(u8) speaker(u8) gamepad_max(u8, 0 = unsupported)
+/// codecs(u8 bitmask, bit n = codec id n) max_width(u16) max_height(u16) max_fps(u8)
+/// bitrate_min(u32) bitrate_max(u32) hostname(UTF-8, rest of message)`.
 struct DaemonCapabilities: Equatable {
     var camera: Bool
     var microphone: Bool
@@ -29,122 +22,37 @@ struct DaemonCapabilities: Equatable {
     var maxFps: Int
     var bitrateMinBps: UInt32
     var bitrateMaxBps: UInt32
+    /// The daemon host's name, for display. May be empty.
+    var hostname: String
 
     static let codecH264: UInt8 = 0x00
     static let codecH265: UInt8 = 0x01
 
-    private static let magic = Data("CAPS".utf8)
+    private static let fixedLength = 18
 
-    private static let tagCamera: UInt8 = 0x01
-    private static let tagMicrophone: UInt8 = 0x02
-    private static let tagSpeaker: UInt8 = 0x03
-    private static let tagGamepad: UInt8 = 0x04
-    private static let tagCodecs: UInt8 = 0x05
-    private static let tagMaxResolution: UInt8 = 0x06
-    private static let tagMaxFramerate: UInt8 = 0x07
-    private static let tagBitrateRange: UInt8 = 0x08
-
-    /// Permissive "assume everything works" defaults. Used two ways:
-    /// - As the starting point while parsing a real `CAPS` message, so a daemon that
-    ///   omits a tag still yields a usable value for that field.
-    /// - As the legacy-daemon fallback when no `CAPS` message ever arrives at all (an
-    ///   old daemon that predates this feature) — this preserves today's "everything is
-    ///   available, just connect" behavior exactly.
-    static let assumeAllAvailable = DaemonCapabilities(
-        camera: true,
-        microphone: true,
-        speaker: true,
-        gamepadMaxControllers: 4,
-        codecs: [codecH264, codecH265],
-        maxWidth: 3840,
-        maxHeight: 2160,
-        maxFps: 60,
-        bitrateMinBps: 500_000,
-        bitrateMaxBps: 20_000_000
-    )
-
-    /// Parses a `CAPS` payload. Returns nil only if the payload doesn't start with the
-    /// `CAPS` magic or is too short to contain a version/entry_count header — malformed
-    /// or truncated individual entries are simply skipped, not treated as a hard failure,
-    /// so a partially-garbled message still yields whatever fields it could read.
-    static func parse(_ payload: Data) -> DaemonCapabilities? {
-        guard payload.starts(with: magic) else { return nil }
-
-        var offset = payload.startIndex + magic.count
-        guard offset + 2 <= payload.endIndex else { return nil }
-
-        // version(u8): no behavior differs by version yet, just skip it.
-        offset += 1
-        let entryCount = Int(payload[offset])
-        offset += 1
-
-        var result = assumeAllAvailable
-
-        for _ in 0..<entryCount {
-            guard offset + 3 <= payload.endIndex else { break }
-            let tag = payload[offset]
-            offset += 1
-            let length = Int(payload[offset]) << 8 | Int(payload[offset + 1])
-            offset += 2
-            guard offset + length <= payload.endIndex else { break }
-            let value = payload[offset..<offset + length]
-            offset += length
-
-            switch tag {
-            case tagCamera:
-                guard length >= 1 else { continue }
-                result.camera = value[value.startIndex] != 0
-
-            case tagMicrophone:
-                guard length >= 1 else { continue }
-                result.microphone = value[value.startIndex] != 0
-
-            case tagSpeaker:
-                guard length >= 1 else { continue }
-                result.speaker = value[value.startIndex] != 0
-
-            case tagGamepad:
-                guard length >= 2 else { continue }
-                let available = value[value.startIndex] != 0
-                let maxControllers = value[value.startIndex + 1]
-                result.gamepadMaxControllers = available ? maxControllers : nil
-
-            case tagCodecs:
-                guard length >= 1 else { continue }
-                let count = Int(value[value.startIndex])
-                guard length >= 1 + count else { continue }
-                let codecsStart = value.startIndex + 1
-                result.codecs = Array(value[codecsStart..<codecsStart + count])
-
-            case tagMaxResolution:
-                guard length >= 4 else { continue }
-                let b = value.startIndex
-                let width = Int(value[b]) << 8 | Int(value[b + 1])
-                let height = Int(value[b + 2]) << 8 | Int(value[b + 3])
-                result.maxWidth = width
-                result.maxHeight = height
-
-            case tagMaxFramerate:
-                guard length >= 1 else { continue }
-                result.maxFps = Int(value[value.startIndex])
-
-            case tagBitrateRange:
-                guard length >= 8 else { continue }
-                let b = value.startIndex
-                let minBps = UInt32(value[b]) << 24 | UInt32(value[b + 1]) << 16
-                    | UInt32(value[b + 2]) << 8 | UInt32(value[b + 3])
-                let maxBps = UInt32(value[b + 4]) << 24 | UInt32(value[b + 5]) << 16
-                    | UInt32(value[b + 6]) << 8 | UInt32(value[b + 7])
-                result.bitrateMinBps = minBps
-                result.bitrateMaxBps = maxBps
-
-            default:
-                // Unknown/future tag: already skipped above via `length`.
-                break
-            }
+    /// Parses a `CAPS` body. Returns nil if it's shorter than the fixed fields.
+    static func parse(_ body: Data) -> DaemonCapabilities? {
+        let bytes = [UInt8](body)
+        guard bytes.count >= fixedLength else { return nil }
+        func u16(_ i: Int) -> Int { Int(bytes[i]) << 8 | Int(bytes[i + 1]) }
+        func u32(_ i: Int) -> UInt32 {
+            UInt32(bytes[i]) << 24 | UInt32(bytes[i + 1]) << 16 | UInt32(bytes[i + 2]) << 8 | UInt32(bytes[i + 3])
         }
-
-        return result
+        let codecMask = bytes[4]
+        return DaemonCapabilities(
+            camera: bytes[0] != 0,
+            microphone: bytes[1] != 0,
+            speaker: bytes[2] != 0,
+            gamepadMaxControllers: bytes[3] == 0 ? nil : bytes[3],
+            codecs: [codecH264, codecH265].filter { codecMask & (1 << $0) != 0 },
+            maxWidth: u16(5),
+            maxHeight: u16(7),
+            maxFps: Int(bytes[9]),
+            bitrateMinBps: u32(10),
+            bitrateMaxBps: u32(14),
+            hostname: String(decoding: bytes[fixedLength...], as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
     }
 
     /// Returns human-readable violations of `settings` against these capabilities, empty
@@ -211,12 +119,10 @@ struct DaemonCapabilities: Equatable {
     }
 }
 
-/// Client-proposed stream settings, sent to the daemon as `STNG`. Any field left `nil`
-/// means "use the daemon's own default for that field" — the corresponding TLV entry is
-/// simply omitted rather than sent with a placeholder value.
+/// Client-proposed stream settings, sent to the daemon as `SETTINGS`. A `nil` field means
+/// "use the daemon's own default" and goes on the wire as 0 (`codecDefault` for the codec).
 ///
-/// `STNG` wire format: `"STNG"(4 bytes ASCII) + version(u8) + entry_count(u8) + entries`,
-/// same entry shape as `CAPS` (`tag(u8) + length(u16 BE) + value`).
+/// Body layout (after the type byte): `width(u16) height(u16) fps(u8) codec(u8) bitrate(u32)`.
 struct StreamSettings: Equatable {
     var width: Int?
     var height: Int?
@@ -224,23 +130,7 @@ struct StreamSettings: Equatable {
     var codecId: UInt8?
     var bitrateBps: UInt32?
 
-    private static let magic = Data("STNG".utf8)
-    private static let version: UInt8 = 1
-
-    private static let tagResolution: UInt8 = 0x01
-    private static let tagFramerate: UInt8 = 0x02
-    private static let tagCodec: UInt8 = 0x03
-    private static let tagBitrate: UInt8 = 0x04
-    /// Bitmask of optional client features (`u8`), always sent. Older daemons skip it as
-    /// an unknown tag.
-    private static let tagClientFeatures: UInt8 = 0x05
-
-    /// This client reassembles video frames whose FEC is split into several Reed-Solomon
-    /// blocks (see `FrameAssembly` in StreamClient.swift).
-    static let featureMultiblockFEC: UInt8 = 0x01
-    /// This client decodes Opus speaker audio (see `AudioPlayer.enqueueOpus`).
-    static let featureOpusAudio: UInt8 = 0x02
-    private static let clientFeatures: UInt8 = featureMultiblockFEC | featureOpusAudio
+    private static let codecDefault: UInt8 = 0xFF
 
     init(width: Int? = nil, height: Int? = nil, fps: Int? = nil, codecId: UInt8? = nil, bitrateBps: UInt32? = nil) {
         self.width = width
@@ -250,45 +140,20 @@ struct StreamSettings: Equatable {
         self.bitrateBps = bitrateBps
     }
 
-    /// Builds the `STNG` message body (the control-channel framing around it, e.g. the
-    /// encrypted-frame envelope on the network path or the `msgControl` byte on the USB
-    /// path, is added by the caller exactly like it is for every other control message).
-    /// A settings value with every field nil still produces a valid message with
-    /// `entry_count = 1` (just the client-features tag), meaning "everything default, just connect."
+    /// Builds the `SETTINGS` body (the caller adds the type byte and control framing).
     func encode() -> Data {
-        var entries: [(tag: UInt8, value: Data)] = []
+        let fitsU16 = { (v: Int?) -> Bool in v.map { $0 > 0 && $0 <= Int(UInt16.max) } ?? false }
+        let hasResolution = fitsU16(width) && fitsU16(height)
+        let w = UInt16(hasResolution ? width! : 0)
+        let h = UInt16(hasResolution ? height! : 0)
+        let f = UInt8(fps.map { $0 > 0 && $0 <= Int(UInt8.max) ? $0 : 0 } ?? 0)
 
-        if let width, let height, width > 0, height > 0, width <= Int(UInt16.max), height <= Int(UInt16.max) {
-            var value = Data()
-            withUnsafeBytes(of: UInt16(width).bigEndian) { value.append(contentsOf: $0) }
-            withUnsafeBytes(of: UInt16(height).bigEndian) { value.append(contentsOf: $0) }
-            entries.append((Self.tagResolution, value))
-        }
-
-        if let fps, fps > 0, fps <= Int(UInt8.max) {
-            entries.append((Self.tagFramerate, Data([UInt8(fps)])))
-        }
-
-        if let codecId {
-            entries.append((Self.tagCodec, Data([codecId])))
-        }
-
-        if let bitrateBps {
-            var value = Data()
-            withUnsafeBytes(of: bitrateBps.bigEndian) { value.append(contentsOf: $0) }
-            entries.append((Self.tagBitrate, value))
-        }
-
-        entries.append((Self.tagClientFeatures, Data([Self.clientFeatures])))
-
-        var payload = Self.magic
-        payload.append(Self.version)
-        payload.append(UInt8(entries.count))
-        for entry in entries {
-            payload.append(entry.tag)
-            withUnsafeBytes(of: UInt16(entry.value.count).bigEndian) { payload.append(contentsOf: $0) }
-            payload.append(entry.value)
-        }
-        return payload
+        var body = Data()
+        withUnsafeBytes(of: w.bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: h.bigEndian) { body.append(contentsOf: $0) }
+        body.append(f)
+        body.append(codecId ?? Self.codecDefault)
+        withUnsafeBytes(of: (bitrateBps ?? 0).bigEndian) { body.append(contentsOf: $0) }
+        return body
     }
 }
