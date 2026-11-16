@@ -537,7 +537,17 @@ final class StreamViewModel: ObservableObject {
     var isExternalControlPanelVisible: Bool { isExternalOnlyActive && isLaptopMode }
 
     func setLaptopMode(_ enabled: Bool) {
+        let wasVisible = isExternalControlPanelVisible
         isLaptopMode = enabled && isExternalOnlyActive
+        // Leaving laptop mode with the floating trackpad off: don't leave a button held by a
+        // drag that was in progress on the laptop trackpad.
+        if wasVisible && !isExternalControlPanelVisible && !isTrackpadEnabled {
+            let previousMask = physicalMouseButtonMask | trackpadButtonMask
+            trackpadButtonMask = 0
+            sendMouseButtonChanges(from: previousMask)
+        }
+        trackpadMotionRemainder = .zero
+        trackpadScrollRemainder = 0
     }
 
     /// Stream-settings preferences the user picked in the Stream Settings sheet,
@@ -1895,8 +1905,14 @@ final class StreamViewModel: ObservableObject {
         trackpadScrollRemainder = 0
     }
 
+    /// On-screen trackpad input is accepted from the floating trackpad when it's enabled, and
+    /// always from laptop mode's built-in trackpad, independent of the floating toggle.
+    private var acceptsTrackpadInput: Bool {
+        isConnected && (isTrackpadEnabled || isExternalControlPanelVisible)
+    }
+
     func moveTrackpad(dx: CGFloat, dy: CGFloat) {
-        guard isTrackpadEnabled, isConnected else { return }
+        guard acceptsTrackpadInput else { return }
         trackpadMotionRemainder.width += dx
         trackpadMotionRemainder.height += dy
         let x = Int16(clamping: Int(trackpadMotionRemainder.width))
@@ -1911,7 +1927,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func trackpadButton(_ code: UInt8, pressed: Bool) {
-        guard isTrackpadEnabled, isConnected, code < 3 else { return }
+        guard acceptsTrackpadInput, code < 3 else { return }
         let previousMask = physicalMouseButtonMask | trackpadButtonMask
         let bit: UInt8 = 1 << code
         if pressed { trackpadButtonMask |= bit } else { trackpadButtonMask &= ~bit }
@@ -1919,7 +1935,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func scrollTrackpad(deltaY: CGFloat) {
-        guard isTrackpadEnabled, isConnected else { return }
+        guard acceptsTrackpadInput else { return }
         // Natural scrolling: a finger moving down moves the content down.
         trackpadScrollRemainder += deltaY / 18
         let steps = Int16(clamping: Int(trackpadScrollRemainder))
