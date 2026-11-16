@@ -58,6 +58,26 @@ produces a matching release at the nearest display edge.
 
 ## Pointer model
 
+### On-screen trackpad
+
+Expand the in-session pill and tap the trackpad icon to show a semi-transparent trackpad.
+It is off by default and resets to off when the session ends.
+
+- Slide one finger to move the pointer; tap to left-click.
+- Tap with two fingers to right-click; slide two fingers to scroll.
+- Tap, then touch again and drag to hold the left button; lift to release.
+- Drag the top grip to move the trackpad, or the bottom-right handle to resize it.
+
+Size and position are remembered. Touches starting inside the trackpad are consumed locally,
+not forwarded as touchscreen input to the display underneath. The trackpad reuses the existing
+relative mouse messages and works alongside a physical mouse; no daemon update is needed.
+
+If the on-screen keyboard covers the trackpad, it moves above the keyboard without changing
+size. If it is too tall for the remaining space, its height temporarily shrinks to fit.
+The saved size and position return when the keyboard closes.
+
+### Direct touch and external pointers
+
 Touch input is **absolute** — a tap maps directly to that point on the remote display (translated
 to pointer + scroll gestures).
 

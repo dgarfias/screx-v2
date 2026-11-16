@@ -540,6 +540,7 @@ final class StreamViewModel: ObservableObject {
     private static let capsTimeoutInterval: TimeInterval = 5.0
 
     @Published var physicalMouseConnected = false
+    @Published private(set) var isTrackpadEnabled = false
     @Published var physicalKeyboardConnected = false
     @Published var physicalControllerConnectedCount = 0
     @Published private(set) var isControllerPassthroughEnabled = true
@@ -549,6 +550,9 @@ final class StreamViewModel: ObservableObject {
     private var controllerSlots: [ObjectIdentifier: UInt8] = [:]
     private var physicalMouseButtonMask: UInt8 = 0
     private var physicalMouseScrollAccumulator: Float = 0
+    private var trackpadButtonMask: UInt8 = 0
+    private var trackpadMotionRemainder: CGSize = .zero
+    private var trackpadScrollRemainder: CGFloat = 0
 
     private static let recentConnectionsKey = "screx_recent_connections"
     private static let maxRecentConnections = 5
@@ -1475,6 +1479,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func stopPeripheralMonitoring() {
+        setTrackpadEnabled(false)
         for obs in mouseObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in keyboardObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in controllerObservers { NotificationCenter.default.removeObserver(obs) }
@@ -1533,21 +1538,19 @@ final class StreamViewModel: ObservableObject {
 
     private func detachMouse() {
         guard physicalMouseConnected else { return }
+        let previousMask = physicalMouseButtonMask | trackpadButtonMask
         physicalMouseButtonMask = 0
         physicalMouseScrollAccumulator = 0
         physicalMouseConnected = false
-        sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
+        sendMouseButtonChanges(from: previousMask)
+        if !isTrackpadEnabled {
+            sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
+        }
         print("[periph] mouse detached")
     }
 
     private func updatePhysicalMouseButton(button: UInt8, pressed: Bool) {
-        let mouseButtonCode: UInt8
-        switch button {
-        case 0x01: mouseButtonCode = 0x00
-        case 0x02: mouseButtonCode = 0x01
-        case 0x04: mouseButtonCode = 0x02
-        default: return
-        }
+        let previousMask = physicalMouseButtonMask | trackpadButtonMask
 
         if pressed {
             physicalMouseButtonMask |= button
@@ -1555,7 +1558,75 @@ final class StreamViewModel: ObservableObject {
             physicalMouseButtonMask &= ~button
         }
 
-        sendMouse(Data([0x02, mouseButtonCode, pressed ? 1 : 0]))
+        sendMouseButtonChanges(from: previousMask)
+    }
+
+    /// The on-screen trackpad and physical mouse share the host's virtual mouse. Merge their
+    /// held buttons, so releasing one source doesn't release a button held by the other.
+    private func sendMouseButtonChanges(from previousMask: UInt8) {
+        let currentMask = physicalMouseButtonMask | trackpadButtonMask
+        for code: UInt8 in 0..<3 {
+            let bit: UInt8 = 1 << code
+            if (previousMask & bit) != (currentMask & bit) {
+                sendMouse(Data([0x02, code, currentMask & bit != 0 ? 1 : 0]))
+            }
+        }
+    }
+
+    func setTrackpadEnabled(_ enabled: Bool) {
+        guard enabled != isTrackpadEnabled else { return }
+        if enabled {
+            guard isConnected else { return }
+            isTrackpadEnabled = true
+            if !physicalMouseConnected {
+                sendPeripheral(Data([0x01, 0x01]))
+            }
+        } else {
+            let previousMask = physicalMouseButtonMask | trackpadButtonMask
+            trackpadButtonMask = 0
+            sendMouseButtonChanges(from: previousMask)
+            isTrackpadEnabled = false
+            if !physicalMouseConnected {
+                sendPeripheral(Data([0x01, 0x00]))
+            }
+        }
+        trackpadMotionRemainder = .zero
+        trackpadScrollRemainder = 0
+    }
+
+    func moveTrackpad(dx: CGFloat, dy: CGFloat) {
+        guard isTrackpadEnabled, isConnected else { return }
+        trackpadMotionRemainder.width += dx
+        trackpadMotionRemainder.height += dy
+        let x = Int16(clamping: Int(trackpadMotionRemainder.width))
+        let y = Int16(clamping: Int(trackpadMotionRemainder.height))
+        trackpadMotionRemainder.width -= CGFloat(x)
+        trackpadMotionRemainder.height -= CGFloat(y)
+        guard x != 0 || y != 0 else { return }
+        var data = Data([0x01])
+        withUnsafeBytes(of: x.bigEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: y.bigEndian) { data.append(contentsOf: $0) }
+        sendMouse(data)
+    }
+
+    func trackpadButton(_ code: UInt8, pressed: Bool) {
+        guard isTrackpadEnabled, isConnected, code < 3 else { return }
+        let previousMask = physicalMouseButtonMask | trackpadButtonMask
+        let bit: UInt8 = 1 << code
+        if pressed { trackpadButtonMask |= bit } else { trackpadButtonMask &= ~bit }
+        sendMouseButtonChanges(from: previousMask)
+    }
+
+    func scrollTrackpad(deltaY: CGFloat) {
+        guard isTrackpadEnabled, isConnected else { return }
+        // Natural scrolling: a finger moving down moves the content down.
+        trackpadScrollRemainder += deltaY / 18
+        let steps = Int16(clamping: Int(trackpadScrollRemainder))
+        guard steps != 0 else { return }
+        trackpadScrollRemainder -= CGFloat(steps)
+        var data = Data([0x03])
+        withUnsafeBytes(of: steps.bigEndian) { data.append(contentsOf: $0) }
+        sendMouse(data)
     }
 
     private func handlePhysicalMouseScroll(value: Float) {
@@ -1933,6 +2004,7 @@ struct ContentView: View {
     @State private var isDragging = false
     @State private var isKeyboardActive = false
     @State private var keyboardHeight: CGFloat = 0
+    @State private var keyboardFrame: CGRect = .null
     @State private var preKeyboardY: CGFloat? = nil
     @State private var viewSize: CGSize = .zero
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
@@ -2134,6 +2206,19 @@ struct ContentView: View {
                 .frame(width: 0, height: 0)
 
                 if model.isConnected {
+                    if model.isTrackpadEnabled {
+                        TrackpadOverlay(
+                            containerSize: geo.size,
+                            keyboardFrame: keyboardFrame.offsetBy(
+                                dx: -geo.frame(in: .global).minX,
+                                dy: -geo.frame(in: .global).minY
+                            ),
+                            onMove: { dx, dy in model.moveTrackpad(dx: dx, dy: dy) },
+                            onButton: { code, pressed in model.trackpadButton(code, pressed: pressed) },
+                            onScroll: { model.scrollTrackpad(deltaY: $0) }
+                        )
+                        .frame(width: geo.size.width, height: geo.size.height)
+                    }
                     floatingBar(in: geo)
                 }
             }
@@ -2148,34 +2233,36 @@ struct ContentView: View {
             .onChange(of: pillSize) { _ in
                 clampBarPosition(in: geo.size)
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in
-            guard let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
-            let kbH = frame.height
-            keyboardHeight = kbH
-            let clamped = clampedBarPosition(barPosition, in: viewSize, keyboardHeight: kbH)
-            if clamped != barPosition {
-                preKeyboardY = barPosition.y
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notif in
+                guard let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+                let overlap = frame.intersection(geo.frame(in: .global))
+                let kbH = overlap.isEmpty ? 0 : max(0, geo.frame(in: .global).maxY - overlap.minY)
+                let duration = notif.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+                if kbH > 0 && preKeyboardY == nil { preKeyboardY = barPosition.y }
+                withAnimation(.easeOut(duration: duration)) {
+                    keyboardFrame = frame
+                    keyboardHeight = kbH
+                    if kbH == 0, let savedY = preKeyboardY {
+                        barPosition = clampedBarPosition(CGPoint(x: barPosition.x, y: savedY), in: geo.size, keyboardHeight: 0)
+                        preKeyboardY = nil
+                    } else {
+                        clampBarPosition(in: geo.size, persist: false)
+                    }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
                 withAnimation(.easeOut(duration: 0.25)) {
-                    barPosition = clamped
+                    keyboardFrame = .null
+                    keyboardHeight = 0
+                    let y = preKeyboardY ?? barPosition.y
+                    barPosition = clampedBarPosition(CGPoint(x: barPosition.x, y: y), in: geo.size, keyboardHeight: 0)
+                    preKeyboardY = nil
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardHeight = 0
-            if let savedY = preKeyboardY {
-                withAnimation(.easeOut(duration: 0.25)) {
-                    barPosition = clampedBarPosition(
-                        CGPoint(x: barPosition.x, y: savedY),
-                        in: viewSize,
-                        keyboardHeight: 0
-                    )
-                }
-                preKeyboardY = nil
-            } else {
-                barPosition = clampedBarPosition(barPosition, in: viewSize, keyboardHeight: 0)
-            }
-        }
+        // Our floating controls handle keyboard occlusion themselves. Keeping the container
+        // full-height avoids SwiftUI shrinking/shifting it a second time underneath them.
+        .ignoresSafeArea(.keyboard)
         .sheet(isPresented: $model.showPinEntry) {
             VStack(spacing: 20) {
                 Text("Pairing Required")
@@ -2271,6 +2358,16 @@ struct ContentView: View {
                 }
 
                 if isToolbarExpanded {
+                    toolbarButton(
+                        icon: "rectangle.and.hand.point.up.left",
+                        active: model.isTrackpadEnabled,
+                        color: model.isTrackpadEnabled ? .green : .white
+                    ) {
+                        model.setTrackpadEnabled(!model.isTrackpadEnabled)
+                    }
+                    .accessibilityLabel(model.isTrackpadEnabled ? "Hide trackpad" : "Show trackpad")
+                    .accessibilityHint("Move the pointer, tap to click, or use two fingers to scroll")
+
                     toolbarButton(
                         icon: model.isControllerPassthroughEnabled ? "gamecontroller.fill" : "gamecontroller",
                         active: model.isControllerPassthroughEnabled,
