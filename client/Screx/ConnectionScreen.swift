@@ -63,8 +63,7 @@ struct ConnectionScreen: View {
         .animation(.easeInOut(duration: 0.2), value: tiles.map(\.id))
         .sheet(item: $settingsHost) { host in
             HostSettingsSheet(
-                tileId: host.id,
-                hostName: host.displayName,
+                mode: .edit(tileId: host.id, hostName: host.displayName),
                 address: host.endpointLabel,
                 settings: model.settings(for: host.id),
                 limits: model.hostLimits[host.id],
@@ -98,10 +97,16 @@ struct ConnectionScreen: View {
             }
             .disabled(model.isConnecting)
             .accessibilityLabel("Add host")
-            .popover(isPresented: $showAddHost) {
-                AddHostForm(model: model, onStarted: { showAddHost = false })
-                    .padding(20)
-                    .frame(width: 400)
+            .sheet(isPresented: $showAddHost) {
+                HostSettingsSheet(
+                    mode: .add,
+                    address: "",
+                    settings: .defaults,
+                    limits: nil,
+                    addressError: { model.addressError($0, for: nil) },
+                    onConnect: { model.connectNewHost(address: $1, settings: $0) }
+                )
+                .equatable()
             }
             if !model.recentConnections.isEmpty {
                 Menu {
@@ -131,53 +136,6 @@ struct ConnectionScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.bottom, 80)
-    }
-}
-
-/// Address field with Connect. Errors from an invalid address appear under the field.
-private struct AddHostForm: View {
-    @ObservedObject var model: StreamViewModel
-    let onStarted: () -> Void
-    @State private var address = ""
-    @State private var error: String?
-    @FocusState private var isFocused: Bool
-
-    private var trimmed: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                TextField("Host or IP address", text: $address)
-                    .textFieldStyle(.roundedBorder)
-                    .keyboardType(.URL)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .submitLabel(.go)
-                    .focused($isFocused)
-                    .onSubmit(connect)
-                Button("Connect", action: connect)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(trimmed.isEmpty || model.isConnecting)
-            }
-            if let error {
-                Text(error)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-            }
-        }
-        .onAppear { isFocused = true }
-        .onChange(of: address) { _ in error = nil }
-    }
-
-    private func connect() {
-        guard !trimmed.isEmpty, !model.isConnecting else { return }
-        if model.connectManual(trimmed) {
-            error = nil
-            address = ""
-            onStarted()
-        } else {
-            error = model.status
-        }
     }
 }
 

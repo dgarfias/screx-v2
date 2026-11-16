@@ -736,12 +736,14 @@ final class StreamViewModel: ObservableObject {
         tileId.flatMap { hostSettings[$0] } ?? .defaults
     }
 
-    /// The reason `address` can't be used for the tile, or nil if it can.
-    func addressError(_ address: String, for tileId: String) -> String? {
+    /// The reason `address` can't be used for the tile (nil: a new host), or nil if it can.
+    func addressError(_ address: String, for tileId: String?) -> String? {
         switch Self.parseAddress(address) {
         case .failure(let error):
             return error.message
         case .success(let target):
+            // A new host may match a saved tile; it connects through that tile.
+            guard let tileId else { return nil }
             let taken = recentConnections.contains {
                 $0.id != tileId && $0.host == target.host && $0.port == target.port
             }
@@ -1299,31 +1301,27 @@ final class StreamViewModel: ObservableObject {
 
     /// Starts connecting to a typed address. Returns false with the reason in `status` when the
     /// address is invalid.
-    /// An address that matches a saved tile connects through that tile (and its pairing);
-    /// anything else starts a new, unsaved tile.
-    @discardableResult
-    func connectManual(_ address: String) -> Bool {
-        guard !isConnecting else {
-            log("connectManual() ignored while already connecting")
-            return false
-        }
+    /// Connects to an address from New Host with the settings chosen there. An address that
+    /// matches a saved tile connects through that tile (and its pairing), taking the new
+    /// settings; anything else starts a new tile, saved after its first successful connection.
+    /// Returns the reason it can't connect, or nil.
+    func connectNewHost(address: String, settings: HostStreamSettings) -> String? {
+        guard !isConnecting else { return "Wait for the current connection to finish" }
         let target: (host: String, port: UInt16)
         switch Self.parseAddress(address) {
         case .failure(let error):
-            status = error.message
-            return false
+            return error.message
         case .success(let parsed):
             target = parsed
         }
         let matches = { (tile: RecentConnection) in tile.host == target.host && tile.port == target.port }
-        if let saved = recentConnections.first(where: matches) {
-            connect(to: saved)
-        } else if let pending = connectionTarget, matches(pending) {
-            connect(to: pending)
-        } else {
-            connect(to: RecentConnection(host: target.host, port: target.port, name: "", lastConnectedAt: Date()))
-        }
-        return true
+        let tile = recentConnections.first(where: matches)
+            ?? connectionTarget.flatMap { matches($0) ? $0 : nil }
+            ?? RecentConnection(host: target.host, port: target.port, name: "", lastConnectedAt: Date())
+        hostSettings[tile.id] = settings
+        persistHostSettings()
+        connect(to: tile)
+        return nil
     }
 
     func connectRecent(_ tile: RecentConnection) {

@@ -50,7 +50,8 @@ See [README.md](../README.md#use) for the end-to-end connect flow (PIN pairing, 
 virtual display).
 
 The connection screen shows a tile per host. Tap a tile to connect; progress, a Cancel button and
-any error appear on the tile itself. Tap **+** to connect to a new address; it becomes a tile after
+any error appear on the tile itself. Tap **+** to enter an address and choose its video and encoding
+settings before pressing **Connect**. It becomes a tile after
 its first successful connection, and typing the address of an existing tile connects through that
 tile. Each tile's **⋯** menu (or a long press) has **Settings…**, **Pin** and **Remove**; the **⋯**
 next to **+** clears unpinned hosts or all hosts.
