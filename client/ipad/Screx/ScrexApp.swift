@@ -10,12 +10,14 @@ import os
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     let model = StreamViewModel()
+    lazy var externalDisplay = ExternalDisplayCoordinator(model: model)
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         model.configureAudioSession()
+        _ = externalDisplay
         return true
     }
 
@@ -24,8 +26,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         configurationForConnecting connectingSceneSession: UISceneSession,
         options: UIScene.ConnectionOptions
     ) -> UISceneConfiguration {
-        let config = UISceneConfiguration(name: "Default Configuration", sessionRole: connectingSceneSession.role)
-        config.delegateClass = SceneDelegate.self
+        let external = connectingSceneSession.role == .windowExternalDisplayNonInteractive
+        let config = UISceneConfiguration(name: external ? "External Display" : "Default Configuration", sessionRole: connectingSceneSession.role)
+        config.delegateClass = external ? ExternalDisplaySceneDelegate.self : SceneDelegate.self
         return config
     }
 }
@@ -52,6 +55,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
+        guard scene.session.role == .windowApplication else { return }
         model?.handleAppDidEnterBackground()
     }
 }
@@ -355,6 +359,7 @@ final class ScrexRootViewController: GCEventViewController {
     private let hostingController: UIHostingController<AnyView>
     private var cancellables = Set<AnyCancellable>()
     private let captureView = MouseCaptureRootView()
+    private var externalSceneRegistration: AnyObject?
 
     init(model: StreamViewModel) {
         self.model = model
@@ -381,6 +386,13 @@ final class ScrexRootViewController: GCEventViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        if #available(iOS 27.0, *) {
+            let configuration = UISceneConfiguration(name: "External Display", sessionRole: .windowExternalDisplayNonInteractive)
+            configuration.delegateClass = ExternalDisplaySceneDelegate.self
+            // Keep registration while the main controller lives, including Internal only,
+            // so a monitor can be detected without taking over ordinary system mirroring.
+            externalSceneRegistration = registerSceneAccessory(.externalNonInteractive(sceneConfiguration: configuration))
+        }
         addChild(hostingController)
         hostingController.view.translatesAutoresizingMaskIntoConstraints = false
         hostingController.view.backgroundColor = .clear
@@ -495,6 +507,40 @@ final class StreamViewModel: ObservableObject {
     /// What the currently-connected daemon advertised via `CAPS`. Nil until a `CAPS`
     /// message arrives (or the 2s timeout fallback fires, see `beginCapabilityNegotiation`).
     @Published private(set) var daemonCapabilities: DaemonCapabilities?
+    @Published private(set) var displayStatuses: [StreamDisplayID: DisplayStatus] = [:]
+    @Published private(set) var displayConfigurationError: String?
+    private var currentDisplaySettings: StreamSettings?
+    private var committedDisplaySettings: StreamSettings?
+    @Published private(set) var externalDisplayCapabilities: ExternalDisplayCapabilities?
+    private var readyDisplayGenerations: [StreamDisplayID: UInt32] = [:]
+    @Published private(set) var displayRouting = DisplayRoutingState()
+    @Published private(set) var isChangingDisplays = false
+    @Published private(set) var inputLayoutRevision: UInt32 = 0
+    weak var externalDisplayCoordinator: ExternalDisplayCoordinator?
+    private var attachedDisplaySurfaces = Set<StreamDisplayID>()
+    private var trackpadBeforeExternalOnly: Bool?
+
+    var selectedDisplayMode: DisplayOutputMode { displayRouting.requestedMode }
+    var externalDisplayAvailable: Bool { displayRouting.externalAvailable }
+    var currentDisplayConfiguration: StreamSettings? { currentDisplaySettings }
+    func clearDisplayConfigurationError() { displayConfigurationError = nil }
+    var canForwardInternalTouch: Bool {
+        // During a transition the old internal desktop is still on screen and still valid input
+        // space, so only its visibility matters (the daemon sends its generation-scoped stream).
+        displayRouting.internalVideoVisible && attachedDisplaySurfaces.contains(.internalDisplay)
+    }
+    /// Opt-in for External only; always starts off, and resets whenever External only ends.
+    @Published private(set) var isLaptopMode = false
+    var isExternalOnlyActive: Bool {
+        isConnected && !displayRouting.internalVideoVisible
+            && displayRouting.committedMask == DisplayOutputMode.externalOnly.rawValue
+    }
+    /// Laptop mode replaces the black placeholder, the floating pill and the iOS keyboard.
+    var isExternalControlPanelVisible: Bool { isExternalOnlyActive && isLaptopMode }
+
+    func setLaptopMode(_ enabled: Bool) {
+        isLaptopMode = enabled && isExternalOnlyActive
+    }
 
     /// Stream-settings preferences the user picked in the Stream Settings sheet,
     /// persisted in UserDefaults and re-sent unmodified as `SETTINGS` on every connect —
@@ -509,6 +555,7 @@ final class StreamViewModel: ObservableObject {
     @Published var customBitrateMbps: Double = StreamViewModel.loadCustomBitrateMbps()
 
     let decoder = VideoDecoder()
+    let externalDecoder = VideoDecoder()
     let avSync = AVSyncState()
     let audioPlayer: AudioPlayer
     let cameraCapture = CameraCapture()
@@ -528,6 +575,9 @@ final class StreamViewModel: ObservableObject {
 
     private var lastNetEndpoint: NWEndpoint?
     private var lastNetName: String?
+    /// Daemon hostname (or connection name) used to key remembered display choices.
+    @Published private(set) var currentHostKey: String?
+    private static let hostDisplayPreferencesKey = "screx_host_display_preferences"
     private var micSeq: UInt32 = 0
     @Published private(set) var isConnecting = false
     private var activeTransport: ConnectionTransport = .none
@@ -568,11 +618,8 @@ final class StreamViewModel: ObservableObject {
 
     /// Configures the shared AVAudioSession based on whether the in-app microphone is active.
     ///
-    /// We always keep the category as `.playAndRecord` so iOS honors the low-latency IO buffer
-    /// duration. The Bluetooth option changes based on mic state:
-    /// - Mic OFF: `.allowBluetoothA2DP` routes Bluetooth output over the high-quality A2DP profile.
-    /// - Mic ON: `.allowBluetooth` lets the system default input be a Bluetooth HFP mic.
-    /// We always use the system default route and do not force a speaker override or add any picker UI.
+    /// Playback-only sessions allow normal HDMI/AirPlay/A2DP output selection. Enable duplex
+    /// routing only while recording; forcing a recording category can exclude output-only routes.
     func configureAudioSession() {
         configureAudioSession(micActive: micCapture.isRunning)
     }
@@ -582,12 +629,13 @@ final class StreamViewModel: ObservableObject {
         do {
             let options: AVAudioSession.CategoryOptions = micActive
                 ? [.defaultToSpeaker, .mixWithOthers, .allowBluetooth]
-                : [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP]
-            try session.setCategory(.playAndRecord, mode: .default, options: options)
+                : [.mixWithOthers]
+            try session.setCategory(micActive ? .playAndRecord : .playback, mode: .default, options: options)
             try session.setPreferredSampleRate(48000)
             try session.setPreferredIOBufferDuration(0.01)
             try session.setActive(true)
             print("[app] audio session configured: mic=\(micActive), options=\(options), sampleRate=\(session.sampleRate), ioBufferDuration=\(session.ioBufferDuration)")
+            print("[app] audio output: \(session.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ", "))")
         } catch {
             print("[app] audio session configuration failed: \(error)")
         }
@@ -946,8 +994,27 @@ final class StreamViewModel: ObservableObject {
         capsTimeoutWorkItem = nil
         daemonCapabilities = capabilities
         updateSessionHostname(capabilities.hostname)
+        currentHostKey = capabilities.hostname.isEmpty
+            ? (lastNetName ?? "")
+            : capabilities.hostname
 
-        let settings = preferredStreamSettings
+        // Internal resolution/FPS/codec/bitrate come from Stream Settings. The display mode and
+        // the external output's resolution/FPS come from this host's remembered choice, falling
+        // back to internal-only and the display's recommended resolution.
+        var settings = preferredStreamSettings
+        let remembered = displayPreferences(forHost: currentHostKey)
+        settings.enabledDisplayMask = DisplayPreferenceRules.mode(
+            storedMode: remembered?.mode,
+            externalAvailable: externalDisplayAvailable
+        ).rawValue
+        if settings.enabledDisplayMask & 2 != 0 {
+            if let resolution = externalResolution(stored: remembered) {
+                settings.externalWidth = resolution.width
+                settings.externalHeight = resolution.height
+            }
+            settings.externalFps = remembered?.externalFps
+        }
+
         let violations = capabilities.validate(settings)
         guard violations.isEmpty else {
             log("CAPS received: \(capabilities); settings \(settings) violate capabilities: \(violations)")
@@ -986,7 +1053,225 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func sendStreamSettingsTransportState(_ settings: StreamSettings) {
+        currentDisplaySettings = settings
+        displayRouting.sessionEnabled = true
+        displayRouting.requestedMode = DisplayOutputMode(rawValue: settings.enabledDisplayMask) ?? .internalOnly
+        isChangingDisplays = true
+        externalDisplayCoordinator?.reconcile()
         networkControl?.sendStreamSettings(settings)
+    }
+
+    func setExternalDisplayAvailable(_ available: Bool) {
+        guard available != displayRouting.externalAvailable else { return }
+        displayRouting.externalAvailable = available
+        if available {
+            applyRememberedDisplayModeIfNeeded()
+        } else if let settings = currentDisplaySettings,
+                  (settings.enabledDisplayMask | displayRouting.committedMask) & 2 != 0 {
+            var fallback = settings
+            fallback.enabledDisplayMask = DisplayOutputMode.internalOnly.rawValue
+            _ = requestDisplaySettings(fallback)
+        }
+    }
+
+    func setExternalDisplayCapabilities(_ capabilities: ExternalDisplayCapabilities?) {
+        externalDisplayCapabilities = capabilities
+    }
+
+    // MARK: - Remembered display choices
+
+    var availableExternalResolutions: [DisplayResolution] {
+        externalDisplayCapabilities?.resolutionChoices(
+            maxWidth: daemonCapabilities?.maxWidth ?? 3840,
+            maxHeight: daemonCapabilities?.maxHeight ?? 2160
+        ) ?? []
+    }
+
+    var recommendedExternalResolution: DisplayResolution? {
+        guard let capabilities = externalDisplayCapabilities else { return nil }
+        let available = availableExternalResolutions
+        if let preferred = capabilities.preferredResolution, available.contains(preferred) {
+            return preferred
+        }
+        return available.last
+    }
+
+    func displayPreferences(forHost host: String?) -> HostDisplayPreferences? {
+        guard let host, !host.isEmpty else { return nil }
+        return hostDisplayPreferences[host]
+    }
+
+    private var hostDisplayPreferences: [String: HostDisplayPreferences] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: Self.hostDisplayPreferencesKey),
+                  let decoded = try? JSONDecoder().decode([String: HostDisplayPreferences].self, from: data)
+            else { return [:] }
+            return decoded
+        }
+        set {
+            guard let data = try? JSONEncoder().encode(newValue) else { return }
+            UserDefaults.standard.set(data, forKey: Self.hostDisplayPreferencesKey)
+        }
+    }
+
+    private func rememberDisplaySelection(_ mode: DisplayOutputMode,
+                                          resolution: DisplayResolution, frameRate: Int) {
+        guard let host = currentHostKey, !host.isEmpty else { return }
+        var all = hostDisplayPreferences
+        all[host] = HostDisplayPreferences(mode: mode.rawValue,
+                                           externalWidth: resolution.width,
+                                           externalHeight: resolution.height,
+                                           externalFps: frameRate)
+        hostDisplayPreferences = all
+    }
+
+    private func externalResolution(stored: HostDisplayPreferences?) -> DisplayResolution? {
+        DisplayPreferenceRules.resolution(stored: stored,
+                                          available: availableExternalResolutions,
+                                          recommended: recommendedExternalResolution)
+    }
+
+    /// A monitor appearing after connect applies this host's remembered external choice once.
+    private func applyRememberedDisplayModeIfNeeded() {
+        guard isConnected, externalDisplayAvailable,
+              let stored = displayPreferences(forHost: currentHostKey), stored.mode & 2 != 0,
+              var settings = currentDisplaySettings,
+              settings.enabledDisplayMask != stored.mode else { return }
+        settings.enabledDisplayMask = stored.mode
+        if let resolution = externalResolution(stored: stored) {
+            settings.externalWidth = resolution.width
+            settings.externalHeight = resolution.height
+        }
+        settings.externalFps = stored.externalFps
+        _ = requestDisplaySettings(settings)
+    }
+
+    func setDisplaySurfaceAttached(_ display: StreamDisplayID, attached: Bool) {
+        if attached {
+            guard attachedDisplaySurfaces.insert(display).inserted else { return }
+            if let generation = readyDisplayGenerations[display] {
+                acknowledgeReadyDisplay(display, generation: generation)
+            }
+        } else {
+            attachedDisplaySurfaces.remove(display)
+        }
+    }
+
+    @discardableResult
+    func selectDisplayMode(_ mode: DisplayOutputMode, externalResolution: DisplayResolution,
+                           externalFrameRate: Int) -> Bool {
+        guard var settings = currentDisplaySettings else { return false }
+        guard mode == .internalOnly || externalDisplayAvailable else {
+            displayConfigurationError = "Connect an external display first."
+            return false
+        }
+        settings.enabledDisplayMask = mode.rawValue
+        if mode != .internalOnly {
+            settings.externalWidth = externalResolution.width
+            settings.externalHeight = externalResolution.height
+            settings.externalFps = externalFrameRate
+        }
+        let applied = requestDisplaySettings(settings)
+        if applied {
+            rememberDisplaySelection(mode, resolution: externalResolution, frameRate: externalFrameRate)
+        }
+        return applied
+    }
+
+    private func releaseInputForDisplayChange() {
+        let previousMask = physicalMouseButtonMask | trackpadButtonMask
+        physicalMouseButtonMask = 0
+        trackpadButtonMask = 0
+        sendMouseButtonChanges(from: previousMask)
+        // Release hardware keys even if a cable was pulled in the middle of a chord.
+        sendPeripheral(Data([0x02, 0x00]))
+        if physicalKeyboardConnected { sendPeripheral(Data([0x02, 0x01])) }
+        trackpadMotionRemainder = .zero
+        trackpadScrollRemainder = 0
+        inputLayoutRevision &+= 1
+    }
+
+    /// Runtime topology requests use one monotonically increasing revision for both outputs.
+    @discardableResult
+    func requestDisplaySettings(_ settings: StreamSettings) -> Bool {
+        guard let capabilities = daemonCapabilities, let current = currentDisplaySettings,
+              networkControl != nil, current.revision < UInt32.max else { return false }
+        let violations = capabilities.validate(settings)
+        guard violations.isEmpty, (1...3).contains(settings.enabledDisplayMask) else {
+            displayConfigurationError = violations.first ?? "Select at least one display."
+            return false
+        }
+        var next = settings
+        next.revision = current.revision + 1
+        releaseInputForDisplayChange()
+        displayConfigurationError = nil
+        sendStreamSettingsTransportState(next)
+        return true
+    }
+
+    private func acknowledgeReadyDisplay(_ display: StreamDisplayID, generation: UInt32) {
+        readyDisplayGenerations[display] = generation
+        guard let settings = currentDisplaySettings,
+              settings.enabledDisplayMask & (1 << display.rawValue) != 0,
+              displayRouting.canAcknowledge(display, surfaceAttached: attachedDisplaySurfaces.contains(display)) else { return }
+        networkControl?.sendDisplayPresented(revision: settings.revision, display: display, generation: generation)
+    }
+
+    private func handleDisplayStatus(_ update: DisplayStatus) {
+        guard update.revision == currentDisplaySettings?.revision else { return }
+        displayStatuses[update.display] = update
+        if update.phase == .failed {
+            if update.activeMask == 0 {
+                failConnection(detail: "Could not start the display: \(update.detail)")
+                return
+            }
+            displayConfigurationError = update.detail
+            currentDisplaySettings?.enabledDisplayMask = update.activeMask
+            currentDisplaySettings?.externalFps = committedDisplaySettings?.externalFps
+            displayRouting.requestedMode = DisplayOutputMode(rawValue: update.activeMask) ?? .internalOnly
+            displayRouting.committedMask = update.activeMask
+            isChangingDisplays = false
+            if update.generation > 0, update.width > 0, update.height > 0 {
+                if update.display == .internalDisplay {
+                    currentDisplaySettings?.width = update.width
+                    currentDisplaySettings?.height = update.height
+                } else {
+                    currentDisplaySettings?.externalWidth = update.width
+                    currentDisplaySettings?.externalHeight = update.height
+                }
+            }
+            externalDisplayCoordinator?.reconcile()
+            restoreTrackpadAfterExternalOnly()
+        } else if update.phase == .committed || update.phase == .removed {
+            committedDisplaySettings = currentDisplaySettings
+            displayRouting.committedMask = update.activeMask
+            isChangingDisplays = false
+            if update.activeMask == DisplayOutputMode.externalOnly.rawValue {
+                if trackpadBeforeExternalOnly == nil { trackpadBeforeExternalOnly = isTrackpadEnabled }
+                setTrackpadEnabled(true)
+            } else {
+                restoreTrackpadAfterExternalOnly()
+            }
+            externalDisplayCoordinator?.reconcile()
+            // A monitor can disappear between the final ACK and the committed status.
+            if !externalDisplayAvailable, update.activeMask & 2 != 0,
+               currentDisplaySettings?.enabledDisplayMask != DisplayOutputMode.internalOnly.rawValue,
+               let settings = currentDisplaySettings {
+                var fallback = settings
+                fallback.enabledDisplayMask = DisplayOutputMode.internalOnly.rawValue
+                _ = requestDisplaySettings(fallback)
+            }
+        } else if update.phase == .streaming, readyDisplayGenerations[update.display] == update.generation {
+            acknowledgeReadyDisplay(update.display, generation: update.generation)
+        }
+    }
+
+    private func restoreTrackpadAfterExternalOnly() {
+        if displayRouting.committedMask != DisplayOutputMode.externalOnly.rawValue { isLaptopMode = false }
+        guard displayRouting.committedMask != DisplayOutputMode.externalOnly.rawValue,
+              let saved = trackpadBeforeExternalOnly else { return }
+        trackpadBeforeExternalOnly = nil
+        setTrackpadEnabled(saved)
     }
 
     /// Clears capability-negotiation state on disconnect so a fresh connection starts
@@ -996,6 +1281,18 @@ final class StreamViewModel: ObservableObject {
         capsTimeoutWorkItem?.cancel()
         capsTimeoutWorkItem = nil
         daemonCapabilities = nil
+        currentDisplaySettings = nil
+        committedDisplaySettings = nil
+        displayStatuses.removeAll()
+        readyDisplayGenerations.removeAll()
+        displayConfigurationError = nil
+        displayRouting.sessionEnabled = false
+        displayRouting.requestedMode = .internalOnly
+        displayRouting.committedMask = 0
+        isChangingDisplays = false
+        trackpadBeforeExternalOnly = nil
+        isLaptopMode = false
+        externalDisplayCoordinator?.reconcile()
     }
 
     func handleAppDidEnterBackground() {
@@ -1008,6 +1305,7 @@ final class StreamViewModel: ObservableObject {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
+        log("local display: \(DeviceDisplayIdentity.current.name), EDID: \(DeviceDisplayIdentity.current.edidName)")
         startTrafficMonitoring()
         syncCameraCompressionQuality()
         if !isConnected && !isConnecting {
@@ -1181,6 +1479,12 @@ final class StreamViewModel: ObservableObject {
                         self.handleDaemonCapabilities(capabilities)
                     }
                 }
+                control.onDisplayStatus = { [weak self, weak control] update in
+                    Task { @MainActor in
+                        guard let self, let control, self.networkControl === control else { return }
+                        self.handleDisplayStatus(update)
+                    }
+                }
                 control.onLatency = { [weak self, weak control] rttMs, jitterMs in
                     Task { @MainActor in
                         guard let self, let control else { return }
@@ -1248,12 +1552,18 @@ final class StreamViewModel: ObservableObject {
 
         decoder.hasReportedFirstFrame = false
 
-        let client = StreamClient(endpoint: endpoint, decoder: decoder, audioPlayer: audioPlayer, avSync: avSync)
+        let client = StreamClient(endpoint: endpoint, decoder: decoder, externalDecoder: externalDecoder, audioPlayer: audioPlayer, avSync: avSync)
         client.sessionKey = sessionKey
-        client.sendPliRequest = { [weak controlClient] in
-            controlClient?.sendPli()
+        client.sendPliRequest = { [weak controlClient] display, generation in
+            controlClient?.sendPli(display: display, generation: generation)
         }
         self.stream = client
+        client.onVideoFrameReady = { [weak self, weak client] display, generation in
+            Task { @MainActor in
+                guard let self, let client, self.stream === client else { return }
+                self.acknowledgeReadyDisplay(display, generation: generation)
+            }
+        }
         client.onTraffic = { [weak self] rxBytes, txBytes in
             self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
         }
@@ -1934,6 +2244,10 @@ final class StreamViewModel: ObservableObject {
                 self.stream?.sendMicPacket(opusData, seq: seq)
             }
             micCapture.start()
+            if !micCapture.isRunning {
+                sendMicDisable()
+                configureAudioSession()
+            }
             if speakerWasEnabled {
                 resetSpeakerOutput()
             }
@@ -2010,6 +2324,7 @@ struct ContentView: View {
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
     @State private var showStreamSettings = false
+    @State private var showDisplaySettings = false
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
@@ -2027,7 +2342,7 @@ struct ContentView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                if let layer = model.displayLayer {
+                if model.displayRouting.internalVideoVisible, let layer = model.displayLayer {
                     VideoDisplayView(
                         layer: layer,
                         videoWidth: model.decoder.videoWidth,
@@ -2035,9 +2350,46 @@ struct ContentView: View {
                         onTouch: { data in model.sendTouch(data) },
                         onScroll: { deltaY in model.forwardPhysicalMouseScroll(deltaY: deltaY) },
                         hidePointer: model.physicalMouseConnected,
-                        lockPointer: model.physicalMouseConnected
+                        lockPointer: model.physicalMouseConnected,
+                        acceptsTouch: model.canForwardInternalTouch,
+                        onWindowAttachmentChanged: { model.setDisplaySurfaceAttached(.internalDisplay, attached: $0) }
                     )
                     .ignoresSafeArea()
+                } else if model.isConnected {
+                    Group {
+                        if model.isExternalControlPanelVisible {
+                            ExternalControlPanel(
+                                model: model,
+                                onShowDisplays: { showDisplaySettings = true },
+                                onMessage: { showToolbarMessage($0) }
+                            )
+                            .ignoresSafeArea(.container, edges: .bottom)
+                            .onAppear { isKeyboardActive = false }
+                        } else {
+                            VStack(spacing: 16) {
+                                Image(systemName: "display")
+                                    .font(.system(size: 44))
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
+                                Text("You are running only in the external display")
+                                    .font(.headline)
+                                Button {
+                                    model.setLaptopMode(true)
+                                } label: {
+                                    Label("Switch to laptop mode", systemImage: "laptopcomputer")
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .padding(24)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                    }
+                    // No video view in External only, which normally owns pointer lock. Keep the
+                    // iPad cursor hidden and locked so a physical mouse moves the remote pointer
+                    // relatively instead of stopping at the iPad's screen edges.
+                    .background(PointerLockRegion(locked: model.physicalMouseConnected).ignoresSafeArea())
                 }
 
                 // MARK: Connection screen (always visible when disconnected)
@@ -2149,36 +2501,12 @@ struct ContentView: View {
                 }
 
                 // MARK: Info overlay (toggleable when connected)
-                if model.isConnected && showOverlay {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(model.sessionTransportTitle)
-                            .font(.title3.weight(.bold))
-
-                        VStack(alignment: .leading, spacing: 6) {
-                            infoRow(label: "Hostname", value: model.sessionDisplayName.isEmpty ? "Unknown" : model.sessionDisplayName)
-                            infoRow(label: "Receiving", value: model.receiveRateText)
-                            infoRow(label: "Sending", value: model.sendRateText)
-                            infoRow(label: "Codec", value: model.codecLabel)
-                            infoRow(label: "Latency", value: model.latencyText)
-                            infoRow(label: "Jitter", value: model.jitterText)
-                        }
-
-                        if !model.status.isEmpty {
-                            Text(model.status)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Button("Disconnect") { model.disconnect() }
-                            .buttonStyle(.bordered)
-                            .font(.caption)
-                    }
-                    .padding(12)
-                    .frame(maxWidth: 380, alignment: .leading)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                // Laptop mode shows connection info inline in its top bar.
+                if model.isConnected && showOverlay && !model.isExternalControlPanelVisible {
+                    StreamInfoView(model: model)
                     .padding(.horizontal, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 8)
+                    .padding(.top, model.isExternalControlPanelVisible ? 64 : 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
@@ -2205,7 +2533,7 @@ struct ContentView: View {
                 )
                 .frame(width: 0, height: 0)
 
-                if model.isConnected {
+                if model.isConnected && !model.isExternalControlPanelVisible {
                     if model.isTrackpadEnabled {
                         TrackpadOverlay(
                             containerSize: geo.size,
@@ -2217,6 +2545,7 @@ struct ContentView: View {
                             onButton: { code, pressed in model.trackpadButton(code, pressed: pressed) },
                             onScroll: { model.scrollTrackpad(deltaY: $0) }
                         )
+                        .id(model.inputLayoutRevision)
                         .frame(width: geo.size.width, height: geo.size.height)
                     }
                     floatingBar(in: geo)
@@ -2232,6 +2561,11 @@ struct ContentView: View {
             }
             .onChange(of: pillSize) { _ in
                 clampBarPosition(in: geo.size)
+            }
+            .onChange(of: model.externalDisplayAvailable) { available in
+                if available && model.isConnected {
+                    showToolbarMessage("External display connected. Open Displays to choose an output.")
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notif in
                 guard let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
@@ -2263,6 +2597,17 @@ struct ContentView: View {
         // Our floating controls handle keyboard occlusion themselves. Keeping the container
         // full-height avoids SwiftUI shrinking/shifting it a second time underneath them.
         .ignoresSafeArea(.keyboard)
+        .sheet(isPresented: $showDisplaySettings) {
+            DisplaySettingsView(model: model)
+        }
+        .alert("Couldn’t switch displays", isPresented: Binding(
+            get: { model.displayConfigurationError != nil && !showDisplaySettings },
+            set: { if !$0 { model.clearDisplayConfigurationError() } }
+        )) {
+            Button("OK") { model.clearDisplayConfigurationError() }
+        } message: {
+            Text(model.displayConfigurationError ?? "The previous display configuration was kept.")
+        }
         .sheet(isPresented: $model.showPinEntry) {
             VStack(spacing: 20) {
                 Text("Pairing Required")
@@ -2420,6 +2765,22 @@ struct ContentView: View {
                     }
                 }
 
+                if model.externalDisplayAvailable || model.displayRouting.committedMask & 2 != 0 {
+                    Button {
+                        showDisplaySettings = true
+                    } label: {
+                        Image(systemName: model.isChangingDisplays ? "arrow.triangle.2.circlepath" : "display.2")
+                            .font(.footnote)
+                            .foregroundStyle(model.isChangingDisplays ? .orange : .white)
+                            .frame(width: Self.btnSize, height: Self.btnSize)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Displays")
+                    .accessibilityValue(model.isChangingDisplays ? "Switching displays" : model.selectedDisplayMode.label)
+                    .accessibilityHint("Choose internal, external, or both displays")
+                }
+
                 toolbarButton(
                     icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
                     active: isKeyboardActive && !model.physicalKeyboardConnected,
@@ -2519,19 +2880,6 @@ struct ContentView: View {
             .frame(width: Self.btnSize, height: Self.btnSize)
             .contentShape(Circle())
             .onTapGesture(perform: action)
-    }
-
-    @ViewBuilder
-    private func infoRow(label: String, value: String) -> some View {
-        HStack(spacing: 8) {
-            Text("\(label):")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption)
-                .foregroundStyle(.primary)
-            Spacer(minLength: 0)
-        }
     }
 
     private func showToolbarMessage(_ message: String) {

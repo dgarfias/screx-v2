@@ -27,6 +27,7 @@ final class NetworkControlClient {
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var onCapabilities: ((DaemonCapabilities) -> Void)?
+    var onDisplayStatus: ((DisplayStatus) -> Void)?
     /// (rttMs, jitterMs) of the control-channel latency probe.
     var onLatency: ((Double, Double) -> Void)?
 
@@ -239,6 +240,8 @@ final class NetworkControlClient {
                 return
             }
             onCapabilities?(capabilities)
+        case ScrexMessage.Daemon.displayStatus:
+            if let status = DisplayStatus.parse(Data(body)) { onDisplayStatus?(status) }
         default:
             log("unexpected inbound tcp control message type 0x\(String(type, radix: 16)) (\(payload.count) bytes)")
         }
@@ -295,8 +298,18 @@ final class NetworkControlClient {
         sendFrame(payload, label: label)
     }
 
-    func sendPli() {
-        send(ScrexMessage.Client.pli, label: "PLI")
+    func sendPli(display: StreamDisplayID, generation: UInt32) {
+        var body = Data([display.rawValue])
+        withUnsafeBytes(of: generation.bigEndian) { body.append(contentsOf: $0) }
+        send(ScrexMessage.Client.pli, body, label: "PLI")
+    }
+
+    func sendDisplayPresented(revision: UInt32, display: StreamDisplayID, generation: UInt32) {
+        var body = Data()
+        withUnsafeBytes(of: revision.bigEndian) { body.append(contentsOf: $0) }
+        body.append(display.rawValue)
+        withUnsafeBytes(of: generation.bigEndian) { body.append(contentsOf: $0) }
+        send(ScrexMessage.Client.displayPresented, body, label: "display presented")
     }
 
     func sendSpeakerState(isEnabled: Bool) {

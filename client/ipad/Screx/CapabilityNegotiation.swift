@@ -73,11 +73,19 @@ struct DaemonCapabilities: Equatable {
                 )
             }
         }
+        if settings.enabledDisplayMask & 2 != 0,
+           let width = settings.externalWidth, let height = settings.externalHeight,
+           width > maxWidth || height > maxHeight {
+            violations.append("external resolution is higher than maximum allowed by daemon (current: \(width)×\(height), maximum allowed: \(maxWidth)×\(maxHeight))")
+        }
 
         if let fps = settings.fps, fps > maxFps {
             violations.append(
                 "framerate is higher than maximum allowed by daemon (current: \(fps) fps, maximum allowed: \(maxFps) fps)"
             )
+        }
+        if settings.enabledDisplayMask & 2 != 0, let fps = settings.externalFps, fps > maxFps {
+            violations.append("external frame rate exceeds the daemon’s maximum (\(maxFps) fps)")
         }
 
         if let codecId = settings.codecId, !codecs.contains(codecId) {
@@ -122,13 +130,19 @@ struct DaemonCapabilities: Equatable {
 /// Client-proposed stream settings, sent to the daemon as `SETTINGS`. A `nil` field means
 /// "use the daemon's own default" and goes on the wire as 0 (`codecDefault` for the codec).
 ///
-/// Body layout (after the type byte): `width(u16) height(u16) fps(u8) codec(u8) bitrate(u32)`.
+/// Body: internal width/height/FPS, shared codec/bitrate, mask, external width/height, revision, external FPS.
 struct StreamSettings: Equatable {
     var width: Int?
     var height: Int?
     var fps: Int?
     var codecId: UInt8?
     var bitrateBps: UInt32?
+    var enabledDisplayMask: UInt8 = 1
+    var externalWidth: Int?
+    var externalHeight: Int?
+    var externalFps: Int?
+    var revision: UInt32 = 1
+    var internalDisplayName = DeviceDisplayIdentity.current.edidName
 
     private static let codecDefault: UInt8 = 0xFF
 
@@ -154,6 +168,17 @@ struct StreamSettings: Equatable {
         body.append(f)
         body.append(codecId ?? Self.codecDefault)
         withUnsafeBytes(of: (bitrateBps ?? 0).bigEndian) { body.append(contentsOf: $0) }
+        body.append(enabledDisplayMask)
+        let hasExternalResolution = fitsU16(externalWidth) && fitsU16(externalHeight)
+        let ew = UInt16(hasExternalResolution ? externalWidth! : 0)
+        let eh = UInt16(hasExternalResolution ? externalHeight! : 0)
+        withUnsafeBytes(of: ew.bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: eh.bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: revision.bigEndian) { body.append(contentsOf: $0) }
+        body.append(UInt8(externalFps.map { $0 > 0 && $0 <= 255 ? $0 : 0 } ?? 0))
+        let name = Array(internalDisplayName.utf8.prefix(13))
+        body.append(contentsOf: name)
+        body.append(Data(repeating: 0x20, count: 13 - name.count))
         return body
     }
 }

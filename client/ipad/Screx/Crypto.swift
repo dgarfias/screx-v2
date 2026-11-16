@@ -88,7 +88,7 @@ struct ScrexCrypto {
     // MARK: - Nonce construction
 
     /// Server→client nonce from packet header fields.
-    static func nonceServer(frameId: UInt32, chunkIdx: UInt16, flags: UInt8) -> Data {
+    static func nonceServer(frameId: UInt32, chunkIdx: UInt16, flags: UInt8, generation: UInt32) -> Data {
         withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 12) { ptr in
             // The daemon zero-pads unused nonce bytes; the temporary buffer is
             // uninitialized stack memory, so it must be zeroed before use.
@@ -101,6 +101,10 @@ struct ScrexCrypto {
             ptr[5] = UInt8(truncatingIfNeeded: chunkIdx >> 8)
             ptr[6] = UInt8(truncatingIfNeeded: chunkIdx)
             ptr[7] = flags
+            ptr[8] = UInt8(truncatingIfNeeded: generation >> 24)
+            ptr[9] = UInt8(truncatingIfNeeded: generation >> 16)
+            ptr[10] = UInt8(truncatingIfNeeded: generation >> 8)
+            ptr[11] = UInt8(truncatingIfNeeded: generation)
             return Data(UnsafeBufferPointer(start: ptr.baseAddress!, count: 12))
         }
     }

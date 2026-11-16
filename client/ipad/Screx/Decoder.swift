@@ -33,6 +33,9 @@ final class VideoDecoder {
     private var vclRanges: [Range<Int>] = []
 
     var sendPliRequest: (() -> Void)?
+    var onFrameReady: ((UInt32) -> Void)?
+    // Accessed only on renderQueue. A prior generation cannot acknowledge a replacement.
+    private var renderGeneration: UInt32?
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -53,14 +56,47 @@ final class VideoDecoder {
 
     func setCodec(_ codec: VideoCodecType) {
         guard codec != self.codec else { return }
+        beginStream(codec: codec)
+    }
+
+    /// Called on the receive queue before submitting a new authenticated generation.
+    /// Clear the prior image so isReadyForDisplay can only acknowledge the new generation.
+    /// Other output layers remain untouched throughout topology transitions.
+    func beginStream(codec: VideoCodecType, generation: UInt32? = nil) {
         self.codec = codec
         formatDescription = nil
         sps = nil
         pps = nil
         vps = nil
         naluCount = 0
+        hasReportedFirstFrame = false
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.renderGeneration = generation
+            self.displayLayer.flushAndRemoveImage()
+            if let generation { self.checkPresentation(generation: generation, attempts: 0) }
+        }
         let codecName = codec == .h264 ? "H.264" : "H.265"
         print("[decoder] codec set to \(codecName)")
+    }
+
+    private func checkPresentation(generation: UInt32, attempts: Int) {
+        guard renderGeneration == generation else { return }
+        let frameReady: Bool
+        if #available(iOS 17.4, *) {
+            frameReady = displayLayer.isReadyForDisplay
+        } else {
+            // Earlier iOS exposes only the renderer state, reset by flushAndRemoveImage.
+            frameReady = displayLayer.status == .rendering
+        }
+        if frameReady && displayLayer.status == .rendering {
+            onFrameReady?(generation)
+            return
+        }
+        guard attempts < 300 else { return }
+        renderQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.checkPresentation(generation: generation, attempts: attempts + 1)
+        }
     }
 
     func decodeAccessUnit(_ data: Data) {

@@ -122,7 +122,7 @@ request to turn them on.
 1. Start the daemon.
 2. Open Screx on the iPad, enter the host/IP, and tap `Connect`.
 3. If it is the first connection, enter the PIN shown by the daemon.
-4. Enable the `Screx Virtual` display in GNOME Settings if the virtual monitor is not already
+4. Enable the iPad-named display in GNOME Settings if the virtual monitor is not already
    active.
 
 ### Black screen on GNOME 51 (mutter 51)

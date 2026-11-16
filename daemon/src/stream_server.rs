@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::audio::MicWriter;
 use crate::camera::{CamReassembler, CamWriter, CameraConfig};
+use crate::capture::DisplayId;
 use crate::encode::{EncodedAccessUnit, EncoderBackend, VideoCodec};
 use crate::input::{
     parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, GamepadState,
@@ -21,7 +22,7 @@ use crate::platform::net::{
 };
 
 const CHUNK_PAYLOAD: usize = 1400;
-const HEADER_LEN: usize = 18;
+const HEADER_LEN: usize = 22;
 use crate::protocol;
 
 /// Validation/clamping bounds for client-proposed `SETTINGS`. The bitrate
@@ -82,6 +83,20 @@ fn seq_is_stale(seq_num: u32, expected_seq: u32) -> bool {
 
 pub type LifecycleCallback = Box<dyn Fn() + Send + Sync>;
 
+/// Extract only this session's messages. Never let a retiring consumer steal a new session's queue.
+pub fn take_session_messages<T>(queue: &mut VecDeque<(u64, T)>, session: u64) -> Vec<T> {
+    let mut messages = Vec::new();
+    for _ in 0..queue.len() {
+        let (id, message) = queue.pop_front().unwrap();
+        if id == session {
+            messages.push(message);
+        } else if id > session {
+            queue.push_back((id, message));
+        }
+    }
+    messages
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StreamTuning {
     pub bitrate_bps: u32,
@@ -117,15 +132,6 @@ impl AdaptiveStreamState {
         self.pframe_fec_percent = PFRAME_FEC_PERCENT;
         self.pli_events.clear();
         self.last_adjust_at = Instant::now();
-    }
-
-    /// Rebaseline the adaptive bitrate loop around a new base (the
-    /// client-negotiated `SETTINGS` bitrate). The adaptive loop in `adjust()` throttles up/down from
-    /// `base_bitrate_bps`, so changing it without also resetting the current
-    /// value would leave the stream ramping from the old client's bitrate.
-    fn set_base(&mut self, base_bitrate_bps: u32) {
-        self.base_bitrate_bps = base_bitrate_bps;
-        self.reset();
     }
 
     fn note_pli(&mut self, now: Instant) {
@@ -208,13 +214,46 @@ impl AdaptiveStreamState {
     }
 }
 
+pub struct DisplayStreamControl {
+    pub force_idr: AtomicBool,
+    pub force_refresh: Arc<AtomicBool>,
+    pub generation: AtomicU32,
+    adaptive_stream: Mutex<AdaptiveStreamState>,
+}
+
+impl DisplayStreamControl {
+    pub fn new(base_bitrate_bps: u32) -> Self {
+        Self {
+            force_idr: AtomicBool::new(false),
+            force_refresh: Arc::new(AtomicBool::new(false)),
+            generation: AtomicU32::new(0),
+            adaptive_stream: Mutex::new(AdaptiveStreamState::new(base_bitrate_bps)),
+        }
+    }
+
+    pub fn tuning(&self) -> StreamTuning {
+        self.adaptive_stream
+            .lock()
+            .unwrap()
+            .current_tuning(Instant::now())
+    }
+
+    fn request_keyframe(&self, generation: u32) {
+        if generation == 0 || self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.adaptive_stream
+            .lock()
+            .unwrap()
+            .note_pli(Instant::now());
+        self.force_idr.store(true, Ordering::Relaxed);
+        self.force_refresh.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct SharedState {
     pub client_addr: Mutex<Option<SocketAddr>>,
-    pub force_idr: AtomicBool,
-    pub force_refresh_handle: Mutex<Option<Arc<AtomicBool>>>,
-    pub capture_start: Arc<AtomicBool>,
-    pub capture_start_signal: Arc<(Mutex<bool>, Condvar)>,
-    pub capture_stop_flag: Arc<AtomicBool>,
+    display_streams: [Mutex<Arc<DisplayStreamControl>>; 2],
     pub input_backend: Arc<Mutex<dyn InputBackend>>,
     pub keyboard_worker: Mutex<Option<KeyboardWorker>>,
     pub audio_notify: Arc<Condvar>,
@@ -231,8 +270,9 @@ pub struct SharedState {
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
     pub network_session_id: AtomicU64,
+    network_session_closing: AtomicBool,
+    network_session_lock: Mutex<()>,
     pub session_key: Mutex<Option<[u8; 32]>>,
-    adaptive_stream: Mutex<AdaptiveStreamState>,
     /// IP expected from the TCP handshake; used to accept the first UDP packet
     pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
     /// Local source IP/interface pinned for daemon→client UDP (from TCP handshake)
@@ -248,12 +288,11 @@ pub struct SharedState {
     pub encoder_backend: EncoderBackend,
     /// Operator-disabled optional features.
     pub features: FeatureToggles,
-    /// Settings parsed out of a client's `SETTINGS` control message, consumed
-    /// once by the capture thread at the start of the next session (see
-    /// `main.rs`'s capture loop). `None` means "no SETTINGS received yet for
-    /// the pending session" — the capture thread waits on the condvar until
-    /// one arrives.
-    pub pending_settings: Arc<(Mutex<Option<RequestedSettings>>, Condvar)>,
+    /// Latest topology request, tagged with the owning network session. Consumed by the
+    /// display manager both at startup and while streaming. Superseded revisions coalesce.
+    pub pending_settings: Arc<(Mutex<Option<(u64, RequestedSettings)>>, Condvar)>,
+    pub presentation_acks: Mutex<VecDeque<(u64, crate::display_manager::PresentationAck)>>,
+    pub display_status: Mutex<VecDeque<(u64, Vec<u8>)>>,
 }
 
 impl SharedState {
@@ -270,11 +309,9 @@ impl SharedState {
     ) -> Self {
         Self {
             client_addr: Mutex::new(None),
-            force_idr: AtomicBool::new(false),
-            force_refresh_handle: Mutex::new(None),
-            capture_start: Arc::new(AtomicBool::new(false)),
-            capture_start_signal: Arc::new((Mutex::new(false), Condvar::new())),
-            capture_stop_flag: Arc::new(AtomicBool::new(false)),
+            display_streams: std::array::from_fn(|_| {
+                Mutex::new(Arc::new(DisplayStreamControl::new(base_bitrate_bps)))
+            }),
             input_backend,
             keyboard_worker: Mutex::new(None),
             audio_notify: Arc::new(Condvar::new()),
@@ -294,8 +331,9 @@ impl SharedState {
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
+            network_session_closing: AtomicBool::new(false),
+            network_session_lock: Mutex::new(()),
             session_key: Mutex::new(None),
-            adaptive_stream: Mutex::new(AdaptiveStreamState::new(base_bitrate_bps)),
             expected_client_ip: Mutex::new(None),
             udp_source: Mutex::new(None),
             max_width,
@@ -305,15 +343,19 @@ impl SharedState {
             encoder_backend,
             features,
             pending_settings: Arc::new((Mutex::new(None), Condvar::new())),
+            presentation_acks: Mutex::new(VecDeque::new()),
+            display_status: Mutex::new(VecDeque::new()),
             start_time: Instant::now(),
         }
     }
 
     pub fn reserve_network_session(&self) -> Option<u64> {
+        let _guard = self.network_session_lock.lock().unwrap();
         self.network_session_busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
         self.network_session_pending.store(true, Ordering::SeqCst);
+        self.network_session_closing.store(false, Ordering::SeqCst);
         Some(
             self.network_session_id
                 .fetch_add(1, Ordering::SeqCst)
@@ -323,6 +365,7 @@ impl SharedState {
 
     pub fn is_current_network_session(&self, session_id: u64) -> bool {
         self.network_session_busy.load(Ordering::SeqCst)
+            && !self.network_session_closing.load(Ordering::SeqCst)
             && self.network_session_id.load(Ordering::SeqCst) == session_id
     }
 
@@ -332,31 +375,36 @@ impl SharedState {
         }
     }
 
-    pub fn note_pli(&self) {
-        self.adaptive_stream
-            .lock()
-            .unwrap()
-            .note_pli(Instant::now());
+    pub fn display_stream(&self, display: DisplayId) -> Arc<DisplayStreamControl> {
+        Arc::clone(&self.display_streams[display as usize].lock().unwrap())
     }
 
-    pub fn current_stream_tuning(&self) -> StreamTuning {
-        self.adaptive_stream
-            .lock()
-            .unwrap()
-            .current_tuning(Instant::now())
+    pub fn install_display_stream(&self, display: DisplayId, control: Arc<DisplayStreamControl>) {
+        *self.display_streams[display as usize].lock().unwrap() = control;
     }
 
     pub fn reset_stream_tuning(&self) {
-        self.adaptive_stream.lock().unwrap().reset();
+        for stream in &self.display_streams {
+            stream
+                .lock()
+                .unwrap()
+                .adaptive_stream
+                .lock()
+                .unwrap()
+                .reset();
+        }
     }
 
-    /// Rebaseline the adaptive bitrate loop to the client-negotiated `SETTINGS`
-    /// bitrate at session start.
-    pub fn set_base_bitrate(&self, base_bitrate_bps: u32) {
-        self.adaptive_stream
-            .lock()
-            .unwrap()
-            .set_base(base_bitrate_bps);
+    pub fn queue_display_status(
+        &self,
+        session: u64,
+        status: crate::display_manager::DisplayStatus,
+    ) {
+        let mut queue = self.display_status.lock().unwrap();
+        if queue.len() >= 128 {
+            queue.pop_front();
+        }
+        queue.push_back((session, status.encode()));
     }
 }
 
@@ -409,6 +457,12 @@ pub struct RequestedSettings {
     pub fps: Option<u32>,
     pub codec: Option<VideoCodec>,
     pub bitrate_bps: Option<u32>,
+    pub enabled_mask: u8,
+    pub external_width: Option<u32>,
+    pub external_height: Option<u32>,
+    pub external_fps: Option<u32>,
+    pub internal_display_name: Option<[u8; 13]>,
+    pub revision: u32,
 }
 
 /// Cheap, real probes (not just "compiled in") for what this daemon can
@@ -488,15 +542,30 @@ fn clamp_u32(value: u32, floor: u32, ceiling: u32) -> u32 {
 }
 
 /// Length of a `SETTINGS` body (after the type byte).
-const SETTINGS_BODY_LEN: usize = 10;
+const SETTINGS_BODY_LEN: usize = 33;
 
-/// Parse a `SETTINGS` body: `width(u16) height(u16) fps(u8) codec(u8)
-/// bitrate(u32)`, big-endian. A zero (or `CODEC_DEFAULT` for the codec)
+/// Parse a `SETTINGS` body: internal width/height/FPS, shared codec/bitrate, enabled mask,
+/// external width/height, revision, external FPS, big-endian. A zero (or `CODEC_DEFAULT` for the codec)
 /// means "use the daemon's default" for that field.
 fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
-    if body.len() != SETTINGS_BODY_LEN {
+    if body.len() != SETTINGS_BODY_LEN || !(1..=3).contains(&body[10]) {
         return None;
     }
+    let revision = u32::from_be_bytes(body[15..19].try_into().unwrap());
+    if revision == 0 {
+        return None;
+    }
+    // Safe both for EDID ASCII descriptors and GNOME's single-quoted output identity.
+    let name: [u8; 13] = body[20..33].try_into().ok()?;
+    if name
+        .iter()
+        .any(|b| !(0x20..=0x7e).contains(b) || matches!(*b, b'\'' | b'\\'))
+        || name.iter().all(|b| *b == b' ')
+    {
+        return None;
+    }
+    let ew = u32::from(u16::from_be_bytes(body[11..13].try_into().unwrap()));
+    let eh = u32::from(u16::from_be_bytes(body[13..15].try_into().unwrap()));
     let width = u32::from(u16::from_be_bytes([body[0], body[1]]));
     let height = u32::from(u16::from_be_bytes([body[2], body[3]]));
     let fps = u32::from(body[4]);
@@ -521,6 +590,12 @@ fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
             }
         },
         bitrate_bps: nonzero(bitrate),
+        enabled_mask: body[10],
+        external_width: (ew > 0 && eh > 0).then_some(ew),
+        external_height: (ew > 0 && eh > 0).then_some(eh),
+        external_fps: nonzero(u32::from(body[19])),
+        internal_display_name: Some(name),
+        revision,
     })
 }
 
@@ -545,6 +620,13 @@ fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) ->
             println!("[control] requested framerate {fps} clamped to {clamped}");
         }
         req.fps = Some(clamped);
+    }
+    if let (Some(w), Some(h)) = (req.external_width, req.external_height) {
+        req.external_width = Some(clamp_u32(w, SETTINGS_RESOLUTION_FLOOR_W, shared.max_width));
+        req.external_height = Some(clamp_u32(h, SETTINGS_RESOLUTION_FLOOR_H, shared.max_height));
+    }
+    if let Some(fps) = req.external_fps {
+        req.external_fps = Some(clamp_u32(fps, SETTINGS_FPS_FLOOR, shared.max_fps));
     }
 
     if let Some(codec) = req.codec {
@@ -572,9 +654,8 @@ fn clamp_requested_settings(shared: &SharedState, mut req: RequestedSettings) ->
 }
 
 /// Handle an inbound `SETTINGS` control message: parse, clamp, and hand off to
-/// the capture thread via the `pending_settings` condvar for the *next*
-/// session it starts (see main.rs's capture loop).
-fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
+/// the display manager via the session-tagged `pending_settings` mailbox.
+fn apply_requested_settings(shared: &Arc<SharedState>, session: u64, body: &[u8]) {
     let Some(parsed) = parse_settings_body(body) else {
         eprintln!(
             "[control] malformed SETTINGS message ({} bytes), ignoring",
@@ -584,10 +665,16 @@ fn apply_requested_settings(shared: &Arc<SharedState>, body: &[u8]) {
     };
 
     let clamped = clamp_requested_settings(shared, parsed);
-    println!("[control] received SETTINGS, will apply to next session: {clamped:?}");
+    println!("[control] received display SETTINGS: {clamped:?}");
 
     let (lock, cvar) = &*shared.pending_settings;
-    *lock.lock().unwrap() = Some(clamped);
+    let mut pending = lock.lock().unwrap();
+    if pending
+        .as_ref()
+        .is_none_or(|(id, old)| *id != session || clamped.revision > old.revision)
+    {
+        *pending = Some((session, clamped));
+    }
     cvar.notify_all();
 }
 
@@ -636,8 +723,9 @@ pub fn disable_camera(shared: &Arc<SharedState>) {
 
 pub const FLAG_IDR: u8 = 0x01;
 pub const FLAG_AUDIO: u8 = 0x02;
+pub const FLAG_EXTERNAL: u8 = 0x10;
 
-/// 18-byte packet header (14 original + 4 byte timestamp_ms)
+/// 22-byte packet header, including the authenticated stream generation.
 /// Byte 11 = codec_id: 0x00=H.264, 0x01=H.265
 fn build_header(
     frame_id: u32,
@@ -648,6 +736,7 @@ fn build_header(
     codec_id: u8,
     payload_len: u16,
     timestamp_ms: u32,
+    generation: u32,
 ) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..4].copy_from_slice(&frame_id.to_be_bytes());
@@ -658,6 +747,7 @@ fn build_header(
     h[11] = codec_id;
     h[12..14].copy_from_slice(&payload_len.to_be_bytes());
     h[14..18].copy_from_slice(&timestamp_ms.to_be_bytes());
+    h[18..22].copy_from_slice(&generation.to_be_bytes());
     h
 }
 
@@ -707,21 +797,36 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 /// Dispatch one decrypted client -> daemon control message (`type(u8) +
 /// body`). `PING` and `DISCONNECT` are handled by the control loop in
 /// pairing.rs before this is called.
-pub fn handle_control_message_data(shared: &Arc<SharedState>, msg: &[u8]) {
+pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg: &[u8]) {
+    if !shared.is_current_network_session(session) {
+        return;
+    }
     let Some((&msg_type, body)) = msg.split_first() else {
         return;
     };
     use protocol::client;
 
     match msg_type {
-        client::PLI => {
-            shared.note_pli();
-            shared.force_idr.store(true, Ordering::Relaxed);
-            if let Some(ref refresh) = *shared.force_refresh_handle.lock().unwrap() {
-                refresh.store(true, Ordering::Relaxed);
+        client::PLI if body.len() == 5 => {
+            if let Some(display) = DisplayId::from_wire(body[0]) {
+                let generation = u32::from_be_bytes(body[1..5].try_into().unwrap());
+                shared.display_stream(display).request_keyframe(generation);
             }
         }
-        client::SETTINGS => apply_requested_settings(shared, body),
+        client::SETTINGS => apply_requested_settings(shared, session, body),
+        client::DISPLAY_PRESENTED if body.len() == 9 => {
+            if let Some(display) = DisplayId::from_wire(body[4]) {
+                let ack = crate::display_manager::PresentationAck {
+                    revision: u32::from_be_bytes(body[..4].try_into().unwrap()),
+                    display,
+                    generation: u32::from_be_bytes(body[5..9].try_into().unwrap()),
+                };
+                let mut queue = shared.presentation_acks.lock().unwrap();
+                if queue.len() < 128 {
+                    queue.push_back((session, ack));
+                }
+            }
+        }
         client::SPEAKER if body.len() == 1 => {
             let enabled = body[0] != 0;
             if enabled && !shared.features.speaker {
@@ -941,8 +1046,12 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 }
 
 pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
-    if !shared.is_current_network_session(session_id) {
-        return;
+    {
+        let _guard = shared.network_session_lock.lock().unwrap();
+        if !shared.is_current_network_session(session_id) {
+            return;
+        }
+        shared.network_session_closing.store(true, Ordering::SeqCst);
     }
 
     *shared.client_addr.lock().unwrap() = None;
@@ -952,21 +1061,34 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
     shared
         .network_session_pending
         .store(false, Ordering::SeqCst);
-    shared.network_session_busy.store(false, Ordering::SeqCst);
 
     if shared.has_active_client.swap(false, Ordering::SeqCst) {
         shared.audio_notify.notify_all();
         shared.reset_stream_tuning();
-        let shared_lc = Arc::clone(shared);
-        std::thread::Builder::new()
-            .name("lifecycle-disconnect".into())
-            .spawn(move || {
-                if let Some(ref cb) = *shared_lc.on_client_disconnected.lock().unwrap() {
-                    cb();
-                }
-            })
-            .ok();
+        // Keep the session reserved until cleanup completes. A delayed old callback must
+        // never remove peripherals or settings belonging to the next connection.
+        if let Some(ref cb) = *shared.on_client_disconnected.lock().unwrap() {
+            cb();
+        }
     }
+    {
+        let mut pending = shared.pending_settings.0.lock().unwrap();
+        if pending.as_ref().is_some_and(|(id, _)| *id == session_id) {
+            *pending = None;
+        }
+    }
+    shared
+        .presentation_acks
+        .lock()
+        .unwrap()
+        .retain(|(id, _)| *id != session_id);
+    shared
+        .display_status
+        .lock()
+        .unwrap()
+        .retain(|(id, _)| *id != session_id);
+    shared.pending_settings.1.notify_all();
+    shared.network_session_busy.store(false, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1107,7 @@ pub fn run_client_manager(
 
     let mut last_keepalive = Instant::now();
     let mut last_heartbeat = Instant::now();
+    let mut heartbeat_sequence = crate::crypto::ServerPacketSequence::new();
     let mut recv_buf = vec![0u8; 4096];
     let mut cam_reassembler = CamReassembler::new();
     let mut input_seq_expected: u32 = 0;
@@ -1176,15 +1299,12 @@ pub fn run_client_manager(
                         *shared.expected_client_ip.lock().unwrap() = None;
                         shared.mark_network_session_active(current_session_id);
                         pending_started_at = None;
-                        shared.force_idr.store(true, Ordering::Relaxed);
-                        shared.capture_start.store(true, Ordering::Release);
-                        {
-                            let (_, cvar) = &*shared.capture_start_signal;
-                            cvar.notify_all();
+                        for stream in &shared.display_streams {
+                            let stream = stream.lock().unwrap();
+                            stream.force_idr.store(true, Ordering::Relaxed);
+                            stream.force_refresh.store(true, Ordering::Relaxed);
                         }
-                        if let Some(ref fr) = *shared.force_refresh_handle.lock().unwrap() {
-                            fr.store(true, Ordering::Relaxed);
-                        }
+                        shared.pending_settings.1.notify_all();
                         if !shared.has_active_client.swap(true, Ordering::SeqCst) {
                             shared.audio_notify.notify_all();
                             drop(client);
@@ -1204,9 +1324,14 @@ pub fn run_client_manager(
                         // Send an immediate heartbeat so the iPad's data timeout
                         // doesn't fire while peripherals are being created.
                         if let Some(ref c) = local_cipher {
-                            let hb_frame_id = 0xFFFF_FFFFu32;
+                            let hb_frame_id = heartbeat_sequence.take_frame()?;
                             let hb_flags: u8 = 0x80;
-                            let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
+                            let nonce = crate::crypto::nonce_server(
+                                hb_frame_id,
+                                0,
+                                hb_flags,
+                                heartbeat_sequence.generation,
+                            );
                             let header = build_header(
                                 hb_frame_id,
                                 0,
@@ -1216,6 +1341,7 @@ pub fn run_client_manager(
                                 0,
                                 HEARTBEAT_MAGIC.len() as u16,
                                 0,
+                                heartbeat_sequence.generation,
                             );
                             let hb_magic_len = HEARTBEAT_MAGIC.len();
                             let mut hb_buf = [0u8; HEADER_LEN + 64];
@@ -1224,7 +1350,7 @@ pub fn run_client_manager(
                                 .copy_from_slice(HEARTBEAT_MAGIC);
                             let enc_len = c.encrypt_slice(
                                 &nonce,
-                                &[],
+                                &header,
                                 &mut hb_buf[HEADER_LEN..],
                                 hb_magic_len,
                             );
@@ -1296,9 +1422,14 @@ pub fn run_client_manager(
             if let Some(addr) = *shared.client_addr.lock().unwrap() {
                 if let Some(ref c) = local_cipher {
                     heartbeat_count = heartbeat_count.wrapping_add(1);
-                    let hb_frame_id = 0xFFFF_FFFFu32;
+                    let hb_frame_id = heartbeat_sequence.take_frame()?;
                     let hb_flags: u8 = 0x80;
-                    let nonce = crate::crypto::nonce_server(hb_frame_id, 0, hb_flags);
+                    let nonce = crate::crypto::nonce_server(
+                        hb_frame_id,
+                        0,
+                        hb_flags,
+                        heartbeat_sequence.generation,
+                    );
                     let header = build_header(
                         hb_frame_id,
                         0,
@@ -1308,13 +1439,14 @@ pub fn run_client_manager(
                         0,
                         HEARTBEAT_MAGIC.len() as u16,
                         0,
+                        heartbeat_sequence.generation,
                     );
                     let hb_magic_len = HEARTBEAT_MAGIC.len();
                     let mut hb_buf = [0u8; HEADER_LEN + 64]; // enough for magic + tag
                     hb_buf[..HEADER_LEN].copy_from_slice(&header);
                     hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
                     let enc_len =
-                        c.encrypt_slice(&nonce, &[], &mut hb_buf[HEADER_LEN..], hb_magic_len);
+                        c.encrypt_slice(&nonce, &header, &mut hb_buf[HEADER_LEN..], hb_magic_len);
                     match send_to_from(
                         &socket,
                         &hb_buf[..HEADER_LEN + enc_len],
@@ -1359,11 +1491,183 @@ pub fn run_client_manager(
 
 const MAX_RS_CACHE_ENTRIES: usize = 64;
 
+#[cfg(test)]
+mod display_stream_tests {
+    use super::*;
+
+    #[test]
+    fn retiring_session_cannot_consume_new_session_messages() {
+        let mut queue = VecDeque::from([
+            (1, "stale"),
+            (2, "current"),
+            (3, "new"),
+            (2, "also current"),
+        ]);
+        assert_eq!(
+            take_session_messages(&mut queue, 2),
+            vec!["current", "also current"]
+        );
+        assert_eq!(queue, VecDeque::from([(3, "new")]));
+    }
+
+    #[test]
+    fn reconnect_waits_for_old_cleanup_and_stale_teardown_cannot_drop_it() {
+        let shared = crate::test_support::shared_state();
+        let session = shared.reserve_network_session().unwrap();
+        shared.has_active_client.store(true, Ordering::Release);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(1);
+        let finish_rx = Mutex::new(finish_rx);
+        *shared.on_client_disconnected.lock().unwrap() = Some(Box::new(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.lock().unwrap().recv().unwrap();
+        }));
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || drop_network_client(&worker_shared, session));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(shared.reserve_network_session().is_none());
+        assert!(!shared.is_current_network_session(session));
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let next = shared.reserve_network_session().unwrap();
+        assert_ne!(session, next);
+        drop_network_client(&shared, session);
+        assert!(shared.is_current_network_session(next));
+    }
+
+    #[test]
+    fn header_matches_swift_fixture() {
+        assert_eq!(
+            build_header(0x01020304, 2, 3, 1, 0x11, 1, 4, 0x05060708, 0x090a0b0c),
+            [1, 2, 3, 4, 0, 2, 0, 3, 0, 1, 0x11, 1, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn failed_video_send_does_not_reuse_the_frame_nonce() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut sender =
+            UdpSender::new(UdpSocket::bind("127.0.0.1:0").unwrap(), DisplayId::Internal);
+        sender.set_cipher(crate::crypto::SessionCipher::new(&[0x42; 32]));
+        let au = EncodedAccessUnit {
+            is_idr: true,
+            annex_b: crate::encode::AnnexB::Vec(vec![1, 2, 3, 4]),
+        };
+        let tuning = StreamTuning {
+            bitrate_bps: 20_000_000,
+            idr_fec_percent: 0,
+            pframe_fec_percent: 0,
+        };
+        assert!(sender
+            .send_frame(&au, "127.0.0.1:0".parse().unwrap(), 0, 0, tuning)
+            .is_err());
+        sender
+            .send_frame(&au, receiver.local_addr().unwrap(), 0, 0, tuning)
+            .unwrap();
+        let mut packet = [0u8; 2048];
+        receiver.recv_from(&mut packet).unwrap();
+        assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn pli_targets_only_the_current_generation_of_one_display() {
+        let streams = [
+            DisplayStreamControl::new(20_000_000),
+            DisplayStreamControl::new(20_000_000),
+        ];
+        streams[0].generation.store(10, Ordering::Release);
+        streams[1].generation.store(11, Ordering::Release);
+        streams[0].request_keyframe(9);
+        streams[1].request_keyframe(10);
+        assert!(!streams[0].force_idr.load(Ordering::Relaxed));
+        assert!(!streams[1].force_idr.load(Ordering::Relaxed));
+        streams[1].request_keyframe(11);
+        assert!(!streams[0].force_idr.load(Ordering::Relaxed));
+        assert!(!streams[0].force_refresh.load(Ordering::Relaxed));
+        assert!(streams[1].force_idr.load(Ordering::Relaxed));
+        assert!(streams[1].force_refresh.load(Ordering::Relaxed));
+        assert!(streams[0]
+            .adaptive_stream
+            .lock()
+            .unwrap()
+            .pli_events
+            .is_empty());
+        assert_eq!(
+            streams[1].adaptive_stream.lock().unwrap().pli_events.len(),
+            1
+        );
+        assert_eq!(DisplayId::from_wire(2), None);
+    }
+
+    #[test]
+    fn two_video_senders_route_and_authenticate_independently() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let target = receiver.local_addr().unwrap();
+        let key = [0x42; 32];
+        let cipher = crate::crypto::SessionCipher::new(&key);
+        let mut generations = Vec::new();
+        for display in [
+            DisplayId::Internal,
+            DisplayId::External,
+            DisplayId::External,
+        ] {
+            // The last sender represents tearing down and recreating the external worker.
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut sender = UdpSender::new(socket, display);
+            sender.set_cipher(crate::crypto::SessionCipher::new(&key));
+            let au = EncodedAccessUnit {
+                is_idr: true,
+                annex_b: crate::encode::AnnexB::Vec(vec![1, 2, 3, 4]),
+            };
+            let tuning = StreamTuning {
+                bitrate_bps: 20_000_000,
+                idr_fec_percent: 0,
+                pframe_fec_percent: 0,
+            };
+            sender.send_frame(&au, target, 123, 1, tuning).unwrap();
+            let mut packet = [0u8; 2048];
+            let (len, _) = receiver.recv_from(&mut packet).unwrap();
+            assert_eq!(len, HEADER_LEN + 4 + crate::crypto::TAG_LEN);
+            assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), 0);
+            assert_eq!(
+                packet[10],
+                FLAG_IDR
+                    | if display == DisplayId::External {
+                        FLAG_EXTERNAL
+                    } else {
+                        0
+                    }
+            );
+            assert_eq!(packet[11], 1);
+            assert_eq!(u32::from_be_bytes(packet[14..18].try_into().unwrap()), 123);
+            let generation = u32::from_be_bytes(packet[18..22].try_into().unwrap());
+            assert_eq!(generation, sender.generation());
+            assert!(!generations.contains(&generation));
+            generations.push(generation);
+            let nonce = crate::crypto::nonce_server(0, 0, packet[10], generation);
+            let header: [u8; HEADER_LEN] = packet[..HEADER_LEN].try_into().unwrap();
+            assert_eq!(
+                cipher
+                    .decrypt(&nonce, &header, &mut packet[HEADER_LEN..len])
+                    .unwrap(),
+                &[1, 2, 3, 4]
+            );
+        }
+    }
+}
+
 pub struct UdpSender {
     socket: UdpSocket,
     packet_pool: Vec<[u8; MAX_PACKET_LEN]>,
     packet_lens: Vec<usize>,
-    frame_id: u32,
+    sequence: crate::crypto::ServerPacketSequence,
+    display_id: crate::capture::DisplayId,
     stats_start: Instant,
     stats_frames: u64,
     stats_bytes: u64,
@@ -1378,12 +1682,13 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn new(socket: UdpSocket) -> Self {
+    pub fn new(socket: UdpSocket, display_id: crate::capture::DisplayId) -> Self {
         Self {
             socket,
             packet_pool: Vec::new(),
             packet_lens: Vec::new(),
-            frame_id: 0,
+            sequence: crate::crypto::ServerPacketSequence::new(),
+            display_id,
             stats_start: Instant::now(),
             stats_frames: 0,
             stats_bytes: 0,
@@ -1399,6 +1704,14 @@ impl UdpSender {
 
     pub fn set_cipher(&mut self, cipher: crate::crypto::SessionCipher) {
         self.cipher = Some(cipher);
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.sequence.generation
+    }
+
+    pub fn replace_sequence(&mut self, sequence: crate::crypto::ServerPacketSequence) {
+        self.sequence = sequence;
     }
 
     pub fn set_source(&mut self, source: Option<UdpSource>) {
@@ -1446,13 +1759,14 @@ impl UdpSender {
         codec_id: u8,
         tuning: StreamTuning,
     ) -> Result<u64> {
+        let frame_id = self.sequence.take_frame()?;
         let payload: &[u8] = &*au.annex_b;
         let is_idr = au.is_idr;
         if self.log_sent_aus {
             let prefix_len = payload.len().min(24);
             println!(
                 "[stream/send] frame_id={} codec={} idr={} bytes={} fnv=0x{:016x} prefix={:02x?}",
-                self.frame_id,
+                frame_id,
                 codec_id,
                 is_idr,
                 payload.len(),
@@ -1527,7 +1841,12 @@ impl UdpSender {
             }
         }
 
-        let flags = if is_idr { FLAG_IDR } else { 0 };
+        let flags = if is_idr { FLAG_IDR } else { 0 }
+            | if self.display_id == crate::capture::DisplayId::External {
+                FLAG_EXTERNAL
+            } else {
+                0
+            };
 
         for idx in 0..total_shards {
             // Data shards go out at their real length (only the last one is
@@ -1542,7 +1861,7 @@ impl UdpSender {
             };
 
             let header = build_header(
-                self.frame_id,
+                frame_id,
                 idx as u16,
                 data_count as u16,
                 actual_parity as u16,
@@ -1550,6 +1869,7 @@ impl UdpSender {
                 codec_id,
                 actual_payload_len as u16,
                 timestamp_ms,
+                self.sequence.generation,
             );
 
             self.packet_pool[idx][..HEADER_LEN].copy_from_slice(&header);
@@ -1557,7 +1877,12 @@ impl UdpSender {
                 .copy_from_slice(&self.shard_pool[idx][..actual_payload_len]);
 
             self.packet_lens[idx] = if let Some(ref cipher) = self.cipher {
-                let nonce = crate::crypto::nonce_server(self.frame_id, idx as u16, flags);
+                let nonce = crate::crypto::nonce_server(
+                    frame_id,
+                    idx as u16,
+                    flags,
+                    self.sequence.generation,
+                );
                 let enc_len = cipher.encrypt_slice(
                     &nonce,
                     &header,
@@ -1572,7 +1897,6 @@ impl UdpSender {
 
         let frame_bytes = self.send_frame_batch(client_addr, total_shards)?;
 
-        self.frame_id = self.frame_id.wrapping_add(1);
         self.stats_frames += 1;
         self.stats_bytes += frame_bytes;
 
@@ -1694,7 +2018,7 @@ pub fn fec_block_range(total: usize, blocks: usize, index: usize) -> (usize, usi
 
 pub struct AudioSender {
     socket: UdpSocket,
-    frame_id: u32,
+    sequence: crate::crypto::ServerPacketSequence,
     send_buf: Vec<u8>,
     cipher: Option<crate::crypto::SessionCipher>,
     source: Option<UdpSource>,
@@ -1705,7 +2029,7 @@ impl AudioSender {
     pub fn new(socket: UdpSocket) -> Self {
         Self {
             socket,
-            frame_id: 0,
+            sequence: crate::crypto::ServerPacketSequence::new(),
             send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN],
             cipher: None,
             source: None,
@@ -1733,6 +2057,7 @@ impl AudioSender {
         client_addr: SocketAddr,
         timestamp_ms: u32,
     ) -> Result<()> {
+        let frame_id = self.sequence.take_frame()?;
         let data_count = (opus.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
 
         for i in 0..data_count {
@@ -1742,7 +2067,7 @@ impl AudioSender {
             let payload_len = (end - start) as u16;
 
             let header = build_header(
-                self.frame_id,
+                frame_id,
                 i as u16,
                 data_count as u16,
                 0,
@@ -1750,6 +2075,7 @@ impl AudioSender {
                 0, // codec byte is unused for audio (always Opus)
                 payload_len,
                 timestamp_ms,
+                self.sequence.generation,
             );
 
             self.send_buf[..HEADER_LEN].copy_from_slice(&header);
@@ -1757,7 +2083,12 @@ impl AudioSender {
             self.send_buf[HEADER_LEN..HEADER_LEN + chunk_len].copy_from_slice(chunk);
 
             let pkt_len = if let Some(ref cipher) = self.cipher {
-                let nonce = crate::crypto::nonce_server(self.frame_id, i as u16, FLAG_AUDIO);
+                let nonce = crate::crypto::nonce_server(
+                    frame_id,
+                    i as u16,
+                    FLAG_AUDIO,
+                    self.sequence.generation,
+                );
                 let enc_len = cipher.encrypt_slice(
                     &nonce,
                     &header,
@@ -1781,7 +2112,6 @@ impl AudioSender {
             }
         }
 
-        self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
 }
@@ -1883,26 +2213,90 @@ mod settings_tests {
         body.push(60);
         body.push(protocol::CODEC_H265);
         body.extend_from_slice(&15_000_000u32.to_be_bytes());
+        body.push(3);
+        body.extend_from_slice(&3840u16.to_be_bytes());
+        body.extend_from_slice(&2160u16.to_be_bytes());
+        body.extend_from_slice(&7u32.to_be_bytes());
+        body.push(30);
+        body.extend_from_slice(b"iPad A16 11\" ");
         let s = parse_settings_body(&body).unwrap();
         assert_eq!((s.width, s.height), (Some(1920), Some(1080)));
         assert_eq!(s.fps, Some(60));
         assert_eq!(s.codec, Some(VideoCodec::H265));
         assert_eq!(s.bitrate_bps, Some(15_000_000));
+        assert_eq!(s.enabled_mask, 3);
+        assert_eq!(
+            (s.external_width, s.external_height),
+            (Some(3840), Some(2160))
+        );
+        assert_eq!(s.revision, 7);
+        assert_eq!(s.external_fps, Some(30));
+        assert_eq!(s.internal_display_name, Some(*b"iPad A16 11\" "));
     }
 
     #[test]
     fn zero_and_codec_default_mean_daemon_default() {
         let mut body = vec![0u8; SETTINGS_BODY_LEN];
+        body[20..33].copy_from_slice(b"Screx        ");
         body[5] = protocol::CODEC_DEFAULT;
+        body[10] = 1;
+        body[18] = 1;
         let s = parse_settings_body(&body).unwrap();
         assert_eq!((s.width, s.height, s.fps), (None, None, None));
         assert_eq!(s.codec, None);
         assert_eq!(s.bitrate_bps, None);
+        assert_eq!(s.external_fps, None);
     }
 
     #[test]
     fn rejects_wrong_length() {
         assert!(parse_settings_body(&[0u8; SETTINGS_BODY_LEN - 1]).is_none());
         assert!(parse_settings_body(&[0u8; SETTINGS_BODY_LEN + 1]).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_masks_revisions_and_legacy_settings() {
+        let mut body = vec![0; SETTINGS_BODY_LEN];
+        body[20..33].copy_from_slice(b"Screx        ");
+        body[18] = 1;
+        for mask in [0, 4, 255] {
+            body[10] = mask;
+            assert!(parse_settings_body(&body).is_none());
+        }
+        body[10] = 1;
+        body[18] = 0;
+        assert!(parse_settings_body(&body).is_none());
+        assert!(parse_settings_body(&[0; 10]).is_none());
+        assert!(parse_settings_body(&[0; 19]).is_none());
+        assert!(parse_settings_body(&[0; 20]).is_none());
+    }
+
+    #[test]
+    fn rejects_unsafe_or_empty_edid_names() {
+        let mut body = vec![0; SETTINGS_BODY_LEN];
+        body[10] = 1;
+        body[18] = 1;
+        body[20..33].fill(b' ');
+        assert!(parse_settings_body(&body).is_none());
+        for byte in [b'\'', b'\\', b'\n', 0, 0xff] {
+            body[20..33].copy_from_slice(b"Screx        ");
+            body[20] = byte;
+            assert!(parse_settings_body(&body).is_none());
+        }
+    }
+
+    #[test]
+    fn external_fps_is_clamped_independently() {
+        let shared = crate::test_support::shared_state();
+        let settings = clamp_requested_settings(
+            &shared,
+            RequestedSettings {
+                fps: Some(30),
+                external_fps: Some(120),
+                ..Default::default()
+            },
+        );
+        assert_eq!(settings.fps, Some(30));
+        assert_eq!(settings.external_fps, Some(60));
     }
 }

@@ -2,13 +2,17 @@ mod audio;
 mod camera;
 mod capture;
 mod crypto;
+mod display_manager;
 mod encode;
 mod input;
 mod logging;
 mod pairing;
+mod pipeline;
 mod platform;
 mod protocol;
 mod stream_server;
+#[cfg(test)]
+mod test_support;
 
 use std::fs;
 use std::net::UdpSocket;
@@ -308,20 +312,6 @@ async fn main() -> Result<()> {
 
             // Audio sink
             crate::stream_server::disable_virtual_sink(&shared_d);
-
-            // Discard any SETTINGS left over from this connection so it can't
-            // leak into the next session (e.g. a client that sent SETTINGS then
-            // aborted before ever starting to stream).
-            {
-                let (lock, _) = &*shared_d.pending_settings;
-                *lock.lock().unwrap() = None;
-            }
-
-            // Signal capture thread to stop (EVDI will be torn down)
-            shared_d.capture_stop_flag.store(true, Ordering::SeqCst);
-            shared_d.capture_start.store(false, Ordering::Release);
-            let (_, cvar) = &*shared_d.capture_start_signal;
-            cvar.notify_all();
         }));
     }
 
@@ -356,288 +346,9 @@ async fn main() -> Result<()> {
     let send_socket = socket.try_clone().context("clone socket for sender")?;
     let capture_shared = Arc::clone(&shared);
     let capture_stop = Arc::clone(&stop);
-    // Used once, below, to construct the display backend before the
-    // per-session loop starts (see the "do NOT reconstruct it per session"
-    // note on `capture_config` inside the loop). `config` itself is moved
-    // into the capture thread closure so each session can merge in
-    // client-requested (SETTINGS) settings over these CLI/max defaults.
-    let capture_config = capture::CaptureConfig {
-        width: config.width,
-        height: config.height,
-        fps: config.fps,
-    };
-
-    let force_refresh = Arc::new(AtomicBool::new(false));
-    let capture_force_refresh = Arc::clone(&force_refresh);
-    shared
-        .force_refresh_handle
-        .lock()
-        .unwrap()
-        .replace(Arc::clone(&force_refresh));
-
-    let capture_start = Arc::clone(&shared.capture_start);
-    let capture_start_signal = Arc::clone(&shared.capture_start_signal);
-    let capture_stop_flag = Arc::clone(&shared.capture_stop_flag);
-
     let capture_thread = thread::Builder::new()
-        .name("capture".into())
-        .spawn(move || -> Result<()> {
-            let mut sender = stream_server::UdpSender::new(send_socket);
-            // Backend is constructed ONCE for the life of the process, from
-            // the CLI/max-derived `capture_config` above — NOT per session.
-            // Per-session resolution/fps changes are applied below via
-            // `display.attach(mode)`, which this backend already supports
-            // being called with fresh each session.
-            let mut display = match capture::create_display_backend(&capture_config) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("[capture] display backend init failed: {e:#}");
-                    return Err(e);
-                }
-            };
-
-            loop {
-                if capture_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // Wait for capture_start to be set (client connected)
-                while !capture_start.load(Ordering::Acquire) {
-                    if capture_stop.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    let (lock, cvar) = &*capture_start_signal;
-                    let guard = lock.lock().unwrap();
-                    if !capture_start.load(Ordering::Acquire)
-                        && !capture_stop.load(Ordering::Relaxed)
-                    {
-                        let _ = cvar
-                            .wait_timeout(guard, std::time::Duration::from_millis(20))
-                            .unwrap();
-                    }
-                }
-
-                // Reset the stop flag for this capture session
-                capture_stop_flag.store(false, Ordering::SeqCst);
-
-                // Wait for the client's SETTINGS (sent in reply to CAPS over the
-                // TCP control channel). It can arrive slightly after the first
-                // UDP packet flips capture_start, so block until it does — or
-                // until the session/daemon stops.
-                let requested = {
-                    let (lock, cvar) = &*capture_shared.pending_settings;
-                    let mut guard = lock.lock().unwrap();
-                    loop {
-                        if let Some(settings) = guard.take() {
-                            break Some(settings);
-                        }
-                        if capture_stop.load(Ordering::Relaxed)
-                            || capture_stop_flag.load(Ordering::Relaxed)
-                        {
-                            break None;
-                        }
-                        guard = cvar
-                            .wait_timeout(guard, std::time::Duration::from_millis(100))
-                            .unwrap()
-                            .0;
-                    }
-                };
-                let Some(requested) = requested else {
-                    println!("[capture] session ended before the client sent SETTINGS");
-                    capture_start.store(false, Ordering::Release);
-                    let (_, cvar) = &*capture_start_signal;
-                    cvar.notify_all();
-                    continue;
-                };
-
-                // Merge the (already-clamped) requested settings over the
-                // CLI/max defaults; a tag the client omitted means "use the
-                // daemon default" for that field.
-                let session_width = requested.width.unwrap_or(config.width);
-                let session_height = requested.height.unwrap_or(config.height);
-                let session_fps = requested.fps.unwrap_or(config.fps);
-                let session_codec = requested.codec.unwrap_or(config.codec);
-                let session_bitrate_bps = requested.bitrate_bps.unwrap_or(config.bitrate_bps);
-
-                println!(
-                    "[capture] starting session with negotiated settings: {requested:?} -> {session_width}x{session_height}@{session_fps} codec={session_codec:?} bitrate={session_bitrate_bps}"
-                );
-
-                // Rebaseline the adaptive bitrate loop around this session's
-                // bitrate so it throttles up/down from the negotiated value
-                // instead of the CLI default. Restored on session teardown
-                // below.
-                capture_shared.set_base_bitrate(session_bitrate_bps);
-
-                let capture_config = capture::CaptureConfig {
-                    width: session_width,
-                    height: session_height,
-                    fps: session_fps,
-                };
-                let enc_config = encode::EncoderConfig {
-                    bitrate_bps: session_bitrate_bps,
-                    gop: config.gop,
-                    fps: session_fps,
-                    width: session_width,
-                    height: session_height,
-                    backend: config.encoder_backend,
-                    codec: session_codec,
-                    intra_refresh: config.intra_refresh,
-                };
-
-                // Create encoder fresh for each session
-                let mut encoder = match encode::Encoder::new(enc_config.clone()) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("[capture] encoder init failed: {e:#}");
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        continue;
-                    }
-                };
-                let codec_id = encoder.codec().transport_id();
-
-                // Set up encryption on the sender using the current session key
-                if let Some(key) = *capture_shared.session_key.lock().unwrap() {
-                    sender.set_cipher(crypto::SessionCipher::new(&key));
-                }
-                // Pin the UDP source address to the IP the client dialed
-                // (multi-homed hosts may otherwise reply from another IP).
-                sender.set_source(*capture_shared.udp_source.lock().unwrap());
-                sender.set_session(session_fps);
-
-                println!("[capture] attaching display backend");
-                if let Err(e) = display.attach(capture::DisplayMode {
-                    width: capture_config.width,
-                    height: capture_config.height,
-                    fps: capture_config.fps,
-                }) {
-                    eprintln!("[capture] display attach failed: {e:#}");
-                    capture_start.store(false, Ordering::Release);
-                    let (_, cvar) = &*capture_start_signal;
-                    cvar.notify_all();
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-
-                if let Ok(mut backend) = capture_shared.input_backend.lock() {
-                    backend.set_stream_size(capture_config.width, capture_config.height);
-                }
-
-                println!("[capture] starting display capture session");
-
-                let session_shared = Arc::clone(&capture_shared);
-                let session_stop = Arc::clone(&capture_stop);
-                let session_stop_flag = Arc::clone(&capture_stop_flag);
-                let session_refresh = Arc::clone(&capture_force_refresh);
-                let mut dump_capture_remaining = std::env::var("SCREX_DUMP_CAPTURE_FRAMES")
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(0);
-                let mut dump_au_remaining = std::env::var("SCREX_DUMP_SENT_AUS")
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(0);
-
-                // Combined stop: global stop OR per-session stop (client disconnected)
-                let combined_stop = Arc::new(AtomicBool::new(false));
-                let cs1 = Arc::clone(&combined_stop);
-                let cs2 = Arc::clone(&combined_stop);
-                let ss = Arc::clone(&session_stop);
-                let sf = Arc::clone(&session_stop_flag);
-
-                // Watchdog thread: sets combined_stop when either flag fires
-                let watchdog =
-                    match thread::Builder::new()
-                        .name("capture-wd".into())
-                        .spawn(move || {
-                            while !cs1.load(Ordering::Relaxed) {
-                                if ss.load(Ordering::Relaxed) || sf.load(Ordering::Relaxed) {
-                                    cs1.store(true, Ordering::SeqCst);
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                        }) {
-                        Ok(handle) => handle,
-                        Err(e) => {
-                            eprintln!("[capture] failed to spawn watchdog thread: {e}");
-                            capture_stop_flag.store(true, Ordering::SeqCst);
-                            capture_start.store(false, Ordering::Release);
-                            let (_, cvar) = &*capture_start_signal;
-                            cvar.notify_all();
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            continue;
-                        }
-                    };
-
-                if let Err(e) = display.run_capture_loop(
-                    &*cs2,
-                    &*session_refresh,
-                    &mut |frame: capture::CaptureFrame<'_>| {
-                        if dump_capture_remaining > 0 {
-                            dump_capture_frame_ppm(dump_capture_remaining, &frame);
-                            dump_capture_remaining -= 1;
-                        }
-                        let force_idr = session_shared.force_idr.swap(false, Ordering::Relaxed);
-                        let ts = session_shared.start_time.elapsed().as_millis() as u32;
-                        let tuning = session_shared.current_stream_tuning();
-
-                        if tuning.bitrate_bps != encoder.bitrate_bps() {
-                            if let Err(e) = encoder.reconfigure_bitrate(tuning.bitrate_bps) {
-                                eprintln!("[pipeline] encoder retune failed: {e:#}");
-                            }
-                        }
-
-                        match encoder.encode_frame(&frame, force_idr) {
-                            Ok(aus) => {
-                                if dump_au_remaining > 0 {
-                                    for au in &aus {
-                                        if dump_au_remaining == 0 {
-                                            break;
-                                        }
-                                        dump_sent_access_unit(
-                                            dump_au_remaining,
-                                            codec_id,
-                                            au.is_idr,
-                                            &*au.annex_b,
-                                        );
-                                        dump_au_remaining -= 1;
-                                    }
-                                }
-                                let udp_addr = *session_shared.client_addr.lock().unwrap();
-                                if let Some(addr) = udp_addr {
-                                    for au in &aus {
-                                        if let Err(e) =
-                                            sender.send_frame(au, addr, ts, codec_id, tuning)
-                                        {
-                                            eprintln!("[pipeline] send error: {e:#}");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[pipeline] encode error: {e:#}");
-                            }
-                        }
-                    },
-                ) {
-                    eprintln!("[capture] session error: {e:#}");
-                }
-
-                display.detach();
-
-                let _ = watchdog.join();
-
-                println!("[capture] display session ended, waiting for next client...");
-
-                // Reset capture_start so we wait for the next client
-                capture_start.store(false, Ordering::Release);
-                let (_, cvar) = &*capture_start_signal;
-                cvar.notify_all();
-            }
-
-            Ok(())
-        })
+        .name("display-manager".into())
+        .spawn(move || pipeline::run(send_socket, capture_shared, capture_stop, config))
         .context("failed to spawn capture thread")?;
 
     // -----------------------------------------------------------------------
@@ -662,11 +373,7 @@ async fn main() -> Result<()> {
 
     let do_shutdown = move || {
         stop.store(true, Ordering::SeqCst);
-        shared.capture_stop_flag.store(true, Ordering::SeqCst);
-        {
-            let (_, cvar) = &*shared.capture_start_signal;
-            cvar.notify_all();
-        }
+        shared.pending_settings.1.notify_all();
 
         // Cleanup remaining resources
         *shared.keyboard_worker.lock().unwrap() = None;

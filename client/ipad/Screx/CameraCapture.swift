@@ -248,10 +248,11 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     private func currentVideoOrientation() -> AVCaptureVideoOrientation? {
-        guard let scene = UIApplication.shared.connectedScenes
+        let applicationScenes = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive })
-            ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+            .filter { $0.session.role == .windowApplication }
+        guard let scene = applicationScenes.first(where: { $0.activationState == .foregroundActive })
+            ?? applicationScenes.first
         else {
             return nil
         }

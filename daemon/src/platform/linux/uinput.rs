@@ -208,14 +208,14 @@ pub struct LinuxInput {
     /// coordinates need to be rescaled onto the touchscreen's fixed ABS
     /// range before injection.
     session_size: Option<(u32, u32)>,
+    mapped_display_name: Option<String>,
 }
 
 impl LinuxInput {
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        // Mapping is deferred to the first session, whose SETTINGS carries the EDID name. Doing it
+        // here would repeat the ~800 ms gsettings work with a name the session then replaces.
         let touch = VirtualTouchscreen::new(width, height).ok();
-        if let Some(ref ts) = touch {
-            ts.map_to_output();
-        }
         let keyboard = VirtualKeyboard::new().ok();
         Ok(Self {
             touch,
@@ -224,11 +224,22 @@ impl LinuxInput {
             gamepads: std::collections::HashMap::new(),
             held_keys: std::collections::HashSet::new(),
             session_size: None,
+            mapped_display_name: None,
         })
     }
 }
 
 impl InputBackend for LinuxInput {
+    fn set_display_name(&mut self, name: &str) {
+        if self.mapped_display_name.as_deref() == Some(name) {
+            return;
+        }
+        if let Some(ref touch) = self.touch {
+            touch.map_to_output(name);
+        }
+        self.mapped_display_name = Some(name.into());
+    }
+
     fn set_stream_size(&mut self, width: u32, height: u32) {
         // The gsettings tablet->EVDI-output mapping (see `map_to_output`)
         // confines the fixed-size virtual touchscreen to the captured
@@ -439,13 +450,13 @@ impl VirtualTouchscreen {
         })
     }
 
-    pub fn map_to_output(&self) {
+    pub fn map_to_output(&self, display_name: &str) {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let vendor_product = format!("{:04x}:{:04x}", SCREX_VENDOR, SCREX_PRODUCT);
         let schema_path = format!(
             "org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/{vendor_product}/"
         );
-        let output_value = "['SRX', 'Screx Virtual', '001']";
+        let output_value = format!("['SRX', '{display_name}', '001']");
         let (sudo_user, sudo_uid) = (
             std::env::var("SUDO_USER").ok(),
             std::env::var("SUDO_UID").ok(),
@@ -465,12 +476,12 @@ impl VirtualTouchscreen {
                 .arg("set")
                 .arg(&schema_path)
                 .arg("output")
-                .arg(output_value)
+                .arg(&output_value)
                 .output()
         } else {
             println!("[touch] running gsettings directly (not under sudo)");
             Command::new("gsettings")
-                .args(["set", &schema_path, "output", output_value])
+                .args(["set", &schema_path, "output", &output_value])
                 .output()
         };
         match result {
@@ -1011,6 +1022,10 @@ impl VirtualKeyboard {
         if mods & 0x04 != 0 {
             ev.push(input_event(EV_KEY, KEY_LEFTMETA, value));
         }
+        // Shift, so held-Shift chords like Shift+arrows (selection) and Shift+Tab work.
+        if mods & 0x08 != 0 {
+            ev.push(input_event(EV_KEY, KEY_LEFTSHIFT, value));
+        }
     }
 
     pub fn key_event(&mut self, code: u16, value: i32) {
@@ -1048,6 +1063,19 @@ fn special_to_keycode(code: u8) -> Option<u16> {
         0x0D => Some(KEY_LEFTALT),
         0x0E => Some(KEY_LEFTMETA),
         0x0F => Some(KEY_INSERT),
+        // F1–F12 for the laptop-mode function row.
+        0x10 => Some(KEY_F1),
+        0x11 => Some(KEY_F2),
+        0x12 => Some(KEY_F3),
+        0x13 => Some(KEY_F4),
+        0x14 => Some(KEY_F5),
+        0x15 => Some(KEY_F6),
+        0x16 => Some(KEY_F7),
+        0x17 => Some(KEY_F8),
+        0x18 => Some(KEY_F9),
+        0x19 => Some(KEY_F10),
+        0x1A => Some(KEY_F11),
+        0x1B => Some(KEY_F12),
         _ => None,
     }
 }

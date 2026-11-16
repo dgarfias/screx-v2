@@ -8,6 +8,9 @@ final class AudioPlayer {
     private var sourceNode: AVAudioSourceNode?
     private let avSync: AVSyncState
     private(set) var isOutputEnabled = true
+    private var wantsPlayback = false
+    private var configurationObserver: NSObjectProtocol?
+    private var routeObserver: NSObjectProtocol?
 
     // NOTE: The ideal implementation here is a lock-free SPSC ring using
     // atomics for head (render thread) and tail (network thread). Adding
@@ -50,6 +53,9 @@ final class AudioPlayer {
     private var windowFrames = 0
 
     deinit {
+        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        engine.stop()
         ringStorage.deallocate()
     }
 
@@ -143,10 +149,24 @@ final class AudioPlayer {
         self.sourceNode = node
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: format)
+        configurationObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                                        object: engine, queue: .main) { [weak self] _ in
+            guard let self, self.wantsPlayback, self.isOutputEnabled, !self.engine.isRunning else { return }
+            // The engine stops when the hardware route's format changes (e.g. HDMI hotplug).
+            self.engine.stop()
+            self.lock.withLock { self.ringClear() }
+            self.start()
+        }
+        routeObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification,
+                                                               object: AVAudioSession.sharedInstance(), queue: .main) { _ in
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            print("[audio] route changed: \(outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ", "))")
+        }
     }
 
     func start() {
         guard isOutputEnabled else { return }
+        wantsPlayback = true
         guard !engine.isRunning else { return }
         do {
             try engine.start()
@@ -157,6 +177,7 @@ final class AudioPlayer {
     }
 
     func stop() {
+        wantsPlayback = false
         guard engine.isRunning || ringCount > 0 else { return }
         engine.stop()
         lock.withLock {

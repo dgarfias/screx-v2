@@ -1,11 +1,40 @@
 use std::os::raw::{c_int, c_uint, c_void};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::capture::{CaptureFrame, DisplayBackend, DisplayMode};
+use crate::capture::{CaptureFrame, DisplayBackend, DisplayId, DisplayMode};
+
+// Allocation and opening must be serialized: checking a card does not reserve it.
+// Keep an explicit lease until close, even if libevdi still reports it available.
+static DEVICE_LEASES: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+
+struct DeviceLease(c_int);
+
+impl DeviceLease {
+    fn open() -> Result<(Self, EvdiHandle)> {
+        let mut leased = DEVICE_LEASES.lock().unwrap();
+        let device = find_or_create_device(&leased)?;
+        let handle = unsafe { evdi_open(device) };
+        if handle.is_null() {
+            anyhow::bail!("evdi_open({device}) returned null");
+        }
+        leased.push(device);
+        Ok((Self(device), handle))
+    }
+}
+
+impl Drop for DeviceLease {
+    fn drop(&mut self) {
+        DEVICE_LEASES
+            .lock()
+            .unwrap()
+            .retain(|&device| device != self.0);
+    }
+}
 
 type EvdiHandle = *mut c_void;
 
@@ -110,22 +139,34 @@ extern "C" fn on_crtc_state(state: c_int, _user_data: *mut c_void) {
 }
 
 pub struct EvdiDisplay {
+    display_id: DisplayId,
+    monitor_name: [u8; 13],
     width: u32,
     height: u32,
     fps: u32,
     handle: Option<EvdiHandle>,
+    device_lease: Option<DeviceLease>,
     pixel_buf: Option<Vec<u8>>,
 }
 
 unsafe impl Send for EvdiDisplay {}
 
 impl EvdiDisplay {
-    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
+    pub fn new(
+        display_id: DisplayId,
+        monitor_name: [u8; 13],
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self> {
         Ok(Self {
+            display_id,
+            monitor_name,
             width,
             height,
             fps,
             handle: None,
+            device_lease: None,
             pixel_buf: None,
         })
     }
@@ -145,15 +186,15 @@ impl DisplayBackend for EvdiDisplay {
         force_refresh: &AtomicBool,
         on_frame: &mut dyn FnMut(CaptureFrame<'_>),
     ) -> Result<()> {
-        let dev = find_or_create_device()?;
-        let handle = unsafe { evdi_open(dev) };
-        if handle.is_null() {
-            anyhow::bail!("evdi_open({dev}) returned null");
-        }
+        anyhow::ensure!(self.handle.is_none(), "EVDI capture is already running");
+        let (lease, handle) = DeviceLease::open()?;
+        let dev = lease.0;
         println!("[capture] EVDI device {dev} opened");
         self.handle = Some(handle);
+        self.device_lease = Some(lease);
 
-        let edid = generate_edid(self.width, self.height, self.fps.max(30));
+        let mut edid = generate_edid(self.display_id, self.width, self.height, self.fps.max(1));
+        set_monitor_name(&mut edid, &self.monitor_name);
         let area_limit = self.width * self.height;
         unsafe {
             evdi_connect(handle, edid.as_ptr(), edid.len() as c_uint, area_limit);
@@ -212,10 +253,12 @@ impl DisplayBackend for EvdiDisplay {
         let evdi_fd = unsafe { evdi_get_event_ready(handle) };
         if evdi_fd < 0 {
             unsafe {
+                evdi_unregister_buffer(handle, 0);
                 evdi_disconnect(handle);
                 evdi_close(handle);
             }
             self.handle = None;
+            self.device_lease = None;
             anyhow::bail!("evdi_get_event_ready returned {evdi_fd}");
         }
 
@@ -226,7 +269,10 @@ impl DisplayBackend for EvdiDisplay {
         let start_time = Instant::now();
 
         println!("[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms)");
-        println!("[capture] NOTE: enable the 'Screx Virtual' display in GNOME Settings > Displays");
+        println!(
+            "[capture] monitor: {}",
+            String::from_utf8_lossy(&self.monitor_name).trim_end()
+        );
 
         let mut pending_request = false;
         let mut no_update_count: u64 = 0;
@@ -340,6 +386,7 @@ impl DisplayBackend for EvdiDisplay {
             evdi_close(handle);
         }
         self.handle = None;
+        self.device_lease = None;
         println!("[capture] EVDI cleanup complete");
         Ok(())
     }
@@ -352,23 +399,38 @@ impl DisplayBackend for EvdiDisplay {
             }
             println!("[capture] EVDI detached");
         }
+        self.device_lease = None;
     }
 }
 
-fn generate_edid(width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
+impl Drop for EvdiDisplay {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+fn generate_edid(display_id: DisplayId, width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
     let mut edid = [0u8; 128];
 
     edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
     edid[8] = 0x4E;
     edid[9] = 0x58;
     edid[10..16].copy_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    if display_id == DisplayId::External {
+        edid[10..16].copy_from_slice(&[0x02, 0x00, 0x02, 0x00, 0x00, 0x00]);
+    }
     edid[16] = 0x01;
     edid[17] = 0x22;
     edid[18] = 0x01;
     edid[19] = 0x04;
     edid[20] = 0xA5;
-    edid[21] = ((width as f64 * 0.02646) as u8).max(1);
-    edid[22] = ((height as f64 * 0.02646) as u8).max(1);
+    // Physical size is unknown, and pixel counts do not determine a diagonal. EDID defines
+    // 16x10 cm as the marker for "aspect ratio encoded instead of size" (16:9 is 16x9 cm).
+    // Mutter/gnome-control-center recognize exactly this marker and then name the output from
+    // the product descriptor; with the size left at zero it shows only the 3-letter vendor ID.
+    // It also keeps Mutter at 100% scale, which is correct for a virtual monitor.
+    edid[21] = 16;
+    edid[22] = 10;
     edid[23] = 120;
     edid[24] = 0x2E;
     edid[25..35].copy_from_slice(&[0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
@@ -412,7 +474,11 @@ fn generate_edid(width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
     d[16] = 0x00;
     d[17] = 0x1E;
 
-    let name = b"Screx Virtual";
+    // Product/serial IDs stay stable; the session supplies the internal descriptor name.
+    let name: &[u8] = match display_id {
+        DisplayId::Internal => b"Screx",
+        DisplayId::External => b"iPad External",
+    };
     let nd = &mut edid[72..90];
     nd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFC, 0x00]);
     for (i, &ch) in name.iter().enumerate().take(13) {
@@ -421,11 +487,14 @@ fn generate_edid(width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
     if name.len() < 13 {
         nd[5 + name.len()] = 0x0A;
         for i in (5 + name.len() + 1)..18 {
-            edid[i] = 0x20;
+            nd[i] = 0x20;
         }
     }
 
-    let serial = b"001";
+    let serial = match display_id {
+        DisplayId::Internal => b"001",
+        DisplayId::External => b"002",
+    };
     let sd = &mut edid[90..108];
     sd[0..5].copy_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0x00]);
     for (i, &ch) in serial.iter().enumerate().take(13) {
@@ -455,14 +524,24 @@ fn generate_edid(width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
     edid
 }
 
-fn find_available_device() -> Option<c_int> {
-    for dev in 0..16 {
-        let status = unsafe { evdi_check_device(dev) };
-        if status == 0 {
-            return Some(dev);
-        }
+fn set_monitor_name(edid: &mut [u8; 128], name: &[u8; 13]) {
+    edid[77..90].copy_from_slice(name);
+    let len = name.iter().rposition(|b| *b != b' ').map_or(0, |i| i + 1);
+    if len < 13 {
+        edid[77 + len] = b'\n';
     }
-    None
+    edid[127] = 0u8.wrapping_sub(edid[..127].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)));
+}
+
+fn find_available_device(leased: &[c_int]) -> Option<c_int> {
+    select_available_device(leased, |dev| unsafe { evdi_check_device(dev) } == 0)
+}
+
+fn select_available_device(
+    leased: &[c_int],
+    mut available: impl FnMut(c_int) -> bool,
+) -> Option<c_int> {
+    (0..16).find(|dev| !leased.contains(dev) && available(*dev))
 }
 
 fn ensure_evdi_module_loaded() -> Result<()> {
@@ -490,10 +569,10 @@ fn ensure_evdi_module_loaded() -> Result<()> {
     anyhow::bail!("modprobe evdi reported success but /sys/module/evdi is still missing")
 }
 
-fn find_or_create_device() -> Result<c_int> {
+fn find_or_create_device(leased: &[c_int]) -> Result<c_int> {
     ensure_evdi_module_loaded()?;
 
-    if let Some(dev) = find_available_device() {
+    if let Some(dev) = find_available_device(leased) {
         println!("[capture] found existing EVDI device at card {dev}");
         return Ok(dev);
     }
@@ -513,11 +592,82 @@ fn find_or_create_device() -> Result<c_int> {
 
     for attempt in 0..40 {
         std::thread::sleep(Duration::from_millis(250));
-        if let Some(dev) = find_available_device() {
+        if let Some(dev) = find_available_device(leased) {
             println!("[capture] EVDI device created at card {dev} (attempt {attempt})");
             return Ok(dev);
         }
     }
 
     anyhow::bail!("evdi_add_device succeeded but no EVDI card became available after 10s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leased_devices_are_not_reused_even_if_reported_available() {
+        assert_eq!(select_available_device(&[0], |_| true), Some(1));
+        assert_eq!(select_available_device(&[0, 1], |_| true), Some(2));
+        assert_eq!(select_available_device(&[], |dev| dev == 4), Some(4));
+        assert_eq!(select_available_device(&[4], |dev| dev == 4), None);
+        assert_eq!(
+            select_available_device(&(0..16).collect::<Vec<_>>(), |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn model_names_preserve_stable_product_and_serial_identity() {
+        let mut edid = generate_edid(DisplayId::Internal, 1920, 1080, 60);
+        set_monitor_name(&mut edid, b"iPad A16 11\" ");
+        assert_eq!(&edid[8..16], &[0x4e, 0x58, 1, 0, 1, 0, 0, 0]);
+        assert_eq!(&edid[77..90], b"iPad A16 11\"\n");
+        assert_eq!(&edid[95..108], b"001\n         ");
+        assert_eq!(edid.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
+        assert_eq!(
+            &edid[21..23],
+            &[16, 10],
+            "Must use EDID's aspect-as-size marker so desktop environments show the model name"
+        );
+    }
+
+    #[test]
+    fn physical_size_is_never_derived_from_stream_resolution() {
+        for (width, height) in [(1280, 720), (2360, 1640), (3840, 2160)] {
+            let edid = generate_edid(DisplayId::Internal, width, height, 60);
+            assert_eq!(&edid[21..23], &[16, 10]);
+        }
+    }
+
+    #[test]
+    fn displays_have_distinct_stable_identities_and_valid_checksums() {
+        let internal = generate_edid(DisplayId::Internal, 1920, 1080, 60);
+        let external = generate_edid(DisplayId::External, 1920, 1080, 60);
+        assert_ne!(&internal[10..16], &external[10..16]);
+        assert_ne!(&internal[72..108], &external[72..108]);
+        for id in [DisplayId::Internal, DisplayId::External] {
+            for (width, height) in [(1920, 1080), (2360, 1640), (3840, 2160)] {
+                let edid = generate_edid(id, width, height, 60);
+                assert_eq!(
+                    edid.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+                    0
+                );
+                assert_eq!(&edid[8..16], &generate_edid(id, 1280, 720, 30)[8..16]);
+                assert_eq!(&edid[72..108], &generate_edid(id, 1280, 720, 30)[72..108]);
+                assert_eq!(u32::from(edid[56]) | (u32::from(edid[58] >> 4) << 8), width);
+                assert_eq!(
+                    u32::from(edid[59]) | (u32::from(edid[61] >> 4) << 8),
+                    height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_monitor_name_does_not_corrupt_the_edid_header() {
+        let edid = generate_edid(DisplayId::External, 1920, 1080, 60);
+        assert_eq!(&edid[..8], &[0, 255, 255, 255, 255, 255, 255, 0]);
+        assert_eq!(&edid[77..90], b"iPad External");
+    }
 }

@@ -184,7 +184,7 @@ struct TrackpadOverlay: View {
 }
 
 /// UIKit surface that turns touches into mouse actions.
-private struct TrackpadSurface: UIViewRepresentable {
+struct TrackpadSurface: UIViewRepresentable {
     let onMove: (CGFloat, CGFloat) -> Void
     let onButton: (UInt8, Bool) -> Void
     let onScroll: (CGFloat) -> Void
@@ -254,7 +254,16 @@ final class TrackpadSurfaceView: UIView {
         backgroundColor = .clear
     }
 
+    /// A physical mouse or trackpad emits `.indirectPointer` touches wherever its cursor is.
+    /// Those are the desktop's own pointer, already forwarded through GCMouse, so the on-screen
+    /// trackpad must treat them as neither movement nor clicks.
+    private func isFingerTouch(_ touch: UITouch) -> Bool {
+        touch.type == .direct || touch.type == .pencil
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        let touches = touches.filter(isFingerTouch)
+        guard !touches.isEmpty else { return }
         let now = CACurrentMediaTime()
         if activeTouches.isEmpty {
             onInteractionChanged?(true)
@@ -274,6 +283,7 @@ final class TrackpadSurfaceView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard touches.contains(where: { activeTouches.contains($0) }) else { return }
         if activeTouches.count >= 2 {
             let location = centroid()
             if let last = lastTwoFingerLocation {
@@ -306,14 +316,21 @@ final class TrackpadSurfaceView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finish(touches, cancelled: false)
+        finish(trackedOnly(touches), cancelled: false)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finish(touches, cancelled: true)
+        finish(trackedOnly(touches), cancelled: true)
+    }
+
+    /// Mouse button-up/cancel events must not complete a finger gesture.
+    private func trackedOnly(_ touches: Set<UITouch>) -> Set<UITouch> {
+        touches.filter { activeTouches.contains($0) }
     }
 
     private func finish(_ touches: Set<UITouch>, cancelled: Bool) {
+        // Nothing we track ended, so there is no gesture to finish or click to synthesize.
+        guard !touches.isEmpty else { return }
         wasCancelled = wasCancelled || cancelled
         activeTouches.removeAll { touches.contains($0) }
         resetTrackingPoints()

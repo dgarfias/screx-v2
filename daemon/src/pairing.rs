@@ -555,6 +555,18 @@ fn handle_hello_request(
 }
 
 fn run_control_loop(
+    stream: TcpStream,
+    shared: &Arc<crate::stream_server::SharedState>,
+    stop: &Arc<AtomicBool>,
+    session_key: [u8; 32],
+    session_id: u64,
+) -> Result<()> {
+    let result = run_control_messages(stream, shared, stop, session_key, session_id);
+    crate::stream_server::drop_network_client(shared, session_id);
+    result
+}
+
+fn run_control_messages(
     mut stream: TcpStream,
     shared: &Arc<crate::stream_server::SharedState>,
     stop: &Arc<AtomicBool>,
@@ -565,8 +577,8 @@ fn run_control_loop(
     stream.set_nodelay(true).ok();
 
     let cipher = crypto::SessionCipher::new(&session_key);
-    let mut len_buf = [0u8; 4];
-    let mut msg_buf = vec![0u8; 256];
+    let mut received = Vec::new();
+    let mut incoming = [0u8; 4096];
     let mut seq_expected = 0u32;
     let mut seq_initialized = false;
     let mut send_seq = 0u32;
@@ -586,14 +598,24 @@ fn run_control_loop(
         eprintln!("[control] failed to send capabilities: {e:#}");
     }
 
-    while !stop.load(Ordering::Relaxed) {
+    'control: while !stop.load(Ordering::Relaxed) {
         if !shared.is_current_network_session(session_id) {
             println!("[control] network control loop exiting for stale session {session_id}");
             break;
         }
 
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
+        // This is the sole TCP writer; capture workers enqueue session-scoped status messages.
+        let statuses = crate::stream_server::take_session_messages(
+            &mut shared.display_status.lock().unwrap(),
+            session_id,
+        );
+        for status in statuses {
+            send_control_frame(&mut stream, &cipher, &mut send_seq, &status)?;
+        }
+
+        match stream.read(&mut incoming) {
+            Ok(0) => break,
+            Ok(count) => received.extend_from_slice(&incoming[..count]),
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -606,68 +628,62 @@ fn run_control_loop(
             }
         }
 
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
-            eprintln!(
-                "[control] invalid framed control message length: {msg_len}, closing channel"
-            );
-            break;
-        }
+        // Keep partial headers/bodies across socket timeouts; read_exact would discard progress.
+        while received.len() >= 4 {
+            let msg_len = u32::from_be_bytes(received[..4].try_into().unwrap()) as usize;
+            if msg_len < 4 + crypto::TAG_LEN || msg_len > CONTROL_MAX_FRAME {
+                eprintln!(
+                    "[control] invalid framed control message length: {msg_len}, closing channel"
+                );
+                break 'control;
+            }
 
-        if msg_buf.len() < msg_len {
-            msg_buf.resize(msg_len, 0);
-        }
-
-        match stream.read_exact(&mut msg_buf[..msg_len]) {
-            Ok(()) => {}
-            Err(_) => {
-                println!("[control] network control channel disconnected (payload)");
+            if received.len() < 4 + msg_len {
                 break;
             }
-        }
+            let mut msg_buf: Vec<_> = received.drain(..4 + msg_len).skip(4).collect();
 
-        let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
-        if seq_initialized && seq_num != seq_expected {
-            crate::vlog!(
+            let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
+            if seq_initialized && seq_num != seq_expected {
+                crate::vlog!(
                 "[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}"
             );
+            }
+            seq_expected = seq_num.wrapping_add(1);
+            seq_initialized = true;
+
+            let nonce = crypto::nonce_control_client(seq_num);
+            let aad = [msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]];
+            let plaintext = match cipher.decrypt(&nonce, &aad, &mut msg_buf[4..msg_len]) {
+                Some(pt) => pt,
+                None => {
+                    crate::vlog!("[control] failed to decrypt tcp control frame seq={seq_num}");
+                    continue;
+                }
+            };
+
+            match plaintext.first().copied() {
+                Some(protocol::client::DISCONNECT) => {
+                    println!("[control] graceful disconnect requested by client");
+                    break 'control;
+                }
+                Some(protocol::client::PING) => {
+                    // Latency probe: answer immediately so the client can measure
+                    // control-channel RTT/jitter.
+                    send_control_frame(
+                        &mut stream,
+                        &cipher,
+                        &mut send_seq,
+                        &[protocol::daemon::PONG],
+                    )?;
+                    continue;
+                }
+                _ => {}
+            }
+
+            crate::stream_server::handle_control_message_data(shared, session_id, plaintext);
         }
-        seq_expected = seq_num.wrapping_add(1);
-        seq_initialized = true;
-
-        let nonce = crypto::nonce_control_client(seq_num);
-        let aad = [msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]];
-        let plaintext = match cipher.decrypt(&nonce, &aad, &mut msg_buf[4..msg_len]) {
-            Some(pt) => pt,
-            None => {
-                crate::vlog!("[control] failed to decrypt tcp control frame seq={seq_num}");
-                continue;
-            }
-        };
-
-        match plaintext.first().copied() {
-            Some(protocol::client::DISCONNECT) => {
-                println!("[control] graceful disconnect requested by client");
-                break;
-            }
-            Some(protocol::client::PING) => {
-                // Latency probe: answer immediately so the client can measure
-                // control-channel RTT/jitter.
-                send_control_frame(
-                    &mut stream,
-                    &cipher,
-                    &mut send_seq,
-                    &[protocol::daemon::PONG],
-                )?;
-                continue;
-            }
-            _ => {}
-        }
-
-        crate::stream_server::handle_control_message_data(shared, plaintext);
     }
-
-    crate::stream_server::drop_network_client(shared, session_id);
 
     Ok(())
 }

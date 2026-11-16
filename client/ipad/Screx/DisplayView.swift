@@ -238,12 +238,16 @@ struct VideoDisplayView: UIViewControllerRepresentable {
     var onScroll: ((CGFloat) -> Void)?
     var hidePointer: Bool = false
     var lockPointer: Bool = false
+    var acceptsTouch: Bool = true
+    var onWindowAttachmentChanged: ((Bool) -> Void)?
 
     func makeUIViewController(context: Context) -> DisplayContainerController {
         let controller = DisplayContainerController()
         controller.displayView.videoWidth = videoWidth
         controller.displayView.videoHeight = videoHeight
         controller.displayView.onTouch = onTouch
+        controller.displayView.onWindowAttachmentChanged = onWindowAttachmentChanged
+        controller.displayView.touchForwardingEnabled = acceptsTouch
         controller.displayView.onScroll = onScroll
         controller.displayView.hidePointer = hidePointer
         controller.lockPointer = lockPointer
@@ -255,10 +259,18 @@ struct VideoDisplayView: UIViewControllerRepresentable {
         uiViewController.displayView.videoWidth = videoWidth
         uiViewController.displayView.videoHeight = videoHeight
         uiViewController.displayView.onTouch = onTouch
+        uiViewController.displayView.onWindowAttachmentChanged = onWindowAttachmentChanged
+        uiViewController.displayView.touchForwardingEnabled = acceptsTouch
         uiViewController.displayView.onScroll = onScroll
         uiViewController.displayView.hidePointer = hidePointer
         uiViewController.lockPointer = lockPointer
         uiViewController.displayView.attach(layer: layer)
+    }
+
+    static func dismantleUIViewController(_ controller: DisplayContainerController, coordinator: ()) {
+        controller.displayView.cancelActiveTouches()
+        controller.displayView.onWindowAttachmentChanged?(false)
+        controller.displayView.detachVideoLayer()
     }
 }
 
@@ -300,6 +312,10 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     var videoWidth: Int = 1920
     var videoHeight: Int = 1080
     var onTouch: ((Data) -> Void)?
+    var onWindowAttachmentChanged: ((Bool) -> Void)?
+    var touchForwardingEnabled = true {
+        didSet { if !touchForwardingEnabled { cancelActiveTouches() } }
+    }
     var onScroll: ((CGFloat) -> Void)?
     var hidePointer: Bool = false {
         didSet {
@@ -359,6 +375,27 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         attachedLayer?.frame = bounds
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { cancelActiveTouches() }
+        onWindowAttachmentChanged?(window != nil)
+    }
+
+    func detachVideoLayer() {
+        attachedLayer?.removeFromSuperlayer()
+        attachedLayer = nil
+    }
+
+    func cancelActiveTouches() {
+        guard !touchSlots.isEmpty else { return }
+        var packet = Data([UInt8(touchSlots.count)])
+        for slot in touchSlots.values {
+            packet.append(contentsOf: [slot, 2, 0, 0, 0, 0, 0, 0])
+        }
+        touchSlots.removeAll()
+        onTouch?(packet)
     }
 
     func attach(layer: AVSampleBufferDisplayLayer) {
@@ -458,7 +495,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     }
 
     private func sendTouchEvents(_ touches: Set<UITouch>, eventType: UInt8) {
-        guard let onTouch else { return }
+        guard touchForwardingEnabled, let onTouch else { return }
 
         var contacts = Data()
         contacts.reserveCapacity(touches.count * 8)

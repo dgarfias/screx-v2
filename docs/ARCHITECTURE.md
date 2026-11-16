@@ -47,6 +47,8 @@ Key files:
 
 - `daemon/src/main.rs`
 - `daemon/src/capture.rs`
+- `daemon/src/display_manager.rs` — transactional topology and presentation acknowledgement
+- `daemon/src/pipeline.rs` — independently owned capture/encode/send workers
 - `daemon/src/encode.rs`
 - `daemon/src/stream_server.rs`
 - `daemon/src/pairing.rs`
@@ -188,7 +190,7 @@ If a session is already active, the daemon replies with `SCREX_BUSY`.
 
 ## Network Media Transport (UDP)
 
-Each UDP packet starts with an 18-byte header:
+Each UDP packet starts with a 22-byte header (followed by encrypted payload and a 16-byte tag):
 
 | Field | Size | Description |
 |---|---|---|
@@ -196,13 +198,24 @@ Each UDP packet starts with an 18-byte header:
 | `chunk_idx` | u16 BE | Chunk number within frame |
 | `total_data` | u16 BE | Number of data chunks |
 | `total_parity` | u16 BE | Number of parity chunks |
-| `flags` | u8 | Bit 0 = IDR, Bit 1 = audio |
+| `flags` | u8 | Bit 0 = IDR, Bit 1 = audio, Bit 4 = external video, Bit 7 = heartbeat |
 | `codec_id` | u8 | Video: `0x00` = H.264, `0x01` = H.265. Audio: unused (`0x00`); audio is always Opus |
 | `payload_len` | u16 BE | Payload size |
 | `timestamp_ms` | u32 BE | Daemon timestamp |
+| `generation` | u32 BE | Nonzero sender namespace, unique across sender recreation |
 
 Notes:
 
+- all 22 header bytes are authenticated as AAD, including heartbeats. The server nonce is
+  `0x00 + frame_id(u32) + chunk_idx(u16) + flags(u8) + generation(u32)`, all big-endian
+- each video sender, audio sender, and heartbeat sender reserves a process-unique generation.
+  Frame IDs are reserved before encryption (even if transmission fails), and never wrap.
+  Recreating a sender always allocates a fresh generation; namespace exhaustion fails closed
+- internal video uses display ID 0 and external video uses display ID 1 (flag `0x10`). Each
+  has independent FEC, frame completion, PLI throttling, codec parameters, and decoder state.
+  Only authenticated newer generations may reset those states; retired generations are ignored
+- heartbeats use flags `0x80`, zero data/parity counts, and an incrementing frame ID, not a
+  fixed frame ID/nonce. Audio and heartbeats never set the external-video flag
 - video is split into chunks of 1400 bytes; every data chunk except a frame's last is full-size,
   and parity chunks are always full-size (receivers zero-pad short chunks before FEC recovery)
 - optional Reed-Solomon parity is added for video
@@ -216,7 +229,7 @@ Notes:
   stereo Opus at 128 kbps
 - client-to-daemon UDP packets are `seq(u32 BE) + encrypted payload`; the payload is
   `type(u8) + body`, see "Client -> daemon UDP payloads" below
-- the iPad retains incomplete video assemblies for 100 ms, then reconstructs recoverable frames
+- the iPad retains incomplete video assemblies for 50 ms, then reconstructs recoverable frames
   from parity or discards them and requests recovery
 
 ### Network Control Transport (TCP)
@@ -237,9 +250,10 @@ Client -> daemon:
 | Type | Name | Body |
 |---|---|---|
 | `0x01` | SETTINGS | see Capability Negotiation |
-| `0x02` | PLI | empty |
+| `0x02` | PLI | `display_id(u8) + generation(u32)` |
 | `0x03` | PING | empty; answered with PONG |
 | `0x04` | DISCONNECT | empty |
+| `0x05` | DISPLAY_PRESENTED | `revision(u32) + display_id(u8) + generation(u32)` |
 | `0x10` | TOUCH | packed contacts, see Input Protocol |
 | `0x11` | KEY | see Input Protocol |
 | `0x12` | RAWKEY | see Input Protocol |
@@ -256,11 +270,15 @@ Daemon -> client:
 |---|---|---|
 | `0x80` | CAPS | see Capability Negotiation |
 | `0x81` | PONG | empty |
+| `0x82` | DISPLAY_STATUS | see Runtime Display Topology |
 
 The daemon ignores unknown types and wrong-length bodies.
 
-`PLI` requests an IDR and raises a capture-refresh signal, which makes the capture loop obtain or
-resend a frame so a static desktop can still answer the recovery request.
+`PLI` requests an IDR and raises a capture-refresh signal for only the named display and current
+generation. Stale generations and invalid display IDs are ignored. This makes the capture loop
+obtain or resend a frame so a static desktop can still answer the recovery request. Adaptive
+bitrate/FEC tuning is independent per display. The 22-byte header and display-scoped PLI are a
+breaking protocol change: daemon and iPad client must be updated together.
 
 ### Client -> daemon UDP payloads
 
@@ -307,9 +325,152 @@ Offsets are within the body, after the type byte.
 | 4 | fps | u8 | 0 |
 | 5 | codec | u8 (`0x00` H.264, `0x01` H.265) | `0xFF` |
 | 6 | bitrate | u32 (bps) | 0 |
+| 10 | enabled_mask | u8 | no default: 1 = internal, 2 = external, 3 = both |
+| 11 | external_width | u16 | 0 |
+| 13 | external_height | u16 | 0 |
+| 15 | revision | u32 | nonzero, monotonically increasing within the session |
+| 19 | external_fps | u8 | 0 = follow internal FPS |
+| 20 | internal_display_name | 13 ASCII bytes | space-padded EDID name, required |
 
 The iPad's "Daemon default" options map to these values; the daemon then uses its CLI-configured
 default for that field.
+
+The body is exactly 33 bytes. Width/height/FPS at offsets 0/2/4 describe the internal display.
+External FPS is independent, inheriting internal FPS only when omitted. Codec and the base bitrate
+target are shared settings; the target applies to **each** enabled video pipeline. Each pipeline
+adapts bitrate/FEC independently from that target. Both
+resolutions are independently clamped against the same advertised limits. Each width/height
+pair must either be specified together or uses daemon defaults. Masks outside 1–3, zero
+revisions, and legacy 10-/19-/20-byte bodies are rejected. The daemon's maximum FPS applies per output.
+Monitor names must be nonempty printable ASCII, without single quotes or backslashes, so the same
+validated identity can safely be used in both EDID and GNOME's touchscreen output mapping.
+
+### Runtime Display Topology
+
+`SETTINGS` may also be sent while streaming. The display manager coalesces pending requests and
+ignores revisions older than or equal to the latest request. Settings, presentation ACKs, and
+outbound status messages are all tagged with their owning network session internally, so delayed
+work from a disconnected client cannot affect its replacement.
+
+Each enabled output has its own capture, encoder, UDP sender, recovery controls, and stop/join
+lifecycle. Adding/removing another output does not restart an unchanged pipeline. New or
+reconfigured outputs start as candidates alongside retained committed monitors. The daemon reports
+`streaming` after successfully sending a candidate keyframe, but retains the old topology until
+the iPad acknowledges that generation's first frame is ready for display. Unchanged, already
+presented generations need no new ACK. Only after **all** requested outputs are ready does the
+daemon retire disabled/replaced monitors and report the committed topology.
+
+`DISPLAY_STATUS` body (15 fixed bytes plus UTF-8 detail):
+
+| Offset | Field | Size |
+|---|---|---|
+| 0 | revision | u32 |
+| 4 | display_id | u8: 0 internal, 1 external |
+| 5 | phase | u8: 0 streaming, 1 committed, 2 failed, 3 removed |
+| 6 | active_mask | u8: currently committed outputs |
+| 7 | generation | u32: 0 if no pipeline for this output |
+| 11 | width | u16: 0 if absent |
+| 13 | height | u16: 0 if absent |
+| 15 | detail | UTF-8 remainder, bounded error detail |
+
+**Monitor order.** Each new monitor takes the lowest free EVDI card, and GNOME numbers monitors by
+card, so plug order decides which is 1 and 2. Whenever the requested topology has both monitors and
+the internal one must (re)start (e.g. External only → Both, or a new internal resolution in Both),
+the daemon unplugs every monitor (stop all, then join), plugs the internal one, and plugs the
+external one only after the internal pipeline is streaming. The internal monitor is therefore
+always 1 and the external 2. This path does not keep old monitors alive during the switch; if it
+fails or times out, the previous monitors are plugged back in the same order, and the failure
+status reports that restored mask. Other changes (adding an external monitor to a running internal
+one, removing one, external-only resolution/FPS) keep the transactional behavior below.
+
+On candidate failure, cancellation, or a 15-second presentation timeout, candidates are stopped
+and joined without removing the previously committed monitors. If a same-output replacement had
+advanced the client's generation, the retained worker reissues a keyframe under a fresh namespace
+so stale-generation filtering cannot prevent rollback. Failed requests report both retained output
+states. A request superseding an in-flight transition cancels its candidates first; stale ACKs
+cannot commit it. Disconnect/shutdown signals every worker before joining any of them. If no
+committed output survives an initialization failure, the iPad reports the error and disconnects.
+
+The renderer acknowledges readiness rather than merely receiving or reassembling a frame. On
+iOS 17.4+ it checks `AVSampleBufferDisplayLayer.isReadyForDisplay`; earlier supported iOS releases
+use the layer's rendering status. An ACK also requires the corresponding surface to be attached
+to a window; decoding an offscreen external stream cannot retire a visible monitor.
+
+### iPad external-display scenes
+
+The app starts in Internal only, even with a monitor connected. An external noninteractive scene
+is configured in the manifest for earlier iPadOS releases and registered as a scene accessory
+on the primary controller on iPadOS 27+. The coordinator owns at most one external video window
+and never makes it key; keyboard, mouse, trackpad, and app controls stay on the iPad.
+
+The in-session Displays button (also available with the pill collapsed) selects Internal only,
+External only, or Both. The Displays menu edits only external resolution and target FPS; the iPad's
+resolution and FPS remain those from Stream Settings. Changing external FPS replaces only its pipeline.
+The selected mode, external resolution, and external FPS are stored per daemon hostname in
+UserDefaults. On connect, the remembered mode is used when a monitor is attached (otherwise
+internal-only until it appears), the remembered resolution is reused only while iPadOS still
+reports it, and the display's recommended mode is the fallback and default. A monitor appearing
+mid-session reapplies the host's remembered external mode once.
+Both uses independent desktops, not a mirrored video layer. Requested and committed output masks
+keep retiring surfaces attached during transitions. Once Internal only commits, the external
+window is released entirely so iPadOS can resume normal screen mirroring. External scene teardown
+never invokes the primary scene's background/disconnect handler. Unplugging requests Internal only
+on the same network session. Mode changes cancel in-flight touch gestures and release held input.
+
+External only keeps the normal interface (pill, floating trackpad, iOS keyboard) over a black
+placeholder with a **Switch to laptop mode** button. The floating trackpad is enabled automatically
+on entry; leaving restores its previous enabled state and layout. No touchscreen coordinates are
+forwarded, and indirect pointer touches from a connected mouse/trackpad are ignored by trackpad
+surfaces. A `PointerLockRegion` behind the placeholder/panel requests pointer lock and hides the
+iPad cursor while a physical mouse is connected, replacing the video view that owns this in the
+other modes.
+
+Laptop mode is per-session state (`StreamViewModel.isLaptopMode`), off on every entry to External
+only and cleared when it ends. `ExternalControlPanel` then replaces the placeholder, pill and iOS
+keyboard with a top bar (options left, inline connection info right), `LaptopKeyboardView`, and the
+trackpad at the bottom. `LaptopKeyboardView` is a UIKit surface that
+fires on touch-down for multi-touch typing and ignores indirect-pointer touches. Layouts are pure
+data in `LaptopKeyboardLayout.swift` (15-unit rows; the function row is esc, F1–F12, home, end,
+ins, del). The initial layout comes from
+`UITextInputMode.activeInputModes` primary languages, then the device language, then US; a stored
+choice wins. iPadOS exposes keyboard languages, not key geometry, so the language→layout mapping is
+an approximation with a manual 🌐 override. Keys reuse existing KEY messages: characters as text
+(composed client-side for dead keys), editing/navigation as special codes, and Ctrl/Alt/Super as
+combos. Special codes `0x10`–`0x1B` are F1–F12. Modifier masks are ctrl `0x01`, alt `0x02`, super
+`0x04`, shift `0x08` (shift is only needed for special keys; characters are already shifted).
+Modifiers are held per touch, as on a physical keyboard, and an unused modifier release sends the
+lone key.
+
+The external coordinator reads `UIScreen.availableModes`, `preferredMode`, and
+`maximumFramesPerSecond`, refreshing on screen-mode changes. These expose resolution modes and a
+screen-wide FPS ceiling, not the monitor's complete EDID or per-resolution refresh-rate pairs.
+The resolution picker marks the preferred mode Recommended and lists only resolutions exposed by
+iPadOS, filtered by daemon limits. No standard/scaled/custom sizes are synthesized. If none fit,
+external activation is disabled instead of inventing a mode. Target FPS choices respect both screen
+and daemon ceilings. These select the remote stream's format; they do not switch physical monitor timing.
+
+Audio uses the system-selected output route. With mic off, the session uses `.playback` so
+output-only HDMI/AirPlay/A2DP routes remain eligible; mic on uses `.playAndRecord` for duplex
+input/output, subject to iPadOS route restrictions. Audio engine configuration changes restart
+requested playback if the engine was stopped by a route-format change. Output route names/types
+are logged for physical HDMI troubleshooting; no speaker-output override is forced.
+
+`DeviceDisplayIdentity.swift` maps 107 released iPad hardware identifiers (46 model/size groups,
+snapshot 2026-11-15) to full marketing names, known diagonal sizes, and 13-byte ASCII EDID labels.
+Sources are Apple's model/specification pages and the IPSW hardware-ID catalog, referenced in the
+file. Unknown identifiers and other device families use Screx. For example, iPad (A16) 11″ uses
+`iPad A16 11"` in EDID. The external monitor is always `iPad External`, exactly 13 ASCII characters.
+UIKit supplies no physical external diagonal, so no inch suffix is inferred from pixels. Instead of
+guessing DPI, the EDID sets 16×10 cm, the specification's marker for "aspect ratio encoded instead
+of size". Mutter/gnome-control-center recognize that marker, keep the output at 100% scale, and
+name it `<three-letter vendor> <product descriptor>`, so GNOME shows `SRX iPad A16 11"` and
+`SRX iPad External`. With the size fields left at zero (the previous behavior), Mutter ignores the
+product descriptor and shows only `SRX`. Product IDs and serials remain stable and distinct; the
+internal touchscreen's GNOME mapping is updated to the session's EDID name before capture starts.
+
+The compact connection overlay is four short lines: hostname, ↓/↑ transfer rates, RTT and jitter,
+then a plain Disconnect button. It shows no codec or display-mode row; display selection belongs
+only in Displays.
 
 ### Client-side validation
 

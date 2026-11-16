@@ -13,6 +13,7 @@ pub mod client {
     pub const PING: u8 = 0x03;
     /// Graceful end of session.
     pub const DISCONNECT: u8 = 0x04;
+    pub const DISPLAY_PRESENTED: u8 = 0x05;
     pub const TOUCH: u8 = 0x10;
     pub const KEY: u8 = 0x11;
     pub const RAWKEY: u8 = 0x12;
@@ -34,6 +35,7 @@ pub mod daemon {
     pub const CAPS: u8 = 0x80;
     /// Reply to `client::PING`.
     pub const PONG: u8 = 0x81;
+    pub const DISPLAY_STATUS: u8 = 0x82;
 }
 
 /// Client -> daemon UDP payloads (inside the encrypted datagram).

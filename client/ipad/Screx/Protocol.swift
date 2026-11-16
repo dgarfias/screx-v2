@@ -10,6 +10,7 @@ enum ScrexMessage {
         static let pli: UInt8 = 0x02
         static let ping: UInt8 = 0x03
         static let disconnect: UInt8 = 0x04
+        static let displayPresented: UInt8 = 0x05
         static let touch: UInt8 = 0x10
         static let key: UInt8 = 0x11
         static let rawKey: UInt8 = 0x12
@@ -25,6 +26,7 @@ enum ScrexMessage {
     enum Daemon {
         static let caps: UInt8 = 0x80
         static let pong: UInt8 = 0x81
+        static let displayStatus: UInt8 = 0x82
     }
 
     /// Client -> daemon UDP payloads.

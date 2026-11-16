@@ -17,7 +17,7 @@ final class StreamClient {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
     private let debugId = String(UUID().uuidString.prefix(6))
-    let decoder: VideoDecoder
+    private let videoStreams: [StreamDisplayID: VideoReceiveState]
     let audioPlayer: AudioPlayer
     let avSync: AVSyncState
 
@@ -25,9 +25,12 @@ final class StreamClient {
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var sessionKey: SymmetricKey?
-    var sendPliRequest: (() -> Void)?
+    var sendPliRequest: ((StreamDisplayID, UInt32) -> Void)?
+    /// First complete access unit of each generation (not a presentation acknowledgement).
+    var onVideoStreamStarted: ((StreamDisplayID, UInt32) -> Void)?
+    var onVideoFrameReady: ((StreamDisplayID, UInt32) -> Void)?
 
-    private static let headerLen = 18
+    private static let headerLen = MediaPacketHeader.byteCount
     static let chunkPayload = 1400
     private static let keepaliveInterval: TimeInterval = 2.0
     /// How long an incomplete frame may sit before we give up on it. Only a
@@ -38,15 +41,12 @@ final class StreamClient {
     private static let frameTimeout: TimeInterval = 0.050
     private static let dataTimeout: TimeInterval = 5.0
 
-    private static let flagAudio: UInt8 = 0x02
-
-    private var reassembly: [UInt32: FrameAssembly] = [:]
     private var audioReassembly: [UInt32: AudioAssembly] = [:]
-    private var lastCompletedFrameId: UInt32 = 0
+    private var audioGeneration: UInt32 = 0
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
     private var dataTimeoutTimer: DispatchSourceTimer?
-    private var lastPliTime: TimeInterval = 0
+    private var videoRecoveryTimer: DispatchSourceTimer?
     private static let pliMinInterval: TimeInterval = 1.0
     private var sendSeq: UInt32 = 0
     private var registerSendCount = 0
@@ -62,9 +62,12 @@ final class StreamClient {
         count <= 3 || (count > 0 && (count & (count - 1)) == 0)
     }
 
-    init(endpoint: NWEndpoint, decoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
+    init(endpoint: NWEndpoint, decoder: VideoDecoder, externalDecoder: VideoDecoder, audioPlayer: AudioPlayer, avSync: AVSyncState) {
         self.endpoint = endpoint
-        self.decoder = decoder
+        self.videoStreams = [
+            .internalDisplay: VideoReceiveState(decoder: decoder),
+            .externalDisplay: VideoReceiveState(decoder: externalDecoder)
+        ]
         self.audioPlayer = audioPlayer
         self.avSync = avSync
     }
@@ -87,7 +90,19 @@ final class StreamClient {
                 self.sendRegister(conn)
                 self.startKeepalive(conn)
                 self.startDataTimeout()
-                self.decoder.sendPliRequest = { [weak self] in self?.sendPli() }
+                self.startVideoRecovery()
+                for (display, stream) in self.videoStreams {
+                    stream.decoder.onFrameReady = { [weak self] generation in
+                        self?.queue.async { [weak self] in
+                            guard let self, self.videoStreams[display]?.timeline.generation == generation else { return }
+                            self.onVideoFrameReady?(display, generation)
+                        }
+                    }
+                    stream.decoder.sendPliRequest = { [weak self] in
+                        // Decoder callbacks may originate on the render queue.
+                        self?.queue.async { [weak self] in self?.sendPli(display: display) }
+                    }
+                }
                 self.receiveLoop(conn)
             case .failed(let error):
                 self.disconnect()
@@ -109,6 +124,8 @@ final class StreamClient {
         keepaliveTimer = nil
         dataTimeoutTimer?.cancel()
         dataTimeoutTimer = nil
+        videoRecoveryTimer?.cancel()
+        videoRecoveryTimer = nil
         connection?.cancel()
         connection = nil
     }
@@ -185,6 +202,20 @@ final class StreamClient {
         lastInboundTime = CACurrentMediaTime()
     }
 
+    private func startVideoRecovery() {
+        videoRecoveryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.frameTimeout, repeating: Self.frameTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            for display in StreamDisplayID.allCases {
+                self.pruneOldFrames(display: display)
+            }
+        }
+        timer.resume()
+        videoRecoveryTimer = timer
+    }
+
     private func handleTimeout() {
         guard connection != nil else { return }
         log("data timeout fired after \(Self.dataTimeout)s without inbound UDP")
@@ -212,7 +243,6 @@ final class StreamClient {
                 if self.shouldLogDebug(self.receiveCount) {
                     self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")
                 }
-                self.resetDataTimeout()
                 if data.count >= Self.headerLen {
                     self.handlePacket(data)
                 } else {
@@ -225,35 +255,18 @@ final class StreamClient {
     }
 
     private func handlePacket(_ data: Data) {
-        guard data.count >= Self.headerLen else { return }
-
-        let frameId: UInt32 = UInt32(data[0]) << 24 | UInt32(data[1]) << 16
-                           | UInt32(data[2]) << 8  | UInt32(data[3])
-        let chunkIdx: UInt16 = UInt16(data[4]) << 8 | UInt16(data[5])
-        let totalData: UInt16 = UInt16(data[6]) << 8 | UInt16(data[7])
-        let totalParity: UInt16 = UInt16(data[8]) << 8 | UInt16(data[9])
-        let flags = data[10]
-        let codecId = data[11]
-        let payloadLen: UInt16 = UInt16(data[12]) << 8 | UInt16(data[13])
-        let timestampMs: UInt32 = UInt32(data[14]) << 24 | UInt32(data[15]) << 16
-                               | UInt32(data[16]) << 8  | UInt32(data[17])
-        let isAudio = (flags & Self.flagAudio) != 0
-        let isIdr = (flags & 1) != 0
+        guard let packet = MediaPacketHeader(data) else { return }
+        let frameId = packet.frameID
+        let chunkIdx = packet.chunkIndex
+        let totalData = packet.totalData
+        let totalParity = packet.totalParity
+        let flags = packet.flags
+        let codecId = packet.codecID
+        let payloadLen = packet.payloadLength
+        let timestampMs = packet.timestampMs
 
         if shouldLogDebug(receiveCount) {
             log("handlePacket frameId=\(frameId) chunkIdx=\(chunkIdx) totalData=\(totalData) totalParity=\(totalParity) flags=0x\(String(flags, radix: 16)) codecId=\(codecId) payloadLen=\(payloadLen)")
-        }
-
-        if frameId == 0xFFFF_FFFF && totalData == 0 {
-            log("received heartbeat packet")
-            return
-        }
-
-        if !isAudio {
-            let wantCodec: VideoCodecType = codecId == 0x01 ? .h265 : .h264
-            if wantCodec != decoder.codec {
-                decoder.setCodec(wantCodec)
-            }
         }
 
         // Decrypt payload using Data slices (COW, no copy until mutation)
@@ -261,7 +274,7 @@ final class StreamClient {
         let encryptedPayload = data[Self.headerLen...]
 
         if let key = sessionKey {
-            let nonce = ScrexCrypto.nonceServer(frameId: frameId, chunkIdx: chunkIdx, flags: flags)
+            let nonce = ScrexCrypto.nonceServer(frameId: frameId, chunkIdx: chunkIdx, flags: flags, generation: packet.generation)
             let header = data[..<Self.headerLen]
             guard let decrypted = ScrexCrypto.decrypt(key: key, nonce: nonce, ciphertextAndTag: encryptedPayload, aad: header) else {
                 decryptFailCount += 1
@@ -270,16 +283,30 @@ final class StreamClient {
             }
             payload = decrypted
         } else {
-            log("no session key set while decoding inbound packet")
-            payload = Data(encryptedPayload)
+            return
         }
 
-        if isAudio {
+        // No unauthenticated header can reset a decoder, retire an epoch, or keep us alive.
+        guard packet.generation > 0, flags & ~0x93 == 0,
+              Int(payloadLen) == payload.count else { return }
+        resetDataTimeout()
+        if packet.isHeartbeat {
+            guard flags == 0x80, totalData == 0, totalParity == 0, chunkIdx == 0 else { return }
+            return
+        }
+
+        if packet.isAudio {
+            guard flags == 0x02, totalParity == 0 else { return }
             guard totalData > 0,
                   chunkIdx < totalData,
                   Int(payloadLen) <= payload.count else {
                 log("ignoring invalid audio shard metadata for frameId=\(frameId)")
                 return
+            }
+            guard packet.generation >= audioGeneration else { return }
+            if packet.generation != audioGeneration {
+                audioGeneration = packet.generation
+                audioReassembly.removeAll(keepingCapacity: true)
             }
             handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
                               totalData: Int(totalData), payload: payload,
@@ -288,6 +315,7 @@ final class StreamClient {
         }
 
         // Video path
+        guard codecId <= 1, let stream = videoStreams[packet.displayID] else { return }
         let shardCount = Int(totalData) + Int(totalParity)
         guard totalData > 0,
               shardCount <= 4096,
@@ -298,14 +326,30 @@ final class StreamClient {
             return
         }
 
-        if hasReceivedFirstFrame && frameId < lastCompletedFrameId && (lastCompletedFrameId - frameId) < 0x80000000 {
+        let previousGeneration = stream.timeline.generation
+        guard stream.timeline.accept(generation: packet.generation) else { return }
+        let wantCodec: VideoCodecType = codecId == 0x01 ? .h265 : .h264
+        if previousGeneration != packet.generation {
+            stream.reassembly.removeAll(keepingCapacity: true)
+            stream.lastPliTime = nil
+            stream.waitingForIDR = true
+            stream.decoder.beginStream(codec: wantCodec, generation: packet.generation)
+        } else if stream.decoder.codec != wantCodec {
+            // Codec changes require a new generation, not a decoder reset on a late shard.
+            return
+        }
+        guard stream.timeline.isNewFrame(frameId) else { return }
+        if stream.waitingForIDR && !packet.isIDR {
+            sendPli(display: packet.displayID)
             return
         }
 
         let assembly: FrameAssembly
-        if let existing = reassembly[frameId] {
+        if let existing = stream.reassembly[frameId] {
             guard existing.totalData == Int(totalData),
-                  existing.totalParity == Int(totalParity) else {
+                  existing.totalParity == Int(totalParity),
+                  existing.isIdr == packet.isIDR,
+                  existing.timestampMs == timestampMs else {
                 log("ignoring inconsistent shard metadata for frameId=\(frameId)")
                 return
             }
@@ -314,7 +358,7 @@ final class StreamClient {
             guard let created = FrameAssembly(
                 totalData: Int(totalData),
                 totalParity: Int(totalParity),
-                isIdr: isIdr,
+                isIdr: packet.isIDR,
                 createdAt: CACurrentMediaTime(),
                 timestampMs: timestampMs
             ) else {
@@ -323,15 +367,15 @@ final class StreamClient {
             }
             assembly = created
         }
-        reassembly[frameId] = assembly
+        stream.reassembly[frameId] = assembly
 
         assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen))
 
         if assembly.isComplete {
-            deliverFrame(frameId: frameId, assembly: assembly, timestampMs: assembly.timestampMs)
+            deliverFrame(display: packet.displayID, frameId: frameId, assembly: assembly)
         }
 
-        pruneOldFrames()
+        pruneOldFrames(display: packet.displayID)
     }
 
     private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
@@ -365,40 +409,47 @@ final class StreamClient {
         }
     }
 
-    private func deliverFrame(frameId: UInt32, assembly: FrameAssembly, timestampMs: UInt32 = 0) {
+    private func deliverFrame(display: StreamDisplayID, frameId: UInt32, assembly: FrameAssembly) {
+        guard let stream = videoStreams[display] else { return }
+        stream.reassembly.removeValue(forKey: frameId)
+        guard stream.timeline.isNewFrame(frameId) else { return }
         guard let accessUnit = assembly.reassemble() else {
-            reassembly.removeValue(forKey: frameId)
+            sendPli(display: display)
             return
         }
-
-        reassembly.removeValue(forKey: frameId)
-
-        // Detect frame_id gap → frames were lost in transit
-        if hasReceivedFirstFrame && frameId > lastCompletedFrameId + 1 {
-            let gap = frameId - lastCompletedFrameId - 1
-            if gap > 0 && gap < 0x80000000 {
-                sendPli()
+        if stream.timeline.complete(frameId) {
+            sendPli(display: display)
+        }
+        if assembly.isIdr { stream.waitingForIDR = false }
+        stream.lastFrameTime = CACurrentMediaTime()
+        // Audio remains a single session stream; prefer the internal video clock when active.
+        if display == .internalDisplay || stream.lastFrameTime - (videoStreams[.internalDisplay]?.lastFrameTime ?? 0) > 0.25 {
+            avSync.updateVideo(timestamp: assembly.timestampMs)
+        }
+        stream.decoder.decodeAccessUnit(accessUnit)
+        if !stream.decoder.hasReportedFirstFrame {
+            stream.decoder.hasReportedFirstFrame = true
+            if let generation = stream.timeline.generation {
+                onVideoStreamStarted?(display, generation)
             }
         }
-
-        lastCompletedFrameId = frameId
-        hasReceivedFirstFrame = true
-
-        avSync.updateVideo(timestamp: timestampMs)
-        decoder.decodeAccessUnit(accessUnit)
-
-        if !decoder.hasReportedFirstFrame {
-            decoder.hasReportedFirstFrame = true
-            log("first video frame delivered to decoder")
+        if !hasReceivedFirstFrame {
+            hasReceivedFirstFrame = true
             onEvent?(.firstFrame)
         }
     }
 
-    private func pruneOldFrames() {
+    private func pruneOldFrames(display: StreamDisplayID) {
+        guard let stream = videoStreams[display] else { return }
         let now = CACurrentMediaTime()
         var recoverable: [(UInt32, FrameAssembly)] = []
         var expired: [UInt32] = []
-        for (fid, assembly) in reassembly {
+        var superseded: [UInt32] = []
+        for (fid, assembly) in stream.reassembly {
+            if !stream.timeline.isNewFrame(fid) {
+                superseded.append(fid)
+                continue
+            }
             if now - assembly.createdAt > Self.frameTimeout {
                 if assembly.canRecover {
                     recoverable.append((fid, assembly))
@@ -407,26 +458,28 @@ final class StreamClient {
                 }
             }
         }
+        for fid in superseded { stream.reassembly.removeValue(forKey: fid) }
         // Never mutate `reassembly` while enumerating it. Apart from avoiding
         // a rare collection-mutation crash, ordering recovered frames keeps a
         // late older frame from replacing a newer one at the decoder.
         recoverable.sort { $0.0 < $1.0 }
         for (fid, assembly) in recoverable {
-            deliverFrame(frameId: fid, assembly: assembly, timestampMs: assembly.timestampMs)
+            deliverFrame(display: display, frameId: fid, assembly: assembly)
         }
         if !expired.isEmpty {
             for fid in expired {
-                reassembly.removeValue(forKey: fid)
+                stream.reassembly.removeValue(forKey: fid)
             }
-            sendPli()
+            sendPli(display: display)
         }
     }
 
-    private func sendPli() {
+    private func sendPli(display: StreamDisplayID) {
+        guard let stream = videoStreams[display], let generation = stream.timeline.generation else { return }
         let now = CACurrentMediaTime()
-        guard now - lastPliTime >= Self.pliMinInterval else { return }
-        lastPliTime = now
-        sendPliRequest?()
+        if let last = stream.lastPliTime, now - last < Self.pliMinInterval { return }
+        stream.lastPliTime = now
+        sendPliRequest?(display, generation)
     }
 
     func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
@@ -457,6 +510,18 @@ final class StreamClient {
         packet.append(opus)
         encryptAndSend(packet, conn: conn, label: "mic")
     }
+}
+
+/// Accessed only on the stream receive queue. No FEC, loss, or decoder state crosses displays.
+private final class VideoReceiveState {
+    let decoder: VideoDecoder
+    var timeline = VideoStreamTimeline()
+    var reassembly: [UInt32: FrameAssembly] = [:]
+    var lastPliTime: TimeInterval?
+    var waitingForIDR = true
+    var lastFrameTime: TimeInterval = 0
+
+    init(decoder: VideoDecoder) { self.decoder = decoder }
 }
 
 /// Reed-Solomon block layout shared with the daemon (`fec_block_count` /
