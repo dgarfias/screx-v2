@@ -18,6 +18,10 @@ struct TrackpadOverlay: View {
     @State private var dragOffset: CGSize = .zero
     @State private var resizeDelta: CGSize = .zero
     @State private var temporaryKeyboardFrame: CGRect?
+    @State private var isSurfaceActive = false
+    @GestureState private var isAdjusting = false
+    @State private var isIdle = false
+    @State private var idleTask: Task<Void, Never>?
 
     private static let minSize = CGSize(width: 180, height: 130)
     private static let handleSize: CGFloat = 44
@@ -25,19 +29,24 @@ struct TrackpadOverlay: View {
 
     var body: some View {
         let frame = currentFrame()
+        let visualOpacity = isIdle ? 0.35 : 1.0
         ZStack(alignment: .top) {
-            TrackpadSurface(onMove: onMove, onButton: onButton, onScroll: onScroll)
+            TrackpadSurface(
+                onMove: onMove, onButton: onButton, onScroll: onScroll,
+                onInteractionChanged: { isSurfaceActive = $0 }
+            )
                 .padding(.top, Self.gripHeight)
 
             // Grip: drag to move the trackpad.
             Capsule()
-                .fill(Color.white.opacity(0.55))
+                .fill(Color.white.opacity(0.55 * visualOpacity))
                 .frame(width: 44, height: 5)
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.gripHeight)
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(coordinateSpace: .global)
+                        .updating($isAdjusting) { _, active, _ in active = true }
                         .onChanged { dragOffset = $0.translation }
                         .onEnded { value in
                             let base = baseFrame()
@@ -50,21 +59,22 @@ struct TrackpadOverlay: View {
                 )
         }
         .frame(width: frame.width, height: frame.height)
-        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 16))
+        .background(Color.black.opacity(0.28 * visualOpacity), in: RoundedRectangle(cornerRadius: 16))
         .overlay(
             RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.white.opacity(0.35), lineWidth: 1)
+                .stroke(Color.white.opacity(0.35 * visualOpacity), lineWidth: 1)
                 .allowsHitTesting(false)
         )
         .overlay(alignment: .bottomTrailing) {
             // Corner handle: drag to resize.
             Image(systemName: "arrow.up.left.and.arrow.down.right")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.7))
+                .foregroundStyle(Color.white.opacity(0.7 * visualOpacity))
                 .frame(width: Self.handleSize, height: Self.handleSize)
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(coordinateSpace: .global)
+                        .updating($isAdjusting) { _, active, _ in active = true }
                         .onChanged { resizeDelta = $0.translation }
                         .onEnded { value in
                             let base = baseFrame()
@@ -78,11 +88,33 @@ struct TrackpadOverlay: View {
         }
         .clipped()
         .allowsHitTesting(frame.height >= 80)
+        // Fade only the decoration, never the interactive surface. SwiftUI can exclude
+        // low-opacity views from hit testing, which would leave the faded pad unusable.
         .opacity(frame.height >= 80 ? 1 : 0)
+        .animation(.easeInOut(duration: 0.25), value: isIdle)
         .position(x: frame.midX, y: frame.midY)
+        .onAppear { updateActivity() }
+        .onDisappear { idleTask?.cancel() }
+        .onChange(of: isSurfaceActive) { _ in updateActivity() }
+        .onChange(of: isAdjusting) { _ in updateActivity() }
         .onChange(of: keyboardFrame) { keyboard in
             if keyboard.intersection(CGRect(origin: .zero, size: containerSize)).isEmpty {
                 temporaryKeyboardFrame = nil
+            }
+        }
+    }
+
+    private func updateActivity() {
+        idleTask?.cancel()
+        isIdle = false
+        guard !isSurfaceActive && !isAdjusting else { return }
+        idleTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                try Task.checkCancellation()
+                isIdle = true
+            } catch {
+                // A new touch or removal of the overlay cancels the pending fade.
             }
         }
     }
@@ -156,6 +188,7 @@ private struct TrackpadSurface: UIViewRepresentable {
     let onMove: (CGFloat, CGFloat) -> Void
     let onButton: (UInt8, Bool) -> Void
     let onScroll: (CGFloat) -> Void
+    let onInteractionChanged: (Bool) -> Void
 
     func makeUIView(context: Context) -> TrackpadSurfaceView {
         let view = TrackpadSurfaceView()
@@ -175,6 +208,7 @@ private struct TrackpadSurface: UIViewRepresentable {
         view.onMove = onMove
         view.onButton = onButton
         view.onScroll = onScroll
+        view.onInteractionChanged = onInteractionChanged
     }
 }
 
@@ -187,6 +221,7 @@ final class TrackpadSurfaceView: UIView {
     var onMove: ((CGFloat, CGFloat) -> Void)?
     var onButton: ((UInt8, Bool) -> Void)?
     var onScroll: ((CGFloat) -> Void)?
+    var onInteractionChanged: ((Bool) -> Void)?
 
     static let buttonLeft: UInt8 = 0x00
     static let buttonRight: UInt8 = 0x01
@@ -222,6 +257,7 @@ final class TrackpadSurfaceView: UIView {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         let now = CACurrentMediaTime()
         if activeTouches.isEmpty {
+            onInteractionChanged?(true)
             gestureStart = now
             maxFingers = 0
             movement = 0
@@ -282,6 +318,7 @@ final class TrackpadSurfaceView: UIView {
         activeTouches.removeAll { touches.contains($0) }
         resetTrackingPoints()
         guard activeTouches.isEmpty else { return }
+        onInteractionChanged?(false)
 
         let now = CACurrentMediaTime()
         let wasTap = !wasCancelled
@@ -322,11 +359,13 @@ final class TrackpadSurfaceView: UIView {
     }
 
     func cancelInteraction() {
+        let wasActive = !activeTouches.isEmpty
         if dragging { onButton?(Self.buttonLeft, false) }
         dragging = false
         dragArmed = false
         lastTapEnd = 0
         activeTouches.removeAll()
         resetTrackingPoints()
+        if wasActive { onInteractionChanged?(false) }
     }
 }
