@@ -617,7 +617,10 @@ fn run_control_messages(
         }
 
         match stream.read(&mut incoming) {
-            Ok(0) => break,
+            Ok(0) => {
+                println!("[control] control channel closed by the client");
+                break;
+            }
             Ok(count) => received.extend_from_slice(&incoming[..count]),
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

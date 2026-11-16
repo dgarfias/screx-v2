@@ -593,6 +593,7 @@ final class StreamViewModel: ObservableObject {
     @Published var physicalControllerConnectedCount = 0
     @Published private(set) var isControllerPassthroughEnabled = true
     private var mouseObservers: [Any] = []
+    private var connectedMice: [ObjectIdentifier: GCMouse] = [:]
     private var keyboardObservers: [Any] = []
     private var controllerObservers: [Any] = []
     private var controllerSlots: [ObjectIdentifier: UInt8] = [:]
@@ -1426,12 +1427,12 @@ final class StreamViewModel: ObservableObject {
         ps.onResult = { [weak self] result in
             guard let self else { return }
             switch result {
-            case .sessionEstablished(let key, let connection):
+            case .sessionEstablished(let key, let connection, let initialData):
                 self.log("PairingService result: session established")
                 self.sessionKey = key
                 self.pairingService = nil
 
-                let control = NetworkControlClient(connection: connection, sessionKey: key)
+                let control = NetworkControlClient(connection: connection, sessionKey: key, initialData: initialData)
                 control.onDisconnect = { [weak self, weak control] in
                     Task { @MainActor in
                         guard let self, let control else { return }
@@ -1713,7 +1714,9 @@ final class StreamViewModel: ObservableObject {
     func startPeripheralMonitoring() {
         stopPeripheralMonitoring()
 
-        if let mouse = GCMouse.current {
+        // iPadOS can report several pointing devices (an external mouse, a keyboard trackpad,
+        // a Bluetooth mouse reconnecting after sleep). Drive the desktop from all of them.
+        for mouse in GCMouse.mice() {
             attachMouse(mouse)
         }
         if let kb = GCKeyboard.coalesced {
@@ -1730,8 +1733,8 @@ final class StreamViewModel: ObservableObject {
         let md = NotificationCenter.default.addObserver(
             forName: .GCMouseDidDisconnect, object: nil, queue: .main
         ) { [weak self] note in
-            guard let self else { return }
-            Task { @MainActor in self.detachMouse() }
+            guard let self, let mouse = note.object as? GCMouse else { return }
+            Task { @MainActor in self.detachMouse(mouse) }
         }
         let kc = NotificationCenter.default.addObserver(
             forName: .GCKeyboardDidConnect, object: nil, queue: .main
@@ -1770,16 +1773,20 @@ final class StreamViewModel: ObservableObject {
         mouseObservers.removeAll()
         keyboardObservers.removeAll()
         controllerObservers.removeAll()
-        detachMouse()
+        for mouse in connectedMice.values { detachMouse(mouse) }
         detachKeyboard()
         detachAllControllers()
     }
 
     private func attachMouse(_ mouse: GCMouse) {
-        physicalMouseConnected = true
-        physicalMouseButtonMask = 0
-        physicalMouseScrollAccumulator = 0
-        sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
+        let wasConnected = !connectedMice.isEmpty
+        connectedMice[ObjectIdentifier(mouse)] = mouse
+        if !wasConnected {
+            physicalMouseConnected = true
+            physicalMouseButtonMask = 0
+            physicalMouseScrollAccumulator = 0
+            sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
+        }
 
         guard let input = mouse.mouseInput else { return }
 
@@ -1820,8 +1827,18 @@ final class StreamViewModel: ObservableObject {
         print("[periph] mouse attached")
     }
 
-    private func detachMouse() {
-        guard physicalMouseConnected else { return }
+    /// Pointer lock and "mouse connected" state end only when the last pointing device is gone;
+    /// another device disconnecting must not release the one still in use.
+    private func detachMouse(_ mouse: GCMouse) {
+        if let input = mouse.mouseInput {
+            input.mouseMovedHandler = nil
+            input.leftButton.pressedChangedHandler = nil
+            input.rightButton?.pressedChangedHandler = nil
+            input.middleButton?.pressedChangedHandler = nil
+            input.scroll.valueChangedHandler = nil
+        }
+        guard connectedMice.removeValue(forKey: ObjectIdentifier(mouse)) != nil,
+              connectedMice.isEmpty, physicalMouseConnected else { return }
         let previousMask = physicalMouseButtonMask | trackpadButtonMask
         physicalMouseButtonMask = 0
         physicalMouseScrollAccumulator = 0

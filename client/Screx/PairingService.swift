@@ -3,7 +3,10 @@ import Network
 import CryptoKit
 
 enum PairingResult {
-    case sessionEstablished(sessionKey: SymmetricKey, connection: NWConnection)
+    /// `initialData`: control-channel bytes that arrived in the same read as the handshake reply.
+    /// The daemon sends CAPS right after OK, so they can share a TCP read; dropping them would
+    /// leave the control channel mid-frame.
+    case sessionEstablished(sessionKey: SymmetricKey, connection: NWConnection, initialData: Data)
     case pinRequired(completion: (String) -> Void)
     case rejected(reason: String)
     case error(String)
@@ -234,6 +237,16 @@ final class PairingService {
     private func waitForPinResult(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pin: String, ecdhSecret: Data) {
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
+            if error == nil, let data { self.completeOK(conn: conn, data: data) { data in
+                self.handlePinResult(conn: conn, data: data, error: nil, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
+            } } else {
+                self.handlePinResult(conn: conn, data: data, error: error, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
+            }
+        }
+    }
+
+    private func handlePinResult(conn: NWConnection, data: Data?, error: NWError?, deviceId: Data, pin: String, ecdhSecret: Data) {
+        do {
 
             if let error {
                 self.emitResult(.error("PIN result receive failed: \(error.localizedDescription)"))
@@ -297,7 +310,8 @@ final class PairingService {
             self.log("pairing flow complete, session established")
             conn.stateUpdateHandler = nil
             self.connection = nil
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
+            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn,
+                                                initialData: data.dropFirst(Self.okLength)))
         }
     }
 
@@ -326,6 +340,16 @@ final class PairingService {
     private func waitForHelloResponse(conn: NWConnection, host: String, port: UInt16, clientNonce: Data) {
         conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
             guard let self else { return }
+            if error == nil, let data { self.completeOK(conn: conn, data: data) { data in
+                self.handleHelloResponse(conn: conn, data: data, error: nil, host: host, port: port, clientNonce: clientNonce)
+            } } else {
+                self.handleHelloResponse(conn: conn, data: data, error: error, host: host, port: port, clientNonce: clientNonce)
+            }
+        }
+    }
+
+    private func handleHelloResponse(conn: NWConnection, data: Data?, error: NWError?, host: String, port: UInt16, clientNonce: Data) {
+        do {
 
             if let error {
                 self.emitResult(.error("Hello response receive failed: \(error.localizedDescription)"))
@@ -387,7 +411,30 @@ final class PairingService {
 
             conn.stateUpdateHandler = nil
             self.connection = nil
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn))
+            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn,
+                                                initialData: data.dropFirst(Self.okLength)))
+        }
+    }
+
+    /// SCREX_OK(10) + daemon_device_id(16) + nonce/salt(32) + hmac(32).
+    private static let okLength = 10 + deviceIdLen + nonceLen + hmacLen
+
+    /// TCP has no message boundaries: an OK can arrive split across reads. Read the rest before
+    /// parsing instead of failing with "Invalid OK response". Other replies pass through as is.
+    private func completeOK(conn: NWConnection, data: Data, then handle: @escaping (Data) -> Void) {
+        guard data.count >= Self.magicOK.count, data.prefix(Self.magicOK.count) == Self.magicOK,
+              data.count < Self.okLength else {
+            handle(data)
+            return
+        }
+        let missing = Self.okLength - data.count
+        conn.receive(minimumIncompleteLength: missing, maximumLength: missing) { [weak self] more, _, _, error in
+            guard let self else { return }
+            guard error == nil, let more, !more.isEmpty else {
+                self.emitResult(.error("Incomplete OK response"))
+                return
+            }
+            self.completeOK(conn: conn, data: data + more, then: handle)
         }
     }
 

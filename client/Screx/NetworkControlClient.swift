@@ -31,9 +31,11 @@ final class NetworkControlClient {
     /// (rttMs, jitterMs) of the control-channel latency probe.
     var onLatency: ((Double, Double) -> Void)?
 
-    init(connection: NWConnection, sessionKey: SymmetricKey) {
+    /// `initialData`: control bytes already read during the handshake (see `PairingService`).
+    init(connection: NWConnection, sessionKey: SymmetricKey, initialData: Data = Data()) {
         self.connection = connection
         self.sessionKey = sessionKey
+        self.recvBuffer = Data(initialData)
     }
 
     private func log(_ message: String) {
@@ -56,6 +58,12 @@ final class NetworkControlClient {
             }
         }
         startPingLoop()
+        // Parse frames that arrived with the handshake reply before reading anything new, so
+        // they keep their order. No receive callback can run yet: the loop hasn't started.
+        if !recvBuffer.isEmpty {
+            log("processing \(recvBuffer.count) control bytes received with the handshake")
+            processReceiveBuffer()
+        }
         receiveLoop()
     }
 
