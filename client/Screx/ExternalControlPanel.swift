@@ -44,6 +44,16 @@ final class PointerLockController: UIViewController, UIPointerInteractionDelegat
     }
 }
 
+/// Only this small view re-renders when the per-second stats change.
+private struct InlineStreamStats: View {
+    @ObservedObject var stats: StreamStats
+    var body: some View {
+        Text("↓ \(stats.receiveRateText)  ↑ \(stats.sendRateText)")
+        Text("RTT \(stats.latencyText)  Jitter \(stats.jitterText)")
+            .foregroundStyle(.secondary)
+    }
+}
+
 /// **Laptop mode** for External only: top bar (options left, connection info right), a drawn
 /// laptop keyboard, and the trackpad at the bottom. Replaces the pill and the iOS keyboard.
 struct ExternalControlPanel: View {
@@ -154,9 +164,7 @@ struct ExternalControlPanel: View {
                 Text(model.sessionDisplayName.isEmpty ? "Screx" : model.sessionDisplayName)
                     .fontWeight(.semibold)
                     .lineLimit(1)
-                Text("↓ \(model.receiveRateText)  ↑ \(model.sendRateText)")
-                Text("RTT \(model.latencyText)  Jitter \(model.jitterText)")
-                    .foregroundStyle(.secondary)
+                InlineStreamStats(stats: model.stats)
             }
             .font(.caption.monospacedDigit())
             .foregroundStyle(.white)

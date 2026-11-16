@@ -237,10 +237,6 @@ impl AudioBackend for PulseAudioBackend {
         })?;
         Ok(Box::new(sink))
     }
-
-    fn destroy_mic(&mut self) {
-        // Sinks are cleaned up when the Box<dyn MicSink> is dropped.
-    }
 }
 
 struct PulseMicSink {

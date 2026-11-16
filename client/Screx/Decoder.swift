@@ -10,9 +10,11 @@ enum VideoCodecType {
 
 final class VideoDecoder {
     let displayLayer = AVSampleBufferDisplayLayer()
-    var hasReportedFirstFrame = false
-    private(set) var videoWidth: Int = 1920
-    private(set) var videoHeight: Int = 1080
+    /// Decoded stream size; touched only on the receive queue. UI observers get changes through
+    /// `onVideoSizeChanged` rather than reading these across threads.
+    private var videoWidth: Int = 1920
+    private var videoHeight: Int = 1080
+    var onVideoSizeChanged: ((Int, Int) -> Void)?
     private(set) var isSuspended = false
 
     private(set) var codec: VideoCodecType = .h264
@@ -54,11 +56,6 @@ final class VideoDecoder {
         }
     }
 
-    func setCodec(_ codec: VideoCodecType) {
-        guard codec != self.codec else { return }
-        beginStream(codec: codec)
-    }
-
     /// Called on the receive queue before submitting a new authenticated generation.
     /// Clear the prior image so isReadyForDisplay can only acknowledge the new generation.
     /// Other output layers remain untouched throughout topology transitions.
@@ -69,7 +66,6 @@ final class VideoDecoder {
         pps = nil
         vps = nil
         naluCount = 0
-        hasReportedFirstFrame = false
         renderQueue.async { [weak self] in
             guard let self else { return }
             self.renderGeneration = generation
@@ -97,6 +93,13 @@ final class VideoDecoder {
         renderQueue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.checkPresentation(generation: generation, attempts: attempts + 1)
         }
+    }
+
+    private func updateVideoSize(_ width: Int, _ height: Int) {
+        guard width != videoWidth || height != videoHeight else { return }
+        videoWidth = width
+        videoHeight = height
+        onVideoSizeChanged?(width, height)
     }
 
     func decodeAccessUnit(_ data: Data) {
@@ -221,8 +224,7 @@ final class VideoDecoder {
         if status == noErr, let newFmt {
             formatDescription = newFmt
             let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
-            videoWidth = Int(dims.width)
-            videoHeight = Int(dims.height)
+            updateVideoSize(Int(dims.width), Int(dims.height))
             if naluCount <= 20 {
                 print("[decoder] H.264 format: \(dims.width)x\(dims.height)")
             }
@@ -293,8 +295,7 @@ final class VideoDecoder {
         if status == noErr, let newFmt {
             formatDescription = newFmt
             let dims = CMVideoFormatDescriptionGetDimensions(newFmt)
-            videoWidth = Int(dims.width)
-            videoHeight = Int(dims.height)
+            updateVideoSize(Int(dims.width), Int(dims.height))
             if naluCount <= 20 {
                 print("[decoder] H.265 format: \(dims.width)x\(dims.height)")
             }

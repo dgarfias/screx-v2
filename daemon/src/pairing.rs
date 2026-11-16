@@ -200,7 +200,10 @@ fn rand_bytes_into(rng: &SystemRandom, buf: &mut [u8]) {
 
 const MAGIC_BUSY: &[u8] = b"SCREX_BUSY\0\0"; // 12 bytes
 const CONTROL_MAX_FRAME: usize = 65536;
-const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// The control loop is also the only writer for queued DISPLAY_STATUS messages, which it sends
+/// between reads. A short timeout keeps display switches responsive (an ack round trip used to
+/// wait up to 2 × 200 ms); 50 idle wakeups per second per session is negligible.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// Run the TCP pairing/handshake server. Blocks until `stop` is set.
 /// On successful handshake, pushes a `SessionInfo` into `session_tx`.

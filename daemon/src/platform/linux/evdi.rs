@@ -146,7 +146,6 @@ pub struct EvdiDisplay {
     fps: u32,
     handle: Option<EvdiHandle>,
     device_lease: Option<DeviceLease>,
-    pixel_buf: Option<Vec<u8>>,
 }
 
 unsafe impl Send for EvdiDisplay {}
@@ -167,7 +166,6 @@ impl EvdiDisplay {
             fps,
             handle: None,
             device_lease: None,
-            pixel_buf: None,
         })
     }
 }

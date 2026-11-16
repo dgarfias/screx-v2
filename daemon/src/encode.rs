@@ -524,7 +524,7 @@ impl BandedScaler {
             };
             std::thread::scope(|scope| {
                 for job in jobs {
-                    scope.spawn(move || unsafe { job.run() });
+                    scope.spawn(move || job.run());
                 }
                 last.run();
             });
@@ -550,7 +550,6 @@ struct HwEncoder {
     hw_frame: *mut ffi::AVFrame,
     mapped_frame: *mut ffi::AVFrame,
     pkt: *mut ffi::AVPacket,
-    height: i32,
     frame_index: u64,
     fps: u32,
     extradata: Vec<u8>,
@@ -701,7 +700,7 @@ impl HwEncoder {
             }
 
             let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-            let mut hw_frames_ref: *mut ffi::AVBufferRef = ptr::null_mut();
+            let hw_frames_ref: *mut ffi::AVBufferRef;
 
             {
                 let device_cstr = std::ffi::CString::new(device_path).unwrap();
@@ -894,7 +893,6 @@ impl HwEncoder {
                 hw_frame,
                 mapped_frame,
                 pkt,
-                height,
                 frame_index: 0,
                 fps: config.fps.max(1),
                 extradata,
@@ -1076,7 +1074,6 @@ struct SwEncoder {
     sw_bgra: *mut ffi::AVFrame,
     sw_yuv: *mut ffi::AVFrame,
     pkt: *mut ffi::AVPacket,
-    height: i32,
     frame_index: u64,
     fps: u32,
     codec: VideoCodec,
@@ -1232,7 +1229,6 @@ impl SwEncoder {
                 sw_bgra,
                 sw_yuv,
                 pkt,
-                height,
                 frame_index: 0,
                 fps: config.fps.max(1),
                 codec: config.codec,

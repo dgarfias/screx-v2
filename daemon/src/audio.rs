@@ -75,7 +75,6 @@ pub trait AudioBackend: Send {
     fn destroy_sink(&mut self);
     fn run_loopback(&mut self, stop: &AtomicBool, on_chunk: &mut dyn FnMut(&[u8])) -> Result<()>;
     fn create_mic(&mut self) -> Result<Box<dyn MicSink>>;
-    fn destroy_mic(&mut self);
 }
 
 /// Sink for decoded microphone PCM.

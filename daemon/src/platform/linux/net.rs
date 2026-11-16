@@ -70,27 +70,6 @@ pub fn tune_udp_socket(sock: &UdpSocket) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Send a batch of packets, optionally pinning the source IPv4 address/interface.
-pub fn send_packets(
-    sock: &UdpSocket,
-    pkts: &[&[u8]],
-    dest: SocketAddr,
-    from_local_ip: Option<std::net::IpAddr>,
-) -> anyhow::Result<()> {
-    let source = udp_source_for_local_ip(from_local_ip);
-    let cmsg_buf = source.map(build_pktinfo_cmsg);
-    for pkt in pkts {
-        send_to_from(
-            sock,
-            pkt,
-            dest,
-            source,
-            cmsg_buf.as_ref().map(|b| b.as_slice()),
-        )?;
-    }
-    Ok(())
-}
-
 /// Find the interface index owning a local IPv4 address (0 if unknown).
 pub fn ifindex_for_ipv4(ip: std::net::Ipv4Addr) -> u32 {
     unsafe {

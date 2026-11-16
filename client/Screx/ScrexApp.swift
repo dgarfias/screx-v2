@@ -497,17 +497,15 @@ final class StreamViewModel: ObservableObject {
     @Published var pairingStatus: String = ""
     @Published var recentConnections: [RecentConnection] = StreamViewModel.loadRecentConnections()
     @Published private(set) var sessionDisplayName: String = ""
-    @Published private(set) var receiveRateText: String = "0 B/s"
-    @Published private(set) var sendRateText: String = "0 B/s"
-    /// Control-channel round-trip time from the in-session `PING` probe.
-    @Published private(set) var latencyText: String = "—"
-    /// Inter-sample variation of the control-channel RTT.
-    @Published private(set) var jitterText: String = "—"
+    /// Per-second diagnostics, observed only by the info views. Kept out of the view model's own
+    /// @Published state so their updates don't recompute the entire session UI twice a second.
+    let stats = StreamStats()
+    /// Internal stream size for touch mapping; changes only when the decoded format changes.
+    @Published private(set) var internalVideoSize = CGSize(width: 1920, height: 1080)
 
     /// What the currently-connected daemon advertised via `CAPS`. Nil until a `CAPS`
     /// message arrives (or the 2s timeout fallback fires, see `beginCapabilityNegotiation`).
     @Published private(set) var daemonCapabilities: DaemonCapabilities?
-    @Published private(set) var displayStatuses: [StreamDisplayID: DisplayStatus] = [:]
     @Published private(set) var displayConfigurationError: String?
     private var currentDisplaySettings: StreamSettings?
     private var committedDisplaySettings: StreamSettings?
@@ -873,25 +871,6 @@ final class StreamViewModel: ObservableObject {
         connectionHealth.rawValue
     }
 
-    var sessionTransportTitle: String {
-        let transportLabel = transport.isEmpty ? "connection" : transport.lowercased()
-        switch connectionHealth {
-        case .streaming:
-            return "Streaming via \(transportLabel)"
-        default:
-            return "\(connectionHealthTitle) via \(transportLabel)"
-        }
-    }
-
-    var codecLabel: String {
-        switch decoder.codec {
-        case .h264:
-            return "H264"
-        case .h265:
-            return "H265"
-        }
-    }
-
     private func applyConnectionHealth(
         _ state: ConnectionHealthState,
         detail: String? = nil,
@@ -905,10 +884,7 @@ final class StreamViewModel: ObservableObject {
         isConnected = state.isConnected
         isConnecting = state.isConnecting
         if transport == .none && !state.isConnected {
-            receiveRateText = "0 bytes/s"
-            sendRateText = "0 bytes/s"
-            latencyText = "—"
-            jitterText = "—"
+            stats.reset()
         }
     }
 
@@ -1219,7 +1195,6 @@ final class StreamViewModel: ObservableObject {
 
     private func handleDisplayStatus(_ update: DisplayStatus) {
         guard update.revision == currentDisplaySettings?.revision else { return }
-        displayStatuses[update.display] = update
         if update.phase == .failed {
             if update.activeMask == 0 {
                 failConnection(detail: "Could not start the display: \(update.detail)")
@@ -1283,7 +1258,6 @@ final class StreamViewModel: ObservableObject {
         daemonCapabilities = nil
         currentDisplaySettings = nil
         committedDisplaySettings = nil
-        displayStatuses.removeAll()
         readyDisplayGenerations.removeAll()
         displayConfigurationError = nil
         displayRouting.sessionEnabled = false
@@ -1320,8 +1294,7 @@ final class StreamViewModel: ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             let (rxDelta, txDelta) = self.trafficCounter.readAndReset()
-            self.receiveRateText = formatByteRate(Double(rxDelta))
-            self.sendRateText = formatByteRate(Double(txDelta))
+            self.stats.setRates(receive: formatByteRate(Double(rxDelta)), send: formatByteRate(Double(txDelta)))
         }
         timer.resume()
         trafficTimer = timer
@@ -1489,8 +1462,7 @@ final class StreamViewModel: ObservableObject {
                     Task { @MainActor in
                         guard let self, let control else { return }
                         guard self.networkControl === control else { return }
-                        self.latencyText = Self.formatLatency(rttMs)
-                        self.jitterText = Self.formatLatency(jitterMs)
+                        self.stats.setLatency(rtt: Self.formatLatency(rttMs), jitter: Self.formatLatency(jitterMs))
                     }
                 }
                 self.beginCapabilityNegotiation(transport: .network)
@@ -1550,8 +1522,10 @@ final class StreamViewModel: ObservableObject {
         log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
         applyConnectionHealth(.waitingForVideo, detail: "Waiting for video from \(name).", transport: .network)
 
-        decoder.hasReportedFirstFrame = false
 
+        decoder.onVideoSizeChanged = { [weak self] width, height in
+            Task { @MainActor in self?.internalVideoSize = CGSize(width: width, height: height) }
+        }
         let client = StreamClient(endpoint: endpoint, decoder: decoder, externalDecoder: externalDecoder, audioPlayer: audioPlayer, avSync: avSync)
         client.sessionKey = sessionKey
         client.sendPliRequest = { [weak controlClient] display, generation in
@@ -2345,8 +2319,8 @@ struct ContentView: View {
                 if model.displayRouting.internalVideoVisible, let layer = model.displayLayer {
                     VideoDisplayView(
                         layer: layer,
-                        videoWidth: model.decoder.videoWidth,
-                        videoHeight: model.decoder.videoHeight,
+                        videoWidth: Int(model.internalVideoSize.width),
+                        videoHeight: Int(model.internalVideoSize.height),
                         onTouch: { data in model.sendTouch(data) },
                         onScroll: { deltaY in model.forwardPhysicalMouseScroll(deltaY: deltaY) },
                         hidePointer: model.physicalMouseConnected,

@@ -26,8 +26,6 @@ final class StreamClient {
     var onTraffic: ((Int, Int) -> Void)?
     var sessionKey: SymmetricKey?
     var sendPliRequest: ((StreamDisplayID, UInt32) -> Void)?
-    /// First complete access unit of each generation (not a presentation acknowledgement).
-    var onVideoStreamStarted: ((StreamDisplayID, UInt32) -> Void)?
     var onVideoFrameReady: ((StreamDisplayID, UInt32) -> Void)?
 
     private static let headerLen = MediaPacketHeader.byteCount
@@ -427,12 +425,6 @@ final class StreamClient {
             avSync.updateVideo(timestamp: assembly.timestampMs)
         }
         stream.decoder.decodeAccessUnit(accessUnit)
-        if !stream.decoder.hasReportedFirstFrame {
-            stream.decoder.hasReportedFirstFrame = true
-            if let generation = stream.timeline.generation {
-                onVideoStreamStarted?(display, generation)
-            }
-        }
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
             onEvent?(.firstFrame)

@@ -61,7 +61,7 @@ produces a matching release at the nearest display edge.
 
 ## Pointer model
 
-### External displays (test build)
+### External displays
 
 Connect a monitor by cable or AirPlay, then open **Displays** (the two-display icon in the
 in-session pill, available even when the pill is collapsed). Connection alone never changes the
@@ -105,11 +105,6 @@ display still reports that resolution; otherwise it falls back to the display's 
 mode. With nothing remembered, Recommended is used. A remembered External only/Both choice waits
 until a monitor is attached, then applies automatically; choosing Internal only is remembered too.
 Stream Settings own the iPad's own resolution and FPS.
-
-For the first hardware test, select **1080p / 60 fps in Stream Settings before connecting**.
-In Displays, use 1080p for the external output too, then try Both, External only, Internal only,
-and unplugging in External only. This avoids combining the first dual-stream test with an internal
-resolution change. Daemon and client must both be updated for the new protocol.
 
 Audio follows the iPadOS output route, including HDMI when offered by the monitor/adapter. Test
 monitor sound with Screx's microphone off first: recording can restrict the routes iPadOS permits.

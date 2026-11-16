@@ -87,6 +87,13 @@ Key files:
 - `client/Screx/MicCapture.swift`
 - `client/Screx/CameraCapture.swift`
 - `client/Screx/Crypto.swift`
+- `client/Screx/MediaPacket.swift` — media header parsing and per-display stream timelines
+- `client/Screx/DisplayTopology.swift` — display modes, routing state, per-host preferences
+- `client/Screx/ExternalDisplay.swift` — external-display scene and video window
+- `client/Screx/DisplaySettingsView.swift` — Displays menu
+- `client/Screx/ExternalControlPanel.swift` — laptop mode panel and pointer lock
+- `client/Screx/LaptopKeyboardLayout.swift`, `LaptopKeyboardView.swift` — drawn laptop keyboard
+- `client/Screx/DeviceDisplayIdentity.swift` — iPad model names for EDID
 
 Responsibilities:
 
@@ -98,6 +105,7 @@ Responsibilities:
 - local audio playback
 - input forwarding
 - microphone and camera forwarding
+- external-display routing (Internal only, External only, Both) and laptop mode
 - connection-health UI and session state
 - Stream Settings sheet for choosing resolution, framerate, codec, and bitrate before connecting
 
@@ -375,7 +383,7 @@ daemon retire disabled/replaced monitors and report the committed topology.
 
 **Monitor order.** Each new monitor takes the lowest free EVDI card, and GNOME numbers monitors by
 card, so plug order decides which is 1 and 2. Whenever the requested topology has both monitors and
-the internal one must (re)start (e.g. External only → Both, or a new internal resolution in Both),
+the internal one must (re)start (in practice External only → Both),
 the daemon unplugs every monitor (stop all, then join), plugs the internal one, and plugs the
 external one only after the internal pipeline is streaming. The internal monitor is therefore
 always 1 and the external 2. This path does not keep old monitors alive during the switch; if it

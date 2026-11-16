@@ -1,4 +1,34 @@
+import Combine
 import SwiftUI
+
+/// Per-second session diagnostics, separate from `StreamViewModel` so that their updates
+/// re-render only the views that display them.
+@MainActor
+final class StreamStats: ObservableObject {
+    @Published private(set) var receiveRateText = "0 B/s"
+    @Published private(set) var sendRateText = "0 B/s"
+    /// Control-channel round-trip time from the in-session `PING` probe.
+    @Published private(set) var latencyText = "—"
+    /// Inter-sample variation of the control-channel RTT.
+    @Published private(set) var jitterText = "—"
+
+    nonisolated init() {}
+
+    func setRates(receive: String, send: String) {
+        if receive != receiveRateText { receiveRateText = receive }
+        if send != sendRateText { sendRateText = send }
+    }
+
+    func setLatency(rtt: String, jitter: String) {
+        if rtt != latencyText { latencyText = rtt }
+        if jitter != jitterText { jitterText = jitter }
+    }
+
+    func reset() {
+        setRates(receive: "0 B/s", send: "0 B/s")
+        setLatency(rtt: "—", jitter: "—")
+    }
+}
 
 /// Small connection card: hostname, transfer rates, latency, and a plain Disconnect action.
 struct StreamInfoView: View {
@@ -11,15 +41,7 @@ struct StreamInfoView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
 
-            HStack(spacing: 12) {
-                rate(icon: "arrow.down", value: model.receiveRateText, name: "Receiving")
-                rate(icon: "arrow.up", value: model.sendRateText, name: "Sending")
-            }
-
-            HStack(spacing: 12) {
-                stat("RTT", model.latencyText)
-                stat("Jitter", model.jitterText)
-            }
+            StreamStatsRows(stats: model.stats)
 
             Button("Disconnect") { model.disconnect() }
                 .font(.caption.weight(.medium))
@@ -32,6 +54,21 @@ struct StreamInfoView: View {
         .padding(.vertical, 10)
         .frame(maxWidth: 300, alignment: .leading)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct StreamStatsRows: View {
+    @ObservedObject var stats: StreamStats
+
+    var body: some View {
+        HStack(spacing: 12) {
+            rate(icon: "arrow.down", value: stats.receiveRateText, name: "Receiving")
+            rate(icon: "arrow.up", value: stats.sendRateText, name: "Sending")
+        }
+        HStack(spacing: 12) {
+            stat("RTT", stats.latencyText)
+            stat("Jitter", stats.jitterText)
+        }
     }
 
     private func rate(icon: String, value: String, name: String) -> some View {
