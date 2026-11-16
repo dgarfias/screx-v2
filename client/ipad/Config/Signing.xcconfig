@@ -1,0 +1,10 @@
+// Signing identity for the Screx iPad app.
+//
+// The committed defaults contain no personal identifiers: no team is set, and the bundle ID is
+// com.example.screx. To build on a device, copy Local.xcconfig.example to Local.xcconfig (ignored by
+// git) and fill in your own team ID and bundle ID prefix.
+
+DEVELOPMENT_TEAM =
+SCREX_BUNDLE_ID_PREFIX = com.example
+
+#include? "Local.xcconfig"

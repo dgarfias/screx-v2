@@ -9,3 +9,6 @@
 *.xcuserstate
 *.xcarchive
 *.dSYM/
+
+# Personal iPad signing identity (see client/ipad/Config/Signing.xcconfig)
+client/ipad/Config/Local.xcconfig

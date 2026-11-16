@@ -25,8 +25,11 @@ CoreImage, GameController) with no additional package manager setup required.
 
 1. Open `client/ipad/Screx.xcodeproj` in Xcode.
 2. Select the `Screx` scheme and your iPad as the run destination.
-3. In **Signing & Capabilities**, set your own development team, and change the bundle identifier
-   if it collides with an existing provisioning profile.
+3. Copy `client/ipad/Config/Local.xcconfig.example` to `client/ipad/Config/Local.xcconfig` and set
+   your team ID and bundle ID prefix (the app becomes `<prefix>.screx`). That file is git-ignored,
+   so the committed project carries no personal identifiers; without it the bundle ID is
+   `com.example.screx` and no team is set. Don't set the team in **Signing & Capabilities**: Xcode
+   would write it into `project.pbxproj`.
 4. Build and run (`Cmd+R`). On the first run, trust the developer certificate on the iPad
    under Settings → General → VPN & Device Management.
 
