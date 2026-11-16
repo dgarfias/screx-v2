@@ -28,7 +28,7 @@ struct LaptopKeyboardTests {
         // Layout-specific keys.
         func characters(_ id: LaptopKeyboardLayoutID) -> [String] {
             LaptopKeyboardLayout.make(id).rows.flatMap { $0 }.compactMap {
-                if case let .character(base, _, _, _) = $0.key { return base }
+                if case let .character(base, _, _, _, _) = $0.key { return base }
                 return nil
             }
         }
@@ -36,7 +36,7 @@ struct LaptopKeyboardTests {
         precondition(characters(.fr).starts(with: ["²", "&", "é"]) && characters(.fr).contains("a"))
         precondition(characters(.de).contains("ß") && characters(.de).contains("z"))
         let esAltGr = LaptopKeyboardLayout.make(.es).rows.flatMap { $0 }.contains {
-            if case let .character(base, _, altGr, _) = $0.key { return base == "2" && altGr == "@" }
+            if case let .character(base, _, altGr, _, _) = $0.key { return base == "2" && altGr == "@" }
             return false
         }
         precondition(esAltGr, "Spanish @ is AltGr+2")
@@ -50,6 +50,11 @@ struct LaptopKeyboardTests {
         precondition(DeadKeyComposer.compose(dead: "~", next: "n") == "ñ")
         precondition(DeadKeyComposer.compose(dead: "´", next: " ") == "´", "Space sends the accent itself")
         precondition(DeadKeyComposer.compose(dead: "´", next: "x") == "´x", "No composed form: send both")
+        precondition(DeadKeyComposer.compose(dead: "'", next: "e") == "é", "US-Intl dead apostrophe")
+        precondition(DeadKeyComposer.compose(dead: "\"", next: "u") == "ü", "US-Intl dead quote")
+        precondition(DeadKeyComposer.compose(dead: "'", next: "c") == "ç", "US-Intl ' c is ç")
+        precondition(DeadKeyComposer.compose(dead: "'", next: "s") == "'s", "Contractions still type")
+        precondition(DeadKeyComposer.compose(dead: "\"", next: " ") == "\"", "Space sends the quote")
         print("Laptop keyboard tests passed")
     }
 }

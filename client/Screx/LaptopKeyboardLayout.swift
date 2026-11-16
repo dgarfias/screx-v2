@@ -40,8 +40,10 @@ enum LaptopKeyboardLayoutID: String, CaseIterable {
 }
 
 enum LaptopKey: Equatable {
-    /// A character key. `dead` marks legends that compose with the next character (´ ` ^ ¨ ~).
-    case character(base: String, shifted: String, altGr: String? = nil, dead: Set<String> = [])
+    /// A character key. `altGrShifted` is the Shift+AltGr level (falls back to `altGr`). `dead`
+    /// marks legends that compose with the next character (´ ` ^ ¨ ~, and ' " on US-International).
+    case character(base: String, shifted: String, altGr: String? = nil, altGrShifted: String? = nil,
+                   dead: Set<String> = [])
     case special(label: String, code: UInt8, repeats: Bool = false)
     case modifier(label: String, mask: UInt8)
     case shift, capsLock, altGr, layout, space, backspace, enter, tab
@@ -62,13 +64,20 @@ struct LaptopKeyboardLayout {
     let id: LaptopKeyboardLayoutID
     let rows: [[LaptopKeyCell]]
 
-    private static func c(_ base: String, _ shifted: String, _ altGr: String? = nil,
+    private static func c(_ base: String, _ shifted: String, _ altGr: String? = nil, _ altGrShifted: String? = nil,
                           dead: Set<String> = [], _ units: Double = 1) -> LaptopKeyCell {
-        LaptopKeyCell(key: .character(base: base, shifted: shifted, altGr: altGr, dead: dead), units: units)
+        LaptopKeyCell(key: .character(base: base, shifted: shifted, altGr: altGr, altGrShifted: altGrShifted,
+                                      dead: dead), units: units)
     }
 
-    private static func letters(_ s: String) -> [LaptopKeyCell] {
-        s.map { c(String($0), String($0).uppercased()) }
+    /// Letter keys; `altGr` maps a letter to its AltGr character. A letter AltGr character gets its
+    /// uppercase as the Shift+AltGr level (é/É); anything else has no shifted level (®).
+    private static func letters(_ s: String, altGr: [Character: String] = [:]) -> [LaptopKeyCell] {
+        s.map { letter in
+            let extra = altGr[letter]
+            let extraShifted = extra.flatMap { $0.lowercased() != $0.uppercased() ? $0.uppercased() : nil }
+            return c(String(letter), String(letter).uppercased(), extra, extraShifted)
+        }
     }
 
     /// esc, F1–F12, home, end, ins, del: 17 equal keys across the 15-unit row.
@@ -101,13 +110,23 @@ struct LaptopKeyboardLayout {
         let rows: [[LaptopKeyCell]]
         switch id {
         case .us:
+            // US-International (Windows): ` ~ ^ ' " are dead keys; AltGr adds accented letters and symbols.
             rows = [
                 functionRow,
-                [c("`", "~"), c("1", "!"), c("2", "@"), c("3", "#"), c("4", "$"), c("5", "%"), c("6", "^"),
-                 c("7", "&"), c("8", "*"), c("9", "("), c("0", ")"), c("-", "_"), c("=", "+"), cell(.backspace, 2)],
-                [cell(.tab, 1.5)] + letters("qwertyuiop") + [c("[", "{"), c("]", "}"), c("\\", "|", nil, 1.5)],
-                [cell(.capsLock, 1.75)] + letters("asdfghjkl") + [c(";", ":"), c("'", "\""), cell(.enter, 2.25)],
-                [cell(.shift, 2.25)] + letters("zxcvbnm") + [c(",", "<"), c(".", ">"), c("/", "?"), cell(.shift, 2.75)],
+                [c("`", "~", dead: ["`", "~"]), c("1", "!", "¡", "¹"), c("2", "@", "²"), c("3", "#", "³"),
+                 c("4", "$", "¤", "£"), c("5", "%", "€"), c("6", "^", "¼", dead: ["^"]), c("7", "&", "½"),
+                 c("8", "*", "¾"), c("9", "(", "‘"), c("0", ")", "’"), c("-", "_", "¥"), c("=", "+", "×", "÷"),
+                 cell(.backspace, 2)],
+                [cell(.tab, 1.5)]
+                    + letters("qwertyuiop", altGr: ["q": "ä", "w": "å", "e": "é", "r": "®", "t": "þ",
+                                                    "y": "ü", "u": "ú", "i": "í", "o": "ó", "p": "ö"])
+                    + [c("[", "{", "«"), c("]", "}", "»"), c("\\", "|", "¬", "¦", dead: [], 1.5)],
+                [cell(.capsLock, 1.75)]
+                    + letters("asdfghjkl", altGr: ["a": "á", "s": "ß", "d": "ð", "l": "ø"])
+                    + [c(";", ":", "¶", "°"), c("'", "\"", "´", "¨", dead: ["'", "\""]), cell(.enter, 2.25)],
+                [cell(.shift, 2.25)]
+                    + letters("zxcvbnm", altGr: ["z": "æ", "c": "©", "n": "ñ", "m": "µ"])
+                    + [c(",", "<", "ç", "Ç"), c(".", ">"), c("/", "?", "¿"), cell(.shift, 2.75)],
                 bottomRow,
             ]
         case .es:
@@ -117,7 +136,7 @@ struct LaptopKeyboardLayout {
                  c("5", "%", "€"), c("6", "&", "¬"), c("7", "/"), c("8", "("), c("9", ")"), c("0", "="),
                  c("'", "?"), c("¡", "¿"), cell(.backspace, 2)],
                 [cell(.tab, 1.5)] + letters("qwertyuiop")
-                    + [c("`", "^", "[", dead: ["`", "^"]), c("+", "*", "]"), c("ç", "Ç", "}", dead: [], 1.5)],
+                    + [c("`", "^", "[", dead: ["`", "^"]), c("+", "*", "]"), c("ç", "Ç", "}", nil, dead: [], 1.5)],
                 [cell(.capsLock, 1.75)] + letters("asdfghjkl")
                     + [c("ñ", "Ñ"), c("´", "¨", "{", dead: ["´", "¨"]), cell(.enter, 2.25)],
                 [cell(.shift, 1.25), c("<", ">")] + letters("zxcvbnm")
@@ -131,7 +150,7 @@ struct LaptopKeyboardLayout {
                  c("-", "6", "|"), c("è", "7", "`"), c("_", "8", "\\"), c("ç", "9", "^"), c("à", "0", "@"),
                  c(")", "°", "]"), c("=", "+", "}"), cell(.backspace, 2)],
                 [cell(.tab, 1.5), c("a", "A"), c("z", "Z"), c("e", "E", "€")] + letters("rtyuiop")
-                    + [c("^", "¨", dead: ["^", "¨"]), c("$", "£", "¤"), c("*", "µ", nil, 1.5)],
+                    + [c("^", "¨", dead: ["^", "¨"]), c("$", "£", "¤"), c("*", "µ", nil, nil, dead: [], 1.5)],
                 [cell(.capsLock, 1.75)] + letters("qsdfghjklm") + [c("ù", "%"), cell(.enter, 2.25)],
                 [cell(.shift, 1.25), c("<", ">")] + letters("wxcvbn")
                     + [c(",", "?"), c(";", "."), c(":", "/"), c("!", "§"), cell(.shift, 2.75)],
@@ -144,7 +163,7 @@ struct LaptopKeyboardLayout {
                  c("5", "%"), c("6", "&"), c("7", "/", "{"), c("8", "(", "["), c("9", ")", "]"), c("0", "=", "}"),
                  c("ß", "?", "\\"), c("´", "`", dead: ["´", "`"]), cell(.backspace, 2)],
                 [cell(.tab, 1.5), c("q", "Q", "@"), c("w", "W"), c("e", "E", "€")] + letters("rtzuiop")
-                    + [c("ü", "Ü"), c("+", "*", "~"), c("#", "'", nil, 1.5)],
+                    + [c("ü", "Ü"), c("+", "*", "~"), c("#", "'", nil, nil, dead: [], 1.5)],
                 [cell(.capsLock, 1.75)] + letters("asdfghjkl") + [c("ö", "Ö"), c("ä", "Ä"), cell(.enter, 2.25)],
                 [cell(.shift, 1.25), c("<", ">", "|")] + letters("yxcvbn")
                     + [c("m", "M", "µ"), c(",", ";"), c(".", ":"), c("-", "_"), cell(.shift, 2.75)],
@@ -159,12 +178,18 @@ struct LaptopKeyboardLayout {
 enum DeadKeyComposer {
     private static let combining: [String: String] = [
         "´": "\u{0301}", "`": "\u{0300}", "^": "\u{0302}", "¨": "\u{0308}", "~": "\u{0303}",
+        // US-International's dead apostrophe and quote.
+        "'": "\u{0301}", "\"": "\u{0308}",
     ]
 
     /// The text to send for `dead` followed by `next`. Unsupported pairs send both characters,
     /// and a space after a dead key sends the accent itself, as on a desktop keyboard.
     static func compose(dead: String, next: String) -> String {
         if next == " " { return dead }
+        // US-International types ç for ' then c (canonical composition would give ć).
+        if dead == "'", next == "c" || next == "C" { return next == "c" ? "ç" : "Ç" }
+        // It only composes ' and " with vowels and y, so contractions like it's type as written.
+        if dead == "'" || dead == "\"", !"aeiouyAEIOUY".contains(next) { return dead + next }
         guard let mark = combining[dead], next.unicodeScalars.count == 1 else { return dead + next }
         let composed = (next + mark).precomposedStringWithCanonicalMapping
         return composed.unicodeScalars.count == 1 ? composed : dead + next

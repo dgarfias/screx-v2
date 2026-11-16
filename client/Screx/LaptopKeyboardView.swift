@@ -165,8 +165,13 @@ final class LaptopKeyboardSurface: UIView {
 
     // MARK: - Appearance
 
-    private func characterLevel(base: String, shifted: String, altGrChar: String?) -> String {
-        if altGr, let altGrChar { return altGrChar }
+    private func characterLevel(base: String, shifted: String, altGrChar: String?, altGrShifted: String?) -> String {
+        if altGr, let altGrChar {
+            // Caps Lock capitalizes AltGr letters too (é → É), like Shift does.
+            let isLetter = altGrChar.lowercased() != altGrChar.uppercased()
+            if let altGrShifted, isLetter ? shift != capsLock : shift { return altGrShifted }
+            return altGrChar
+        }
         let isLetter = base.lowercased() != base.uppercased()
         return (isLetter ? shift != capsLock : shift) ? shifted : base
     }
@@ -177,9 +182,9 @@ final class LaptopKeyboardSurface: UIView {
             var isCharacter = false
             key.accessibilityLabel = nil
             switch key.cell.key {
-            case let .character(base, shifted, altGrChar, dead):
+            case let .character(base, shifted, altGrChar, altGrShifted, dead):
                 isCharacter = true
-                let text = characterLevel(base: base, shifted: shifted, altGrChar: altGrChar)
+                let text = characterLevel(base: base, shifted: shifted, altGrChar: altGrChar, altGrShifted: altGrShifted)
                 key.label.text = text
                 key.corner.text = altGr ? nil : altGrChar
                 active = pendingDead != nil && dead.contains(pendingDead!) && (text == pendingDead)
@@ -297,9 +302,9 @@ final class LaptopKeyboardSurface: UIView {
 
     private func press(_ key: LaptopKey) {
         switch key {
-        case let .character(base, shifted, altGrChar, dead):
+        case let .character(base, shifted, altGrChar, altGrShifted, dead):
             // The character already reflects Shift/AltGr, so only Ctrl/Alt/Super form a chord.
-            let text = characterLevel(base: base, shifted: shifted, altGrChar: altGrChar)
+            let text = characterLevel(base: base, shifted: shifted, altGrChar: altGrChar, altGrShifted: altGrShifted)
             if modifiers != 0 {
                 flushDeadKey()
                 onComboText?(modifiers, text)
