@@ -80,9 +80,9 @@ sudo ./target/release/screx --no-speaker --no-gamepad
 # Try the virtual webcam without exclusive caps
 sudo ./target/release/screx --no-camera-exclusive-caps
 
-# List or remove pairings
+# List pairings, then remove one by the short ID from the list (e.g. a3f9c), or all of them
 sudo ./target/release/screx unpair
-sudo ./target/release/screx unpair <device_id>
+sudo ./target/release/screx unpair a3f9c
 sudo ./target/release/screx unpair --all
 ```
 

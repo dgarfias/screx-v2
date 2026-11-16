@@ -50,14 +50,22 @@ final class PairingService {
 
     var onResult: ((PairingResult) -> Void)?
 
+    /// The host tile being connected: its ID keys the pairing key on this side, and its device ID
+    /// identifies this tile to the daemon. `clientName` labels the pairing in the daemon's list.
+    private var tileId = ""
+    private var deviceId = Data()
+    private var clientName = ""
+
     private func log(_ message: String) {
         print("[pairing \(debugId)] \(message)")
     }
 
-    func pair(host: String, port: UInt16) {
-        let deviceId = Self.getOrCreateDeviceId()
-        let hasPairingKeys = KeychainHelper.hasPairingKeys()
-        log("starting pair(host=\(host), port=\(port)) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) hasPairingKeys=\(hasPairingKeys)")
+    func pair(host: String, port: UInt16, tileId: String, deviceId: Data, clientName: String) {
+        self.tileId = tileId
+        self.deviceId = deviceId
+        self.clientName = clientName
+        let hasPairingKey = KeychainHelper.loadPairingKey(tileId: tileId) != nil
+        log("starting pair(host=\(host), port=\(port)) tile=\(tileId.prefix(5)) hasPairingKey=\(hasPairingKey)")
 
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
@@ -72,7 +80,7 @@ final class PairingService {
             switch state {
             case .ready:
                 self.cancelConnectTimeout()
-                if hasPairingKeys {
+                if hasPairingKey {
                     self.log("tcp ready, trying reconnect HELLO flow")
                     self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId)
                 } else {
@@ -129,9 +137,13 @@ final class PairingService {
         let pubKey = keyPair.publicKey.rawRepresentation
         log("sending PAIR request: deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pubKeyLen=\(pubKey.count)")
 
+        // SCREX_PAIR + device_id(16) + pubkey(32) + name_len(1) + name (UTF-8, up to 63 bytes)
         var packet = Self.magicPair
         packet.append(deviceId)
         packet.append(pubKey)
+        let name = Data(clientName.utf8.prefix(63))
+        packet.append(UInt8(name.count))
+        packet.append(name)
 
         conn.send(content: packet, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
@@ -275,7 +287,6 @@ final class PairingService {
                 self.emitResult(.error("Invalid OK response"))
                 return
             }
-            let daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
             let sessionSalt = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
             let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
 
@@ -288,8 +299,7 @@ final class PairingService {
                 info: Data("screx-pairing".utf8)
             )
 
-            // Store the pairing key by daemon identity so IP changes don't break pairing.
-            KeychainHelper.storePairingKey(pairingKey, daemonId: daemonDeviceId)
+            KeychainHelper.storePairingKey(pairingKey, tileId: self.tileId)
 
             // Derive session key
             let sessionKeyData = ScrexCrypto.hkdfSHA256Bytes(
@@ -368,7 +378,7 @@ final class PairingService {
 
             if data.count >= Self.magicReject.count && data.prefix(Self.magicReject.count) == Self.magicReject {
                 self.log("daemon rejected HELLO — stale key, switching to PAIR flow")
-                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: Self.getOrCreateDeviceId())
+                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: self.deviceId)
                 return
             }
 
@@ -382,16 +392,15 @@ final class PairingService {
                 self.emitResult(.error("Invalid OK response"))
                 return
             }
-            let daemonDeviceId = data.subdata(in: 10..<(10 + Self.deviceIdLen))
             let serverNonce = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
             let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
 
             var salt = clientNonce
             salt.append(serverNonce)
 
-            // The reply names the daemon, so load the key stored for it. No key, or one
-            // that doesn't verify (the daemon was reset), means pairing again.
-            let sessionKeyData = KeychainHelper.loadPairingKey(daemonId: daemonDeviceId).flatMap { key -> Data? in
+            // No key, or one that doesn't verify (the daemon was reset, or a different computer
+            // now answers at this address), means pairing again.
+            let sessionKeyData = KeychainHelper.loadPairingKey(tileId: self.tileId).flatMap { key -> Data? in
                 let derived = ScrexCrypto.hkdfSHA256Bytes(
                     ikm: key,
                     salt: salt,
@@ -401,8 +410,8 @@ final class PairingService {
                 return expectedHmac == serverHmac ? derived : nil
             }
             guard let sessionKeyData else {
-                self.log("no valid stored key for this daemon — re-pairing")
-                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: Self.getOrCreateDeviceId())
+                self.log("no valid stored key for this host — re-pairing")
+                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: self.deviceId)
                 return
             }
 
@@ -466,102 +475,75 @@ final class PairingService {
             self?.onResult?(result)
         }
     }
-
-    /// Stable device ID persisted in UserDefaults.
-    private static func getOrCreateDeviceId() -> Data {
-        let key = "screx_device_id"
-        if let existing = UserDefaults.standard.data(forKey: key), existing.count == deviceIdLen {
-            return existing
-        }
-        var id = Data(count: deviceIdLen)
-        _ = id.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, deviceIdLen, $0.baseAddress!) }
-        UserDefaults.standard.set(id, forKey: key)
-        return id
-    }
 }
 
 // MARK: - Keychain helpers
 
+/// Pairing keys, one per host tile, stored in the Keychain under the tile's ID.
 enum KeychainHelper {
     private static let servicePrefix = "com.screx.pairing."
-    private static let knownDaemonIdsKey = "screx_known_daemon_ids"
-    private static func daemonServiceName(daemonId: Data) -> String {
-        servicePrefix + "daemon." + daemonId.map { String(format: "%02x", $0) }.joined()
-    }
+    /// Tile IDs that have a key, so keys of removed tiles can be found and deleted.
+    private static let pairedTileIdsKey = "screx_paired_tile_ids"
 
-    /// Keys are stored by daemon identity so IP changes do not break pairing.
-    static func storePairingKey(_ key: Data, daemonId: Data) {
-        let service = daemonServiceName(daemonId: daemonId)
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
+    private static func service(tileId: String) -> String { servicePrefix + "tile." + tileId }
 
-        let addQuery: [String: Any] = [
+    static func storePairingKey(_ key: Data, tileId: String) {
+        let service = service(tileId: tileId)
+        SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                       kSecAttrService as String: service] as CFDictionary)
+        let status = SecItemAdd([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecValueData as String: key,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-        ]
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        ] as CFDictionary, nil)
         if status == errSecSuccess {
-            registerKnownDaemonId(daemonId)
+            var ids = pairedTileIds()
+            if !ids.contains(tileId) {
+                ids.append(tileId)
+                UserDefaults.standard.set(ids, forKey: pairedTileIdsKey)
+            }
         } else {
-            print("[keychain] daemon-id store failed: \(status)")
+            print("[keychain] store failed: \(status)")
         }
     }
 
-    static func loadPairingKey(daemonId: Data) -> Data? {
-        let service = daemonServiceName(daemonId: daemonId)
-        let query: [String: Any] = [
+    static func loadPairingKey(tileId: String) -> Data? {
+        var result: AnyObject?
+        let status = SecItemCopyMatching([
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: service(tileId: tileId),
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecSuccess {
-            return result as? Data
+        ] as CFDictionary, &result)
+        return status == errSecSuccess ? result as? Data : nil
+    }
+
+    /// Deletes the keys of every tile not in `keep`.
+    static func deletePairingKeys(except keep: Set<String>) {
+        let ids = pairedTileIds()
+        let removed = ids.filter { !keep.contains($0) }
+        guard !removed.isEmpty else { return }
+        for tileId in removed {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                           kSecAttrService as String: service(tileId: tileId)] as CFDictionary)
         }
-        return nil
+        UserDefaults.standard.set(ids.filter { keep.contains($0) }, forKey: pairedTileIdsKey)
     }
 
-    /// Whether this device has paired with any daemon (decides HELLO vs PAIR).
-    static func hasPairingKeys() -> Bool {
-        !knownDaemonIds().isEmpty
+    private static func pairedTileIds() -> [String] {
+        UserDefaults.standard.stringArray(forKey: pairedTileIdsKey) ?? []
     }
 
-    static func deletePairingKey(daemonId: Data) {
-        let service = daemonServiceName(daemonId: daemonId)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        SecItemDelete(query as CFDictionary)
-        unregisterKnownDaemonId(daemonId)
-    }
-
-    // MARK: - Known daemon IDs (stored in UserDefaults; keys themselves stay in Keychain)
-
-    private static func knownDaemonIds() -> [String] {
-        UserDefaults.standard.stringArray(forKey: knownDaemonIdsKey) ?? []
-    }
-
-    private static func registerKnownDaemonId(_ daemonId: Data) {
-        let hex = daemonId.map { String(format: "%02x", $0) }.joined()
-        var ids = knownDaemonIds()
-        if !ids.contains(hex) {
-            ids.append(hex)
-            UserDefaults.standard.set(ids, forKey: knownDaemonIdsKey)
+    /// Before pairings were per tile, keys were stored per daemon with one device ID for the
+    /// whole iPad. Those can't be used any more; delete them once.
+    static func removeLegacyPairings() {
+        let defaults = UserDefaults.standard
+        for daemonId in defaults.stringArray(forKey: "screx_known_daemon_ids") ?? [] {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                           kSecAttrService as String: servicePrefix + "daemon." + daemonId] as CFDictionary)
         }
-    }
-
-    private static func unregisterKnownDaemonId(_ daemonId: Data) {
-        let hex = daemonId.map { String(format: "%02x", $0) }.joined()
-        var ids = knownDaemonIds()
-        ids.removeAll { $0 == hex }
-        UserDefaults.standard.set(ids, forKey: knownDaemonIdsKey)
+        defaults.removeObject(forKey: "screx_known_daemon_ids")
+        defaults.removeObject(forKey: "screx_device_id")
     }
 }

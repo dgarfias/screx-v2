@@ -107,7 +107,7 @@ Responsibilities:
 - microphone and camera forwarding
 - external-display routing (Internal only, External only, Both) and laptop mode
 - connection-health UI and session state
-- Stream Settings sheet for choosing resolution, framerate, codec, and bitrate before connecting
+- host tiles with per-host settings (address, resolution, framerate, codec, bitrate) and per-host pairing
 
 ## Transport Model
 
@@ -140,7 +140,8 @@ Why:
 
 ### New device flow
 
-1. Client sends `SCREX_PAIR` + device ID + X25519 public key
+1. Client sends `SCREX_PAIR` + device ID + X25519 public key + name length (1 byte) + client name
+   (UTF-8, up to 63 bytes; a label shown in the daemon's logs and `screx unpair` list)
 2. daemon generates its own X25519 keypair and a 6-digit PIN
 3. daemon sends `SCREX_PIN` + server public key
 4. User enters the PIN in the client
@@ -152,16 +153,21 @@ Why:
 
 ### Reconnect flow
 
-1. Client sends `SCREX_HELLO` + device ID + client nonce (only if it has paired with some
-   daemon before; otherwise it starts with the new device flow)
+1. Client sends `SCREX_HELLO` + device ID + client nonce (only if it has a key for this host
+   tile; otherwise it starts with the new device flow)
 2. daemon loads the pairing key for that device, or replies `SCREX_REJECT` if it doesn't know it
 3. both sides derive a fresh session key using nonces
 4. daemon sends `SCREX_OK` + daemon device ID + server nonce + HMAC
-5. client loads the key it stored for that daemon ID and verifies the HMAC
+5. client verifies the HMAC with the key stored for the host tile
 
-If the daemon rejects the HELLO, or the client has no key for that daemon ID (or it doesn't verify),
-the client runs the new device flow on the same connection. Clients store pairing keys by daemon ID,
-so a daemon that changes IP address keeps working.
+If the daemon rejects the HELLO, or the client's key doesn't verify, the client runs the new device
+flow on the same connection.
+
+On the iPad, every host tile has its own random 16-byte device ID and its own pairing key, stored in
+the Keychain under the tile. Two tiles that reach the same computer (for example through two IP
+addresses) are two separate pairings, and removing a tile deletes its key, so adding it back asks
+for the PIN again. Editing a tile's address keeps its ID and key. The iPad's own IP address plays no
+part in pairing.
 
 ### Busy rejection
 
@@ -413,7 +419,7 @@ and never makes it key; keyboard, mouse, trackpad, and app controls stay on the 
 
 The in-session Displays button (also available with the pill collapsed) selects Internal only,
 External only, or Both. The Displays menu edits only external resolution and target FPS; the iPad's
-resolution and FPS remain those from Stream Settings. Changing external FPS replaces only its pipeline.
+resolution and FPS remain those from the host's settings. Changing external FPS replaces only its pipeline.
 The selected mode, external resolution, and external FPS are stored per daemon hostname in
 UserDefaults. On connect, the remembered mode is used when a monitor is attached (otherwise
 internal-only until it appears), the remembered resolution is reused only while iPadOS still

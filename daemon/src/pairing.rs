@@ -115,6 +115,14 @@ impl PairingState {
         self.paired_devices.contains_key(device_id)
     }
 
+    /// "<name> (<short id>)" for log lines; just the short id for unknown devices.
+    fn label(&self, device_id: &str) -> String {
+        match self.paired_devices.get(device_id) {
+            Some(dev) => format!("{} ({})", dev.name, short_id(device_id)),
+            None => short_id(device_id).to_string(),
+        }
+    }
+
     fn get_pairing_key(&self, device_id: &str) -> Option<[u8; 32]> {
         self.paired_devices.get(device_id).and_then(|dev| {
             let bytes = hex_decode(&dev.pairing_key)?;
@@ -342,9 +350,20 @@ fn handle_pair_request(
     pairing: &Arc<Mutex<PairingState>>,
 ) -> Result<SessionInfo> {
     // Already read 12 bytes; SCREX_PAIR is 10, so 2 bytes of device_id are in header_buf[10..12]
-    // Read remaining: device_id(14 more) + client_pubkey(32) = 46 bytes
-    let mut rest = [0u8; 46];
+    // Read remaining: device_id(14 more) + client_pubkey(32) + name_len(1) = 47 bytes, then the
+    // client's name (UTF-8, up to 63 bytes). The device ID is random per host tile on the iPad;
+    // the name only labels the pairing.
+    let mut rest = [0u8; 47];
     stream.read_exact(&mut rest)?;
+    let name_len = usize::from(rest[46]).min(63);
+    let mut name_bytes = vec![0u8; name_len];
+    stream.read_exact(&mut name_bytes)?;
+    let client_name = String::from_utf8_lossy(&name_bytes).trim().to_string();
+    let client_name = if client_name.is_empty() {
+        addr.ip().to_string()
+    } else {
+        client_name
+    };
 
     let mut device_id = [0u8; DEVICE_ID_LEN];
     device_id[..2].copy_from_slice(&header_buf[10..12]);
@@ -354,7 +373,8 @@ fn handle_pair_request(
     client_pubkey.copy_from_slice(&rest[14..46]);
 
     let device_id_hex = hex_encode(&device_id);
-    println!("[pairing] pair request from device {device_id_hex}");
+    let label = format!("{client_name} ({})", short_id(&device_id_hex));
+    println!("[pairing] pair request from {label}");
 
     // A PAIR request always means the client wants to run the full PIN pairing
     // flow. This happens on first pairing, after the client lost its key, or
@@ -437,7 +457,7 @@ fn handle_pair_request(
             let received_pin = std::str::from_utf8(pin_bytes).unwrap_or("");
             if received_pin != pin {
                 // Wrong PIN
-                println!("[pairing] wrong PIN from device {device_id_hex}");
+                println!("[pairing] wrong PIN from {label}");
                 let mut reject = Vec::new();
                 reject.extend_from_slice(MAGIC_REJECT);
                 let _ = stream.write_all(&reject);
@@ -445,7 +465,7 @@ fn handle_pair_request(
             }
         }
         None => {
-            println!("[pairing] PIN decryption failed for device {device_id_hex}");
+            println!("[pairing] PIN decryption failed for {label}");
             let mut reject = Vec::new();
             reject.extend_from_slice(MAGIC_REJECT);
             let _ = stream.write_all(&reject);
@@ -464,12 +484,12 @@ fn handle_pair_request(
     // Store the pairing
     let daemon_device_id = {
         let mut ps = pairing.lock().unwrap();
-        ps.store_device(&device_id, &pairing_key, &format!("{}", addr.ip()));
+        ps.store_device(&device_id, &pairing_key, &client_name);
         *ps.pending_pin.lock().unwrap() = None;
         ps.daemon_device_id()
     };
 
-    println!("[pairing] device {device_id_hex} paired successfully");
+    println!("[pairing] paired with {label}");
 
     // Send OK: SCREX_OK(10) + daemon_device_id(16) + session_salt(32) + hmac(32)
     let verify_hmac = crypto::hmac_sha256(&session_key, b"server-verify");
@@ -514,9 +534,10 @@ fn handle_hello_request(
     crate::log_detail!("[pairing] hello from device {device_id_hex}");
 
     let ps = pairing.lock().unwrap();
+    let label = ps.label(&device_id_hex);
     let Some(pairing_key) = ps.get_pairing_key(&device_id_hex) else {
         drop(ps);
-        println!("[pairing] hello from unknown/unpaired device {device_id_hex}, sending REJECT");
+        println!("[pairing] hello from unpaired device {label}, asking it to pair");
         let _ = stream.write_all(MAGIC_REJECT);
         let _ = stream.flush();
         return Ok(None);
@@ -553,7 +574,7 @@ fn handle_hello_request(
         client_addr: addr,
     };
 
-    println!("[pairing] session established with paired device {device_id_hex}");
+    println!("[pairing] session established with {label}");
     Ok(Some(session))
 }
 
@@ -754,6 +775,47 @@ fn chrono_now() -> String {
     format!("{secs}")
 }
 
+fn short_id(device_id: &str) -> &str {
+    &device_id[..device_id.len().min(5)]
+}
+
+/// Unix seconds as "YYYY-MM-DD HH:MM UTC".
+fn format_paired_at(secs: &str) -> String {
+    let Ok(secs) = secs.parse::<i64>() else {
+        return secs.to_string();
+    };
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant), proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
+}
+
+fn print_devices(state: &PairingState) {
+    let mut devices = state.list_devices();
+    devices.sort_by(|a, b| a.2.cmp(&b.2));
+    for (id, name, at) in &devices {
+        println!(
+            "  {}  {name}  paired {}",
+            short_id(id),
+            format_paired_at(at)
+        );
+    }
+}
+
+/// Lists pairings, or removes one by ID. The 5-character short ID shown in the list and the
+/// logs is enough, as long as it matches only one pairing.
 pub fn run_unpair(device_id: Option<&str>) -> Result<()> {
     let mut state = PairingState::load();
 
@@ -762,33 +824,59 @@ pub fn run_unpair(device_id: Option<&str>) -> Result<()> {
             let count = state.remove_all();
             println!("Removed all {count} paired device(s).");
         }
-        Some(id) => {
-            if state.remove_device(id) {
-                println!("Unpaired device {id}.");
-            } else {
-                println!("Device {id} not found in paired devices.");
-                let devices = state.list_devices();
-                if !devices.is_empty() {
-                    println!("\nCurrently paired devices:");
-                    for (id, name, at) in &devices {
-                        println!("  {id}  ({name}, paired at {at})");
-                    }
+        Some(prefix) => {
+            let prefix = prefix.to_ascii_lowercase();
+            let matches: Vec<String> = state
+                .list_devices()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .filter(|id| id.starts_with(&prefix))
+                .collect();
+            match matches.as_slice() {
+                [id] => {
+                    let label = state.label(id);
+                    state.remove_device(id);
+                    println!("Unpaired {label}.");
+                }
+                [] => {
+                    println!("No paired device matches {prefix}.");
+                    print_devices(&state);
+                }
+                _ => {
+                    println!("{prefix} matches more than one device; use more characters.");
+                    print_devices(&state);
                 }
             }
         }
         None => {
-            let devices = state.list_devices();
-            if devices.is_empty() {
+            if state.list_devices().is_empty() {
                 println!("No paired devices.");
             } else {
                 println!("Paired devices:");
-                for (id, name, at) in &devices {
-                    println!("  {id}  ({name}, paired at {at})");
-                }
-                println!("\nUsage: screx unpair <device_id> or screx unpair --all");
+                print_devices(&state);
+                println!("\nUsage: screx unpair <id> or screx unpair --all");
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_paired_at, short_id};
+
+    #[test]
+    fn paired_at_is_readable_utc() {
+        assert_eq!(format_paired_at("0"), "1970-01-01 00:00 UTC");
+        assert_eq!(format_paired_at("951782400"), "2000-02-29 00:00 UTC");
+        assert_eq!(format_paired_at("1794811027"), "2026-11-16 06:37 UTC");
+        assert_eq!(format_paired_at("not a time"), "not a time");
+    }
+
+    #[test]
+    fn short_id_is_five_characters() {
+        assert_eq!(short_id("a3f9c0112233"), "a3f9c");
+        assert_eq!(short_id("ab"), "ab");
+    }
 }

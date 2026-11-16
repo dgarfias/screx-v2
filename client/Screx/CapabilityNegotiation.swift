@@ -56,8 +56,8 @@ struct DaemonCapabilities: Equatable {
     }
 
     /// Returns human-readable violations of `settings` against these capabilities, empty
-    /// if everything fits. Messages are shown verbatim to the user after
-    /// "Failed to connect: ". A `nil` field in `settings` means "use the daemon's own
+    /// if everything fits. Messages are shown verbatim on the host's tile, next to a Settings
+    /// button. A `nil` field in `settings` means "use the daemon's own
     /// default", which always fits and is never checked.
     ///
     /// This is a fail-fast check, not a clamp: the caller must not modify or snap the
@@ -68,40 +68,32 @@ struct DaemonCapabilities: Equatable {
 
         if let width = settings.width, let height = settings.height {
             if width > maxWidth || height > maxHeight {
-                violations.append(
-                    "resolution is higher than maximum allowed by daemon (current: \(width)×\(height), maximum allowed: \(maxWidth)×\(maxHeight))"
-                )
+                violations.append("Supports up to \(maxWidth)×\(maxHeight)")
             }
         }
         if settings.enabledDisplayMask & 2 != 0,
            let width = settings.externalWidth, let height = settings.externalHeight,
            width > maxWidth || height > maxHeight {
-            violations.append("external resolution is higher than maximum allowed by daemon (current: \(width)×\(height), maximum allowed: \(maxWidth)×\(maxHeight))")
+            violations.append("Supports up to \(maxWidth)×\(maxHeight) on the external display")
         }
 
         if let fps = settings.fps, fps > maxFps {
-            violations.append(
-                "framerate is higher than maximum allowed by daemon (current: \(fps) fps, maximum allowed: \(maxFps) fps)"
-            )
+            violations.append("Supports up to \(maxFps) fps")
         }
         if settings.enabledDisplayMask & 2 != 0, let fps = settings.externalFps, fps > maxFps {
-            violations.append("external frame rate exceeds the daemon’s maximum (\(maxFps) fps)")
+            violations.append("Supports up to \(maxFps) fps on the external display")
         }
 
         if let codecId = settings.codecId, !codecs.contains(codecId) {
             let codecLabel = codecId == Self.codecH265 ? "H.265" : "H.264"
-            violations.append("codec \(codecLabel) is not supported by the daemon")
+            violations.append("Doesn’t support \(codecLabel)")
         }
 
         if let bitrateBps = settings.bitrateBps {
             if bitrateBps > bitrateMaxBps {
-                violations.append(
-                    "bitrate is higher than maximum allowed by daemon (current: \(Self.formatMbps(bitrateBps)) Mbps, maximum allowed: \(Self.formatMbps(bitrateMaxBps)) Mbps)"
-                )
+                violations.append("Supports up to \(Self.formatMbps(bitrateMaxBps)) Mbps")
             } else if bitrateBps < bitrateMinBps {
-                violations.append(
-                    "bitrate is lower than minimum allowed by daemon (current: \(Self.formatMbps(bitrateBps)) Mbps, minimum allowed: \(Self.formatMbps(bitrateMinBps)) Mbps)"
-                )
+                violations.append("Needs at least \(Self.formatMbps(bitrateMinBps)) Mbps")
             }
         }
 

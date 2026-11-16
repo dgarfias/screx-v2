@@ -49,12 +49,20 @@ The app requests these on first use:
 See [README.md](../README.md#use) for the end-to-end connect flow (PIN pairing, enabling the
 virtual display).
 
-Before connecting, tap **Stream Settings** to choose the resolution, framerate, codec, and bitrate
-for the next session. These settings are validated against the daemon's advertised capabilities and
-sent during connection setup. For the wire protocol, see [ARCHITECTURE.md](ARCHITECTURE.md).
+The connection screen shows a tile per host. Tap a tile to connect; progress, a Cancel button and
+any error appear on the tile itself. Tap **+** to connect to a new address; it becomes a tile after
+its first successful connection, and typing the address of an existing tile connects through that
+tile. Each tile's **⋯** menu (or a long press) has **Settings…**, **Pin** and **Remove**; the **⋯**
+next to **+** clears unpinned hosts or all hosts.
 
-On a fresh install, the preferred framerate defaults to 60 fps; an existing saved preference is
-preserved. TCP establishment fails after 8 seconds if the daemon cannot be reached, and an
+**Settings are per host:** the address, resolution, framerate, codec and bitrate. After a host has
+connected once, its settings only offer what it supports. A new host starts at this iPad's
+resolution, 60 fps, the host's codec and 8 Mbps. Settings are validated against the daemon's
+advertised capabilities and sent during connection setup. For the wire protocol, see
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+**Pairing is per host tile.** Removing a tile forgets its pairing, so adding the host back asks for
+the PIN again; editing the address in Settings keeps it. TCP establishment fails after 8 seconds if the daemon cannot be reached, and an
 established stream is treated as stale after 5 seconds without inbound UDP data. Active
 touch gestures are clamped to the video boundary so dragging outside the letterboxed image still
 produces a matching release at the nearest display edge.
@@ -89,7 +97,7 @@ output or takes over iPadOS mirroring.
   delete and arrows repeat when held. Dictation, autocorrect and emoji need the normal mode.
 - **Both:** two independent Linux virtual monitors, with a decoder for each desktop.
 
-Stream Settings configures the iPad's resolution and FPS. The Displays menu configures only the
+The host's settings configure the iPad's resolution and FPS. The Displays menu configures only the
 external output, with its own resolution and frame rate. The preferred resolution reported by
 iPadOS is marked Recommended. Only resolutions exposed by iPadOS appear; no extra scaled sizes
 are added. Frame rate choices
@@ -104,7 +112,7 @@ Display choices are remembered **per daemon hostname**. Reconnecting restores th
 display still reports that resolution; otherwise it falls back to the display's **Recommended**
 mode. With nothing remembered, Recommended is used. A remembered External only/Both choice waits
 until a monitor is attached, then applies automatically; choosing Internal only is remembered too.
-Stream Settings own the iPad's own resolution and FPS.
+The host's settings own the iPad's own resolution and FPS.
 
 Audio follows the iPadOS output route, including HDMI when offered by the monitor/adapter. Test
 monitor sound with Screx's microphone off first: recording can restrict the routes iPadOS permits.

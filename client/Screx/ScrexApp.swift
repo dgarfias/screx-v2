@@ -87,45 +87,6 @@ private func formatByteRate(_ bytesPerSecond: Double) -> String {
 
 private let networkCameraCompressionQuality: CGFloat = 0.4
 
-struct RecentConnection: Codable, Identifiable, Equatable {
-    let host: String
-    let port: UInt16
-    let name: String
-    let lastConnectedAt: Date
-    let isPinned: Bool
-
-    private enum CodingKeys: String, CodingKey {
-        case host
-        case port
-        case name
-        case lastConnectedAt
-        case isPinned
-    }
-
-    init(host: String, port: UInt16, name: String, lastConnectedAt: Date, isPinned: Bool = false) {
-        self.host = host
-        self.port = port
-        self.name = name
-        self.lastConnectedAt = lastConnectedAt
-        self.isPinned = isPinned
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        host = try container.decode(String.self, forKey: .host)
-        port = try container.decode(UInt16.self, forKey: .port)
-        name = try container.decode(String.self, forKey: .name)
-        lastConnectedAt = try container.decode(Date.self, forKey: .lastConnectedAt)
-        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
-    }
-
-    var id: String { "\(host):\(port)" }
-    var displayName: String { name.isEmpty ? host : name }
-    var endpointLabel: String {
-        formatEndpointInput(host: host, port: port)
-    }
-}
-
 enum ConnectionTransport: String {
     case none = ""
     case network = "Network"
@@ -171,7 +132,7 @@ enum ConnectionHealthState: String {
     }
 }
 
-/// User-facing resolution presets offered in the Stream Settings sheet. `daemonDefault`
+/// User-facing resolution presets offered in a host's Settings sheet. `daemonDefault`
 /// means "send 0 for the resolution in `SETTINGS`" (let the daemon pick). `native`
 /// ("This iPad") is this device's own panel resolution, detected from `UIScreen`; it is
 /// only offered in the picker when no listed preset already matches the panel (see
@@ -217,32 +178,35 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
         return resolution == nativeResolution
     }
 
-    /// The cases offered in the Stream Settings picker: `.native` ("This iPad") is
+    /// The cases offered in the Settings resolution picker: `.native` ("This iPad") is
     /// included only when no listed preset matches this device's panel, so it never
     /// shows up as a duplicate of a listed value.
     static let pickerCases: [StreamResolutionPreset] =
         deviceNative == nil ? allCases : allCases.filter { $0 != .native }
 
+    /// One line in the Settings row, always size first: this device's panel adds "This iPad", other iPad sizes
+    /// name one model instead of the full list that shares the size.
     var label: String {
+        if self == Self.deviceNative || self == .native, let size = resolution {
+            return "\(size.width)×\(size.height) · This iPad"
+        }
         switch self {
-        case .daemonDefault: return "Daemon default"
-        case .native:
-            let native = Self.nativeResolution
-            return "This iPad (\(native.width)×\(native.height))"
-        case .p720: return "720p (1280×720)"
-        case .p1080: return "1080p (1920×1080)"
-        case .p1440: return "1440p (2560×1440)"
-        case .uhd4k: return "4K (3840×2160)"
-        case .wxga1610: return "1280×800 (16:10)"
-        case .wuxga: return "1920×1200 (16:10)"
-        case .wqxga: return "2560×1600 (16:10)"
-        case .ipadMini: return "2266×1488 (iPad mini)"
-        case .ipadBase: return "2160×1620 (iPad 7th–9th gen)"
-        case .ipadA16: return "2360×1640 (iPad 10th/11th gen, Air 11″)"
-        case .ipadPro11: return "2388×1668 (iPad Pro 11″)"
-        case .ipadPro11M4: return "2420×1668 (iPad Pro 11″ M4)"
-        case .ipadPro129: return "2732×2048 (iPad Pro 12.9″, Air 13″)"
-        case .ipadPro13M4: return "2752×2064 (iPad Pro 13″ M4)"
+        case .daemonDefault: return "Host default"
+        case .native: return "This iPad"
+        case .p720: return "1280×720"
+        case .p1080: return "1920×1080"
+        case .p1440: return "2560×1440"
+        case .uhd4k: return "3840×2160 (4K)"
+        case .wxga1610: return "1280×800"
+        case .wuxga: return "1920×1200"
+        case .wqxga: return "2560×1600"
+        case .ipadMini: return "2266×1488 · iPad mini"
+        case .ipadBase: return "2160×1620 · iPad 9th gen"
+        case .ipadA16: return "2360×1640 · iPad Air 11″"
+        case .ipadPro11: return "2388×1668 · iPad Pro 11″"
+        case .ipadPro11M4: return "2420×1668 · iPad Pro 11″ M4"
+        case .ipadPro129: return "2732×2048 · iPad Pro 12.9″"
+        case .ipadPro13M4: return "2752×2064 · iPad Pro 13″ M4"
         }
     }
 
@@ -268,7 +232,7 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// User-facing framerate presets offered in the Stream Settings sheet.
+/// User-facing framerate presets offered in a host's Settings sheet.
 enum StreamFrameratePreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
     case fps30 = "30"
@@ -278,7 +242,7 @@ enum StreamFrameratePreset: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .daemonDefault: return "Daemon default"
+        case .daemonDefault: return "Host default"
         case .fps30: return "30 fps"
         case .fps60: return "60 fps"
         }
@@ -293,7 +257,7 @@ enum StreamFrameratePreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// User-facing codec presets offered in the Stream Settings sheet.
+/// User-facing codec presets offered in a host's Settings sheet.
 enum StreamCodecPreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
     case h264 = "h264"
@@ -303,7 +267,7 @@ enum StreamCodecPreset: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .daemonDefault: return "Daemon default"
+        case .daemonDefault: return "Host default"
         case .h264: return "H.264"
         case .h265: return "H.265"
         }
@@ -318,9 +282,9 @@ enum StreamCodecPreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// User-facing bitrate presets offered in the Stream Settings sheet. `.custom` has no
+/// User-facing bitrate presets offered in a host's Settings sheet. `.custom` has no
 /// fixed `bitrateBps` of its own — its effective value comes from
-/// `StreamViewModel.customBitrateMbps` instead (see `StreamViewModel.resolvedBitrateBps`).
+/// `HostStreamSettings.customBitrateMbps` instead (see `HostStreamSettings.bitrateBps`).
 enum StreamBitratePreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
     case low = "low"
@@ -333,7 +297,7 @@ enum StreamBitratePreset: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .daemonDefault: return "Daemon default"
+        case .daemonDefault: return "Host default"
         case .low: return "Low (3 Mbps)"
         case .medium: return "Medium (8 Mbps)"
         case .high: return "High (15 Mbps)"
@@ -490,13 +454,19 @@ final class StreamViewModel: ObservableObject {
     @Published var status: String = "Enter a daemon host or IP to connect."
     @Published private(set) var connectionHealth: ConnectionHealthState = .idle
     @Published var isConnected = false
-    @Published var manualHost: String = ""
     @Published var transport: String = ""
     @Published var showPinEntry = false
     @Published var pinInput: String = ""
     @Published var pairingStatus: String = ""
     @Published var recentConnections: [RecentConnection] = StreamViewModel.loadRecentConnections()
     @Published private(set) var sessionDisplayName: String = ""
+    /// The host being connected to, or whose connection just failed. The connection screen shows
+    /// progress and errors on its tile, and as a temporary tile when it isn't saved yet.
+    @Published private(set) var connectionTarget: RecentConnection?
+    /// The last failure was the stream settings exceeding the host's limits.
+    @Published private(set) var failureIsSettings = false
+    /// Limits each host advertised, keyed like `RecentConnection.id`.
+    @Published private(set) var hostLimits: [String: HostLimits] = StreamViewModel.loadHostLimits()
     /// Per-second diagnostics, observed only by the info views. Kept out of the view model's own
     /// @Published state so their updates don't recompute the entire session UI twice a second.
     let stats = StreamStats()
@@ -550,17 +520,8 @@ final class StreamViewModel: ObservableObject {
         trackpadScrollRemainder = 0
     }
 
-    /// Stream-settings preferences the user picked in the Stream Settings sheet,
-    /// persisted in UserDefaults and re-sent unmodified as `SETTINGS` on every connect —
-    /// validated against the daemon's advertised bounds first (see
-    /// `handleDaemonCapabilities`); a setting that doesn't fit fails the connection
-    /// instead of being silently clamped.
-    @Published var preferredResolution: StreamResolutionPreset = StreamViewModel.loadPreferredResolution()
-    @Published var preferredFramerate: StreamFrameratePreset = StreamViewModel.loadPreferredFramerate()
-    @Published var preferredCodec: StreamCodecPreset = StreamViewModel.loadPreferredCodec()
-    @Published var preferredBitrate: StreamBitratePreset = StreamViewModel.loadPreferredBitrate()
-    /// Effective bitrate (in Mbps) when `preferredBitrate == .custom`. Ignored otherwise.
-    @Published var customBitrateMbps: Double = StreamViewModel.loadCustomBitrateMbps()
+    /// Stream settings per host tile, keyed by tile ID.
+    @Published private(set) var hostSettings: [String: HostStreamSettings] = StreamViewModel.loadHostSettings()
 
     let decoder = VideoDecoder()
     let externalDecoder = VideoDecoder()
@@ -654,6 +615,28 @@ final class StreamViewModel: ObservableObject {
         recentConnections.filter(\.isPinned)
     }
 
+    var canPinMore: Bool { pinnedConnections.count < Self.maxPinnedConnections }
+
+    func tileState(for id: String) -> HostTileState {
+        guard id == connectionTarget?.id else { return .idle }
+        if isConnecting { return .connecting(showPinEntry ? "Waiting for PIN…" : "Connecting…") }
+        if connectionHealth.isTerminalFailure { return .failed(status) }
+        return .idle
+    }
+
+    private static let hostLimitsKey = "screx_host_limits"
+
+    private static func loadHostLimits() -> [String: HostLimits] {
+        guard let data = UserDefaults.standard.data(forKey: hostLimitsKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: HostLimits].self, from: data)) ?? [:]
+    }
+
+    private func persistHostLimits() {
+        if let data = try? JSONEncoder().encode(hostLimits) {
+            UserDefaults.standard.set(data, forKey: Self.hostLimitsKey)
+        }
+    }
+
     var unpinnedRecentConnections: [RecentConnection] {
         recentConnections.filter { !$0.isPinned }
     }
@@ -675,8 +658,13 @@ final class StreamViewModel: ObservableObject {
             return []
         }
         do {
-            let decoded = try JSONDecoder().decode([RecentConnection].self, from: data)
-            return normalizeConnections(decoded)
+            let connections = normalizeConnections(try JSONDecoder().decode([RecentConnection].self, from: data))
+            // Entries saved before tiles had IDs were just given one; save it so it stays stable
+            // (their pairing key and settings are stored under it).
+            if let updated = try? JSONEncoder().encode(connections), updated != data {
+                UserDefaults.standard.set(updated, forKey: recentConnectionsKey)
+            }
+            return connections
         } catch {
             print("[app] failed to load recent connections: \(error)")
             return []
@@ -684,6 +672,19 @@ final class StreamViewModel: ObservableObject {
     }
 
     private func persistRecentConnections() {
+        // A removed tile takes its pairing key, settings and limits with it. The tile being
+        // connected to is kept while it isn't saved yet.
+        var keep = Set(recentConnections.map(\.id))
+        if let target = connectionTarget?.id { keep.insert(target) }
+        if hostLimits.keys.contains(where: { !keep.contains($0) }) {
+            hostLimits = hostLimits.filter { keep.contains($0.key) }
+            persistHostLimits()
+        }
+        if hostSettings.keys.contains(where: { !keep.contains($0) }) {
+            hostSettings = hostSettings.filter { keep.contains($0.key) }
+            persistHostSettings()
+        }
+        KeychainHelper.deletePairingKeys(except: keep)
         do {
             let data = try JSONEncoder().encode(recentConnections)
             UserDefaults.standard.set(data, forKey: Self.recentConnectionsKey)
@@ -692,119 +693,96 @@ final class StreamViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Stream settings preferences
+    // MARK: - Per-host settings
 
-    private static let preferredResolutionKey = "screx_pref_resolution"
-    private static let preferredFramerateKey = "screx_pref_framerate"
-    private static let preferredCodecKey = "screx_pref_codec"
-    private static let preferredBitrateKey = "screx_pref_bitrate"
-    private static let customBitrateMbpsKey = "screx_pref_bitrate_custom_mbps"
-    private static let defaultCustomBitrateMbps: Double = 10.0
+    private static let hostSettingsKey = "screx_host_stream_settings"
+    private static let legacyPreferenceKeys = ["screx_pref_resolution", "screx_pref_framerate", "screx_pref_codec",
+                                               "screx_pref_bitrate", "screx_pref_bitrate_custom_mbps"]
 
-    /// Falls back to this device's own panel resolution — the matching listed preset
-    /// when there is one, `.native` ("This iPad") otherwise — both when no preference
-    /// has ever been stored and when a stored rawValue is unrecognized (e.g. a preset
-    /// removed in a later version). A stored `.native` is normalized to the matching
-    /// listed preset when one exists, since `.native` isn't offered in the picker then.
-    private static func loadPreferredResolution() -> StreamResolutionPreset {
-        let fallback = StreamResolutionPreset.deviceNative ?? .native
-        guard let raw = UserDefaults.standard.string(forKey: preferredResolutionKey),
-              let preset = StreamResolutionPreset(rawValue: raw) else {
-            return fallback
-        }
-        if preset == .native, let listed = StreamResolutionPreset.deviceNative {
-            return listed
-        }
-        return preset
-    }
-
-    private static func loadPreferredFramerate() -> StreamFrameratePreset {
-        guard let raw = UserDefaults.standard.string(forKey: preferredFramerateKey) else {
-            return .fps60
-        }
-        return StreamFrameratePreset(rawValue: raw) ?? .fps60
-    }
-
-    private static func loadPreferredCodec() -> StreamCodecPreset {
-        let raw = UserDefaults.standard.string(forKey: preferredCodecKey) ?? StreamCodecPreset.daemonDefault.rawValue
-        return StreamCodecPreset(rawValue: raw) ?? .daemonDefault
-    }
-
-    /// Falls back to `.medium` (8 Mbps) both when no preference has ever been stored and
-    /// when a stored rawValue is unrecognized (e.g. a preset removed in a later version).
-    private static func loadPreferredBitrate() -> StreamBitratePreset {
-        guard let raw = UserDefaults.standard.string(forKey: preferredBitrateKey) else {
-            return .medium
-        }
-        return StreamBitratePreset(rawValue: raw) ?? .medium
-    }
-
-    private static func loadCustomBitrateMbps() -> Double {
+    /// Before settings were per host there was one global set; it becomes the starting settings
+    /// of every host saved at the time.
+    private static func loadHostSettings() -> [String: HostStreamSettings] {
         let defaults = UserDefaults.standard
-        guard defaults.object(forKey: customBitrateMbpsKey) != nil else { return defaultCustomBitrateMbps }
-        let value = defaults.double(forKey: customBitrateMbpsKey)
-        return value.isFinite && value > 0 ? value : defaultCustomBitrateMbps
-    }
-
-    /// Called when the Stream Settings sheet is dismissed to persist whatever the user
-    /// picked. These persisted values are what feed the `SETTINGS` validated and sent on every
-    /// subsequent connect (see `handleDaemonCapabilities`).
-    func persistStreamSettingsPreferences() {
-        let defaults = UserDefaults.standard
-        defaults.set(preferredResolution.rawValue, forKey: Self.preferredResolutionKey)
-        defaults.set(preferredFramerate.rawValue, forKey: Self.preferredFramerateKey)
-        defaults.set(preferredCodec.rawValue, forKey: Self.preferredCodecKey)
-        defaults.set(preferredBitrate.rawValue, forKey: Self.preferredBitrateKey)
-        defaults.set(customBitrateMbps, forKey: Self.customBitrateMbpsKey)
-    }
-
-    /// The user's configured stream settings, exactly as picked in the Stream Settings
-    /// sheet — no clamping or snapping against any daemon's advertised bounds. Sent to
-    /// the daemon as-is (see `handleDaemonCapabilities`) once `DaemonCapabilities.validate`
-    /// confirms it fits; otherwise the connection is failed instead of adjusting this.
-    private var preferredStreamSettings: StreamSettings {
-        let resolution = preferredResolution.resolution
-        return StreamSettings(
-            width: resolution?.width,
-            height: resolution?.height,
-            fps: preferredFramerate.fps,
-            codecId: preferredCodec.codecId,
-            bitrateBps: resolvedBitrateBps
-        )
-    }
-
-    /// Resolves `preferredBitrate` (and, for `.custom`, `customBitrateMbps`) to a concrete
-    /// bps value to put on the wire, unmodified. Non-finite or non-positive custom input
-    /// is treated as "no preference" (nil), same as daemon default; a finite custom value
-    /// is capped only against `UInt32.max` to guard the `Double` -> `UInt32` conversion
-    /// from overflowing, never against the daemon's advertised range — that's
-    /// `DaemonCapabilities.validate`'s job, and it fails the connection rather than
-    /// snapping this value.
-    private var resolvedBitrateBps: UInt32? {
-        guard preferredBitrate == .custom else {
-            return preferredBitrate.bitrateBps
+        if let data = defaults.data(forKey: hostSettingsKey),
+           let stored = try? JSONDecoder().decode([String: HostStreamSettings].self, from: data) {
+            return stored
         }
-        guard customBitrateMbps.isFinite, customBitrateMbps > 0 else { return nil }
-        let rawBps = (customBitrateMbps * 1_000_000).rounded()
-        guard rawBps.isFinite, rawBps > 0 else { return nil }
-        let capped = min(rawBps, Double(UInt32.max))
-        return UInt32(capped)
+        var result: [String: HostStreamSettings] = [:]
+        if legacyPreferenceKeys.contains(where: { defaults.object(forKey: $0) != nil }) {
+            var legacy = HostStreamSettings.defaults
+            let raw = { (key: String) in defaults.string(forKey: key) ?? "" }
+            if let value = StreamResolutionPreset(rawValue: raw("screx_pref_resolution")) {
+                legacy.resolution = value == .native ? (StreamResolutionPreset.deviceNative ?? .native) : value
+            }
+            if let value = StreamFrameratePreset(rawValue: raw("screx_pref_framerate")) { legacy.framerate = value }
+            if let value = StreamCodecPreset(rawValue: raw("screx_pref_codec")) { legacy.codec = value }
+            if let value = StreamBitratePreset(rawValue: raw("screx_pref_bitrate")) { legacy.bitrate = value }
+            let custom = defaults.double(forKey: "screx_pref_bitrate_custom_mbps")
+            if custom.isFinite && custom > 0 { legacy.customBitrateMbps = custom }
+            for host in loadRecentConnections() { result[host.id] = legacy }
+            legacyPreferenceKeys.forEach(defaults.removeObject(forKey:))
+        }
+        if let data = try? JSONEncoder().encode(result) { defaults.set(data, forKey: hostSettingsKey) }
+        return result
     }
 
-    private func rememberRecentConnection(name: String, host: String, port: UInt16) {
-        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? host : name
-        let existing = recentConnections.first { $0.host == host && $0.port == port }
-        var updated = recentConnections.filter { $0.host != host || $0.port != port }
-        updated.insert(
-            RecentConnection(
-                host: host,
-                port: port,
-                name: displayName,
-                lastConnectedAt: Date(),
-                isPinned: existing?.isPinned ?? false
-            ),
-            at: 0
-        )
+    private func persistHostSettings() {
+        if let data = try? JSONEncoder().encode(hostSettings) {
+            UserDefaults.standard.set(data, forKey: Self.hostSettingsKey)
+        }
+    }
+
+    func settings(for tileId: String?) -> HostStreamSettings {
+        tileId.flatMap { hostSettings[$0] } ?? .defaults
+    }
+
+    /// The reason `address` can't be used for the tile, or nil if it can.
+    func addressError(_ address: String, for tileId: String) -> String? {
+        switch Self.parseAddress(address) {
+        case .failure(let error):
+            return error.message
+        case .success(let target):
+            let taken = recentConnections.contains {
+                $0.id != tileId && $0.host == target.host && $0.port == target.port
+            }
+            return taken ? "Another host already uses this address" : nil
+        }
+    }
+
+    /// Saves a host's settings and, when valid, a new address. The tile keeps its ID, so its
+    /// pairing survives the address change.
+    func updateHost(_ tileId: String, settings: HostStreamSettings, address: String) {
+        hostSettings[tileId] = settings
+        persistHostSettings()
+        guard addressError(address, for: tileId) == nil,
+              case .success(let target) = Self.parseAddress(address) else { return }
+        if let index = recentConnections.firstIndex(where: { $0.id == tileId }),
+           recentConnections[index].host != target.host || recentConnections[index].port != target.port {
+            // A tile named after its old address would keep showing it.
+            if recentConnections[index].name == recentConnections[index].endpointLabel
+                || recentConnections[index].name == recentConnections[index].host {
+                recentConnections[index].name = ""
+            }
+            recentConnections[index].host = target.host
+            recentConnections[index].port = target.port
+            persistRecentConnections()
+        }
+        if connectionTarget?.id == tileId, !isConnecting, !isConnected {
+            connectionTarget?.host = target.host
+            connectionTarget?.port = target.port
+        }
+    }
+
+    /// Saves the tile that just connected, with the daemon's hostname as its name.
+    private func rememberTarget(name: String) {
+        guard var tile = connectionTarget else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { tile.name = trimmed }
+        tile.lastConnectedAt = Date()
+        if let saved = recentConnections.first(where: { $0.id == tile.id }) { tile.isPinned = saved.isPinned }
+        connectionTarget = tile
+        var updated = recentConnections.filter { $0.id != tile.id }
+        updated.insert(tile, at: 0)
         recentConnections = Self.normalizeConnections(updated)
         persistRecentConnections()
     }
@@ -816,30 +794,32 @@ final class StreamViewModel: ObservableObject {
         )
     }
 
-    private func parseManualEndpoint(_ rawInput: String) -> (host: String, port: UInt16)? {
+    struct AddressError: Error { let message: String }
+
+    static func parseAddress(_ rawInput: String) -> Result<(host: String, port: UInt16), AddressError> {
         let input = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty else { return nil }
+        guard !input.isEmpty else { return .failure(AddressError(message: "Enter an address")) }
+        func fail(_ message: String) -> Result<(host: String, port: UInt16), AddressError> {
+            .failure(AddressError(message: message))
+        }
 
         if input.hasPrefix("[") {
             guard let closeBracket = input.firstIndex(of: "]") else {
-                applyConnectionHealth(.idle, detail: "Invalid address. Use host, host:port, or [ipv6]:port.")
-                return nil
+                return fail("Invalid address. Use host, host:port, or [ipv6]:port.")
             }
 
             let host = String(input[input.index(after: input.startIndex)..<closeBracket])
             let suffix = String(input[input.index(after: closeBracket)...])
             guard !host.isEmpty else {
-                applyConnectionHealth(.idle, detail: "Host cannot be empty.")
-                return nil
+                return fail("Host cannot be empty.")
             }
             if suffix.isEmpty {
-                return (host, defaultDaemonPort)
+                return .success((host, defaultDaemonPort))
             }
             guard suffix.hasPrefix(":"), let port = UInt16(suffix.dropFirst()), port > 0 else {
-                applyConnectionHealth(.idle, detail: "Invalid port. Use a value from 1 to 65535.")
-                return nil
+                return fail("Invalid port. Use a value from 1 to 65535.")
             }
-            return (host, port)
+            return .success((host, port))
         }
 
         let colonCount = input.reduce(into: 0) { count, char in
@@ -850,17 +830,15 @@ final class StreamViewModel: ObservableObject {
             let host = String(input[..<colon])
             let portPart = String(input[input.index(after: colon)...])
             guard !host.isEmpty else {
-                    applyConnectionHealth(.idle, detail: "Host cannot be empty.")
-                return nil
+                    return fail("Host cannot be empty.")
             }
             guard let port = UInt16(portPart), port > 0 else {
-                    applyConnectionHealth(.idle, detail: "Invalid port. Use a value from 1 to 65535.")
-                return nil
+                    return fail("Invalid port. Use a value from 1 to 65535.")
             }
-            return (host, port)
+            return .success((host, port))
         }
 
-        return (input, defaultDaemonPort)
+        return .success((input, defaultDaemonPort))
     }
 
     private func endpointHostAndPort(_ endpoint: NWEndpoint, fallbackHost: String) -> (host: String, port: UInt16) {
@@ -870,16 +848,6 @@ final class StreamViewModel: ObservableObject {
         default:
             return (fallbackHost, defaultDaemonPort)
         }
-    }
-
-    private func disconnectedPrompt() -> String {
-        recentConnections.isEmpty
-            ? "Enter a daemon host or IP[:port] to connect."
-            : "Choose a pinned or recent daemon, or enter a host or IP[:port] to connect."
-    }
-
-    var connectionHealthTitle: String {
-        connectionHealth.rawValue
     }
 
     private func applyConnectionHealth(
@@ -901,42 +869,39 @@ final class StreamViewModel: ObservableObject {
 
     private func defaultDetail(for state: ConnectionHealthState) -> String {
         switch state {
-        case .idle:
-            return disconnectedPrompt()
-        case .connecting:
-            return "Opening a connection to the daemon."
-        case .pairing:
-            return "Negotiating a secure session."
-        case .waitingForVideo:
-            return "Connected, waiting for the first video frame."
-        case .streaming:
+        case .idle, .connecting, .pairing, .waitingForVideo, .streaming:
             return ""
         case .busy:
-            return "The daemon is already in use by another client."
+            return Self.busyMessage
         case .connectionRefused:
-            return "The daemon refused the connection."
+            return Self.refusedMessage
         case .timedOut:
-            return "The daemon stopped responding in time."
+            return Self.timedOutMessage
         case .sessionStale:
-            return "The saved session looks stale. Try again or pair again."
+            return Self.staleMessage
         case .connectionError:
-            return "The connection failed unexpectedly."
+            return "Couldn’t connect. Try again."
         }
     }
+
+    private static let busyMessage = "In use by another device"
+    private static let refusedMessage = "Screx isn’t running on this computer"
+    private static let timedOutMessage = "Not responding. Check that it’s on and on the same network."
+    private static let staleMessage = "Session expired. Try again."
 
     private func applyConnectionFailure(_ message: String, transport: ConnectionTransport = .none) {
         let normalized = message.lowercased()
         if normalized.contains("busy") {
-            applyConnectionHealth(.busy, detail: "The daemon is already in use by another client.", transport: transport)
+            applyConnectionHealth(.busy, detail: Self.busyMessage, transport: transport)
         } else if normalized.contains("refused") {
-            applyConnectionHealth(.connectionRefused, detail: "The daemon refused the connection.", transport: transport)
+            applyConnectionHealth(.connectionRefused, detail: Self.refusedMessage, transport: transport)
         } else if normalized.contains("timed out") || normalized.contains("timeout") {
-            applyConnectionHealth(.timedOut, detail: "The daemon stopped responding in time.", transport: transport)
+            applyConnectionHealth(.timedOut, detail: Self.timedOutMessage, transport: transport)
         } else if normalized.contains("not recognized by daemon")
             || normalized.contains("pair again")
             || normalized.contains("stale")
         {
-            applyConnectionHealth(.sessionStale, detail: "The saved session looks stale. Try again.", transport: transport)
+            applyConnectionHealth(.sessionStale, detail: Self.staleMessage, transport: transport)
         } else {
             applyConnectionHealth(.connectionError, detail: message, transport: transport)
         }
@@ -964,7 +929,7 @@ final class StreamViewModel: ObservableObject {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.log("CAPS timeout")
-            self.failConnection(detail: "Failed to connect: the daemon did not send its capabilities.")
+            self.failConnection(detail: "Screx on this computer didn’t respond. Try again.")
         }
         capsTimeoutWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.capsTimeoutInterval, execute: workItem)
@@ -980,15 +945,19 @@ final class StreamViewModel: ObservableObject {
         capsTimeoutWorkItem?.cancel()
         capsTimeoutWorkItem = nil
         daemonCapabilities = capabilities
+        if let id = connectionTarget?.id {
+            hostLimits[id] = HostLimits(capabilities)
+            persistHostLimits()
+        }
         updateSessionHostname(capabilities.hostname)
         currentHostKey = capabilities.hostname.isEmpty
             ? (lastNetName ?? "")
             : capabilities.hostname
 
-        // Internal resolution/FPS/codec/bitrate come from Stream Settings. The display mode and
+        // Internal resolution/FPS/codec/bitrate come from the host's settings. The display mode and
         // the external output's resolution/FPS come from this host's remembered choice, falling
         // back to internal-only and the display's recommended resolution.
-        var settings = preferredStreamSettings
+        var settings = settings(for: connectionTarget?.id).streamSettings
         let remembered = displayPreferences(forHost: currentHostKey)
         settings.enabledDisplayMask = DisplayPreferenceRules.mode(
             storedMode: remembered?.mode,
@@ -1005,7 +974,8 @@ final class StreamViewModel: ObservableObject {
         let violations = capabilities.validate(settings)
         guard violations.isEmpty else {
             log("CAPS received: \(capabilities); settings \(settings) violate capabilities: \(violations)")
-            failConnection(detail: "Failed to connect: " + violations.joined(separator: "; "))
+            failConnection(detail: violations.joined(separator: ". "))
+            failureIsSettings = true
             return
         }
 
@@ -1283,18 +1253,19 @@ final class StreamViewModel: ObservableObject {
     func handleAppDidEnterBackground() {
         log("sceneDidEnterBackground")
         guard activeTransport != .none || isConnecting || pairingService != nil else { return }
-        disconnect(detail: "Screx disconnected when the app entered the background. Reconnect to continue.")
+        disconnect(detail: "Disconnected while Screx was in the background")
     }
 
     func startServices() {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
+        KeychainHelper.removeLegacyPairings()
         log("local display: \(DeviceDisplayIdentity.current.name), EDID: \(DeviceDisplayIdentity.current.edidName)")
         startTrafficMonitoring()
         syncCameraCompressionQuality()
         if !isConnected && !isConnecting {
-            applyConnectionHealth(.idle, detail: disconnectedPrompt())
+            applyConnectionHealth(.idle)
         }
     }
 
@@ -1326,80 +1297,79 @@ final class StreamViewModel: ObservableObject {
         cameraCapture.compressionQuality = networkCameraCompressionQuality
     }
 
-    func connectManual() {
+    /// Starts connecting to a typed address. Returns false with the reason in `status` when the
+    /// address is invalid.
+    /// An address that matches a saved tile connects through that tile (and its pairing);
+    /// anything else starts a new, unsaved tile.
+    @discardableResult
+    func connectManual(_ address: String) -> Bool {
         guard !isConnecting else {
             log("connectManual() ignored while already connecting")
-            return
+            return false
         }
-        guard let target = parseManualEndpoint(manualHost) else { return }
-        let endpoint = makeEndpoint(host: target.host, port: target.port)
-        lastNetEndpoint = endpoint
-        lastNetName = formatEndpointInput(host: target.host, port: target.port)
-        connectToEndpoint(endpoint, name: lastNetName ?? target.host)
+        let target: (host: String, port: UInt16)
+        switch Self.parseAddress(address) {
+        case .failure(let error):
+            status = error.message
+            return false
+        case .success(let parsed):
+            target = parsed
+        }
+        let matches = { (tile: RecentConnection) in tile.host == target.host && tile.port == target.port }
+        if let saved = recentConnections.first(where: matches) {
+            connect(to: saved)
+        } else if let pending = connectionTarget, matches(pending) {
+            connect(to: pending)
+        } else {
+            connect(to: RecentConnection(host: target.host, port: target.port, name: "", lastConnectedAt: Date()))
+        }
+        return true
     }
 
-    func connectRecent(_ recent: RecentConnection) {
+    func connectRecent(_ tile: RecentConnection) {
         guard !isConnecting else {
             log("connectRecent() ignored while already connecting")
             return
         }
-        manualHost = formatEndpointInput(host: recent.host, port: recent.port)
-        let endpoint = makeEndpoint(host: recent.host, port: recent.port)
+        connect(to: tile)
+    }
+
+    private func connect(to tile: RecentConnection) {
+        let endpoint = makeEndpoint(host: tile.host, port: tile.port)
         lastNetEndpoint = endpoint
-        lastNetName = recent.displayName
-        connectToEndpoint(endpoint, name: recent.displayName)
+        lastNetName = tile.displayName
+        connectionTarget = tile
+        failureIsSettings = false
+        connectToEndpoint(endpoint, name: tile.displayName, tile: tile)
     }
 
-    func clearRecentConnections() {
-        recentConnections = pinnedConnections
-        persistRecentConnections()
-        if !isConnected && !isConnecting {
-            applyConnectionHealth(.idle, detail: disconnectedPrompt())
+    private func removeHosts(where shouldRemove: (RecentConnection) -> Bool) {
+        recentConnections.removeAll(where: shouldRemove)
+        if let target = connectionTarget, !isConnecting, !isConnected,
+           !recentConnections.contains(where: { $0.id == target.id }) {
+            connectionTarget = nil
         }
+        persistRecentConnections()
     }
 
+    func clearUnpinnedHosts() { removeHosts { !$0.isPinned } }
+
+    func clearAllHosts() { removeHosts { _ in true } }
+
+    /// Removing a tile also forgets its pairing, so adding it back asks for the PIN.
     func deleteConnection(_ connection: RecentConnection) {
-        recentConnections.removeAll { $0.id == connection.id }
-        persistRecentConnections()
-        if lastNetEndpoint.map({ endpointHostAndPort($0, fallbackHost: lastNetName ?? "").host == connection.host && endpointHostAndPort($0, fallbackHost: lastNetName ?? "").port == connection.port }) == true {
-            lastNetEndpoint = nil
-            lastNetName = nil
-        }
-        if !isConnected && !isConnecting {
-            applyConnectionHealth(.idle, detail: disconnectedPrompt())
-        }
+        removeHosts { $0.id == connection.id }
     }
 
     func togglePinned(_ connection: RecentConnection) {
-        if !connection.isPinned && pinnedConnections.count >= Self.maxPinnedConnections {
-            if isConnected || isConnecting {
-                status = "Pinned connections are limited to 10."
-            } else {
-                applyConnectionHealth(.idle, detail: "Pinned connections are limited to 10.")
-            }
-            return
-        }
-
-        recentConnections = Self.normalizeConnections(
-            recentConnections.map { existing in
-                guard existing.id == connection.id else { return existing }
-                return RecentConnection(
-                    host: existing.host,
-                    port: existing.port,
-                    name: existing.name,
-                    lastConnectedAt: existing.lastConnectedAt,
-                    isPinned: !existing.isPinned
-                )
-            }
-        )
+        if !connection.isPinned && !canPinMore { return }
+        guard let index = recentConnections.firstIndex(where: { $0.id == connection.id }) else { return }
+        recentConnections[index].isPinned.toggle()
+        recentConnections = Self.normalizeConnections(recentConnections)
         persistRecentConnections()
-
-        if !isConnected && !isConnecting {
-            applyConnectionHealth(.idle, detail: disconnectedPrompt())
-        }
     }
 
-    func connectToEndpoint(_ endpoint: NWEndpoint, name: String) {
+    func connectToEndpoint(_ endpoint: NWEndpoint, name: String, tile: RecentConnection) {
         log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting)")
         // Detach old stream's callbacks so stale async events can't interfere
         stream?.onEvent = nil
@@ -1408,7 +1378,7 @@ final class StreamViewModel: ObservableObject {
         closeNetworkControl(gracefully: true)
         pairingService?.cancel()
 
-        applyConnectionHealth(.connecting, detail: "Connecting to \(name).", transport: .network)
+        applyConnectionHealth(.connecting, transport: .network)
         sessionDisplayName = name
         _ = trafficCounter.readAndReset()
 
@@ -1503,7 +1473,7 @@ final class StreamViewModel: ObservableObject {
             }
         }
 
-        ps.pair(host: host, port: port)
+        ps.pair(host: host, port: port, tileId: tile.tileId, deviceId: tile.deviceId, clientName: UIDevice.current.name)
     }
 
     func submitPin() {
@@ -1526,7 +1496,8 @@ final class StreamViewModel: ObservableObject {
         pendingPinCompletion = nil
         pairingService?.cancel()
         pairingService = nil
-        applyConnectionHealth(.idle, detail: "Pairing cancelled. \(disconnectedPrompt())", transport: .none)
+        connectionTarget = nil
+        applyConnectionHealth(.idle, transport: .none)
     }
 
     private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey, controlClient: NetworkControlClient) {
@@ -1573,13 +1544,10 @@ final class StreamViewModel: ObservableObject {
                 case .receiveError(let message):
                     self.applyConnectionFailure("Receive error: \(message)", transport: .none)
                 case .timedOut:
-                    self.applyConnectionHealth(.timedOut, detail: "Timed out waiting for the daemon's media stream.", transport: .none)
+                    self.applyConnectionHealth(.timedOut, detail: "The stream didn’t start. Try again.", transport: .none)
                 case .firstFrame:
-                    let target = self.endpointHostAndPort(endpoint, fallbackHost: name)
                     self.applyConnectionHealth(.streaming, transport: .network)
-                    self.manualHost = formatEndpointInput(host: target.host, port: target.port)
-                    let displayName = self.sessionDisplayName.isEmpty ? name : self.sessionDisplayName
-                    self.rememberRecentConnection(name: displayName, host: target.host, port: target.port)
+                    self.rememberTarget(name: self.sessionDisplayName)
                     self.audioPlayer.start()
                     self.startPeripheralMonitoring()
                 }
@@ -1617,7 +1585,7 @@ final class StreamViewModel: ObservableObject {
         if preservedHealth.isTerminalFailure {
             applyConnectionHealth(preservedHealth, detail: preservedStatus, transport: .none)
         } else {
-            applyConnectionHealth(.timedOut, detail: "The session ended. \(disconnectedPrompt())", transport: .none)
+            applyConnectionHealth(.timedOut, detail: "Connection lost", transport: .none)
         }
     }
 
@@ -1651,7 +1619,13 @@ final class StreamViewModel: ObservableObject {
         lastNetEndpoint = nil
         lastNetName = nil
         sessionDisplayName = ""
-        applyConnectionHealth(.idle, detail: detail ?? disconnectedPrompt(), transport: .none)
+        // A reason means the app ended the session, so show it on the host's tile.
+        if let detail {
+            applyConnectionHealth(.connectionError, detail: detail, transport: .none)
+        } else {
+            connectionTarget = nil
+            applyConnectionHealth(.idle, transport: .none)
+        }
     }
 
     var displayLayer: AVSampleBufferDisplayLayer? {
@@ -2330,19 +2304,11 @@ struct ContentView: View {
     @State private var viewSize: CGSize = .zero
     @State private var pillSize: CGSize = CGSize(width: 80, height: 44)
     @State private var toolbarMessage: String? = nil
-    @State private var showStreamSettings = false
     @State private var showDisplaySettings = false
 
     private static let btnSize: CGFloat = 32
     private static let btnSpacing: CGFloat = 6
     private static let edgeThreshold: CGFloat = 40
-    private static let connectionRowHeight: CGFloat = 44
-
-    private func connectionListHeight(for rowCount: Int) -> CGFloat {
-        guard rowCount > 0 else { return 0 }
-        let estimated = CGFloat(rowCount) * Self.connectionRowHeight
-        return min(estimated, 220)
-    }
 
     var body: some View {
         GeometryReader { geo in
@@ -2399,112 +2365,9 @@ struct ContentView: View {
                     .background(PointerLockRegion(locked: model.physicalMouseConnected).ignoresSafeArea())
                 }
 
-                // MARK: Connection screen (always visible when disconnected)
                 if !model.isConnected {
-                    VStack(alignment: .leading, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Screx")
-                                .font(.title2.weight(.bold))
-                            Text(model.connectionHealthTitle)
-                                .font(.headline)
-                            Text(model.status)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        HStack {
-                            TextField("Daemon host or IP[:port]", text: $model.manualHost)
-                                .textFieldStyle(.roundedBorder)
-                                .autocorrectionDisabled()
-                                .textInputAutocapitalization(.never)
-                                .keyboardType(.URL)
-                                .disabled(model.isConnecting)
-
-                            Button(
-                                model.connectionHealth == .pairing
-                                    ? "Pairing…"
-                                    : model.connectionHealth == .waitingForVideo && model.transport == ConnectionTransport.network.rawValue
-                                        ? "Waiting…"
-                                        : model.isConnecting
-                                            ? "Connecting…"
-                                            : "Connect"
-                            ) { model.connectManual() }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(model.isConnecting || model.manualHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        }
-
-                        Button {
-                            showStreamSettings = true
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "slider.horizontal.3")
-                                Text("Stream Settings")
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-
-                        if !model.pinnedConnections.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("Pinned")
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(.secondary)
-                                    .textCase(.uppercase)
-
-                                List {
-                                    ForEach(model.pinnedConnections) { connection in
-                                        connectionRow(connection)
-                                    }
-                                }
-                                .listStyle(.plain)
-                                .scrollDisabled(true)
-                                .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                .frame(height: connectionListHeight(for: model.pinnedConnections.count))
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }
-                        }
-
-                        if !model.unpinnedRecentConnections.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(alignment: .center) {
-                                    Text("Recent")
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(.secondary)
-                                        .textCase(.uppercase)
-                                    Spacer()
-                                    Button {
-                                        model.clearRecentConnections()
-                                    } label: {
-                                        Text("Clear All")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.white)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 4)
-                                            .background(Color.red, in: Capsule())
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-
-                                List {
-                                    ForEach(model.unpinnedRecentConnections) { connection in
-                                        connectionRow(connection)
-                                    }
-                                }
-                                .listStyle(.plain)
-                                .scrollDisabled(true)
-                                .environment(\.defaultMinListRowHeight, Self.connectionRowHeight)
-                                .frame(height: connectionListHeight(for: model.unpinnedRecentConnections.count))
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }
-                        }
-                    }
-                    .padding(24)
-                    .frame(maxWidth: 400)
-                    .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16))
-                    .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(.systemGroupedBackground).ignoresSafeArea())
-                    .transition(.opacity)
+                    ConnectionScreen(model: model)
+                        .transition(.opacity)
                 }
 
                 // MARK: Info overlay (toggleable when connected)
@@ -2643,31 +2506,6 @@ struct ContentView: View {
             }
             .padding(32)
             .interactiveDismissDisabled()
-        }
-        .sheet(isPresented: $showStreamSettings) {
-            StreamSettingsSheet(
-                resolution: model.preferredResolution,
-                framerate: model.preferredFramerate,
-                codec: model.preferredCodec,
-                bitrate: model.preferredBitrate,
-                customBitrateMbps: model.customBitrateMbps,
-                onSave: { resolution, framerate, codec, bitrate, customBitrateMbps in
-                    model.preferredResolution = resolution
-                    model.preferredFramerate = framerate
-                    model.preferredCodec = codec
-                    model.preferredBitrate = bitrate
-                    if let customBitrateMbps {
-                        model.customBitrateMbps = customBitrateMbps
-                    }
-                    model.persistStreamSettingsPreferences()
-                }
-            )
-            // The parent ContentView re-renders ~every second from chatty model
-            // traffic/health updates. Wrapping the sheet in .equatable() and
-            // comparing only the seeded initial values lets SwiftUI skip those
-            // identical parent-driven re-renders while @State-driven user edits
-            // still invalidate the view normally.
-            .equatable()
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -2901,50 +2739,6 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func connectionRow(_ connection: RecentConnection) -> some View {
-        Button {
-            model.connectRecent(connection)
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: connection.isPinned ? "star.fill" : "clock.arrow.circlepath")
-                    .font(.system(size: 14))
-                    .foregroundStyle(connection.isPinned ? .orange : Color(.systemGray3))
-                    .frame(width: 20)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(connection.displayName)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                    Text(connection.endpointLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Color(.systemGray3))
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(model.isConnecting)
-        .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-            Button(connection.isPinned ? "Unpin" : "Pin") {
-                model.togglePinned(connection)
-            }
-            .tint(.orange)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button("Delete", role: .destructive) {
-                model.deleteConnection(connection)
-            }
-        }
-    }
-
     private func defaultBarPosition(in size: CGSize) -> CGPoint {
         let halfW = pillSize.width / 2 + 4
         let halfH = pillSize.height / 2 + 4
@@ -3016,154 +2810,5 @@ struct ContentView: View {
 
     private static func saveToolbarExpanded(_ expanded: Bool) {
         UserDefaults.standard.set(expanded, forKey: expandedKey)
-    }
-}
-
-/// Stream Settings sheet content, extracted out of `ContentView` so it does not observe
-/// `StreamViewModel` at all. `ContentView` re-renders roughly every second from the
-/// model's chatty `@Published` properties (connection health, discovery, stats); while a
-/// `.pickerStyle(.menu)` menu is open, each re-render used to rebuild the menu content and
-/// snap its scroll position back to the top. This view only depends on local `@State`
-/// seeded once from the model when the sheet is presented, so it never re-renders because
-/// of model changes.
-private struct StreamSettingsSheet: View, Equatable {
-    @Environment(\.dismiss) private var dismiss
-
-    // Seeded values passed by the parent. These never change during the lifetime
-    // of the sheet, so they are used only for Equatable comparison to skip
-    // parent-driven re-renders caused by the chatty StreamViewModel.
-    private let initialResolution: StreamResolutionPreset
-    private let initialFramerate: StreamFrameratePreset
-    private let initialCodec: StreamCodecPreset
-    private let initialBitrate: StreamBitratePreset
-    private let initialCustomBitrateMbps: Double
-
-    @State private var resolution: StreamResolutionPreset
-    @State private var framerate: StreamFrameratePreset
-    @State private var codec: StreamCodecPreset
-    @State private var bitrate: StreamBitratePreset
-    @State private var customBitrateText: String
-
-    let onSave: (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
-
-    static func == (lhs: StreamSettingsSheet, rhs: StreamSettingsSheet) -> Bool {
-        lhs.initialResolution == rhs.initialResolution
-            && lhs.initialFramerate == rhs.initialFramerate
-            && lhs.initialCodec == rhs.initialCodec
-            && lhs.initialBitrate == rhs.initialBitrate
-            && lhs.initialCustomBitrateMbps == rhs.initialCustomBitrateMbps
-    }
-
-    init(
-        resolution: StreamResolutionPreset,
-        framerate: StreamFrameratePreset,
-        codec: StreamCodecPreset,
-        bitrate: StreamBitratePreset,
-        customBitrateMbps: Double,
-        onSave: @escaping (StreamResolutionPreset, StreamFrameratePreset, StreamCodecPreset, StreamBitratePreset, Double?) -> Void
-    ) {
-        self.initialResolution = resolution
-        self.initialFramerate = framerate
-        self.initialCodec = codec
-        self.initialBitrate = bitrate
-        self.initialCustomBitrateMbps = customBitrateMbps
-        _resolution = State(initialValue: resolution)
-        _framerate = State(initialValue: framerate)
-        _codec = State(initialValue: codec)
-        _bitrate = State(initialValue: bitrate)
-        _customBitrateText = State(initialValue: String(format: "%.1f", customBitrateMbps))
-        self.onSave = onSave
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("Stream Settings")
-                .font(.title2.bold())
-
-            Text("Applied on your next connection. If a setting is beyond what the daemon supports, the connection will fail instead of being adjusted automatically.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 14) {
-                streamSettingRow(title: "Resolution") {
-                    Picker("Resolution", selection: $resolution) {
-                        ForEach(StreamResolutionPreset.pickerCases) { preset in
-                            Text(preset.label).tag(preset)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                }
-
-                streamSettingRow(title: "Framerate") {
-                    Picker("Framerate", selection: $framerate) {
-                        ForEach(StreamFrameratePreset.allCases) { preset in
-                            Text(preset.label).tag(preset)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                }
-
-                streamSettingRow(title: "Codec") {
-                    Picker("Codec", selection: $codec) {
-                        ForEach(StreamCodecPreset.allCases) { preset in
-                            Text(preset.label).tag(preset)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                }
-
-                streamSettingRow(title: "Bitrate") {
-                    HStack(spacing: 8) {
-                        Picker("Bitrate", selection: $bitrate) {
-                            ForEach(StreamBitratePreset.allCases) { preset in
-                                Text(preset.label).tag(preset)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-
-                        if bitrate == .custom {
-                            HStack(spacing: 4) {
-                                TextField("Mbps", text: $customBitrateText)
-                                    .keyboardType(.decimalPad)
-                                    .multilineTextAlignment(.trailing)
-                                    .frame(width: 64)
-                                    .textFieldStyle(.roundedBorder)
-                                Text("Mbps")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-            }
-
-            Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
-                .frame(maxWidth: .infinity)
-        }
-        .padding(32)
-        .onDisappear {
-            let parsedCustomBitrate: Double? = {
-                guard bitrate == .custom, let parsed = Double(customBitrateText), parsed.isFinite, parsed > 0 else {
-                    return nil
-                }
-                return parsed
-            }()
-            onSave(resolution, framerate, codec, bitrate, parsedCustomBitrate)
-        }
-    }
-
-    @ViewBuilder
-    private func streamSettingRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        HStack {
-            Text(title)
-                .font(.subheadline.weight(.medium))
-            Spacer()
-            content()
-        }
     }
 }
