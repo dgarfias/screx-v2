@@ -77,16 +77,16 @@ Host-specific code lives in `daemon/src/platform/linux/`: EVDI virtual display (
 
 Key files:
 
-- `client/ipad/Screx/ScrexApp.swift`
-- `client/ipad/Screx/PairingService.swift`
-- `client/ipad/Screx/NetworkControlClient.swift`
-- `client/ipad/Screx/StreamClient.swift`
-- `client/ipad/Screx/Decoder.swift`
-- `client/ipad/Screx/DisplayView.swift`
-- `client/ipad/Screx/AudioPlayer.swift`
-- `client/ipad/Screx/MicCapture.swift`
-- `client/ipad/Screx/CameraCapture.swift`
-- `client/ipad/Screx/Crypto.swift`
+- `client/Screx/ScrexApp.swift`
+- `client/Screx/PairingService.swift`
+- `client/Screx/NetworkControlClient.swift`
+- `client/Screx/StreamClient.swift`
+- `client/Screx/Decoder.swift`
+- `client/Screx/DisplayView.swift`
+- `client/Screx/AudioPlayer.swift`
+- `client/Screx/MicCapture.swift`
+- `client/Screx/CameraCapture.swift`
+- `client/Screx/Crypto.swift`
 
 Responsibilities:
 
@@ -243,7 +243,7 @@ Each encrypted TCP control frame is:
 | `ciphertext+tag` | variable | AES-GCM encrypted payload |
 
 Every decrypted control payload is `type(u8) + body`. Type values live in
-`daemon/src/protocol.rs` and `client/ipad/Screx/Protocol.swift`. Integers are big-endian.
+`daemon/src/protocol.rs` and `client/Screx/Protocol.swift`. Integers are big-endian.
 
 Client -> daemon:
 

@@ -3,7 +3,7 @@
 Native iPadOS app that connects to the [Linux daemon](DAEMON_LINUX.md) over the network
 (Wi-Fi). Decodes the video/audio stream and forwards touch, keyboard, mouse, controller,
 microphone, and camera input back to the host. Peripheral controls are gated by the capabilities
-advertised by the daemon. Source lives in `client/ipad`.
+advertised by the daemon. Source lives in `client`.
 
 ## Requirements
 
@@ -23,9 +23,9 @@ CoreImage, GameController) with no additional package manager setup required.
 
 ## Build
 
-1. Open `client/ipad/Screx.xcodeproj` in Xcode.
+1. Open `client/Screx.xcodeproj` in Xcode.
 2. Select the `Screx` scheme and your iPad as the run destination.
-3. Copy `client/ipad/Config/Local.xcconfig.example` to `client/ipad/Config/Local.xcconfig` and set
+3. Copy `client/Config/Local.xcconfig.example` to `client/Config/Local.xcconfig` and set
    your team ID and bundle ID prefix (the app becomes `<prefix>.screx`). That file is git-ignored,
    so the committed project carries no personal identifiers; without it the bundle ID is
    `com.example.screx` and no team is set. Don't set the team in **Signing & Capabilities**: Xcode
@@ -117,7 +117,7 @@ If HDMI remains silent, compare with another iPad audio app and check the monito
 
 Linux monitor names identify the iPad model (abbreviated to fit EDID's 13-character ASCII limit)
 and **iPad External**. Unknown devices use **Screx**. The full mapping of released iPad models is in
-`client/ipad/Screx/DeviceDisplayIdentity.swift`. External physical size in inches is not exposed by
+`client/Screx/DeviceDisplayIdentity.swift`. External physical size in inches is not exposed by
 iPadOS and is not guessed from pixel dimensions.
 
 The info overlay is a short card: hostname, ↓/↑ transfer rates, RTT and jitter, then Disconnect.

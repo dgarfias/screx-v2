@@ -9,7 +9,7 @@ For implementation details and protocol documentation, see [`docs/ARCHITECTURE.m
 ## Components
 
 - [`docs/DAEMON_LINUX.md`](docs/DAEMON_LINUX.md): build and run the Linux daemon (`daemon/`)
-- [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md): build and run the iPad app (`client/ipad`)
+- [`docs/CLIENT_IPAD.md`](docs/CLIENT_IPAD.md): build and run the iPad app (`client`)
 
 ## Features
 

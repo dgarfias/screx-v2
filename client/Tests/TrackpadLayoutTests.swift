@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 
 // Standalone tests: no simulator or code signing required.
-// From client/ipad: swiftc Screx/TrackpadLayout.swift Tests/TrackpadLayoutTests.swift -o /tmp/screx-layout-tests && /tmp/screx-layout-tests
+// From client: swiftc Screx/TrackpadLayout.swift Tests/TrackpadLayoutTests.swift -o /tmp/screx-layout-tests && /tmp/screx-layout-tests
 @main
 struct TrackpadLayoutTests {
     static func main() {

@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-// From client/ipad:
+// From client:
 // swiftc Screx/MediaPacket.swift Screx/Crypto.swift Tests/MediaPacketTests.swift -o /tmp/screx-media-tests
 @main
 struct MediaPacketTests {
