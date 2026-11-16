@@ -301,6 +301,30 @@ fn resolve(request: RequestedSettings, config: &crate::AppConfig) -> TopologyReq
     }
 }
 
+/// One default-level line per monitor change; the per-step details are behind `-v`.
+fn log_display_status(status: &crate::display_manager::DisplayStatus) {
+    use crate::display_manager::DisplayPhase;
+    let which = match status.display {
+        DisplayId::Internal => "internal",
+        DisplayId::External => "external",
+    };
+    match (status.phase, status.settings) {
+        (DisplayPhase::Committed, Some(s)) => println!(
+            "[display] {which} monitor \"{}\" {}x{}@{}",
+            String::from_utf8_lossy(&s.monitor_name).trim_end(),
+            s.width,
+            s.height,
+            s.fps
+        ),
+        (DisplayPhase::Removed, _) => crate::log_detail!("[display] {which} monitor off"),
+        // Failures are reported once per request (one status per display carries the same text).
+        (DisplayPhase::Failed, _) if status.display == DisplayId::Internal => {
+            eprintln!("[display] switch failed: {}", status.detail)
+        }
+        _ => {}
+    }
+}
+
 pub fn run(
     socket: UdpSocket,
     shared: Arc<SharedState>,
@@ -356,6 +380,7 @@ pub fn run(
                         },
                     );
                     for status in events {
+                        log_display_status(&status);
                         shared.queue_display_status(session, status);
                     }
                 }
@@ -395,6 +420,7 @@ pub fn run(
                         }
                     }
                 }
+                log_display_status(&status);
                 shared.queue_display_status(session, status);
             }
         }

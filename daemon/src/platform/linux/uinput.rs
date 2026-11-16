@@ -247,9 +247,10 @@ impl InputBackend for LinuxInput {
         // coordinates are expressed in on the wire, which we need in order
         // to scale them onto the touchscreen's ABS range.
         if let Some(ref ts) = self.touch {
-            println!(
+            crate::log_detail!(
                 "[touch] session stream resolution {width}x{height}, tablet ABS range {}x{}",
-                ts.width, ts.height
+                ts.width,
+                ts.height
             );
         }
         self.session_size = Some((width, height));
@@ -337,19 +338,19 @@ impl InputBackend for LinuxInput {
         let m = self.mouse.as_mut().unwrap();
         match ev {
             MouseEvent::MoveRelative { dx, dy } => {
-                crate::vlog!("[mouse] recv move: dx={dx} dy={dy}");
+                crate::log_trace!("[mouse] recv move: dx={dx} dy={dy}");
                 m.move_rel(dx as i32, dy as i32);
             }
             MouseEvent::MoveAbsolute { x, y } => {
-                crate::vlog!("[mouse] recv abs move: x={x} y={y}");
+                crate::log_trace!("[mouse] recv abs move: x={x} y={y}");
                 m.move_abs(x, y);
             }
             MouseEvent::Button { btn, state } => {
-                crate::vlog!("[mouse] recv button: btn={btn} state={state}");
+                crate::log_trace!("[mouse] recv button: btn={btn} state={state}");
                 m.button(btn, state as i32);
             }
             MouseEvent::Scroll { dy } => {
-                crate::vlog!("[mouse] recv scroll: dy={dy}");
+                crate::log_trace!("[mouse] recv scroll: dy={dy}");
                 m.scroll(dy as i32);
             }
         }
@@ -440,7 +441,9 @@ impl VirtualTouchscreen {
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("[touch] virtual touchscreen created: {width}x{height} ({MAX_SLOTS} slots)");
+        crate::log_detail!(
+            "[touch] virtual touchscreen created: {width}x{height} ({MAX_SLOTS} slots)"
+        );
 
         Ok(Self {
             file,
@@ -464,7 +467,7 @@ impl VirtualTouchscreen {
         let result = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
             let runtime_dir = format!("/run/user/{uid}");
             let dbus_addr = format!("unix:path={runtime_dir}/bus");
-            println!(
+            crate::log_detail!(
                 "[touch] running gsettings as user '{user}' (uid={uid}) to map {vendor_product} -> EVDI output"
             );
             Command::new("runuser")
@@ -479,14 +482,14 @@ impl VirtualTouchscreen {
                 .arg(&output_value)
                 .output()
         } else {
-            println!("[touch] running gsettings directly (not under sudo)");
+            crate::log_detail!("[touch] running gsettings directly (not under sudo)");
             Command::new("gsettings")
                 .args(["set", &schema_path, "output", &output_value])
                 .output()
         };
         match result {
             Ok(output) if output.status.success() => {
-                println!(
+                crate::log_detail!(
                     "[touch] mapped touchscreen {vendor_product} to EVDI output via gsettings"
                 );
             }
@@ -585,7 +588,7 @@ impl Drop for VirtualTouchscreen {
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
-        println!("[touch] virtual touchscreen destroyed");
+        crate::log_detail!("[touch] virtual touchscreen destroyed");
     }
 }
 
@@ -631,7 +634,7 @@ impl VirtualMouse {
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("[mouse] virtual mouse created");
+        crate::log_detail!("[mouse] virtual mouse created");
         Ok(Self { file })
     }
 
@@ -715,7 +718,7 @@ impl Drop for VirtualMouse {
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
-        println!("[mouse] virtual mouse destroyed");
+        crate::log_detail!("[mouse] virtual mouse destroyed");
     }
 }
 
@@ -774,7 +777,7 @@ impl VirtualGamepad {
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("[gamepad] virtual gamepad {} created", slot + 1);
+        crate::log_detail!("[gamepad] virtual gamepad {} created", slot + 1);
 
         Ok(Self {
             file,
@@ -845,7 +848,7 @@ impl Drop for VirtualGamepad {
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
-        println!("[gamepad] virtual gamepad destroyed");
+        crate::log_detail!("[gamepad] virtual gamepad destroyed");
     }
 }
 
@@ -883,7 +886,7 @@ impl VirtualKeyboard {
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("[keyboard] virtual keyboard created");
+        crate::log_detail!("[keyboard] virtual keyboard created");
         Ok(Self { file })
     }
 
@@ -1042,7 +1045,7 @@ impl Drop for VirtualKeyboard {
         unsafe {
             libc::ioctl(self.file.as_raw_fd(), ioctl_ui_dev_destroy());
         }
-        println!("[keyboard] virtual keyboard destroyed");
+        crate::log_detail!("[keyboard] virtual keyboard destroyed");
     }
 }
 

@@ -116,9 +116,11 @@ extern "C" fn on_update_ready(_buf_id: c_int, user_data: *mut c_void) {
 
 extern "C" fn on_mode_changed(mode: EvdiMode, user_data: *mut c_void) {
     let state = unsafe { &mut *(user_data as *mut CallbackState) };
-    println!(
+    crate::log_detail!(
         "[capture] EVDI mode changed: {}x{}@{}Hz",
-        mode.width, mode.height, mode.refresh_rate
+        mode.width,
+        mode.height,
+        mode.refresh_rate
     );
     state.mode = Some(mode);
 }
@@ -131,11 +133,11 @@ extern "C" fn on_dpms(mode: c_int, _user_data: *mut c_void) {
         3 => "OFF",
         _ => "UNKNOWN",
     };
-    println!("[capture] DPMS state changed: {name} ({mode})");
+    crate::log_detail!("[capture] DPMS state changed: {name} ({mode})");
 }
 
 extern "C" fn on_crtc_state(state: c_int, _user_data: *mut c_void) {
-    println!("[capture] CRTC state changed: {state}");
+    crate::log_detail!("[capture] CRTC state changed: {state}");
 }
 
 pub struct EvdiDisplay {
@@ -187,7 +189,7 @@ impl DisplayBackend for EvdiDisplay {
         anyhow::ensure!(self.handle.is_none(), "EVDI capture is already running");
         let (lease, handle) = DeviceLease::open()?;
         let dev = lease.0;
-        println!("[capture] EVDI device {dev} opened");
+        crate::log_detail!("[capture] EVDI device {dev} opened");
         self.handle = Some(handle);
         self.device_lease = Some(lease);
 
@@ -197,9 +199,11 @@ impl DisplayBackend for EvdiDisplay {
         unsafe {
             evdi_connect(handle, edid.as_ptr(), edid.len() as c_uint, area_limit);
         }
-        println!(
+        crate::log_detail!(
             "[capture] EVDI connected: {}x{}@{}Hz",
-            self.width, self.height, self.fps
+            self.width,
+            self.height,
+            self.fps
         );
 
         let stride = self.width as usize * 4;
@@ -227,9 +231,10 @@ impl DisplayBackend for EvdiDisplay {
         unsafe {
             evdi_register_buffer(handle, evdi_buf);
         }
-        println!(
+        crate::log_detail!(
             "[capture] buffer registered: {}x{} stride={stride}",
-            self.width, self.height
+            self.width,
+            self.height
         );
 
         let mut cb_state = CallbackState {
@@ -266,8 +271,10 @@ impl DisplayBackend for EvdiDisplay {
         let mut stats_frames: u64 = 0;
         let start_time = Instant::now();
 
-        println!("[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms)");
-        println!(
+        crate::log_detail!(
+            "[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms)"
+        );
+        crate::log_detail!(
             "[capture] monitor: {}",
             String::from_utf8_lossy(&self.monitor_name).trim_end()
         );
@@ -280,7 +287,7 @@ impl DisplayBackend for EvdiDisplay {
         while !stop.load(Ordering::Relaxed) {
             if force_refresh.swap(false, Ordering::Relaxed) {
                 refresh_retries = 100;
-                println!("[capture] force refresh requested, will retry for ~3s");
+                crate::log_detail!("[capture] force refresh requested, will retry for ~3s");
             }
 
             if refresh_retries > 0 {
@@ -337,7 +344,7 @@ impl DisplayBackend for EvdiDisplay {
                 has_first_frame = true;
 
                 if refresh_retries > 0 {
-                    println!("[capture] force refresh: got real frame from compositor");
+                    crate::log_detail!("[capture] force refresh: got real frame from compositor");
                     refresh_retries = 0;
                 }
             } else {
@@ -351,9 +358,9 @@ impl DisplayBackend for EvdiDisplay {
                     refresh_retries -= 1;
                     if refresh_retries == 0 {
                         if has_first_frame {
-                            println!("[capture] force refresh: no new damage, sending last captured buffer");
+                            crate::log_detail!("[capture] force refresh: no new damage, sending last captured buffer");
                         } else {
-                            println!("[capture] force refresh: no compositor damage yet, sending black bootstrap frame");
+                            crate::log_detail!("[capture] force refresh: no compositor damage yet, sending black bootstrap frame");
                         }
                         let frame = CaptureFrame {
                             width: self.width,
@@ -368,16 +375,17 @@ impl DisplayBackend for EvdiDisplay {
             if stats_start.elapsed() >= Duration::from_secs(1) {
                 let fps = stats_frames as f64 / stats_start.elapsed().as_secs_f64();
                 let uptime = start_time.elapsed().as_secs();
-                println!(
+                crate::log_detail!(
                     "[capture] fps={fps:.1} resolution={}x{} uptime={uptime}s",
-                    self.width, self.height
+                    self.width,
+                    self.height
                 );
                 stats_start = Instant::now();
                 stats_frames = 0;
             }
         }
 
-        println!("[capture] stopping EVDI capture");
+        crate::log_detail!("[capture] stopping EVDI capture");
         unsafe {
             evdi_unregister_buffer(handle, 0);
             evdi_disconnect(handle);
@@ -385,7 +393,7 @@ impl DisplayBackend for EvdiDisplay {
         }
         self.handle = None;
         self.device_lease = None;
-        println!("[capture] EVDI cleanup complete");
+        crate::log_detail!("[capture] EVDI cleanup complete");
         Ok(())
     }
 
@@ -395,7 +403,7 @@ impl DisplayBackend for EvdiDisplay {
                 evdi_disconnect(handle);
                 evdi_close(handle);
             }
-            println!("[capture] EVDI detached");
+            crate::log_detail!("[capture] EVDI detached");
         }
         self.device_lease = None;
     }
@@ -547,7 +555,7 @@ fn ensure_evdi_module_loaded() -> Result<()> {
         return Ok(());
     }
 
-    println!("[capture] evdi module not loaded; trying to load it via modprobe...");
+    crate::log_detail!("[capture] evdi module not loaded; trying to load it via modprobe...");
     let status = Command::new("modprobe")
         .arg("evdi")
         .status()
@@ -558,7 +566,7 @@ fn ensure_evdi_module_loaded() -> Result<()> {
 
     for _ in 0..20 {
         if std::path::Path::new("/sys/module/evdi").exists() {
-            println!("[capture] evdi module loaded");
+            crate::log_detail!("[capture] evdi module loaded");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -571,11 +579,11 @@ fn find_or_create_device(leased: &[c_int]) -> Result<c_int> {
     ensure_evdi_module_loaded()?;
 
     if let Some(dev) = find_available_device(leased) {
-        println!("[capture] found existing EVDI device at card {dev}");
+        crate::log_detail!("[capture] found existing EVDI device at card {dev}");
         return Ok(dev);
     }
 
-    println!("[capture] no EVDI device found, creating one...");
+    crate::log_detail!("[capture] no EVDI device found, creating one...");
     let ret = unsafe { evdi_add_device() };
     if ret < 0 {
         anyhow::bail!(
@@ -591,7 +599,7 @@ fn find_or_create_device(leased: &[c_int]) -> Result<c_int> {
     for attempt in 0..40 {
         std::thread::sleep(Duration::from_millis(250));
         if let Some(dev) = find_available_device(leased) {
-            println!("[capture] EVDI device created at card {dev} (attempt {attempt})");
+            crate::log_detail!("[capture] EVDI device created at card {dev} (attempt {attempt})");
             return Ok(dev);
         }
     }

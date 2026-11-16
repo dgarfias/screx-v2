@@ -202,7 +202,7 @@ impl AdaptiveStreamState {
             || self.idr_fec_percent != old_idr_fec
             || self.pframe_fec_percent != old_pframe_fec
         {
-            println!(
+            crate::log_detail!(
                 "[stream/adapt] pli_short={} pli_long={} bitrate={} idr_fec={} p_fec={}",
                 recent_pli,
                 long_pli,
@@ -665,7 +665,7 @@ fn apply_requested_settings(shared: &Arc<SharedState>, session: u64, body: &[u8]
     };
 
     let clamped = clamp_requested_settings(shared, parsed);
-    println!("[control] received display SETTINGS: {clamped:?}");
+    crate::log_detail!("[control] received display SETTINGS: {clamped:?}");
 
     let (lock, cvar) = &*shared.pending_settings;
     let mut pending = lock.lock().unwrap();
@@ -684,9 +684,11 @@ pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
     *current = config;
     drop(current);
 
-    println!(
+    crate::log_detail!(
         "[camera] client enabled virtual webcam: {}x{} @ {}fps",
-        config.width, config.height, config.fps
+        config.width,
+        config.height,
+        config.fps
     );
 
     // Tear down existing writer if config changed or there is none
@@ -704,9 +706,11 @@ pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
         match crate::camera::CamWriter::new(config, shared.camera_exclusive_caps) {
             Ok(writer) => {
                 *shared.cam_writer.lock().unwrap() = Some(writer);
-                println!(
+                crate::log_detail!(
                     "[camera] virtual webcam ready ({}x{} @ {}fps)",
-                    config.width, config.height, config.fps
+                    config.width,
+                    config.height,
+                    config.fps
                 );
             }
             Err(e) => eprintln!("[camera] {e:#}"),
@@ -717,7 +721,7 @@ pub fn enable_camera(shared: &Arc<SharedState>, config: CameraConfig) {
 pub fn disable_camera(shared: &Arc<SharedState>) {
     let had_writer = shared.cam_writer.lock().unwrap().take().is_some();
     if had_writer {
-        println!("[camera] client disabled virtual webcam — writer removed");
+        crate::log_detail!("[camera] client disabled virtual webcam — writer removed");
     }
 }
 
@@ -769,7 +773,7 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
 
     match (device_type, state) {
         (PERIPH_MOUSE, PERIPH_ATTACHED) => {
-            println!("[periph] physical mouse attached");
+            crate::log_detail!("[periph] physical mouse attached");
         }
         (PERIPH_MOUSE, PERIPH_DETACHED) => {
             // A mouse unplugged mid-drag never sends its button-up; release
@@ -777,10 +781,10 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             if let Ok(mut backend) = shared.input_backend.lock() {
                 backend.release_mouse_buttons();
             }
-            println!("[periph] physical mouse detached, buttons released");
+            crate::log_detail!("[periph] physical mouse detached, buttons released");
         }
         (PERIPH_KEYBOARD, PERIPH_ATTACHED) => {
-            println!("[periph] physical keyboard attached");
+            crate::log_detail!("[periph] physical keyboard attached");
         }
         (PERIPH_KEYBOARD, PERIPH_DETACHED) => {
             // Same for keys: go through the keyboard worker so the release
@@ -788,7 +792,7 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             if let Some(ref worker) = *shared.keyboard_worker.lock().unwrap() {
                 worker.send(crate::input::KeyboardEvent::ReleaseAll);
             }
-            println!("[periph] physical keyboard detached, keys released");
+            crate::log_detail!("[periph] physical keyboard detached, keys released");
         }
         _ => {}
     }
@@ -832,13 +836,13 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
             if enabled && !shared.features.speaker {
                 println!("[audio] ignoring speaker enable: disabled with --no-speaker");
             } else if enabled {
-                println!("[audio] client enabled speaker passthrough");
+                crate::log_detail!("[audio] client enabled speaker passthrough");
                 // Create the sink BEFORE setting the flag so the audio capture
                 // thread never sees "enabled" without a ready PulseAudio sink.
                 ensure_virtual_sink(shared);
                 shared.audio_output_enabled.store(true, Ordering::SeqCst);
             } else {
-                println!("[audio] client disabled speaker passthrough");
+                crate::log_detail!("[audio] client disabled speaker passthrough");
                 // Clear the flag BEFORE removing the sink so the capture thread
                 // stops trying to read from the monitor source.
                 shared.audio_output_enabled.store(false, Ordering::SeqCst);
@@ -903,7 +907,7 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
             }
         }
         _ => {
-            crate::vlog!(
+            crate::log_trace!(
                 "[control] ignoring unknown or malformed message type 0x{msg_type:02x} ({} bytes)",
                 body.len()
             );
@@ -920,7 +924,7 @@ pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
     match crate::audio::create_virtual_sink() {
         Ok(id) => {
             *shared.audio_module_id.lock().unwrap() = id;
-            println!("[lifecycle] audio: virtual sink ready (module {id})");
+            crate::log_detail!("[lifecycle] audio: virtual sink ready (module {id})");
         }
         Err(e) => eprintln!("[lifecycle] audio: {e:#}"),
     }
@@ -949,7 +953,7 @@ pub fn enable_virtual_mic(shared: &Arc<SharedState>) {
     match crate::audio::create_virtual_mic() {
         Ok(writer) => {
             *shared.mic_writer.lock().unwrap() = Some(writer);
-            println!("[mic] client enabled virtual microphone");
+            crate::log_detail!("[mic] client enabled virtual microphone");
         }
         Err(e) => eprintln!("[mic] failed to create virtual microphone: {e:#}"),
     }
@@ -959,7 +963,7 @@ pub fn disable_virtual_mic(shared: &Arc<SharedState>) {
     let mut mic = shared.mic_writer.lock().unwrap();
     if let Some(ref mut writer) = *mic {
         crate::audio::remove_virtual_mic(writer);
-        println!("[mic] client disabled virtual microphone");
+        crate::log_detail!("[mic] client disabled virtual microphone");
     }
     *mic = None;
 }
@@ -985,7 +989,7 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
                         controller_id + 1
                     );
                 } else {
-                    println!(
+                    crate::log_detail!(
                         "[gamepad] controller {} attached — virtual gamepad created",
                         controller_id + 1
                     );
@@ -995,7 +999,7 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
         GPAD_DETACHED => {
             if let Ok(mut backend) = shared.input_backend.lock() {
                 backend.gamepad_detach(controller_id);
-                println!(
+                crate::log_detail!(
                     "[gamepad] controller {} detached — virtual gamepad destroyed",
                     controller_id + 1
                 );
@@ -1012,7 +1016,7 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             let hat_x = data[16] as i8;
             let hat_y = data[17] as i8;
 
-            crate::vlog!(
+            crate::log_trace!(
                 "[gamepad] recv state controller={} buttons=0x{:x} lx={} ly={} rx={} ry={} lt={} rt={} hat=({}, {})",
                 controller_id + 1,
                 buttons_mask,
@@ -1124,7 +1128,7 @@ pub fn run_client_manager(
     let mut pending_started_at: Option<Instant> = None;
     let mut session_udp_source: Option<UdpSource> = None;
 
-    println!("[client] waiting for paired handshake...");
+    crate::log_detail!("[client] waiting for paired handshake...");
 
     while !stop.load(Ordering::Relaxed) {
         // Check for new session from the pairing TCP handshake
@@ -1132,7 +1136,7 @@ pub fn run_client_manager(
             let mut rx = session_rx.lock().unwrap();
             if let Some(session) = rx.take() {
                 if !shared.is_current_network_session(session.session_id) {
-                    crate::vlog!(
+                    crate::log_trace!(
                         "[client] ignoring stale session info: session_id={} current_id={} busy={}",
                         session.session_id,
                         shared.network_session_id.load(Ordering::SeqCst),
@@ -1143,11 +1147,11 @@ pub fn run_client_manager(
                 session_serial = session_serial.wrapping_add(1);
                 let previous_expected = *shared.expected_client_ip.lock().unwrap();
                 let previous_client = *shared.client_addr.lock().unwrap();
-                println!(
+                crate::log_detail!(
                     "[client] session key established from TCP handshake ({})",
                     session.client_addr.ip(),
                 );
-                crate::vlog!(
+                crate::log_trace!(
                     "[client] session #{session_serial} key established from TCP handshake: tcp_addr={} expected_udp_ip={} previous_expected_ip={previous_expected:?} previous_udp_client={previous_client:?}",
                     session.client_addr,
                     session.client_addr.ip(),
@@ -1163,11 +1167,12 @@ pub fn run_client_manager(
                 session_udp_source = udp_source_for_local_ip(session.local_ip);
                 *shared.udp_source.lock().unwrap() = session_udp_source;
                 match session_udp_source {
-                    Some(src) => println!(
+                    Some(src) => crate::log_detail!(
                         "[client] pinning UDP source address to {} (ifindex {})",
-                        src.ip, src.ifindex
+                        src.ip,
+                        src.ifindex
                     ),
-                    None => crate::vlog!(
+                    None => crate::log_trace!(
                         "[client] no UDP source pinning (handshake local ip: {:?})",
                         session.local_ip
                     ),
@@ -1188,7 +1193,7 @@ pub fn run_client_manager(
                 if should_log_debug(recv_count) {
                     let registered_client = *shared.client_addr.lock().unwrap();
                     let expected_ip = *shared.expected_client_ip.lock().unwrap();
-                    crate::vlog!(
+                    crate::log_trace!(
                         "[client] udp recv #{recv_count}: from={addr} len={len} registered_client={registered_client:?} expected_ip={expected_ip:?} has_cipher={}",
                         local_cipher.is_some()
                     );
@@ -1199,7 +1204,7 @@ pub fn run_client_manager(
                 if len < 4 + crate::crypto::TAG_LEN {
                     short_drop_count = short_drop_count.wrapping_add(1);
                     if should_log_debug(short_drop_count) {
-                        crate::vlog!(
+                        crate::log_trace!(
                             "[client] drop short udp packet #{short_drop_count}: from={addr} len={len} min_len={}",
                             4 + crate::crypto::TAG_LEN
                         );
@@ -1221,7 +1226,7 @@ pub fn run_client_manager(
                     if !registered_ok && !expected_ok {
                         ip_mismatch_drop_count = ip_mismatch_drop_count.wrapping_add(1);
                         if should_log_debug(ip_mismatch_drop_count) {
-                            crate::vlog!(
+                            crate::log_trace!(
                                 "[client] drop udp packet #{ip_mismatch_drop_count}: from={addr} registered_client={registered_client:?} expected_ip={expected_ip:?} reason=ip_mismatch"
                             );
                         }
@@ -1229,7 +1234,7 @@ pub fn run_client_manager(
                     }
                     if let Some(ref mut r) = *client {
                         if *r != addr {
-                            crate::vlog!("[client] udp client address updated: {r} -> {addr}");
+                            crate::log_trace!("[client] udp client address updated: {r} -> {addr}");
                             *r = addr;
                         }
                     }
@@ -1244,7 +1249,7 @@ pub fn run_client_manager(
                     None => {
                         no_cipher_drop_count = no_cipher_drop_count.wrapping_add(1);
                         if should_log_debug(no_cipher_drop_count) {
-                            crate::vlog!(
+                            crate::log_trace!(
                                 "[client] drop udp packet #{no_cipher_drop_count}: from={addr} seq={seq_num} reason=no_session_cipher"
                             );
                         }
@@ -1258,7 +1263,7 @@ pub fn run_client_manager(
                     None => {
                         decrypt_fail_count = decrypt_fail_count.wrapping_add(1);
                         if should_log_debug(decrypt_fail_count) {
-                            crate::vlog!(
+                            crate::log_trace!(
                                 "[client] drop udp packet #{decrypt_fail_count}: from={addr} seq={seq_num} len={len} reason=decrypt_failed"
                             );
                         }
@@ -1268,20 +1273,20 @@ pub fn run_client_manager(
 
                 last_keepalive = Instant::now();
                 if should_log_debug(recv_count) {
-                    crate::vlog!(
+                    crate::log_trace!(
                         "[client] udp packet authenticated: from={addr} seq={seq_num} plaintext_len={}",
                         plaintext.len()
                     );
                 }
 
                 if input_seq_initialized && seq_is_stale(seq_num, input_seq_expected) {
-                    crate::vlog!(
+                    crate::log_trace!(
                         "[client] drop udp packet: from={addr} seq={seq_num} expected_seq={input_seq_expected} reason=stale_out_of_order"
                     );
                     continue;
                 }
                 if input_seq_initialized && seq_num != input_seq_expected {
-                    crate::vlog!(
+                    crate::log_trace!(
                         "[client] udp sequence gap: from={addr} seq={seq_num} expected_seq={input_seq_expected}"
                     );
                 }
@@ -1295,7 +1300,7 @@ pub fn run_client_manager(
                     *client = Some(addr);
 
                     if is_new {
-                        println!("[client] authenticated UDP client: {addr}");
+                        crate::log_detail!("[client] authenticated UDP client: {addr}");
                         *shared.expected_client_ip.lock().unwrap() = None;
                         shared.mark_network_session_active(current_session_id);
                         pending_started_at = None;
@@ -1369,7 +1374,7 @@ pub fn run_client_manager(
                 let pt_len = plaintext.len();
                 match plaintext.split_first() {
                     Some((&protocol::udp::KEEPALIVE, _)) => {
-                        crate::vlog!("[client] keepalive received: from={addr} seq={seq_num} plaintext_len={pt_len}");
+                        crate::log_trace!("[client] keepalive received: from={addr} seq={seq_num} plaintext_len={pt_len}");
                     }
                     Some((&protocol::udp::CAMERA, cam_data)) => {
                         if let Some(jpeg) = cam_reassembler.feed(cam_data) {
@@ -1389,7 +1394,7 @@ pub fn run_client_manager(
                         }
                     }
                     _ => {
-                        crate::vlog!(
+                        crate::log_trace!(
                             "[client] ignoring unknown udp payload from {addr} ({pt_len} bytes)"
                         );
                     }
@@ -1456,7 +1461,7 @@ pub fn run_client_manager(
                     ) {
                         Ok(sent) => {
                             if should_log_debug(heartbeat_count) {
-                                crate::vlog!(
+                                crate::log_trace!(
                                     "[client] heartbeat sent #{heartbeat_count}: to={addr} bytes={sent} payload_len={hb_magic_len}"
                                 );
                             }
@@ -1481,7 +1486,7 @@ pub fn run_client_manager(
         }
     }
 
-    println!("[client] manager stopped");
+    crate::log_detail!("[client] manager stopped");
     Ok(())
 }
 
@@ -1904,7 +1909,7 @@ impl UdpSender {
             let elapsed = self.stats_start.elapsed().as_secs_f64();
             let fps = self.stats_frames as f64 / elapsed;
             let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
-            crate::vlog!(
+            crate::log_trace!(
                 "[stream] fps={fps:.1} throughput={mbps:.2}Mbps chunks={data_count}+{actual_parity}fec",
             );
             self.stats_frames = 0;
@@ -1965,7 +1970,7 @@ impl UdpSender {
                 Ok(_) => anyhow::bail!("sendmmsg returned 0 packets sent"),
                 Err(error) => {
                     if sent == 0 {
-                        crate::vlog!(
+                        crate::log_trace!(
                             "[stream] sendmmsg unavailable, falling back to send_to: {error}"
                         );
                     }

@@ -75,12 +75,12 @@ impl PairingState {
 
         let count = paired_devices.len();
         if count > 0 {
-            println!("[pairing] loaded {count} paired device(s)");
+            crate::log_detail!("[pairing] loaded {count} paired device(s)");
         }
 
         let daemon_id_path = config_dir().join("daemon_id");
         let daemon_device_id = load_or_create_daemon_id(&daemon_id_path);
-        println!(
+        crate::log_detail!(
             "[pairing] daemon device id: {}",
             hex_encode(&daemon_device_id)
         );
@@ -247,7 +247,7 @@ pub fn run_pairing_server(
                     }
                 };
 
-                println!("[pairing] incoming handshake from {addr}");
+                crate::log_detail!("[pairing] incoming handshake from {addr}");
                 stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
@@ -255,7 +255,7 @@ pub fn run_pairing_server(
                     Ok(mut session) => {
                         session.session_id = reserved_session_id;
                         session.local_ip = stream.local_addr().ok().map(|a| a.ip());
-                        println!("[pairing] handshake with {addr} completed");
+                        crate::log_detail!("[pairing] handshake with {addr} completed");
                         *session_tx.lock().unwrap() = Some(session.clone());
                         let shared_control = Arc::clone(&shared);
                         let stop_control = Arc::clone(&stop);
@@ -318,10 +318,10 @@ fn handle_handshake(
         stream.read_exact(&mut header)?;
 
         if header[..MAGIC_PAIR.len()] == *MAGIC_PAIR {
-            crate::vlog!("[pairing] handshake type=PAIR from {addr}");
+            crate::log_trace!("[pairing] handshake type=PAIR from {addr}");
             return handle_pair_request(stream, addr, &header, pairing);
         } else if header[..MAGIC_HELLO.len()] == *MAGIC_HELLO {
-            crate::vlog!("[pairing] handshake type=HELLO from {addr}");
+            crate::log_trace!("[pairing] handshake type=HELLO from {addr}");
             match handle_hello_request(stream, addr, &header, pairing)? {
                 Some(session) => return Ok(session),
                 None => {
@@ -363,7 +363,7 @@ fn handle_pair_request(
     {
         let ps = pairing.lock().unwrap();
         if ps.is_paired(&device_id_hex) {
-            crate::vlog!("[pairing] device {device_id_hex} already paired; re-pairing");
+            crate::log_trace!("[pairing] device {device_id_hex} already paired; re-pairing");
         }
     }
 
@@ -397,7 +397,7 @@ fn handle_pair_request(
     response.extend_from_slice(server_public.as_ref());
     stream.write_all(&response)?;
     stream.flush()?;
-    crate::vlog!("[pairing] sent PIN challenge to {addr} for device {device_id_hex}");
+    crate::log_trace!("[pairing] sent PIN challenge to {addr} for device {device_id_hex}");
 
     // Store pending pairing for PIN verification
     {
@@ -408,7 +408,7 @@ fn handle_pair_request(
             ecdh_secret: ecdh_secret.clone(),
         });
     }
-    crate::vlog!("[pairing] waiting for PIN answer from {addr} for device {device_id_hex}");
+    crate::log_trace!("[pairing] waiting for PIN answer from {addr} for device {device_id_hex}");
 
     // Wait for PIN answer: SCREX_ANSWER(12) + encrypted_pin_data
     let mut answer_header = [0u8; 12];
@@ -430,7 +430,7 @@ fn handle_pair_request(
     nonce.copy_from_slice(&encrypted_pin[..12]);
     let mut ct = encrypted_pin[12..].to_vec();
     let plaintext = cipher.decrypt(&nonce, b"screx-pin-verify", &mut ct);
-    crate::vlog!("[pairing] received PIN answer from {addr} for device {device_id_hex}");
+    crate::log_trace!("[pairing] received PIN answer from {addr} for device {device_id_hex}");
 
     match plaintext {
         Some(pin_bytes) => {
@@ -480,7 +480,7 @@ fn handle_pair_request(
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
     stream.flush()?;
-    crate::vlog!("[pairing] sent pairing OK to {addr} for device {device_id_hex}");
+    crate::log_trace!("[pairing] sent pairing OK to {addr} for device {device_id_hex}");
 
     let session = SessionInfo {
         session_id: 0,
@@ -511,7 +511,7 @@ fn handle_hello_request(
     client_nonce.copy_from_slice(&rest[15..47]);
 
     let device_id_hex = hex_encode(&device_id);
-    println!("[pairing] hello from device {device_id_hex}");
+    crate::log_detail!("[pairing] hello from device {device_id_hex}");
 
     let ps = pairing.lock().unwrap();
     let Some(pairing_key) = ps.get_pairing_key(&device_id_hex) else {
@@ -544,7 +544,7 @@ fn handle_hello_request(
     ok_msg.extend_from_slice(&verify_hmac);
     stream.write_all(&ok_msg)?;
     stream.flush()?;
-    crate::vlog!("[pairing] sent hello OK to {addr} for device {device_id_hex}");
+    crate::log_trace!("[pairing] sent hello OK to {addr} for device {device_id_hex}");
 
     let session = SessionInfo {
         session_id: 0,
@@ -586,7 +586,7 @@ fn run_control_messages(
     let mut seq_initialized = false;
     let mut send_seq = 0u32;
 
-    println!("[control] network control channel active");
+    crate::log_detail!("[control] network control channel active");
 
     // Settings are per session: drop anything a previous connection sent but
     // never used (e.g. it disconnected before its video started), so the
@@ -651,7 +651,7 @@ fn run_control_messages(
 
             let seq_num = u32::from_be_bytes([msg_buf[0], msg_buf[1], msg_buf[2], msg_buf[3]]);
             if seq_initialized && seq_num != seq_expected {
-                crate::vlog!(
+                crate::log_trace!(
                 "[control] tcp control sequence mismatch: got={seq_num} expected={seq_expected}"
             );
             }
@@ -663,7 +663,9 @@ fn run_control_messages(
             let plaintext = match cipher.decrypt(&nonce, &aad, &mut msg_buf[4..msg_len]) {
                 Some(pt) => pt,
                 None => {
-                    crate::vlog!("[control] failed to decrypt tcp control frame seq={seq_num}");
+                    crate::log_trace!(
+                        "[control] failed to decrypt tcp control frame seq={seq_num}"
+                    );
                     continue;
                 }
             };

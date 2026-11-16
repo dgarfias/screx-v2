@@ -42,7 +42,7 @@ pub fn cleanup_stale_modules() {
                     let _ = pactl_cmd()
                         .args(["unload-module", &id.to_string()])
                         .output();
-                    println!("[audio] cleaned up stale module {id}: {}", line.trim());
+                    crate::log_detail!("[audio] cleaned up stale module {id}: {}", line.trim());
                 }
             }
         }
@@ -154,7 +154,7 @@ impl AudioBackend for PulseAudioBackend {
             .trim()
             .parse()
             .unwrap_or(0);
-        println!(
+        crate::log_detail!(
             "[audio] created virtual sink '{SINK_NAME}' (module {})",
             self.sink_module_id
         );
@@ -166,7 +166,7 @@ impl AudioBackend for PulseAudioBackend {
             let _ = pactl_cmd()
                 .args(["unload-module", &self.sink_module_id.to_string()])
                 .output();
-            println!(
+            crate::log_detail!(
                 "[audio] removed virtual sink (module {})",
                 self.sink_module_id
             );
@@ -280,7 +280,7 @@ impl Drop for PulseMicSink {
         if let Some(ref path) = self.fifo_path {
             let _ = fs::remove_file(path);
         }
-        println!("[mic] virtual mic removed");
+        crate::log_detail!("[mic] virtual mic removed");
     }
 }
 
@@ -319,7 +319,7 @@ fn try_pipe_source() -> Result<PulseMicSink> {
         .trim()
         .parse()
         .unwrap_or(0);
-    println!("[mic] module-pipe-source loaded (module {module_id})");
+    crate::log_detail!("[mic] module-pipe-source loaded (module {module_id})");
 
     let mut fifo = None;
     for attempt in 0..20 {
@@ -345,7 +345,7 @@ fn try_pipe_source() -> Result<PulseMicSink> {
         }
     }
 
-    println!("[mic] virtual mic ready via pipe-source (FIFO)");
+    crate::log_detail!("[mic] virtual mic ready via pipe-source (FIFO)");
     Ok(PulseMicSink {
         output: MicOutput::Fifo(fifo.unwrap()),
         module_ids: vec![module_id],
@@ -439,7 +439,7 @@ fn try_null_sink_mic() -> Result<PulseMicSink> {
         let flags = libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
-    println!("[mic] pacat started (pid {})", child.id());
+    crate::log_detail!("[mic] pacat started (pid {})", child.id());
 
     Ok(PulseMicSink {
         output: MicOutput::Pacat(stdin),

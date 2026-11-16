@@ -64,7 +64,9 @@ impl CameraBackend for V4l2Camera {
             fd if fd < 0 => anyhow::bail!("v4l2 setup failed (code {fd})"),
             fd => {
                 let file = unsafe { File::from_raw_fd(fd) };
-                println!("[camera] writer ready: {w}x{h} @ {fps}fps MJPEG -> {VIDEO_DEVICE}");
+                crate::log_detail!(
+                    "[camera] writer ready: {w}x{h} @ {fps}fps MJPEG -> {VIDEO_DEVICE}"
+                );
                 self.file = Some(file);
                 Ok(())
             }
@@ -93,7 +95,7 @@ fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
     } else {
         "exclusive_caps=0"
     };
-    println!("[camera] loading v4l2loopback with {exclusive_caps_arg}");
+    crate::log_detail!("[camera] loading v4l2loopback with {exclusive_caps_arg}");
 
     let status = Command::new("modprobe")
         .args([
@@ -121,6 +123,6 @@ fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
         anyhow::bail!("{VIDEO_DEVICE} did not appear after modprobe");
     }
 
-    println!("[camera] v4l2loopback loaded, {VIDEO_DEVICE} ready");
+    crate::log_detail!("[camera] v4l2loopback loaded, {VIDEO_DEVICE} ready");
     Ok(())
 }

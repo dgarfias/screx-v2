@@ -263,13 +263,15 @@ impl Encoder {
                 };
                 {
                     if let Ok(enc) = HwEncoder::new_vaapi(&config) {
-                        println!("[encode] auto-selected: vaapi ({codec_name})");
+                        crate::log_detail!("[encode] auto-selected: vaapi ({codec_name})");
                         ActiveEncoder::HwAccel(enc)
                     } else if let Ok(enc) = HwEncoder::new_nvenc(&config) {
-                        println!("[encode] auto-selected: nvenc ({codec_name})");
+                        crate::log_detail!("[encode] auto-selected: nvenc ({codec_name})");
                         ActiveEncoder::HwAccel(enc)
                     } else {
-                        println!("[encode] no hw encoder available, using software ({codec_name})");
+                        crate::log_detail!(
+                            "[encode] no hw encoder available, using software ({codec_name})"
+                        );
                         let enc = SwEncoder::new(&config)?;
                         ActiveEncoder::Software(enc)
                     }
@@ -297,9 +299,12 @@ impl Encoder {
         force_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
         if frame.width != self.config.width || frame.height != self.config.height {
-            println!(
+            crate::log_detail!(
                 "[encode] resolution change: {}x{} -> {}x{}",
-                self.config.width, self.config.height, frame.width, frame.height
+                self.config.width,
+                self.config.height,
+                frame.width,
+                frame.height
             );
             self.config.width = frame.width.max(1);
             self.config.height = frame.height.max(1);
@@ -355,7 +360,7 @@ impl Encoder {
             let elapsed = self.stats_start.elapsed().as_secs_f64();
             let fps = self.stats_encoded as f64 / elapsed;
             let mbps = (self.stats_bytes as f64 * 8.0 / elapsed) / 1_000_000.0;
-            crate::vlog!(
+            crate::log_trace!(
                 "[encode] fps={fps:.1} stream_mbps={mbps:.2} idr={}/{} bitrate={}",
                 self.stats_idr_count,
                 self.stats_encoded,
@@ -620,7 +625,7 @@ impl HwEncoder {
         if config.codec == VideoCodec::H265 {
             match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
                 Ok(enc) => {
-                    println!("[encode] VA-API HEVC using bitrate-based rate control");
+                    crate::log_detail!("[encode] VA-API HEVC using bitrate-based rate control");
                     Ok(enc)
                 }
                 Err(primary_err) => {
@@ -791,7 +796,7 @@ impl HwEncoder {
 
                         let qp = std::ffi::CString::new("qp").unwrap();
                         ffi::av_opt_set_int((*ctx).priv_data, qp.as_ptr(), qp_value, 0);
-                        println!(
+                        crate::log_detail!(
                             "[encode] VA-API HEVC using CQP mode (qp={qp_value}) to support Intel drivers"
                         );
                     }
@@ -878,7 +883,7 @@ impl HwEncoder {
                 VideoCodec::H265 => "H.265",
             };
 
-            println!(
+            crate::log_detail!(
                 "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={} intra_refresh={}",
                 width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
@@ -1218,7 +1223,7 @@ impl SwEncoder {
                 bail!("failed to allocate packet");
             }
 
-            println!(
+            crate::log_detail!(
                 "[encode] software encoder ({enc_name}): {}x{}@{} bitrate={} gop={} intra_refresh={}",
                 width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );

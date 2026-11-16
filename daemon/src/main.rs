@@ -94,9 +94,9 @@ struct Cli {
     #[arg(short, long, default_value = "h264")]
     codec: String,
 
-    /// Enable detailed diagnostic logs
-    #[arg(short, long, default_value_t = false)]
-    verbose: bool,
+    /// More logging: -v for connection, device and pipeline details; -vv adds per-packet diagnostics
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Disable v4l2loopback exclusive capture caps for better app compatibility
     #[arg(long, default_value_t = false)]
@@ -174,7 +174,7 @@ impl AppConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    logging::set_verbose(cli.verbose);
+    logging::set_verbosity(cli.verbose);
 
     match &cli.command {
         Some(Commands::Unpair { device_id }) => {
@@ -184,10 +184,7 @@ async fn main() -> Result<()> {
     }
 
     let config = AppConfig::from_cli(&cli);
-    println!("screx v2 config: {config:?}");
-    if cli.verbose {
-        println!("[main] verbose logging enabled");
-    }
+    crate::log_detail!("screx v2 config: {config:?}");
 
     // One-time startup probe, just for an operator-visible log line — the
     // real per-connection `CAPS` message re-probes fresh every time (see
@@ -201,7 +198,7 @@ async fn main() -> Result<()> {
         config.encoder_backend,
         config.features,
     );
-    println!("[main] daemon capabilities: {startup_capabilities:?}");
+    crate::log_detail!("[main] daemon capabilities: {startup_capabilities:?}");
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -238,7 +235,7 @@ async fn main() -> Result<()> {
         eprintln!("[main] failed to tune UDP socket: {e:#}");
     }
 
-    println!("[main] UDP socket bound on port {}", config.stream_port);
+    crate::log_detail!("[main] UDP socket bound on port {}", config.stream_port);
 
     // Pairing state + TCP handshake server
     let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
@@ -273,7 +270,7 @@ async fn main() -> Result<()> {
     {
         let shared_c = Arc::clone(&shared);
         *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
-            println!("[lifecycle] client connected");
+            crate::log_detail!("[lifecycle] client connected");
             // Peripherals (camera, mic, speaker) are now created on-demand
             // when the client sends the corresponding enable signal (CAMCFG,
             // MICCFG, SPKR). Nothing to create eagerly here.

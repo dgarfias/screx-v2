@@ -100,7 +100,7 @@ sudo ./target/release/screx unpair --all
 | `-p, --port` | `9000` | UDP/TCP streaming port |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
-| `-v, --verbose` | off | Detailed diagnostic logs |
+| `-v, --verbose` | off | More logging. Default output covers startup, pairing, connects/disconnects, monitor changes, warnings and errors. `-v` adds connection, device and pipeline details plus per-second capture stats; `-vv` adds per-packet diagnostics |
 | `--no-camera-exclusive-caps` | off | Disable v4l2loopback exclusive capture caps for better app compatibility |
 | `--no-speaker` | off | Disable forwarding host audio to the iPad |
 | `--no-mic` | off | Disable the virtual microphone fed by the iPad mic |

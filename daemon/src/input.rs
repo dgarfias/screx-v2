@@ -144,7 +144,7 @@ impl KeyboardWorker {
     /// Send an event to the keyboard worker. Non-blocking; drops on full/disconnect.
     pub fn send(&self, event: KeyboardEvent) {
         if self.sender.try_send(event).is_err() {
-            crate::vlog!("[keyboard] worker event dropped (backpressure or stopped)");
+            crate::log_trace!("[keyboard] worker event dropped (backpressure or stopped)");
         }
     }
 }

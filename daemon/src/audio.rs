@@ -234,7 +234,7 @@ pub fn run_audio_capture(
             }
         };
 
-        println!("[audio] starting platform audio loopback capture");
+        crate::log_detail!("[audio] starting platform audio loopback capture");
         let loopback_stop = Arc::new(AtomicBool::new(false));
         let watchdog_done = Arc::new(AtomicBool::new(false));
 
@@ -265,14 +265,14 @@ pub fn run_audio_capture(
             eprintln!("[audio] loopback error: {e:#}");
         }
 
-        println!("[audio] capture session stopped, waiting for next client...");
+        crate::log_detail!("[audio] capture session stopped, waiting for next client...");
         if !shared.audio_output_enabled.load(Ordering::SeqCst) {
             continue;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    println!("[audio] capture thread exiting");
+    crate::log_detail!("[audio] capture thread exiting");
     Ok(())
 }
 
@@ -302,7 +302,7 @@ impl MicWriter {
                 return Ok(()); // late or duplicate packet
             }
             if gap > 0 && gap <= MIC_MAX_CONCEALED_PACKETS {
-                crate::vlog!("[mic] concealing {gap} lost packet(s) before seq {seq}");
+                crate::log_trace!("[mic] concealing {gap} lost packet(s) before seq {seq}");
                 for _ in 0..gap {
                     self.decode_into_sink(&[])?;
                 }
