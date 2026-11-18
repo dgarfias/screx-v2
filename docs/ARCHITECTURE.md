@@ -17,8 +17,8 @@ See [DAEMON_LINUX.md](DAEMON_LINUX.md) and [CLIENT_IPAD.md](CLIENT_IPAD.md) for 
 
 All traffic goes over the network (Wi-Fi):
 
-- UDP for media
-- encrypted TCP for pairing and control
+- one QUIC connection over UDP, with separate reliable control and input streams
+- unreliable QUIC datagrams for media
 
 ## High-Level Data Flow
 
@@ -51,7 +51,10 @@ Key files:
 - `daemon/src/pipeline.rs` — independently owned capture/encode/send workers
 - `daemon/src/encode.rs`
 - `daemon/src/stream_server.rs`
-- `daemon/src/pairing.rs`
+- `daemon/src/quic_transport.rs` — QUIC/TLS, authentication, session admission, streams and datagrams
+- `daemon/src/cpace.rs` — CPace and the eight-digit PIN
+- `daemon/src/pairing.rs` — `screx unpair`
+- `daemon/src/media_sequence.rs` — media frame IDs and generations
 - `daemon/src/audio.rs`
 - `daemon/src/camera.rs`
 - `daemon/src/input.rs`
@@ -62,7 +65,7 @@ Responsibilities:
 - capture frames from it
 - encode H.264/H.265
 - stream media over the network
-- manage pairing and session keys
+- manage pairing identities and authenticated QUIC sessions
 - parse touch/keyboard/mouse/controller input messages
 - expose optional virtual microphone, webcam, speaker, and gamepad devices
 
@@ -70,7 +73,7 @@ Responsibilities:
 
 Host-specific code lives in `daemon/src/platform/linux/`: EVDI virtual display (`evdi.rs`),
 `uinput` virtual input devices (`uinput.rs`), ALSA sound cards (`screx_snd.rs` and `kernel/screx_snd/`), the
-`v4l2loopback` webcam (`v4l2.rs`), and UDP socket tuning (`net.rs`). See
+`v4l2loopback` webcam (`v4l2.rs`). QUIC owns network sockets. See
 [DAEMON_LINUX.md](DAEMON_LINUX.md) for the dependencies each backend needs.
 
 ### iPad app
@@ -86,7 +89,8 @@ Key files:
 - `client/Screx/AudioPlayer.swift`
 - `client/Screx/MicCapture.swift`
 - `client/Screx/CameraCapture.swift`
-- `client/Screx/Crypto.swift`
+- `client/Screx/QUICSession.swift` — QUIC connection, streams, datagrams and certificate pinning
+- `client/Screx/CPace.swift`, `CPacePrimitives.c` — CPace, using the adapter in `shared/`
 - `client/Screx/MediaPacket.swift` — media header parsing and per-display stream timelines
 - `client/Screx/DisplayTopology.swift` — display modes, routing state, per-host preferences
 - `client/Screx/ExternalDisplay.swift` — external-display scene and video window
@@ -111,100 +115,117 @@ Responsibilities:
 
 ## Transport Model
 
-### Network mode
+Everything travels over one QUIC v1 connection (TLS 1.3, ALPN `screx-quic-1`) on UDP port 9000.
+The daemon binds `[::]`, which also accepts IPv4. There is no TCP listener; firewalls must allow
+UDP 9000.
 
-- Pairing and control use a persistent TCP connection.
-- Media uses UDP.
-- Video and audio are sent daemon -> client over UDP.
-- Mic and camera data are sent client -> daemon over UDP.
-- Touch/keyboard/mouse/controller/peripheral state travel over encrypted TCP control.
+- The first client-initiated bidirectional stream carries authentication, then control.
+- The second carries input, so input never waits behind control messages.
+- RFC 9221 datagrams carry video, speaker audio, microphone, camera and audio reports. They are
+  never retransmitted.
+- QUIC owns encryption, replay protection, retransmission of stream data, flow and congestion
+  control, path validation and liveness. The daemon sends a keep-alive every 2 s and both sides
+  close the connection after 15 s without traffic. Zero-RTT is disabled.
+- A stream is ordered, so a lost packet still delays later messages **on the same stream**.
+- QUIC's congestion controller is not a video rate controller; per-display encoder adaptation
+  stays PLI-driven.
 
-Why:
+Network.framework opens an unused bootstrap stream before the control and input streams. The
+daemon allows three bidirectional streams, keeps that placeholder open, and authenticates the
+first stream that sends HELLO.
 
-- UDP avoids head-of-line blocking for media.
-- TCP control gives reliable ordering for input/state messages.
+Nothing is dispatched before authentication finishes: no devices start, no input is injected and
+no datagrams are accepted. Afterwards the daemon rejects control messages on the input stream and
+input messages on the control stream.
 
 ## Connection Lifecycle
 
-### Network session
+1. The client opens the QUIC connection. QUIC setup fails after 8 seconds if the daemon can't be
+   reached.
+2. Authentication on the first stream: eight-digit CPace pairing for a new device, or a signature
+   with the saved identity for a known one (see Pairing Protocol).
+3. The daemon answers `READY` if the session is free, or `BUSY` if another device holds it. A
+   device reconnecting while its own earlier session is still open (app restarted, network
+   changed) replaces that session instead of waiting for it to time out. The iPad gives up after
+   8 seconds without `READY` or `BUSY`.
+4. After `READY`, the client opens the input stream and the datagram flow, and the daemon sends
+   `CAPS` on the control stream.
+5. The first decoded video frame moves the client into the streaming state.
 
-1. Client opens TCP to daemon.
-2. Pairing or reconnect handshake runs.
-3. Session key is established.
-4. TCP control channel stays open.
-5. Client opens UDP path and starts sending encrypted register packets.
-6. Daemon authenticates first UDP packets and starts media.
-7. First decoded frame on the client moves session into streaming state.
+The daemon runs each connection in its own task. Only one authentication runs at a time, so at
+most one PIN is ever shown, and the daemon admits at most one new connection per second in total,
+regardless of source address. Rotating addresses therefore can't turn the eight-digit PIN into
+an unlimited guessing oracle.
 
 ## Pairing Protocol
 
-### New device flow
+### Identities
 
-1. Client sends `SCREX_PAIR` + device ID + X25519 public key + name length (1 byte) + client name
-   (UTF-8, up to 63 bytes; a label shown in the daemon's logs and `screx unpair` list)
-2. daemon generates its own X25519 keypair and a 6-digit PIN
-3. daemon sends `SCREX_PIN` + server public key
-4. User enters the PIN in the client
-5. Client sends `SCREX_ANSWER` + encrypted PIN
-6. daemon verifies PIN
-7. daemon derives and stores a pairing key
-8. both sides derive a session key
-9. daemon sends `SCREX_OK` + daemon device ID + session salt + HMAC
+- The daemon keeps a self-signed TLS identity in `quic-identity-v1.json` and the public signing
+  keys of paired devices in `quic-pairings-v1.json`, both in its config directory
+  (`/root/.config/screx` when run as root).
+- Each iPad host tile has its own device ID, Ed25519 signing key and the SHA-256 fingerprint of
+  the host's TLS certificate, stored in the Keychain.
 
-### Reconnect flow
+This is server-certificate pinning plus application-level client authentication, not TLS client
+certificates. If the daemon's identity changes, remove the host tile and add it again to pair with
+the new identity. `screx unpair <id>` removes one paired device and `screx unpair --all` removes
+all of them.
 
-1. Client sends `SCREX_HELLO` + device ID + client nonce (only if it has a key for this host
-   tile; otherwise it starts with the new device flow)
-2. daemon loads the pairing key for that device, or replies `SCREX_REJECT` if it doesn't know it
-3. both sides derive a fresh session key using nonces
-4. daemon sends `SCREX_OK` + daemon device ID + server nonce + HMAC
-5. client verifies the HMAC with the key stored for the host tile
+### New devices
 
-If the daemon rejects the HELLO, or the client's key doesn't verify, the client runs the new device
-flow on the same connection.
+Pairing uses **CPACE-X25519-SHA512** (`draft-irtf-cfrg-cpace-21`, initiator/responder
+transcript). The daemon prints an eight-digit PIN shown as `1234-5678`; leading zeroes count.
+CPace's context binds:
 
-On the iPad, every host tile has its own random 16-byte device ID and its own pairing key, stored in
-the Keychain under the tile. Two tiles that reach the same computer (for example through two IP
-addresses) are two separate pairings, and removing a tile deletes its key, so adding it back asks
-for the PIN again. Editing a tile's address keeps its ID and key. The iPad's own IP address plays no
-part in pairing.
+1. the protocol identifier
+2. the client and server device IDs
+3. the client's public Ed25519 signing key
+4. the SHA-256 fingerprint of the server's actual TLS certificate
+5. this connection's TLS exporter (`EXPORTER-screx-quic-pair-v1`, 32 bytes)
 
-### Busy rejection
+The daemon supplies a fresh random 32-byte session ID. Both sides confirm the result with
+role-separated HMAC-SHA256 tags before storing anything, so an unauthenticated TLS connection is
+never enough to trust a certificate or use the host. Each PIN allows one attempt and expires after
+120 seconds; a wrong PIN or failed confirmation closes the connection, and the next attempt gets a
+new PIN.
 
-If a session is already active, the daemon replies with `SCREX_BUSY`.
+The Elligator2 map CPace needs comes from Monocypher 4.0.2 through a small adapter in `shared/`,
+compiled into both the daemon and the iPad app.
+
+### Known devices
+
+A reconnect requires the pinned server certificate and an Ed25519 signature over the fresh session
+ID and the same binding, which includes the TLS exporter. A captured proof can't authenticate
+another connection.
+
+### Authentication frames
+
+Frames use the stream framing below (`length(u32 BE) + body`).
+
+| Type | Direction | Body after type |
+|---|---|---|
+| `e0` HELLO | client → daemon | device ID (16), client public key (32), UTF-8 name (1..63) |
+| `e1` CHALLENGE | daemon → client | known (1), server ID (16), certificate hash (32), random session ID (32), daemon PAKE share (32, new devices only) |
+| `e2` PROOF | client → daemon | Ed25519 signature (64), known devices only |
+| `e3` PAIR | client → daemon | client PAKE share (32), client confirmation (32) |
+| `e4` PAIRED | daemon → client | daemon confirmation (32) |
+| `e5` READY | daemon → client | empty; the session is this client's |
+| `e6` BUSY | daemon → client | empty; another device holds the session, and the client closes |
+
+After `READY` the first stream carries control messages.
 
 ## Encryption Model
 
-### Algorithms
-
-- X25519 for key agreement
-- HKDF-SHA256 for key derivation
-- AES-256-GCM for transport encryption and authentication
-- HMAC-SHA256 for handshake verification
-
-### UDP media
-
-- header is plaintext
-- payload is AES-GCM encrypted
-- header is authenticated as AAD
-
-### TCP control
-
-- control payloads are AES-GCM encrypted
-- per-frame sequence number is authenticated as AAD
-
-### Nonce directions
-
-- daemon -> client UDP uses `nonce_server`
-- client -> daemon UDP uses `nonce_client`
-- client -> daemon TCP control uses `nonce_control_client`
-- daemon -> client TCP control uses `nonce_control_server`
+QUIC's TLS 1.3 encrypts and authenticates every stream and datagram; the application adds no
+cipher, tag or nonce of its own. Frame IDs and generations are decoder timelines, not nonces.
 
 ## Protocol Details
 
-## Network Media Transport (UDP)
+### Network Media Transport (QUIC datagrams)
 
-Each UDP packet starts with a 22-byte header (followed by encrypted payload and a 16-byte tag):
+Each server media datagram contains a 22-byte header followed by its payload,
+inside QUIC's authenticated encryption:
 
 | Field | Size | Description |
 |---|---|---|
@@ -212,7 +233,7 @@ Each UDP packet starts with a 22-byte header (followed by encrypted payload and 
 | `chunk_idx` | u16 BE | Chunk number within frame |
 | `total_data` | u16 BE | Number of data chunks |
 | `total_parity` | u16 BE | Number of parity chunks |
-| `flags` | u8 | Bit 0 = IDR, Bit 1 = audio, Bit 4 = external video, Bit 7 = heartbeat |
+| `flags` | u8 | Bit 0 = IDR, Bit 1 = audio, Bit 4 = external video |
 | `codec_id` | u8 | Video: `0x00` = H.264, `0x01` = H.265. Audio: unused (`0x00`); audio is always Opus |
 | `payload_len` | u16 BE | Payload size |
 | `timestamp_ms` | u32 BE | Daemon timestamp |
@@ -220,17 +241,16 @@ Each UDP packet starts with a 22-byte header (followed by encrypted payload and 
 
 Notes:
 
-- all 22 header bytes are authenticated as AAD, including heartbeats. The server nonce is
-  `0x00 + frame_id(u32) + chunk_idx(u16) + flags(u8) + generation(u32)`, all big-endian
-- each video sender, audio sender, and heartbeat sender reserves a process-unique generation.
-  Frame IDs are reserved before encryption (even if transmission fails), and never wrap.
+- all header and payload bytes are protected by QUIC's authenticated encryption
+- each video and audio sender reserves a process-unique generation.
+  Frame IDs are reserved before transmission (even if transmission fails), and never wrap.
   Recreating a sender always allocates a fresh generation; namespace exhaustion fails closed
 - internal video uses display ID 0 and external video uses display ID 1 (flag `0x10`). Each
   has independent FEC, frame completion, PLI throttling, codec parameters, and decoder state.
   Only authenticated newer generations may reset those states; retired generations are ignored
-- heartbeats use flags `0x80`, zero data/parity counts, and an incrementing frame ID, not a
-  fixed frame ID/nonce. Audio and heartbeats never set the external-video flag
-- video is split into chunks of 1400 bytes; every data chunk except a frame's last is full-size,
+- video is split into chunks of 1000 bytes, so a full datagram is 1022 bytes; this fits QUIC's
+  1200-byte minimum path size with room for its overhead, and both peers check at connection
+  setup that the negotiated datagram limit can carry it. Every data chunk except a frame's last is full-size,
   and parity chunks are always full-size (receivers zero-pad short chunks before FEC recovery)
 - optional Reed-Solomon parity is added for video
 - a frame that fits in 255 data+parity chunks is one Reed-Solomon block. Larger frames (usually
@@ -239,26 +259,27 @@ Notes:
   `b`'s parity protects only block `b`'s data
 - frames larger than 48 chunks are paced: sent in batches of 8 spread across half the frame
   interval rather than as one burst
+- the daemon's QUIC datagram send buffer is 64 KB. When it fills, video waits (backpressure)
+  instead of dropping chunks already queued, and part of the buffer is kept free for audio
 - audio goes without FEC; it carries redundant copies of earlier packets instead. Speaker audio is
   one datagram per frame_id (always `chunk_idx` 0, `total_data` 1), each holding the 10 ms Opus
   packet with that frame_id plus copies of earlier ones: 48 kHz stereo Opus at 96, 128 (default),
   192 or 256 kbps, selected in the host's settings. See "Speaker audio" below
-- client-to-daemon UDP packets are `seq(u32 BE) + encrypted payload`; the payload is
-  `type(u8) + body`, see "Client -> daemon UDP payloads" below
+- client-to-daemon datagrams are `type(u8) + body`
 - the iPad retains incomplete video assemblies for 50 ms, then reconstructs recoverable frames
   from parity or discards them and requests recovery
 
-### Network Control Transport (TCP)
+### Network Control and Input Transport (QUIC streams)
 
-Each encrypted TCP control frame is:
+Each stream message is:
 
 | Field | Size | Description |
 |---|---|---|
 | `length` | u32 BE | Frame body length |
-| `seq` | u32 BE | Control sequence number |
-| `ciphertext+tag` | variable | AES-GCM encrypted payload |
+| `payload` | variable | `type(u8) + body`, protected by QUIC |
 
-Every decrypted control payload is `type(u8) + body`. Type values live in
+Bodies are 1..65536 bytes. Messages `0x10` through `0x15` travel on the input stream, all other
+messages on control. Type values live in
 `daemon/src/protocol.rs` and `client/Screx/Protocol.swift`. Integers are big-endian.
 
 Client -> daemon:
@@ -293,14 +314,12 @@ The daemon ignores unknown types and wrong-length bodies.
 `PLI` requests an IDR and raises a capture-refresh signal for only the named display and current
 generation. Stale generations and invalid display IDs are ignored. This makes the capture loop
 obtain or resend a frame so a static desktop can still answer the recovery request. Adaptive
-bitrate/FEC tuning is independent per display. The 22-byte header and display-scoped PLI are a
-breaking protocol change: daemon and iPad client must be updated together.
+bitrate/FEC tuning is independent per display.
 
-### Client -> daemon UDP payloads
+### Client -> daemon QUIC datagram payloads
 
 | Type | Name | Body |
 |---|---|---|
-| `0x01` | KEEPALIVE | empty; the first one tells the daemon where to send media |
 | `0x02` | CAMERA | `frame_id(u32) + chunk_idx(u16) + total_chunks(u16) + jpeg_chunk` |
 | `0x03` | MIC | `seq(u32) + opus_packet` |
 | `0x04` | AUDIO_REPORT | speaker playout report, see "Speaker audio" below |
@@ -360,8 +379,8 @@ External FPS is independent, inheriting internal FPS only when omitted. Codec an
 target are shared settings; the target applies to **each** enabled video pipeline. Each pipeline
 adapts bitrate/FEC independently from that target. Both
 resolutions are independently clamped against the same advertised limits. Each width/height
-pair must either be specified together or uses daemon defaults. Masks outside 1–3, zero
-revisions, and legacy 10-/19-/20-byte bodies are rejected. The daemon's maximum FPS applies per output.
+pair must either be specified together or uses daemon defaults. Other body lengths, masks outside
+1–3 and zero revisions are rejected. The daemon's maximum FPS applies per output.
 Monitor names must be nonempty printable ASCII, without single quotes or backslashes.
 Panel dimensions are in mm; both must be in 50–1000 mm or the size is treated as unknown.
 Audio bitrate controls speaker Opus encoding only; microphone encoding is unchanged.
@@ -374,7 +393,7 @@ ignores revisions older than or equal to the latest request. Settings, presentat
 outbound status messages are all tagged with their owning network session internally, so delayed
 work from a disconnected client cannot affect its replacement.
 
-Each enabled output has its own capture, encoder, UDP sender, recovery controls, and stop/join
+Each enabled output has its own capture, encoder, video sender, recovery controls, and stop/join
 lifecycle. Adding/removing another output does not restart an unchanged pipeline. New or
 reconfigured outputs start as candidates alongside retained committed monitors. The daemon reports
 `streaming` after successfully sending a candidate keyframe, but retains the old topology until
@@ -531,7 +550,7 @@ controllers) stay disabled in the iPad UI until `CAPS` arrives.
 
 ### Camera forwarding
 
-Camera JPEGs are split into UDP `CAMERA` payloads (see above). The daemon reassembles each JPEG
+Camera JPEGs are split into 1000-byte `CAMERA` datagrams (see above). The daemon reassembles each JPEG
 and writes it to the virtual webcam.
 
 ### Speaker audio
@@ -539,7 +558,7 @@ and writes it to the virtual webcam.
 Nothing here depends on the network type: the same mechanisms settle near the minimum delay on a
 LAN and grow toward smoothness on a worse remote link, driven only by what the iPad measures.
 
-Payload of a speaker datagram (inside the encryption), integers big-endian:
+Payload of a speaker datagram, integers big-endian:
 
 | Field | Size | Description |
 |---|---|---|
@@ -549,8 +568,8 @@ Payload of a speaker datagram (inside the encryption), integers big-endian:
 The first entry has distance 0 and is the packet named by the header's `frame_id` and
 `timestamp_ms`. Every further entry is a copy of packet `frame_id - distance`, whose timestamp is
 `timestamp_ms - 10 * distance`. Distances strictly increase and are at most 8. The daemon only
-includes copies of packets it actually sent in the current speaker-card session, and drops copies
-that would not fit in one datagram. Speaker frame IDs are consecutive within a generation, so a
+includes copies of packets it actually sent in the current speaker-card session (each one starts a new
+generation), and drops copies that would not fit in one datagram. Speaker frame IDs are consecutive within a generation, so a
 missing ID is a lost packet. The redundancy level follows the iPad's reports: distance 1 always,
 plus distance 3 for 10 s after the iPad reports a burst of 2 or more consecutive losses. Copies at
 distances 1 and 3 recover any burst of up to 3 lost packets.
@@ -575,7 +594,7 @@ is due to play, so late packets never play out of order and delay can't build up
 - the iPad handles audio datagrams on its receive queue as soon as they are decrypted. Video
   reassembly, FEC recovery and decoding run on a separate queue, so audio never waits behind them
 
-Every 200 ms while speakers play, the iPad sends `AUDIO_REPORT` over UDP:
+Every 200 ms while speakers play, the iPad sends a 31-byte `AUDIO_REPORT` datagram:
 
 | Field | Size | Description |
 |---|---|---|
@@ -590,7 +609,6 @@ Every 200 ms while speakers play, the iPad sends `AUDIO_REPORT` over UDP:
 | `max_burst` | u8 | Longest run of consecutive `primary_lost` packets |
 | `jitter_us` | u32 | Jitter estimate before the render quantum and the video cap are applied |
 | `cap_us` | u32 | The video cap on the target; 0 when there is none |
-| `max_processing_us` | u32 | Longest time a speaker datagram waited on the iPad between the network stack receiving it and the jitter buffer storing it; 0 when unknown |
 
 Reports are unreliable; the daemon keeps its current settings while none arrive and ignores
 reports for other generations. The daemon uses them to:
@@ -603,12 +621,12 @@ reports for other generations. The daemon uses them to:
 - tell the Opus encoder the measured loss rate, so packets depend less on earlier ones while
   packets are being lost
 - log, with `-v`, a summary every 5 s: depth and target, the jitter estimate and video cap,
-  clock correction, redundancy, loss counts, the longest loss burst and the longest wait on the
-  iPad. These are diagnostics for any connection, not tuning for one
+  clock correction, redundancy, loss counts and the longest loss burst. These are diagnostics for
+  any connection, not tuning for one
 
 ### Microphone forwarding
 
-Each UDP `MIC` payload carries one 20 ms Opus packet and a mic-only sequence number. Because the
+Each `MIC` datagram carries one 20 ms Opus packet and a mic-only sequence number. Because the
 number counts mic packets only, the daemon can tell when one was lost. The daemon keeps a jitter
 buffer of mic packets and writes 10 ms to the microphone card on a steady timer, instead of
 whenever a packet arrives, so programs recording from it see a steady device rather than the
@@ -620,7 +638,7 @@ network's arrival pattern:
   After 60 ms of concealment with nothing buffered, the card gets silence until the buffer refills
 - the timer is shortened or lengthened, by at most 500 ppm, to hold the depth at its target, so
   the microphone card runs at the rate the iPad's microphone records
-- the iPad marks mic datagrams for voice priority
+- mic datagrams share the QUIC connection with camera and receiver reports
 
 ## Input Protocol
 
@@ -679,8 +697,8 @@ stuck on the host. The daemon does the same when a session ends.
 - the `SPEAKER` control message attaches/detaches the card
 - the daemon reads 10 ms of PCM about every 10 ms, advancing the card's playback position; the
   exact interval follows the iPad's playback clock (see "Speaker audio")
-- speaker datagrams are marked DSCP EF (voice) so Wi-Fi access points send them ahead of video
-  bursts; video keeps AF41
+- video backpressure keeps part of the QUIC datagram send buffer free for audio; audio and video
+  share QUIC packets, so there is no separate IP priority marking for audio
 
 ### Microphone
 

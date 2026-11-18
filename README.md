@@ -29,7 +29,7 @@ Tested working on GNOME, KDE Plasma, Cinnamon and Hyprland. It may also work on 
 
 1. Start the daemon on the Linux host.
 2. Open Screx on the iPad, tap **+**, enter the host/IP, and tap `Connect`.
-3. If it is the first connection, enter the PIN shown by the daemon.
+3. If it is the first connection, enter the eight-digit PIN shown by the daemon.
 4. Enable the virtual display in GNOME Settings if it is not already active. It is named after the iPad model (e.g. `iPad A16 11"`); a second monitor appears as `iPad External`.
 
 Each host you connect to becomes a tile with its own settings (address, resolution, framerate, codec, and bitrate) under **⋯ → Settings…**, and its own pairing. While a session is running, you can turn the keyboard, audio, camera, controller, and connection features on or off.

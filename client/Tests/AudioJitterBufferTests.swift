@@ -62,11 +62,11 @@ struct AudioJitterBufferTests {
     static func reportEncoding() {
         let report = AudioPlayoutReport(generation: 7, depthUs: 25_000, targetUs: 20_000, due: 20,
                                         primaryLost: 3, recovered: 2, concealed: 1, late: 4, maxBurst: 2,
-                                        jitterUs: 15_000, capUs: 0, maxProcessingUs: 3_000)
+                                        jitterUs: 15_000, capUs: 0)
         // Same bytes as `audio_report_round_trips_the_documented_layout` in daemon/src/audio.rs.
         let expected = Data([0, 0, 0, 7, 0, 0, 0x61, 0xA8, 0, 0, 0x4E, 0x20,
                              0, 20, 0, 3, 0, 2, 0, 1, 0, 4, 2,
-                             0, 0, 0x3A, 0x98, 0, 0, 0, 0, 0, 0, 0x0B, 0xB8])
+                             0, 0, 0x3A, 0x98, 0, 0, 0, 0])
         precondition(report.encoded() == expected)
         precondition(expected.count == AudioPlayoutReport.byteCount)
     }

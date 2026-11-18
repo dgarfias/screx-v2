@@ -1,549 +1,215 @@
 import Foundation
 import Network
 import CryptoKit
+import Security
 
 enum PairingResult {
-    /// `initialData`: control-channel bytes that arrived in the same read as the handshake reply.
-    /// The daemon sends CAPS right after OK, so they can share a TCP read; dropping them would
-    /// leave the control channel mid-frame.
-    case sessionEstablished(sessionKey: SymmetricKey, connection: NWConnection, initialData: Data)
+    case sessionEstablished(session: QUICSession)
     case pinRequired(completion: (String) -> Void)
     case rejected(reason: String)
     case error(String)
 }
 
+/// Pairing is carried over the first QUIC stream. Bootstrap TLS alone is not
+/// trusted: an eight-digit CPace exchange confirms the actual TLS certificate,
+/// client signing key and TLS exporter before either side stores a pairing.
 final class PairingService {
-    private let queue = DispatchQueue(label: "screx.pairing", qos: .userInitiated)
-    private var connection: NWConnection?
-    private let debugId = String(UUID().uuidString.prefix(6))
-    private var didComplete = false
-    private var connectTimeoutWorkItem: DispatchWorkItem?
-
-    private static let magicPair   = Data("SCREX_PAIR".utf8)    // 10 bytes
-    private static let magicHello  = Data("SCREX_HELLO".utf8)   // 11 bytes
-    private static let magicPin    = Data("SCREX_PIN\0".utf8)   // 10 bytes
-    private static let magicAnswer = Data("SCREX_ANSWER".utf8)  // 12 bytes
-    private static let magicBusy   = Data("SCREX_BUSY\0\0".utf8) // 12 bytes
-    private static let magicOK     = Data("SCREX_OK\0\0".utf8)  // 10 bytes
-    private static let magicReject = Data("SCREX_REJECT".utf8)  // 12 bytes
-
-    private static let deviceIdLen = 16
-    private static let pubkeyLen   = 32
-    private static let nonceLen    = 32
-    private static let hmacLen     = 32
-    private static let pinDigits   = 6
-    private static let tagLen      = 16
-    private static let connectTimeout: TimeInterval = 8
-
-    /// TCP parameters for the pairing/control connection. Disables Nagle's
-    /// algorithm (`noDelay`) so small input packets (touch/mouse/key) are sent
-    /// immediately instead of being held behind the receiver's delayed-ACK
-    /// timer — the daemon already sets `TCP_NODELAY` on its side, and this
-    /// connection later becomes the control/input channel.
-    private static func tcpParameters() -> NWParameters {
-        let params = NWParameters.tcp
-        if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-            tcp.noDelay = true
-        }
-        return params
-    }
-
+    private let store: PairingStore
+    private var session: QUICSession?
+    private var completed = false
+    private var timeout: DispatchWorkItem?
     var onResult: ((PairingResult) -> Void)?
 
-    /// The host tile being connected: its ID keys the pairing key on this side, and its device ID
-    /// identifies this tile to the daemon. `clientName` labels the pairing in the daemon's list.
-    private var tileId = ""
-    private var deviceId = Data()
-    private var clientName = ""
-
-    private func log(_ message: String) {
-        print("[pairing \(debugId)] \(message)")
-    }
+    init(store: PairingStore = SystemPairingStore()) { self.store = store }
 
     func pair(host: String, port: UInt16, tileId: String, deviceId: Data, clientName: String) {
-        self.tileId = tileId
-        self.deviceId = deviceId
-        self.clientName = clientName
-        let hasPairingKey = KeychainHelper.loadPairingKey(tileId: tileId) != nil
-        log("starting pair(host=\(host), port=\(port)) tile=\(tileId.prefix(5)) hasPairingKey=\(hasPairingKey)")
-
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(integerLiteral: port)
-        )
-        let conn = NWConnection(to: endpoint, using: Self.tcpParameters())
-        self.connection = conn
-
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            self.log("tcp state -> \(state)")
-            switch state {
-            case .ready:
-                self.cancelConnectTimeout()
-                if hasPairingKey {
-                    self.log("tcp ready, trying reconnect HELLO flow")
-                    self.sendHello(conn: conn, host: host, port: port, deviceId: deviceId)
-                } else {
-                    self.log("tcp ready, using first-time PAIR flow")
-                    self.sendPairRequest(conn: conn, host: host, port: port, deviceId: deviceId)
-                }
-            case .waiting(let error):
-                self.cancelConnectTimeout()
-                self.connection?.cancel()
-                self.connection = nil
-                self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
-            case .failed(let error):
-                self.cancelConnectTimeout()
-                self.connection = nil
-                self.emitResult(.error("TCP connect failed: \(error.localizedDescription)"))
-            case .cancelled:
-                self.log("tcp state -> cancelled")
-            default:
-                break
-            }
-        }
-
-        let timeout = DispatchWorkItem { [weak self, weak conn] in
-            guard let self, let conn else { return }
-            guard self.connection === conn, !self.didComplete else { return }
-            self.log("TCP connect timed out after \(Self.connectTimeout)s")
-            self.connectTimeoutWorkItem = nil
-            self.connection = nil
-            conn.cancel()
-            self.emitResult(.error("TCP connect timed out after \(Int(Self.connectTimeout)) seconds"))
-        }
-        connectTimeoutWorkItem = timeout
-        queue.asyncAfter(deadline: .now() + Self.connectTimeout, execute: timeout)
-        conn.start(queue: queue)
-    }
-
-    func cancel() {
-        log("cancel()")
-        cancelConnectTimeout()
-        didComplete = true
-        connection?.cancel()
-        connection = nil
-    }
-
-    private func cancelConnectTimeout() {
-        connectTimeoutWorkItem?.cancel()
-        connectTimeoutWorkItem = nil
-    }
-
-    // MARK: - New device pairing (SCREX_PAIR flow)
-
-    private func sendPairRequest(conn: NWConnection, host: String, port: UInt16, deviceId: Data) {
-        let keyPair = ScrexCrypto.generateKeyPair()
-        let pubKey = keyPair.publicKey.rawRepresentation
-        log("sending PAIR request: deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined()) pubKeyLen=\(pubKey.count)")
-
-        // SCREX_PAIR + device_id(16) + pubkey(32) + name_len(1) + name (UTF-8, up to 63 bytes)
-        var packet = Self.magicPair
-        packet.append(deviceId)
-        packet.append(pubKey)
-        let name = Data(clientName.utf8.prefix(63))
-        packet.append(UInt8(name.count))
-        packet.append(name)
-
-        conn.send(content: packet, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.emitResult(.error("Send pair request failed: \(error.localizedDescription)"))
-                return
-            }
-            self.log("PAIR request sent (\(packet.count) bytes), waiting for daemon response")
-            self.waitForPinChallenge(conn: conn, host: host, port: port, deviceId: deviceId, keyPair: keyPair)
-        })
-    }
-
-    private func waitForPinChallenge(
-        conn: NWConnection,
-        host: String,
-        port: UInt16,
-        deviceId: Data,
-        keyPair: Curve25519.KeyAgreement.PrivateKey
-    ) {
-        // Response: SCREX_PIN(10) + server_pubkey(32) = 42 bytes
-        conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
-            guard let self else { return }
-
-            if let error {
-                self.emitResult(.error("Receive failed: \(error.localizedDescription)"))
-                return
-            }
-            guard let data, data.count >= 10 else {
-                self.emitResult(.error("Empty response from daemon"))
-                return
-            }
-            self.log("received pair challenge/ok response: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
-
-            // Check for busy (daemon already has an active session)
-            if data.count >= Self.magicBusy.count && data.prefix(Self.magicBusy.count) == Self.magicBusy {
-                self.emitResult(.rejected(reason: "Daemon is busy with another client"))
-                return
-            }
-
-            let magic = data.prefix(10)
-
-            if magic == Self.magicPin {
-                // New pairing: need PIN
-                guard data.count >= 10 + Self.pubkeyLen else {
-                    self.emitResult(.error("Invalid PIN challenge"))
-                    return
-                }
-                let serverPubKey = data.subdata(in: 10..<(10 + Self.pubkeyLen))
-                self.log("daemon requested PIN entry, serverPubKeyLen=\(serverPubKey.count)")
-
-                guard let ecdhSecret = ScrexCrypto.ecdh(privateKey: keyPair, publicKeyBytes: serverPubKey) else {
-                    self.emitResult(.error("ECDH failed"))
-                    return
-                }
-
-                self.emitResult(.pinRequired { [weak self] pin in
-                    self?.sendPinAnswer(conn: conn, host: host, port: port, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
+        do {
+            let record = try store.load(tileId: tileId)
+            let signing = try record.map { try Curve25519.Signing.PrivateKey(rawRepresentation: $0.signingKey) }
+                ?? Curve25519.Signing.PrivateKey()
+            let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
+            let session = QUICSession(endpoint: endpoint, pin: record?.serverPin)
+            self.session = session
+            session.onFailure = { [weak self] message in self?.finish(.error(message)) }
+            let task = DispatchWorkItem { [weak self] in self?.finish(.error("QUIC connection timed out")) }
+            timeout = task
+            session.queue.asyncAfter(deadline: .now() + 8, execute: task)
+            session.start { [weak self] control in
+                guard let self else { return }
+                var hello = Data([0xe0])
+                hello.append(deviceId)
+                hello.append(signing.publicKey.rawRepresentation)
+                var name = Data(clientName.utf8)
+                while name.count > 63 { name.removeLast() }
+                // Drop any incomplete UTF-8 suffix after truncation.
+                while String(data: name, encoding: .utf8) == nil { name.removeLast() }
+                if name.isEmpty { name = Data("iPad".utf8) }
+                hello.append(name)
+                control.send(content: QUICFrame.encode(hello), completion: .contentProcessed { [self] error in
+                    if let error { self.finish(.error(error.localizedDescription)); return }
+                    QUICFrame.read(control) { result in
+                        do {
+                            let challenge = try result.get()
+                            guard challenge.count >= 82, challenge[0] == 0xe1 else {
+                                throw QUICSession.error("Invalid pairing challenge")
+                            }
+                            self.timeout?.cancel()
+                            let serverId = Data(challenge[2..<18])
+                            let pin = Data(challenge[18..<50])
+                            let sid = Data(challenge[50..<82])
+                            guard pin == session.peerCertificateHash else {
+                                throw QUICSession.error("Pairing certificate does not match TLS")
+                            }
+                            let binding = CPace.lv([Data("screx-quic-pair-v1".utf8), deviceId, serverId,
+                                signing.publicKey.rawRepresentation, pin, try session.exporter()])
+                            if challenge[1] == 1 {
+                                guard let record, record.serverPin == pin else {
+                                    throw QUICSession.error("Unknown server identity; remove this host and pair again")
+                                }
+                                let signature = try signing.signature(for:
+                                    CPace.lv([Data("screx-quic-reconnect-v1".utf8), sid, binding]))
+                                control.send(content: QUICFrame.encode(Data([0xe2]) + signature),
+                                    completion: .contentProcessed { error in
+                                        if let error { self.finish(.error(error.localizedDescription)); return }
+                                        self.waitForReady(session, control: control)
+                                    })
+                            } else {
+                                guard challenge.count == 114 else { throw QUICSession.error("Missing PAKE share") }
+                                let yb = Data(challenge[82..<114])
+                                let expiry = DispatchWorkItem { [weak self] in self?.finish(.error("Pairing PIN expired")) }
+                                self.timeout = expiry
+                                session.queue.asyncAfter(deadline: .now() + 120, execute: expiry)
+                                DispatchQueue.main.async {
+                                    self.onResult?(.pinRequired { [weak self] code in
+                                        session.queue.async {
+                                            guard let self, !self.completed else { return }
+                                            do {
+                                                guard code.utf8.count == 8, code.utf8.allSatisfy({ (48...57).contains($0) }) else {
+                                                    throw QUICSession.error("Enter eight digits")
+                                                }
+                                                let exchange = try CPace.Exchange(password: Data(code.utf8), context: binding, sid: sid)
+                                                let key = try exchange.finish(peer: yb, sid: sid, ya: exchange.share,
+                                                    ada: deviceId, yb: yb, adb: serverId)
+                                                var proof = Data([0xe3])
+                                                proof.append(exchange.share)
+                                                proof.append(CPace.confirmation(key: key, role: "client", binding: binding))
+                                                control.send(content: QUICFrame.encode(proof), completion: .contentProcessed { error in
+                                                    if let error { self.finish(.error(error.localizedDescription)); return }
+                                                    QUICFrame.read(control) { result in
+                                                        do {
+                                                            let reply = try result.get()
+                                                            guard reply.count == 33, reply[0] == 0xe4 else {
+                                                                throw QUICSession.error("Pairing rejected")
+                                                            }
+                                                            try CPace.verify(key: key, role: "server", binding: binding,
+                                                                tag: Data(reply.dropFirst()))
+                                                            try self.store.save(
+                                                                .init(signingKey: signing.rawRepresentation, serverPin: pin), tileId: tileId)
+                                                            self.waitForReady(session, control: control)
+                                                        } catch { self.finish(.error("Pairing failed: \(error.localizedDescription)")) }
+                                                    }
+                                                })
+                                            } catch { self.finish(.error(error.localizedDescription)) }
+                                        }
+                                    })
+                                }
+                            }
+                        } catch { self.finish(.error(error.localizedDescription)) }
+                    }
                 })
-            } else {
-                self.emitResult(.error("Unexpected response from daemon"))
             }
-        }
+        } catch { finish(.error(error.localizedDescription)) }
     }
 
-    private func sendPinAnswer(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pin: String, ecdhSecret: Data) {
-        log("sending PIN answer for host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined())")
-        let pinKey = ScrexCrypto.hkdfSHA256Bytes(
-            ikm: ecdhSecret,
-            salt: Data("screx-pin-exchange".utf8),
-            info: Data("pin-encrypt".utf8)
-        )
-        let pinKeySymmetric = SymmetricKey(data: pinKey)
-
-        // Generate random 12-byte nonce
-        var nonceBytes = Data(count: 12)
-        _ = nonceBytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 12, $0.baseAddress!) }
-
-        guard let encrypted = ScrexCrypto.encrypt(
-            key: pinKeySymmetric,
-            nonce: nonceBytes,
-            plaintext: Data(pin.utf8),
-            aad: Data("screx-pin-verify".utf8)
-        ) else {
-            emitResult(.error("PIN encryption failed"))
-            return
-        }
-
-        var packet = Self.magicAnswer
-        packet.append(nonceBytes) // 12 bytes
-        packet.append(encrypted)  // PIN_DIGITS + TAG_LEN bytes
-
-        conn.send(content: packet, completion: .contentProcessed { [weak self] error in
+    /// After authentication the daemon answers READY (0xe5), or BUSY (0xe6) when another
+    /// device holds the session. Replacing this device's own stale session can take a few
+    /// seconds, so the deadline covers that and opening the media flow.
+    private func waitForReady(_ session: QUICSession, control: NWConnection) {
+        timeout?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.finish(.error("Session start timed out")) }
+        timeout = task
+        session.queue.asyncAfter(deadline: .now() + 8, execute: task)
+        QUICFrame.read(control) { [weak self] result in
             guard let self else { return }
-            if let error {
-                self.emitResult(.error("Send PIN answer failed: \(error.localizedDescription)"))
-                return
-            }
-            self.log("PIN answer sent, waiting for final OK")
-            self.waitForPinResult(conn: conn, host: host, port: port, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
-        })
-    }
-
-    private func waitForPinResult(conn: NWConnection, host: String, port: UInt16, deviceId: Data, pin: String, ecdhSecret: Data) {
-        conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
-            guard let self else { return }
-            if error == nil, let data { self.completeOK(conn: conn, data: data) { data in
-                self.handlePinResult(conn: conn, data: data, error: nil, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
-            } } else {
-                self.handlePinResult(conn: conn, data: data, error: error, deviceId: deviceId, pin: pin, ecdhSecret: ecdhSecret)
-            }
+            do {
+                switch try result.get() {
+                case Data([0xe5]):
+                    session.openMedia { self.finish(.sessionEstablished(session: session)) }
+                case Data([0xe6]):
+                    self.finish(.rejected(reason: "Host is busy with another device"))
+                default:
+                    throw QUICSession.error("Host rejected the session")
+                }
+            } catch { self.finish(.error(error.localizedDescription)) }
         }
     }
-
-    private func handlePinResult(conn: NWConnection, data: Data?, error: NWError?, deviceId: Data, pin: String, ecdhSecret: Data) {
-        do {
-
-            if let error {
-                self.emitResult(.error("PIN result receive failed: \(error.localizedDescription)"))
-                return
-            }
-            guard let data, data.count >= 10 else {
-                self.emitResult(.error("Empty PIN result"))
-                return
-            }
-            self.log("received PIN result: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
-
-            let magic = data.prefix(10)
-
-            if data.count >= Self.magicReject.count && data.prefix(Self.magicReject.count) == Self.magicReject {
-                self.emitResult(.rejected(reason: "Wrong PIN"))
-                return
-            }
-
-            guard magic == Self.magicOK else {
-                self.emitResult(.error("Unexpected PIN result"))
-                return
-            }
-
-            // SCREX_OK(10) + daemon_device_id(16) + session_salt(32) + hmac(32) = 90
-            guard data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen else {
-                self.emitResult(.error("Invalid OK response"))
-                return
-            }
-            let sessionSalt = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
-            let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
-
-            // Derive pairing key
-            var ikm = ecdhSecret
-            ikm.append(Data(pin.utf8))
-            let pairingKey = ScrexCrypto.hkdfSHA256Bytes(
-                ikm: ikm,
-                salt: Data("screx-pairing-salt".utf8),
-                info: Data("screx-pairing".utf8)
-            )
-
-            KeychainHelper.storePairingKey(pairingKey, tileId: self.tileId)
-
-            // Derive session key
-            let sessionKeyData = ScrexCrypto.hkdfSHA256Bytes(
-                ikm: pairingKey,
-                salt: sessionSalt,
-                info: Data("screx-session".utf8)
-            )
-            let sessionKey = SymmetricKey(data: sessionKeyData)
-            self.log("PIN flow complete, derived session key and validating server HMAC")
-
-            // Verify server HMAC
-            let expectedHmac = ScrexCrypto.hmacSHA256(key: sessionKeyData, data: Data("server-verify".utf8))
-            guard expectedHmac == serverHmac else {
-                self.emitResult(.rejected(reason: "Server verification failed after pairing"))
-                return
-            }
-
-            self.log("pairing flow complete, session established")
-            conn.stateUpdateHandler = nil
-            self.connection = nil
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn,
-                                                initialData: data.dropFirst(Self.okLength)))
-        }
+    func cancel() {
+        completed = true
+        timeout?.cancel()
+        session?.close()
+        session = nil
     }
-
-    // MARK: - Reconnection (SCREX_HELLO flow)
-
-    private func sendHello(conn: NWConnection, host: String, port: UInt16, deviceId: Data) {
-        var clientNonce = Data(count: Self.nonceLen)
-        _ = clientNonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, Self.nonceLen, $0.baseAddress!) }
-        log("sending HELLO: host=\(host) deviceId=\(deviceId.map { String(format: "%02x", $0) }.joined())")
-
-        var packet = Self.magicHello
-        packet.append(deviceId)
-        packet.append(clientNonce)
-
-        conn.send(content: packet, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.emitResult(.error("Send hello failed: \(error.localizedDescription)"))
-                return
-            }
-            self.log("HELLO sent (\(packet.count) bytes), waiting for hello response")
-            self.waitForHelloResponse(conn: conn, host: host, port: port, clientNonce: clientNonce)
-        })
-    }
-
-    private func waitForHelloResponse(conn: NWConnection, host: String, port: UInt16, clientNonce: Data) {
-        conn.receive(minimumIncompleteLength: 10, maximumLength: 128) { [weak self] data, _, _, error in
-            guard let self else { return }
-            if error == nil, let data { self.completeOK(conn: conn, data: data) { data in
-                self.handleHelloResponse(conn: conn, data: data, error: nil, host: host, port: port, clientNonce: clientNonce)
-            } } else {
-                self.handleHelloResponse(conn: conn, data: data, error: error, host: host, port: port, clientNonce: clientNonce)
-            }
-        }
-    }
-
-    private func handleHelloResponse(conn: NWConnection, data: Data?, error: NWError?, host: String, port: UInt16, clientNonce: Data) {
-        do {
-
-            if let error {
-                self.emitResult(.error("Hello response receive failed: \(error.localizedDescription)"))
-                return
-            }
-            guard let data, data.count >= 10 else {
-                self.emitResult(.error("Empty hello response"))
-                return
-            }
-            self.log("received hello response: \(data.count) bytes prefix=\(String(decoding: data.prefix(min(12, data.count)), as: UTF8.self))")
-
-            if data.count >= Self.magicBusy.count && data.prefix(Self.magicBusy.count) == Self.magicBusy {
-                self.emitResult(.rejected(reason: "Daemon is busy with another client"))
-                return
-            }
-
-            if data.count >= Self.magicReject.count && data.prefix(Self.magicReject.count) == Self.magicReject {
-                self.log("daemon rejected HELLO — stale key, switching to PAIR flow")
-                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: self.deviceId)
-                return
-            }
-
-            guard data.prefix(10) == Self.magicOK else {
-                self.emitResult(.error("Unexpected hello response"))
-                return
-            }
-
-            // SCREX_OK(10) + daemon_device_id(16) + server_nonce(32) + hmac(32) = 90
-            guard data.count >= 10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen else {
-                self.emitResult(.error("Invalid OK response"))
-                return
-            }
-            let serverNonce = data.subdata(in: (10 + Self.deviceIdLen)..<(10 + Self.deviceIdLen + Self.nonceLen))
-            let serverHmac = data.subdata(in: (10 + Self.deviceIdLen + Self.nonceLen)..<(10 + Self.deviceIdLen + Self.nonceLen + Self.hmacLen))
-
-            var salt = clientNonce
-            salt.append(serverNonce)
-
-            // No key, or one that doesn't verify (the daemon was reset, or a different computer
-            // now answers at this address), means pairing again.
-            let sessionKeyData = KeychainHelper.loadPairingKey(tileId: self.tileId).flatMap { key -> Data? in
-                let derived = ScrexCrypto.hkdfSHA256Bytes(
-                    ikm: key,
-                    salt: salt,
-                    info: Data("screx-session".utf8)
-                )
-                let expectedHmac = ScrexCrypto.hmacSHA256(key: derived, data: Data("server-verify".utf8))
-                return expectedHmac == serverHmac ? derived : nil
-            }
-            guard let sessionKeyData else {
-                self.log("no valid stored key for this host — re-pairing")
-                self.sendPairRequest(conn: conn, host: host, port: port, deviceId: self.deviceId)
-                return
-            }
-
-            self.log("HELLO response validated, session established")
-            let sessionKey = SymmetricKey(data: sessionKeyData)
-
-            conn.stateUpdateHandler = nil
-            self.connection = nil
-            self.emitResult(.sessionEstablished(sessionKey: sessionKey, connection: conn,
-                                                initialData: data.dropFirst(Self.okLength)))
-        }
-    }
-
-    /// SCREX_OK(10) + daemon_device_id(16) + nonce/salt(32) + hmac(32).
-    private static let okLength = 10 + deviceIdLen + nonceLen + hmacLen
-
-    /// TCP has no message boundaries: an OK can arrive split across reads. Read the rest before
-    /// parsing instead of failing with "Invalid OK response". Other replies pass through as is.
-    private func completeOK(conn: NWConnection, data: Data, then handle: @escaping (Data) -> Void) {
-        guard data.count >= Self.magicOK.count, data.prefix(Self.magicOK.count) == Self.magicOK,
-              data.count < Self.okLength else {
-            handle(data)
-            return
-        }
-        let missing = Self.okLength - data.count
-        conn.receive(minimumIncompleteLength: missing, maximumLength: missing) { [weak self] more, _, _, error in
-            guard let self else { return }
-            guard error == nil, let more, !more.isEmpty else {
-                self.emitResult(.error("Incomplete OK response"))
-                return
-            }
-            self.completeOK(conn: conn, data: data + more, then: handle)
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func emitResult(_ result: PairingResult) {
-        switch result {
-        case .sessionEstablished, .rejected, .error:
-            guard !didComplete else {
-                log("emitResult ignored after completion")
-                return
-            }
-            didComplete = true
-        case .pinRequired:
-            break
-        }
-
-        switch result {
-        case .sessionEstablished:
-            log("emitResult(.sessionEstablished)")
-        case .pinRequired:
-            log("emitResult(.pinRequired)")
-        case .rejected(let reason):
-            log("emitResult(.rejected: \(reason))")
-        case .error(let message):
-            log("emitResult(.error: \(message))")
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.onResult?(result)
-        }
+    private func finish(_ result: PairingResult) {
+        guard !completed else { return }
+        completed = true
+        timeout?.cancel()
+        if case .sessionEstablished = result {
+            session?.onFailure = nil
+        } else { session?.close() }
+        DispatchQueue.main.async { [self] in onResult?(result) }
     }
 }
 
-// MARK: - Keychain helpers
+/// Storage is injectable so transport/authentication tests can run over SSH,
+/// where macOS deliberately disallows interactive Keychain access.
+protocol PairingStore {
+    func load(tileId: String) throws -> KeychainHelper.Record?
+    func save(_ record: KeychainHelper.Record, tileId: String) throws
+}
+struct SystemPairingStore: PairingStore {
+    func load(tileId: String) throws -> KeychainHelper.Record? { try KeychainHelper.loadRecord(tileId: tileId) }
+    func save(_ record: KeychainHelper.Record, tileId: String) throws { try KeychainHelper.storeRecord(record, tileId: tileId) }
+}
 
-/// Pairing keys, one per host tile, stored in the Keychain under the tile's ID.
+/// Per-tile pairing records: the client signing key and the pinned server certificate.
 enum KeychainHelper {
-    private static let servicePrefix = "com.screx.pairing."
-    /// Tile IDs that have a key, so keys of removed tiles can be found and deleted.
-    private static let pairedTileIdsKey = "screx_paired_tile_ids"
-
-    private static func service(tileId: String) -> String { servicePrefix + "tile." + tileId }
-
-    static func storePairingKey(_ key: Data, tileId: String) {
-        let service = service(tileId: tileId)
-        SecItemDelete([kSecClass as String: kSecClassGenericPassword,
-                       kSecAttrService as String: service] as CFDictionary)
-        let status = SecItemAdd([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-        ] as CFDictionary, nil)
-        if status == errSecSuccess {
-            var ids = pairedTileIds()
-            if !ids.contains(tileId) {
-                ids.append(tileId)
-                UserDefaults.standard.set(ids, forKey: pairedTileIdsKey)
-            }
-        } else {
-            print("[keychain] store failed: \(status)")
-        }
+    struct Record: Codable {
+        let signingKey: Data
+        let serverPin: Data
     }
-
-    static func loadPairingKey(tileId: String) -> Data? {
-        var result: AnyObject?
+    private static let service = "com.screx.quic-pairing.v1"
+    private static let idsKey = "screx_quic_paired_tile_ids_v1"
+    static func loadRecord(tileId: String) throws -> Record? {
+        var value: CFTypeRef?
         let status = SecItemCopyMatching([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service(tileId: tileId),
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ] as CFDictionary, &result)
-        return status == errSecSuccess ? result as? Data : nil
+            kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+            kSecAttrAccount as String: tileId, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne,
+        ] as CFDictionary, &value)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = value as? Data else { throw QUICSession.error("Keychain read failed: \(status)") }
+        return try JSONDecoder().decode(Record.self, from: data)
     }
-
-    /// Deletes the keys of every tile not in `keep`.
+    static func storeRecord(_ record: Record, tileId: String) throws {
+        let query = [kSecClass as String: kSecClassGenericPassword,
+                     kSecAttrService as String: service, kSecAttrAccount as String: tileId] as CFDictionary
+        let data = try JSONEncoder().encode(record)
+        var status = SecItemUpdate(query, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd([
+                kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: tileId,
+                kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            ] as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw QUICSession.error("Keychain write failed: \(status)") }
+        var ids = UserDefaults.standard.stringArray(forKey: idsKey) ?? []
+        if !ids.contains(tileId) { ids.append(tileId); UserDefaults.standard.set(ids, forKey: idsKey) }
+    }
     static func deletePairingKeys(except keep: Set<String>) {
-        let ids = pairedTileIds()
-        let removed = ids.filter { !keep.contains($0) }
-        guard !removed.isEmpty else { return }
-        for tileId in removed {
+        let ids = UserDefaults.standard.stringArray(forKey: idsKey) ?? []
+        for id in ids where !keep.contains(id) {
             SecItemDelete([kSecClass as String: kSecClassGenericPassword,
-                           kSecAttrService as String: service(tileId: tileId)] as CFDictionary)
+                           kSecAttrService as String: service, kSecAttrAccount as String: id] as CFDictionary)
         }
-        UserDefaults.standard.set(ids.filter { keep.contains($0) }, forKey: pairedTileIdsKey)
-    }
-
-    private static func pairedTileIds() -> [String] {
-        UserDefaults.standard.stringArray(forKey: pairedTileIdsKey) ?? []
-    }
-
-    /// Before pairings were per tile, keys were stored per daemon with one device ID for the
-    /// whole iPad. Those can't be used any more; delete them once.
-    static func removeLegacyPairings() {
-        let defaults = UserDefaults.standard
-        for daemonId in defaults.stringArray(forKey: "screx_known_daemon_ids") ?? [] {
-            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
-                           kSecAttrService as String: servicePrefix + "daemon." + daemonId] as CFDictionary)
-        }
-        defaults.removeObject(forKey: "screx_known_daemon_ids")
-        defaults.removeObject(forKey: "screx_device_id")
+        UserDefaults.standard.set(ids.filter { keep.contains($0) }, forKey: idsKey)
     }
 }

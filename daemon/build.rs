@@ -3,4 +3,8 @@ fn main() {
     cc::Build::new()
         .file("csrc/v4l2_helper.c")
         .compile("v4l2_helper");
+    println!("cargo:rerun-if-changed=../shared");
+    cc::Build::new()
+        .file("../shared/cpace_primitives.c")
+        .compile("cpace_primitives");
 }

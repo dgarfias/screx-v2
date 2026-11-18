@@ -1,9 +1,9 @@
-//! Message type bytes for the encrypted control channel (TCP) and for
-//! client -> daemon UDP payloads. Every message is `type(u8) + body`.
+//! Message type bytes for QUIC control/input streams and client -> daemon
+//! QUIC datagrams. Every message is `type(u8) + body`.
 //! See docs/ARCHITECTURE.md "Protocol Details" for the body layouts; the
 //! iPad app mirrors these values in `Protocol.swift`.
 
-/// Client -> daemon control messages (TCP).
+/// Client -> daemon control/input stream messages.
 pub mod client {
     /// Stream settings, sent once in reply to `daemon::CAPS`.
     pub const SETTINGS: u8 = 0x01;
@@ -29,7 +29,7 @@ pub mod client {
     pub const CAMERA: u8 = 0x22;
 }
 
-/// Daemon -> client control messages (TCP).
+/// Daemon -> client control stream messages.
 pub mod daemon {
     /// Capabilities + host name, sent once when the control channel opens.
     pub const CAPS: u8 = 0x80;
@@ -38,10 +38,8 @@ pub mod daemon {
     pub const DISPLAY_STATUS: u8 = 0x82;
 }
 
-/// Client -> daemon UDP payloads (inside the encrypted datagram).
-pub mod udp {
-    /// Registers/keeps alive the client's UDP address. Empty body.
-    pub const KEEPALIVE: u8 = 0x01;
+/// Client -> daemon QUIC datagram payloads.
+pub mod datagram {
     /// One chunk of a camera JPEG: `frame_id(u32) chunk_idx(u16) total_chunks(u16) data`.
     pub const CAMERA: u8 = 0x02;
     /// One mic Opus packet: `seq(u32) opus`.

@@ -1,4 +1,3 @@
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -8,9 +7,10 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::capture::{self, DisplayId};
-use crate::crypto::{ServerPacketSequence, SessionCipher};
+use crate::media_sequence::ServerPacketSequence;
+use crate::quic_transport::MediaTransport;
 use crate::display_manager::{DisplayManager, OutputSettings, Pipeline, TopologyRequest};
-use crate::stream_server::{DisplayStreamControl, RequestedSettings, SharedState, UdpSender};
+use crate::stream_server::{DisplayStreamControl, RequestedSettings, SharedState, VideoSender};
 
 /// Keep the stream's target cadence even if the compositor supplies frames faster than requested.
 /// Accumulated deadlines avoid turning 30 -> 24 fps into an accidental 15 fps.
@@ -61,10 +61,9 @@ pub struct CaptureWorker {
 
 impl CaptureWorker {
     fn start(
-        socket: UdpSocket,
+        media: MediaTransport,
         shared: Arc<SharedState>,
         session: u64,
-        key: [u8; 32],
         display: DisplayId,
         settings: OutputSettings,
         config: &crate::AppConfig,
@@ -74,9 +73,7 @@ impl CaptureWorker {
         let ready = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let next_sequence = Arc::new(Mutex::new(None));
-        let mut sender = UdpSender::new(socket, display);
-        sender.set_cipher(SessionCipher::new(&key));
-        sender.set_source(*shared.udp_source.lock().unwrap());
+        let mut sender = VideoSender::from_quic(media, display);
         sender.set_session(settings.fps);
         control
             .generation
@@ -163,8 +160,7 @@ impl CaptureWorker {
                             }
                             let result = (|| -> Result<()> {
                                 let units = encoder.encode_frame(&frame, force_idr)?;
-                                let addr = *shared.client_addr.lock().unwrap();
-                                if let Some(addr) = addr {
+                                {
                                     if !shared.is_current_network_session(session) {
                                         return Ok(());
                                     }
@@ -178,7 +174,7 @@ impl CaptureWorker {
                                             );
                                             dump_au -= 1;
                                         }
-                                        sender.send_frame(unit, addr, timestamp, codec, tuning)?;
+                                        sender.send_frame(unit, timestamp, codec, tuning)?;
                                         if unit.is_idr {
                                             ready.store(true, Ordering::Release);
                                         }
@@ -330,7 +326,6 @@ fn log_display_status(status: &crate::display_manager::DisplayStatus) {
 }
 
 pub fn run(
-    socket: UdpSocket,
     shared: Arc<SharedState>,
     stop: Arc<AtomicBool>,
     config: crate::AppConfig,
@@ -356,8 +351,8 @@ pub fn run(
                 }
             };
             if let Some((id, request)) = request.filter(|(id, _)| *id == session) {
-                let key = *shared.session_key.lock().unwrap();
-                if let Some(key) = key {
+                let media = shared.quic_media.lock().unwrap().clone();
+                if let Some(media) = media {
                     let outputs = resolve(request, &config);
                     if let Some(settings) = outputs.outputs[0] {
                         if let Ok(mut input) = shared.input_backend.lock() {
@@ -369,10 +364,9 @@ pub fn run(
                         std::time::Instant::now(),
                         &mut |display, settings| {
                             CaptureWorker::start(
-                                socket.try_clone()?,
+                                media.clone(),
                                 Arc::clone(&shared),
                                 id,
-                                key,
                                 display,
                                 settings,
                                 &config,
@@ -393,14 +387,13 @@ pub fn run(
                 manager.acknowledge(ack);
             }
             // Deferred (ordered) plugging and rollbacks also start workers from `tick`.
-            let key = *shared.session_key.lock().unwrap();
+            let media = shared.quic_media.lock().unwrap().clone();
             let mut spawn = |display, settings| -> Result<CaptureWorker> {
-                let key = key.ok_or_else(|| anyhow::anyhow!("session key unavailable"))?;
+                let media = media.clone().ok_or_else(|| anyhow::anyhow!("QUIC session unavailable"))?;
                 CaptureWorker::start(
-                    socket.try_clone()?,
+                    media,
                     Arc::clone(&shared),
                     session,
-                    key,
                     display,
                     settings,
                     &config,

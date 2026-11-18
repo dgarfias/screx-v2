@@ -19,8 +19,10 @@ Resolved automatically by Xcode via Swift Package Manager — no manual install 
 - [`swift-opus`](https://github.com/alta/swift-opus) — Opus: the wrapper encodes the microphone; speaker
   playback calls the bundled libopus (`Copus`) directly for packet-loss concealment
 
-Everything else is a first-party Apple framework (AVFoundation, VideoToolbox, CryptoKit, Network,
-CoreImage, GameController) with no additional package manager setup required.
+QUIC uses Apple's Network.framework; its datagram support needs iPadOS 16. CPace pairing also
+compiles the Monocypher-based Elligator2 adapter in `shared/` (through
+`Screx-Bridging-Header.h`), so check out the **whole repository**, not only `client/`.
+Monocypher's license ships as an app resource.
 
 ## Build
 
@@ -36,6 +38,41 @@ CoreImage, GameController) with no additional package manager setup required.
 
 Xcode builds and installs the app directly to the connected device — there's no separate CLI build
 step or bundler for this target.
+
+## Tests
+
+The tests are standalone programs compiled with `swiftc` from `client/`:
+
+```sh
+swiftc Screx/AudioJitterBuffer.swift Tests/AudioJitterBufferTests.swift -o /tmp/screx-audio-tests && /tmp/screx-audio-tests
+swiftc Screx/MediaPacket.swift Tests/MediaPacketTests.swift -o /tmp/screx-media-tests && /tmp/screx-media-tests
+clang -c Screx/CPacePrimitives.c -o /tmp/cpace-primitives.o
+swiftc -import-objc-header Screx/Screx-Bridging-Header.h \
+  Screx/CPace.swift Tests/CPaceTests.swift /tmp/cpace-primitives.o -o /tmp/cpace-tests && /tmp/cpace-tests
+```
+
+`Tests/QUICInteropSmoke.swift` pairs with a daemon test server over real QUIC (see
+[DAEMON_LINUX.md](DAEMON_LINUX.md#tests) for the Linux side):
+
+```sh
+swiftc -import-objc-header Screx/Screx-Bridging-Header.h \
+  Screx/CPace.swift Screx/QUICSession.swift Screx/PairingService.swift \
+  Tests/QUICInteropSmoke.swift /tmp/cpace-primitives.o -o /tmp/screx-quic-smoke
+/tmp/screx-quic-smoke HOST_IP
+```
+
+Type the PIN the daemon test prints. It checks the PAKE exchange, the TLS exporter binding, both
+streams and a 1022-byte datagram round trip. It keeps pairings in memory because macOS doesn't
+allow Keychain writes from an SSH session.
+
+## App Store notes
+
+- Only public Network.framework, Security and CryptoKit APIs are used; TLS comes from
+  Network.framework.
+- The bundled Monocypher code is used only for pairing; its license must ship with the binary.
+- `ITSAppUsesNonExemptEncryption` is not set. Answer the export-compliance questions for all of
+  the app's cryptography, including the bundled pairing code, before submitting.
+- The security design has not been independently audited.
 
 ## Permissions
 
@@ -69,12 +106,14 @@ resolution or frame rate, and may adapt downward on network loss.
 
 Audio offers Low (96 kbps), Medium (128 kbps), High (192 kbps) and Very high (256 kbps).
 This controls Opus speaker audio only, not the microphone. Like video settings, the choice is
-saved per host and sent on connection; existing hosts default to Medium. Updating the app and
-daemon together is required because the settings message layout has changed.
+saved per host and sent on connection.
 
 **Pairing is per host tile.** Removing a tile forgets its pairing, so adding the host back asks for
-the PIN again; editing the address in Settings keeps it. TCP establishment fails after 8 seconds if the daemon cannot be reached, and an
-established stream is treated as stale after 5 seconds without inbound UDP data. Active
+the PIN again; editing the address in Settings keeps it. Each tile keeps its own signing key and
+the host's pinned certificate in the Keychain. Connecting fails after 8 seconds if the daemon
+can't be reached. If another device is streaming from the host, the tile shows "In use by another
+device"; reconnecting from the same iPad takes over its own earlier session. The connection is
+closed after 15 seconds without traffic from the daemon. Active
 touch gestures are clamped to the video boundary so dragging outside the letterboxed image still
 produces a matching release at the nearest display edge.
 

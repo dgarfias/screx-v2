@@ -1,7 +1,8 @@
 mod audio;
 mod camera;
+mod cpace;
 mod capture;
-mod crypto;
+mod media_sequence;
 mod display_manager;
 mod encode;
 mod input;
@@ -10,12 +11,12 @@ mod pairing;
 mod pipeline;
 mod platform;
 mod protocol;
+mod quic_transport;
 mod stream_server;
 #[cfg(test)]
 mod test_support;
 
 use std::fs;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -82,7 +83,7 @@ struct Cli {
     #[arg(short = 'b', long = "max-bitrate", default_value = "20M", value_parser = parse_bitrate)]
     max_bitrate: u32,
 
-    /// UDP/TCP streaming port
+    /// QUIC streaming port (UDP only)
     #[arg(short, long, default_value_t = 9000)]
     port: u16,
 
@@ -227,38 +228,9 @@ async fn main() -> Result<()> {
         &input_backend,
     )));
 
-    // UDP socket for streaming
-    let socket = UdpSocket::bind(("0.0.0.0", config.stream_port))
-        .with_context(|| format!("failed to bind UDP port {}", config.stream_port))?;
-
-    if let Err(e) = crate::platform::net::tune_udp_socket(&socket) {
-        eprintln!("[main] failed to tune UDP socket: {e:#}");
-    }
-
-    crate::log_detail!("[main] UDP socket bound on port {}", config.stream_port);
-
-    // Pairing state + TCP handshake server
-    let pairing_state = Arc::new(std::sync::Mutex::new(pairing::PairingState::load()));
-    let session_rx: Arc<std::sync::Mutex<Option<pairing::SessionInfo>>> =
-        Arc::new(std::sync::Mutex::new(None));
-
-    let pairing_thread = {
-        let ps = Arc::clone(&pairing_state);
-        let sr = Arc::clone(&session_rx);
-        let pairing_shared = Arc::clone(&shared);
-        let pairing_stop = Arc::clone(&stop);
-        let port = config.stream_port;
-        thread::Builder::new()
-            .name("pairing".into())
-            .spawn(move || {
-                if let Err(e) =
-                    pairing::run_pairing_server(port, ps, sr, pairing_shared, pairing_stop)
-                {
-                    eprintln!("[pairing] server error: {e:#}");
-                }
-            })
-            .context("failed to spawn pairing thread")?
-    };
+    let config_directory = platform::shim::config_dir();
+    let identity = quic_transport::Identity::load(&config_directory)?;
+    let endpoint = identity.endpoint(format!("[::]:{}", config.stream_port).parse()?)?;
 
     // -----------------------------------------------------------------------
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
@@ -303,52 +275,38 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Client manager thread
+    // One QUIC endpoint owns pairing, control, input and media.
     // -----------------------------------------------------------------------
 
-    let client_thread = {
-        let client_socket = socket.try_clone().context("clone socket for client mgr")?;
-        let client_shared = Arc::clone(&shared);
-        let client_stop = Arc::clone(&stop);
-        let client_session_rx = Arc::clone(&session_rx);
-        thread::Builder::new()
-            .name("client-mgr".into())
-            .spawn(move || {
-                if let Err(e) = stream_server::run_client_manager(
-                    client_socket,
-                    client_shared,
-                    client_stop,
-                    client_session_rx,
-                ) {
-                    eprintln!("[client] manager error: {e:#}");
-                }
-            })
-            .context("failed to spawn client manager thread")?
-    };
+    let quic_task = tokio::spawn(quic_transport::serve(
+        endpoint,
+        identity,
+        config_directory,
+        Arc::clone(&shared),
+        Arc::clone(&stop),
+    ));
 
     // -----------------------------------------------------------------------
     // Capture + encode + send thread
     // -----------------------------------------------------------------------
 
-    let send_socket = socket.try_clone().context("clone socket for sender")?;
     let capture_shared = Arc::clone(&shared);
     let capture_stop = Arc::clone(&stop);
     let capture_thread = thread::Builder::new()
         .name("display-manager".into())
-        .spawn(move || pipeline::run(send_socket, capture_shared, capture_stop, config))
+        .spawn(move || pipeline::run(capture_shared, capture_stop, config))
         .context("failed to spawn capture thread")?;
 
     // -----------------------------------------------------------------------
     // Speaker thread (runs continuously; the card exists while speakers are on)
     // -----------------------------------------------------------------------
 
-    let audio_socket = socket.try_clone().context("clone socket for audio")?;
     let audio_shared = Arc::clone(&shared);
     let audio_stop = Arc::clone(&stop);
     let audio_thread = thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
-            if let Err(e) = audio::run_speaker(audio_socket, audio_shared, audio_stop) {
+            if let Err(e) = audio::run_speaker(audio_shared, audio_stop) {
                 eprintln!("[audio] speaker error: {e:#}");
             }
         })
@@ -361,6 +319,7 @@ async fn main() -> Result<()> {
     let do_shutdown = move || {
         stop.store(true, Ordering::SeqCst);
         shared.pending_settings.1.notify_all();
+        if let Some(media) = shared.quic_media.lock().unwrap().as_ref() { media.close(); }
 
         // Cleanup remaining resources
         *shared.keyboard_worker.lock().unwrap() = None;
@@ -372,8 +331,7 @@ async fn main() -> Result<()> {
         if let Err(err) = audio_thread.join() {
             eprintln!("[audio] thread join failed: {err:?}");
         }
-        let _ = client_thread.join();
-        let _ = pairing_thread.join();
+        quic_task.abort();
 
         println!("screx cleanup complete, exiting");
     };

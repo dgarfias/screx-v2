@@ -534,7 +534,6 @@ final class StreamViewModel: ObservableObject {
     private var networkControl: NetworkControlClient?
     private var pairingService: PairingService?
     private var pendingPinCompletion: ((String) -> Void)?
-    private var sessionKey: SymmetricKey?
 
     nonisolated init() {
         self.audioPlayer = AudioPlayer(avSync: avSync)
@@ -899,10 +898,7 @@ final class StreamViewModel: ObservableObject {
             applyConnectionHealth(.connectionRefused, detail: Self.refusedMessage, transport: transport)
         } else if normalized.contains("timed out") || normalized.contains("timeout") {
             applyConnectionHealth(.timedOut, detail: Self.timedOutMessage, transport: transport)
-        } else if normalized.contains("not recognized by daemon")
-            || normalized.contains("pair again")
-            || normalized.contains("stale")
-        {
+        } else if normalized.contains("pair again") || normalized.contains("stale") {
             applyConnectionHealth(.sessionStale, detail: Self.staleMessage, transport: transport)
         } else {
             applyConnectionHealth(.connectionError, detail: message, transport: transport)
@@ -994,8 +990,7 @@ final class StreamViewModel: ObservableObject {
     /// active: every teardown call here is nil-safe.
     private func failConnection(detail: String) {
         log("failConnection: \(detail)")
-        stream?.onEvent = nil
-        stream?.onDisconnect = nil
+        stream?.onFirstFrame = nil
         stream?.disconnect()
         stream = nil
         closeNetworkControl(gracefully: false)
@@ -1262,7 +1257,6 @@ final class StreamViewModel: ObservableObject {
         guard !servicesStarted else { return }
         servicesStarted = true
         log("startServices()")
-        KeychainHelper.removeLegacyPairings()
         log("local display: \(DeviceDisplayIdentity.current.name), EDID: \(DeviceDisplayIdentity.current.edidName)")
         startTrafficMonitoring()
         syncCameraCompressionQuality()
@@ -1368,8 +1362,7 @@ final class StreamViewModel: ObservableObject {
     func connectToEndpoint(_ endpoint: NWEndpoint, name: String, tile: RecentConnection) {
         log("connectToEndpoint(name=\(name), endpoint=\(endpoint)) start; isConnected=\(isConnected) isConnecting=\(isConnecting)")
         // Detach old stream's callbacks so stale async events can't interfere
-        stream?.onEvent = nil
-        stream?.onDisconnect = nil
+        stream?.onFirstFrame = nil
         stream?.disconnect()
         closeNetworkControl(gracefully: true)
         pairingService?.cancel()
@@ -1395,7 +1388,7 @@ final class StreamViewModel: ObservableObject {
             port = defaultDaemonPort
         }
 
-        // Step 1: TCP handshake for pairing/session key exchange
+        // Authenticate one QUIC connection before exposing control, input or media.
         let ps = PairingService()
         self.pairingService = ps
         log("starting PairingService for host=\(host) port=\(port)")
@@ -1403,12 +1396,11 @@ final class StreamViewModel: ObservableObject {
         ps.onResult = { [weak self] result in
             guard let self else { return }
             switch result {
-            case .sessionEstablished(let key, let connection, let initialData):
+            case .sessionEstablished(let session):
                 self.log("PairingService result: session established")
-                self.sessionKey = key
                 self.pairingService = nil
 
-                let control = NetworkControlClient(connection: connection, sessionKey: key, initialData: initialData)
+                let control = NetworkControlClient(session: session)
                 control.onDisconnect = { [weak self, weak control] in
                     Task { @MainActor in
                         guard let self, let control else { return }
@@ -1447,7 +1439,7 @@ final class StreamViewModel: ObservableObject {
                 self.decoder.setSuspended(false)
                 self.syncSpeakerPassthroughState()
 
-                self.startEncryptedStream(endpoint: endpoint, name: name, sessionKey: key, controlClient: control)
+                self.startEncryptedStream(endpoint: endpoint, name: name, session: session, controlClient: control)
 
             case .pinRequired(let completion):
                 self.log("PairingService result: PIN required")
@@ -1474,9 +1466,9 @@ final class StreamViewModel: ObservableObject {
 
     func submitPin() {
         guard let completion = pendingPinCompletion else { return }
-        let pin = pinInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard pin.count == 6, pin.allSatisfy({ $0.isNumber }) else {
-            pairingStatus = "PIN must be exactly 6 digits"
+        let pin = normalizedPairingPin
+        guard pin.utf8.count == 8, pin.utf8.allSatisfy({ (48...57).contains($0) }) else {
+            pairingStatus = "PIN must be exactly 8 digits"
             return
         }
         log("submitPin()")
@@ -1484,6 +1476,12 @@ final class StreamViewModel: ObservableObject {
         applyConnectionHealth(.pairing, detail: "Verifying the pairing PIN.", transport: .network)
         completion(pin)
         pendingPinCompletion = nil
+    }
+
+    /// Accept both the displayed XXXX-XXXX form and eight ungrouped digits.
+    var normalizedPairingPin: String {
+        pinInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "")
     }
 
     func cancelPin() {
@@ -1496,7 +1494,7 @@ final class StreamViewModel: ObservableObject {
         applyConnectionHealth(.idle, transport: .none)
     }
 
-    private func startEncryptedStream(endpoint: NWEndpoint, name: String, sessionKey: SymmetricKey, controlClient: NetworkControlClient) {
+    private func startEncryptedStream(endpoint: NWEndpoint, name: String, session: QUICSession, controlClient: NetworkControlClient) {
         log("startEncryptedStream(name=\(name), endpoint=\(endpoint))")
         applyConnectionHealth(.waitingForVideo, detail: "Waiting for video from \(name).", transport: .network)
 
@@ -1504,8 +1502,7 @@ final class StreamViewModel: ObservableObject {
         decoder.onVideoSizeChanged = { [weak self] width, height in
             Task { @MainActor in self?.internalVideoSize = CGSize(width: width, height: height) }
         }
-        let client = StreamClient(endpoint: endpoint, decoder: decoder, externalDecoder: externalDecoder, audioPlayer: audioPlayer, avSync: avSync)
-        client.sessionKey = sessionKey
+        let client = StreamClient(session: session, decoder: decoder, externalDecoder: externalDecoder, audioPlayer: audioPlayer, avSync: avSync)
         client.sendPliRequest = { [weak controlClient] display, generation in
             controlClient?.sendPli(display: display, generation: generation)
         }
@@ -1520,42 +1517,14 @@ final class StreamViewModel: ObservableObject {
             self?.recordTraffic(rxBytes: rxBytes, txBytes: txBytes)
         }
 
-        client.onEvent = { [weak self, weak client] event in
+        client.onFirstFrame = { [weak self, weak client] in
             Task { @MainActor in
-                guard let self, let client else { return }
-                guard self.stream === client else { return }
-                self.log("StreamClient event: \(String(describing: event))")
-                switch event {
-                case .readyToRegister:
-                    self.applyConnectionHealth(.waitingForVideo, detail: "Connected. Registering for network video.", transport: .network)
-                case .waiting(let message):
-                    let normalized = message.lowercased()
-                    if normalized.contains("refused") || normalized.contains("timed out") || normalized.contains("timeout") {
-                        self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
-                    } else {
-                        self.applyConnectionHealth(.waitingForVideo, detail: "Waiting for video. \(message)", transport: .network)
-                    }
-                case .connectionFailed(let message):
-                    self.applyConnectionFailure("Connection failed: \(message)", transport: .none)
-                case .receiveError(let message):
-                    self.applyConnectionFailure("Receive error: \(message)", transport: .none)
-                case .timedOut:
-                    self.applyConnectionHealth(.timedOut, detail: "The stream didn’t start. Try again.", transport: .none)
-                case .firstFrame:
-                    self.applyConnectionHealth(.streaming, transport: .network)
-                    self.rememberTarget(name: self.sessionDisplayName)
-                    self.audioPlayer.start()
-                    self.startPeripheralMonitoring()
-                }
-            }
-        }
-        client.onDisconnect = { [weak self, weak client] in
-            Task { @MainActor in
-                guard let self, let client else { return }
-                guard self.stream === client else { return }
-                self.log("StreamClient onDisconnect")
-                self.stream = nil
-                self.handleStreamLost()
+                guard let self, let client, self.stream === client else { return }
+                self.log("StreamClient first frame")
+                self.applyConnectionHealth(.streaming, transport: .network)
+                self.rememberTarget(name: self.sessionDisplayName)
+                self.audioPlayer.start()
+                self.startPeripheralMonitoring()
             }
         }
         client.connect()
@@ -1566,8 +1535,7 @@ final class StreamViewModel: ObservableObject {
         log("handleStreamLost() lastNetEndpoint=\(String(describing: lastNetEndpoint)) lastNetName=\(String(describing: lastNetName))")
         let preservedHealth = connectionHealth
         let preservedStatus = status
-        stream?.onEvent = nil
-        stream?.onDisconnect = nil
+        stream?.onFirstFrame = nil
         stream?.disconnect()
         stream = nil
         closeNetworkControl(gracefully: true)
@@ -1598,8 +1566,7 @@ final class StreamViewModel: ObservableObject {
         if audioPlayer.isOutputEnabled {
             sendSpeakerTransportState(isEnabled: false)
         }
-        stream?.onEvent = nil
-        stream?.onDisconnect = nil
+        stream?.onFirstFrame = nil
         stream?.disconnect()
         stream = nil
         closeNetworkControl(gracefully: true)
@@ -2484,11 +2451,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
 
-                TextField("000000", text: $model.pinInput)
+                TextField("0000-0000", text: $model.pinInput)
                     .font(.system(size: 32, weight: .bold, design: .monospaced))
                     .multilineTextAlignment(.center)
                     .keyboardType(.numberPad)
-                    .frame(maxWidth: 200)
+                    .submitLabel(.go)
+                    .onSubmit { model.submitPin() }
+                    .frame(maxWidth: 240)
                     .textFieldStyle(.roundedBorder)
 
                 HStack(spacing: 16) {
@@ -2497,7 +2466,8 @@ struct ContentView: View {
 
                     Button("Pair") { model.submitPin() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.pinInput.count != 6)
+                        .disabled(model.normalizedPairingPin.utf8.count != 8 ||
+                                  !model.normalizedPairingPin.utf8.allSatisfy { (48...57).contains($0) })
                 }
             }
             .padding(32)

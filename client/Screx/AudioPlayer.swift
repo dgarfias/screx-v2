@@ -140,19 +140,11 @@ final class AudioPlayer {
     }
 
     /// Queues the packets of one speaker datagram: the one named by `frameId` and the redundant
-    /// copies of earlier ones. Called on the stream queue. `receiveTimeNs` is when the network
-    /// stack received the datagram (`CLOCK_MONOTONIC_RAW`), 0 if unknown.
+    /// copies of earlier ones. Called on the stream queue.
     func enqueue(payload: Data, entries: [SpeakerAudioEntry], frameId: UInt32, timestampMs: UInt32,
-                 generation: UInt32, receiveTimeNs: UInt64) {
+                 generation: UInt32) {
         guard isOutputEnabled else { return }
         let nowMs = CACurrentMediaTime() * 1000
-        var processingMs: Double?
-        if receiveTimeNs > 0 {
-            let nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-            if nowNs >= receiveTimeNs {
-                processingMs = Double(nowNs - receiveTimeNs) / 1_000_000
-            }
-        }
         let videoOffsetMs = avSync.videoOffsetMs()
         payload.withUnsafeBytes { raw in
             locked {
@@ -171,8 +163,7 @@ final class AudioPlayer {
                                   timestampMs: timestampMs &- UInt32(entry.distance) &* 10,
                                   isPrimary: entry.distance == 0,
                                   bytes: bytes,
-                                  nowMs: nowMs,
-                                  processingMs: processingMs)
+                                  nowMs: nowMs)
                 }
                 // Audio and video timestamps share the daemon's clock. Audio plays about
                 // (its arrival offset - video's) + depth + one render quantum behind the

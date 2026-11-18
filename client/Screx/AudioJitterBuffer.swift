@@ -39,7 +39,7 @@ enum SpeakerAudioPayload {
     }
 }
 
-/// UDP `AUDIO_REPORT` body.
+/// `AUDIO_REPORT` datagram body.
 struct AudioPlayoutReport: Equatable {
     var generation: UInt32
     var depthUs: UInt32
@@ -54,11 +54,8 @@ struct AudioPlayoutReport: Equatable {
     var jitterUs: UInt32
     /// The video cap on the target; 0 when there is none.
     var capUs: UInt32
-    /// Longest time a speaker datagram waited on the iPad between the network stack receiving it
-    /// and the jitter buffer storing it; 0 when the receive time is unavailable.
-    var maxProcessingUs: UInt32
 
-    static let byteCount = 35
+    static let byteCount = 31
 
     func encoded() -> Data {
         var data = Data(capacity: Self.byteCount)
@@ -69,7 +66,7 @@ struct AudioPlayoutReport: Equatable {
             withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
         }
         data.append(maxBurst)
-        for value in [jitterUs, capUs, maxProcessingUs] {
+        for value in [jitterUs, capUs] {
             withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
         }
         return data
@@ -220,7 +217,6 @@ final class AudioJitterBuffer {
     private var late = 0
     private var maxBurst = 0
     private var burst = 0
-    private var maxProcessingMs = 0.0
 
     deinit {
         storage.deallocate()
@@ -251,14 +247,10 @@ final class AudioJitterBuffer {
     }
 
     /// Stores one packet. `isPrimary` is true for the datagram's own packet, false for a
-    /// redundant copy; only primaries count for jitter and lateness. `processingMs` is how long
-    /// the datagram waited on the iPad before reaching here, if known.
+    /// redundant copy; only primaries count for jitter and lateness.
     func insert(seq: Int64, timestampMs: UInt32, isPrimary: Bool, bytes: UnsafeRawBufferPointer,
-                nowMs: Double, processingMs: Double? = nil) {
+                nowMs: Double) {
         guard seq >= 0 else { return }
-        if isPrimary, let processingMs {
-            maxProcessingMs = max(maxProcessingMs, processingMs)
-        }
         if let highest, abs(seq - highest) > Self.resyncGap {
             guard isPrimary else { return }
             reset()
@@ -403,7 +395,6 @@ final class AudioJitterBuffer {
             concealed = 0
             late = 0
             maxBurst = 0
-            maxProcessingMs = 0
         }
         guard isPlaying else { return nil }
         func micros(_ ms: Double) -> UInt32 {
@@ -419,7 +410,6 @@ final class AudioJitterBuffer {
                                   late: UInt16(clamping: late),
                                   maxBurst: UInt8(clamping: maxBurst),
                                   jitterUs: micros(estimator.targetMs),
-                                  capUs: maxTargetMs.isFinite ? micros(maxTargetMs) : 0,
-                                  maxProcessingUs: micros(maxProcessingMs))
+                                  capUs: maxTargetMs.isFinite ? micros(maxTargetMs) : 0)
     }
 }

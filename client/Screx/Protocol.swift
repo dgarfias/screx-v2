@@ -1,10 +1,10 @@
 import Foundation
 
-/// Message type bytes for the encrypted control channel (TCP) and for client -> daemon
-/// UDP payloads. Every message is `type(u8) + body`. Must match `daemon/src/protocol.rs`;
+/// Message types for QUIC control/input streams and media datagrams.
+/// Every message is `type(u8) + body`. Must match `daemon/src/protocol.rs`;
 /// see docs/ARCHITECTURE.md "Protocol Details" for the body layouts.
 enum ScrexMessage {
-    /// Client -> daemon control messages (TCP).
+    /// Client -> daemon control and input stream messages.
     enum Client {
         static let settings: UInt8 = 0x01
         static let pli: UInt8 = 0x02
@@ -22,16 +22,15 @@ enum ScrexMessage {
         static let camera: UInt8 = 0x22
     }
 
-    /// Daemon -> client control messages (TCP).
+    /// Daemon -> client control stream messages.
     enum Daemon {
         static let caps: UInt8 = 0x80
         static let pong: UInt8 = 0x81
         static let displayStatus: UInt8 = 0x82
     }
 
-    /// Client -> daemon UDP payloads.
-    enum Udp {
-        static let keepalive: UInt8 = 0x01
+    /// Client -> daemon QUIC datagram payloads.
+    enum Datagram {
         static let camera: UInt8 = 0x02
         static let mic: UInt8 = 0x03
         static let audioReport: UInt8 = 0x04

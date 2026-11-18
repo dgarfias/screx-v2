@@ -78,6 +78,30 @@ cargo build --release
 
 Output: `daemon/target/release/screx`
 
+The build compiles Monocypher's Elligator2 map from `shared/` for CPace pairing, so build from a
+checkout of the whole repository.
+
+### Tests
+
+```bash
+cd daemon
+cargo test
+```
+
+They cover the published CPace vectors, wrong PINs, low-order shares, pairing persistence, pinned
+TLS, reconnects with a saved identity, busy and same-device takeover, both streams and 1022-byte
+datagrams.
+
+To check interoperability with Apple's QUIC stack, run the ignored test on this host:
+
+```bash
+cargo test quic_transport::tests::apple_interop_server -- --exact --ignored --nocapture
+```
+
+It listens on UDP 19001 for 90 seconds and prints a test PIN. Then run the smoke test on a Mac
+(see [CLIENT_IPAD.md](CLIENT_IPAD.md#tests)) and type that PIN. It uses temporary identity
+files, not the daemon's real pairings.
+
 ## Run
 
 ```bash
@@ -115,7 +139,7 @@ sudo ./target/release/screx unpair --all
 | `-k, --keyframe` | `90` | Keyframe interval (frames) |
 | `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--intra-refresh false` to keep periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
-| `-p, --port` | `9000` | UDP/TCP streaming port |
+| `-p, --port` | `9000` | QUIC port (UDP); open UDP, not TCP, in the firewall |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
 | `-v, --verbose` | off | More logging. Default output covers startup, pairing, connects/disconnects, monitor changes, warnings and errors. `-v` adds connection, device and pipeline details plus per-second capture stats; `-vv` adds per-packet diagnostics |
@@ -139,7 +163,10 @@ request to turn them on.
 
 1. Start the daemon.
 2. Open Screx on the iPad, enter the host/IP, and tap `Connect`.
-3. If it is the first connection, enter the PIN shown by the daemon.
+3. If it is the first connection, enter the eight-digit PIN the daemon prints (shown as
+   `1234-5678`). It allows one attempt and expires after 120 seconds; connecting again prints a
+   new one. Pairings are stored in `quic-pairings-v1.json` and the daemon's TLS identity in
+   `quic-identity-v1.json`, under `/root/.config/screx` when run with `sudo`.
 4. Enable the iPad-named display in GNOME Settings if the virtual monitor is not already
    active.
 

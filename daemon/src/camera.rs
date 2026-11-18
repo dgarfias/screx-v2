@@ -63,7 +63,7 @@ impl Drop for CamWriter {
     }
 }
 
-/// Reassembles chunked camera frames from UDP.
+/// Reassembles camera frames sent as chunks in QUIC datagrams.
 /// Format: frame_id(u32 BE) + chunk_idx(u16 BE) + total_chunks(u16 BE) + jpeg_data
 pub struct CamReassembler {
     current_frame_id: u32,

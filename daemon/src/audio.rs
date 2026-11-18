@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -206,12 +205,10 @@ pub struct AudioReport {
     pub jitter_us: u32,
     /// The video cap on the iPad's target; 0 when there is none.
     pub cap_us: u32,
-    /// Longest wait on the iPad between receiving a datagram and buffering it; 0 if unknown.
-    pub max_processing_us: u32,
 }
 
 impl AudioReport {
-    pub const LEN: usize = 35;
+    pub const LEN: usize = 31;
 
     pub fn parse(body: &[u8]) -> Option<Self> {
         if body.len() != Self::LEN {
@@ -231,7 +228,6 @@ impl AudioReport {
             max_burst: body[22],
             jitter_us: u32_at(23),
             cap_us: u32_at(27),
-            max_processing_us: u32_at(31),
         })
     }
 }
@@ -257,7 +253,6 @@ struct ReportTotals {
     concealed: u32,
     late: u32,
     max_burst: u8,
-    max_processing_us: u32,
 }
 
 impl SpeakerControl {
@@ -281,7 +276,6 @@ impl SpeakerControl {
         self.window.concealed += u32::from(report.concealed);
         self.window.late += u32::from(report.late);
         self.window.max_burst = self.window.max_burst.max(report.max_burst);
-        self.window.max_processing_us = self.window.max_processing_us.max(report.max_processing_us);
         self.last_report_seen = Some(*report);
     }
 
@@ -311,7 +305,7 @@ impl SpeakerControl {
             crate::log_detail!(
                 "[audio] iPad depth {:.1}/{:.1} ms (jitter {:.1} ms, video cap {cap}), clock {:+.0} ppm, \
                  redundancy {:?}, loss hint {}%; last 5 s: {} due, {} lost, {} recovered, \
-                 {} concealed, {} late, longest burst {}, iPad processing max {:.1} ms",
+                 {} concealed, {} late, longest burst {}",
                 ms(r.depth_us),
                 ms(r.target_us),
                 ms(r.jitter_us),
@@ -323,8 +317,7 @@ impl SpeakerControl {
                 w.recovered,
                 w.concealed,
                 w.late,
-                w.max_burst,
-                ms(w.max_processing_us)
+                w.max_burst
             );
         }
         self.window = ReportTotals::default();
@@ -407,9 +400,8 @@ pub fn probe_speaker_available() -> bool {
 /// of what applications play into it about every 10 ms, and sends it to the iPad as Opus.
 /// The read interval follows the iPad's playback clock through its `AUDIO_REPORT`s. Unplugs the
 /// card when speakers go off or the client leaves.
-pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run_speaker(shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()> {
     make_realtime("audio");
-    let mut sender = AudioSender::new(socket);
     let speakers_on = || {
         shared.has_active_client.load(Ordering::Relaxed)
             && shared.audio_output_enabled.load(Ordering::SeqCst)
@@ -427,6 +419,13 @@ pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<Atomic
             name.clone()
         };
 
+        // Speakers are only on while a session is authenticated, so this is a momentary race at
+        // session teardown; wait for the next notification instead of spinning.
+        let Some(media) = shared.quic_media.lock().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let speaker_session = shared.network_session_id.load(Ordering::Acquire);
         let mut speaker_opus = match SpeakerOpus::new(shared.audio_bitrate_bps.load(Ordering::Relaxed)) {
             Ok(opus) => opus,
             Err(e) => {
@@ -444,15 +443,17 @@ pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<Atomic
             }
         };
         crate::log_detail!("[audio] speaker card '{name}' plugged in");
-
-        sender.reset_history();
+        // A fresh sender per card session: a new generation, and no copies of earlier audio.
+        let mut sender = AudioSender::from_quic(media);
         shared.audio_reports.lock().unwrap().clear();
         let mut control = SpeakerControl::default();
         let mut last_log = Instant::now();
-        let mut active_session_key = None;
         let mut chunk = [0u8; BYTES_PER_CHUNK];
         let mut next = Instant::now();
-        while speakers_on() && !stop.load(Ordering::Relaxed) {
+        while speakers_on()
+            && shared.network_session_id.load(Ordering::Acquire) == speaker_session
+            && !stop.load(Ordering::Relaxed)
+        {
             // This schedule is the card's clock.
             wait_for_tick(&mut next, control.read_period(), "audio");
             if let Err(e) = card.read(&mut chunk) {
@@ -472,27 +473,16 @@ pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<Atomic
                 last_log = now;
             }
 
-            let session_key = *shared.session_key.lock().unwrap();
-            if session_key != active_session_key {
-                active_session_key = session_key;
-                sender.set_source(*shared.udp_source.lock().unwrap());
-                match active_session_key {
-                    Some(key) => sender.set_cipher(crate::crypto::SessionCipher::new(&key)),
-                    None => sender.clear_cipher(),
-                }
-            }
-            if let Some(addr) = *shared.client_addr.lock().unwrap() {
-                // Stamped with when the chunk was due to play, on the video timestamps' clock.
-                let ts = next.saturating_duration_since(shared.start_time).as_millis() as u32;
-                speaker_opus.set_loss_percent(control.loss_percent());
-                let redundancy = control.redundancy(now);
-                let result = speaker_opus
-                    .set_bitrate(shared.audio_bitrate_bps.load(Ordering::Relaxed))
-                    .and_then(|()| speaker_opus.encode(&chunk))
-                    .and_then(|packet| sender.send_audio(packet, addr, ts, redundancy));
-                if let Err(e) = result {
-                    eprintln!("[audio] send error: {e:#}");
-                }
+            // Stamped with when the chunk was due to play, on the video timestamps' clock.
+            let ts = next.saturating_duration_since(shared.start_time).as_millis() as u32;
+            speaker_opus.set_loss_percent(control.loss_percent());
+            let redundancy = control.redundancy(now);
+            let result = speaker_opus
+                .set_bitrate(shared.audio_bitrate_bps.load(Ordering::Relaxed))
+                .and_then(|()| speaker_opus.encode(&chunk))
+                .and_then(|packet| sender.send_audio(packet, ts, redundancy));
+            if let Err(e) = result {
+                eprintln!("[audio] send error: {e:#}");
             }
         }
         drop(card);
@@ -873,7 +863,7 @@ mod tests {
             body.extend_from_slice(&v.to_be_bytes());
         }
         body.push(2);
-        for v in [15_000u32, 0, 3_000] {
+        for v in [15_000u32, 0] {
             body.extend_from_slice(&v.to_be_bytes());
         }
         // Same bytes as `reportEncoding` in client/Tests/AudioJitterBufferTests.swift.
@@ -881,7 +871,7 @@ mod tests {
             body,
             [
                 0, 0, 0, 7, 0, 0, 0x61, 0xA8, 0, 0, 0x4E, 0x20, 0, 20, 0, 3, 0, 2, 0, 1, 0, 4, 2, 0,
-                0, 0x3A, 0x98, 0, 0, 0, 0, 0, 0, 0x0B, 0xB8
+                0, 0x3A, 0x98, 0, 0, 0, 0
             ]
         );
         let report = AudioReport::parse(&body).unwrap();
@@ -899,10 +889,9 @@ mod tests {
                 max_burst: 2,
                 jitter_us: 15_000,
                 cap_us: 0,
-                max_processing_us: 3_000,
             }
         );
-        assert!(AudioReport::parse(&body[..34]).is_none());
+        assert!(AudioReport::parse(&body[..30]).is_none());
     }
 
     #[test]
@@ -1096,7 +1085,6 @@ mod tests {
             max_burst: 2,
             jitter_us: 10_000,
             cap_us: 0,
-            max_processing_us: 0,
         };
         control.on_report(&report, now);
         assert_eq!(control.redundancy(now), REDUNDANCY_BURSTY);

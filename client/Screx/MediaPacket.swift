@@ -5,7 +5,7 @@ enum StreamDisplayID: UInt8, CaseIterable {
     case externalDisplay = 1
 }
 
-/// Shared daemon -> client media header. All fields are authenticated as AES-GCM AAD.
+/// Shared daemon -> client media header, inside an authenticated QUIC datagram.
 struct MediaPacketHeader {
     static let byteCount = 22
     let frameID: UInt32
@@ -20,7 +20,6 @@ struct MediaPacketHeader {
 
     var isAudio: Bool { flags & 0x02 != 0 }
     var isIDR: Bool { flags & 0x01 != 0 }
-    var isHeartbeat: Bool { flags & 0x80 != 0 }
     var displayID: StreamDisplayID { flags & 0x10 == 0 ? .internalDisplay : .externalDisplay }
 
     init?(_ data: Data) {

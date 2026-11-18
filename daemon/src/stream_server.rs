@@ -1,6 +1,5 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -9,19 +8,15 @@ use anyhow::Result;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::audio::MicWriter;
-use crate::camera::{CamReassembler, CamWriter, CameraConfig};
+use crate::camera::{CamWriter, CameraConfig};
 use crate::capture::DisplayId;
 use crate::encode::{EncodedAccessUnit, EncoderBackend, VideoCodec};
 use crate::input::{
     parse_key_event, parse_mouse_packet, parse_rawkey_event, parse_touch_packet, GamepadState,
     InputBackend, KeyboardWorker,
 };
-use crate::platform::net::{
-    build_ipv4_cmsg, build_pktinfo_cmsg, send_to_from, send_to_with_cmsg, sendmmsg_batch,
-    udp_source_for_local_ip, PktinfoCmsg, UdpSource, TOS_EF,
-};
 
-const CHUNK_PAYLOAD: usize = 1400;
+const CHUNK_PAYLOAD: usize = crate::quic_transport::CHUNK_PAYLOAD;
 const HEADER_LEN: usize = 22;
 use crate::protocol;
 
@@ -33,10 +28,6 @@ const SETTINGS_RESOLUTION_FLOOR_H: u32 = 360;
 const SETTINGS_FPS_FLOOR: u32 = 15;
 const SETTINGS_BITRATE_FLOOR_BPS: u32 = 500_000;
 
-const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_MAGIC: &[u8] = b"SCREX_HB";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_FEC_SHARDS: usize = 127;
 /// Reed-Solomon over GF(2^8) allows at most 255 data+parity shards per block.
 const MAX_SHARDS_PER_FEC_BLOCK: usize = 255;
@@ -51,7 +42,7 @@ const PACING_BATCH_SIZE: usize = 8;
 /// rest of the interval for the next frame's capture/encode.
 const PACING_SPREAD_NUM: u64 = 1;
 const PACING_SPREAD_DEN: u64 = 2;
-const MAX_PACKET_LEN: usize = HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN;
+const MAX_PACKET_LEN: usize = HEADER_LEN + CHUNK_PAYLOAD;
 const IDR_FEC_PERCENT: usize = 10;
 const PFRAME_FEC_PERCENT: usize = 5;
 const MODERATE_IDR_FEC_PERCENT: usize = 14;
@@ -61,7 +52,6 @@ const SEVERE_PFRAME_FEC_PERCENT: usize = 9;
 const ADAPTIVE_ADJUST_INTERVAL: Duration = Duration::from_secs(1);
 const ADAPTIVE_SHORT_WINDOW: Duration = Duration::from_secs(2);
 const ADAPTIVE_LONG_WINDOW: Duration = Duration::from_secs(6);
-const SENDMMSG_BATCH_SIZE: usize = 32;
 
 fn fnv1a64(data: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -72,14 +62,6 @@ fn fnv1a64(data: &[u8]) -> u64 {
     hash
 }
 
-fn should_log_debug(counter: u64) -> bool {
-    counter <= 12 || counter.is_power_of_two() || counter % 25 == 0
-}
-
-fn seq_is_stale(seq_num: u32, expected_seq: u32) -> bool {
-    let diff = seq_num.wrapping_sub(expected_seq);
-    diff > 0x8000_0000
-}
 
 pub type LifecycleCallback = Box<dyn Fn() + Send + Sync>;
 
@@ -252,7 +234,8 @@ impl DisplayStreamControl {
 }
 
 pub struct SharedState {
-    pub client_addr: Mutex<Option<SocketAddr>>,
+    /// Authenticated QUIC connection, scoped to the currently reserved session.
+    pub quic_media: Mutex<Option<crate::quic_transport::MediaTransport>>,
     display_streams: [Mutex<Arc<DisplayStreamControl>>; 2],
     pub input_backend: Arc<Mutex<dyn InputBackend>>,
     pub keyboard_worker: Mutex<Option<KeyboardWorker>>,
@@ -273,15 +256,9 @@ pub struct SharedState {
     /// like the monitor. Waited on with `audio_notify`.
     pub audio_device_name: Mutex<String>,
     pub network_session_busy: AtomicBool,
-    pub network_session_pending: AtomicBool,
     pub network_session_id: AtomicU64,
     network_session_closing: AtomicBool,
     network_session_lock: Mutex<()>,
-    pub session_key: Mutex<Option<[u8; 32]>>,
-    /// IP expected from the TCP handshake; used to accept the first UDP packet
-    pub expected_client_ip: Mutex<Option<std::net::IpAddr>>,
-    /// Local source IP/interface pinned for daemon→client UDP (from TCP handshake)
-    pub udp_source: Mutex<Option<UdpSource>>,
     /// Ceilings advertised in `CAPS` and enforced when clamping `SETTINGS`
     /// requests — 1:1 with the daemon operator's `--max-width`/
     /// `--max-height`/`--max-framerate`/`--max-bitrate` CLI flags. These
@@ -313,7 +290,7 @@ impl SharedState {
         features: FeatureToggles,
     ) -> Self {
         Self {
-            client_addr: Mutex::new(None),
+            quic_media: Mutex::new(None),
             display_streams: std::array::from_fn(|_| {
                 Mutex::new(Arc::new(DisplayStreamControl::new(base_bitrate_bps)))
             }),
@@ -336,13 +313,9 @@ impl SharedState {
             audio_reports: Mutex::new(VecDeque::new()),
             audio_device_name: Mutex::new("iPad".into()),
             network_session_busy: AtomicBool::new(false),
-            network_session_pending: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
             network_session_closing: AtomicBool::new(false),
             network_session_lock: Mutex::new(()),
-            session_key: Mutex::new(None),
-            expected_client_ip: Mutex::new(None),
-            udp_source: Mutex::new(None),
             max_width,
             max_height,
             max_fps,
@@ -361,7 +334,6 @@ impl SharedState {
         self.network_session_busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
-        self.network_session_pending.store(true, Ordering::SeqCst);
         self.network_session_closing.store(false, Ordering::SeqCst);
         Some(
             self.network_session_id
@@ -374,12 +346,6 @@ impl SharedState {
         self.network_session_busy.load(Ordering::SeqCst)
             && !self.network_session_closing.load(Ordering::SeqCst)
             && self.network_session_id.load(Ordering::SeqCst) == session_id
-    }
-
-    pub fn mark_network_session_active(&self, session_id: u64) {
-        if self.is_current_network_session(session_id) {
-            self.network_session_pending.store(false, Ordering::SeqCst);
-        }
     }
 
     pub fn display_stream(&self, display: DisplayId) -> Arc<DisplayStreamControl> {
@@ -506,8 +472,8 @@ pub fn probe_capabilities(
 
 /// Build the `CAPS` control message advertising what this daemon can do
 /// right now, plus its host name. Re-probes capabilities on every call (see
-/// `probe_capabilities`) rather than reading a cached value — pairing.rs
-/// calls this once per connection.
+/// `probe_capabilities`) rather than reading a cached value; sent once per
+/// session.
 ///
 /// Layout after the type byte: `camera(u8) mic(u8) speaker(u8)
 /// gamepad_max(u8, 0 = unsupported) codecs(u8 bitmask, bit n = codec id n)
@@ -830,9 +796,9 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
     }
 }
 
-/// Dispatch one decrypted client -> daemon control message (`type(u8) +
-/// body`). `PING` and `DISCONNECT` are handled by the control loop in
-/// pairing.rs before this is called.
+/// Dispatch one client -> daemon control or input message (`type(u8) + body`).
+/// `quic_transport` handles `PING` and `DISCONNECT` itself and keeps input
+/// messages on the input stream and everything else on the control stream.
 pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg: &[u8]) {
     if !shared.is_current_network_session(session) {
         return;
@@ -1057,13 +1023,9 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
         shared.network_session_closing.store(true, Ordering::SeqCst);
     }
 
-    *shared.client_addr.lock().unwrap() = None;
-    *shared.session_key.lock().unwrap() = None;
-    *shared.expected_client_ip.lock().unwrap() = None;
-    *shared.udp_source.lock().unwrap() = None;
-    shared
-        .network_session_pending
-        .store(false, Ordering::SeqCst);
+    if let Some(media) = shared.quic_media.lock().unwrap().take() {
+        media.close();
+    }
 
     if shared.has_active_client.swap(false, Ordering::SeqCst) {
         shared.audio_notify.notify_all();
@@ -1095,411 +1057,7 @@ pub fn drop_network_client(shared: &Arc<SharedState>, session_id: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Client manager — runs on its own thread, handles SCREX/PLI/keepalive
-// ---------------------------------------------------------------------------
-
-pub fn run_client_manager(
-    socket: UdpSocket,
-    shared: Arc<SharedState>,
-    stop: Arc<AtomicBool>,
-    session_rx: Arc<Mutex<Option<crate::pairing::SessionInfo>>>,
-) -> Result<()> {
-    socket
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .ok();
-
-    let mut last_keepalive = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let mut heartbeat_sequence = crate::crypto::ServerPacketSequence::new();
-    let mut recv_buf = vec![0u8; 4096];
-    let mut cam_reassembler = CamReassembler::new();
-    let mut input_seq_expected: u32 = 0;
-    let mut input_seq_initialized = false;
-    let mut local_cipher: Option<crate::crypto::SessionCipher> = None;
-    let mut session_serial: u64 = 0;
-    let mut recv_count: u64 = 0;
-    let mut short_drop_count: u64 = 0;
-    let mut ip_mismatch_drop_count: u64 = 0;
-    let mut no_cipher_drop_count: u64 = 0;
-    let mut decrypt_fail_count: u64 = 0;
-    let mut heartbeat_count: u64 = 0;
-    let mut current_session_id: u64 = 0;
-    let mut pending_started_at: Option<Instant> = None;
-    let mut session_udp_source: Option<UdpSource> = None;
-
-    crate::log_detail!("[client] waiting for paired handshake...");
-
-    while !stop.load(Ordering::Relaxed) {
-        // Check for new session from the pairing TCP handshake
-        {
-            let mut rx = session_rx.lock().unwrap();
-            if let Some(session) = rx.take() {
-                if !shared.is_current_network_session(session.session_id) {
-                    crate::log_trace!(
-                        "[client] ignoring stale session info: session_id={} current_id={} busy={}",
-                        session.session_id,
-                        shared.network_session_id.load(Ordering::SeqCst),
-                        shared.network_session_busy.load(Ordering::SeqCst)
-                    );
-                    continue;
-                }
-                session_serial = session_serial.wrapping_add(1);
-                let previous_expected = *shared.expected_client_ip.lock().unwrap();
-                let previous_client = *shared.client_addr.lock().unwrap();
-                crate::log_detail!(
-                    "[client] session key established from TCP handshake ({})",
-                    session.client_addr.ip(),
-                );
-                crate::log_trace!(
-                    "[client] session #{session_serial} key established from TCP handshake: tcp_addr={} expected_udp_ip={} previous_expected_ip={previous_expected:?} previous_udp_client={previous_client:?}",
-                    session.client_addr,
-                    session.client_addr.ip(),
-                );
-
-                *shared.session_key.lock().unwrap() = Some(session.session_key);
-                *shared.expected_client_ip.lock().unwrap() = Some(session.client_addr.ip());
-
-                // Pin daemon→client UDP source to the local IP the client
-                // dialed for the TCP handshake. On multi-homed hosts the
-                // default route may otherwise pick another interface/IP and
-                // the iPad will silently drop every packet we send.
-                session_udp_source = udp_source_for_local_ip(session.local_ip);
-                *shared.udp_source.lock().unwrap() = session_udp_source;
-                match session_udp_source {
-                    Some(src) => crate::log_detail!(
-                        "[client] pinning UDP source address to {} (ifindex {})",
-                        src.ip,
-                        src.ifindex
-                    ),
-                    None => crate::log_trace!(
-                        "[client] no UDP source pinning (handshake local ip: {:?})",
-                        session.local_ip
-                    ),
-                }
-
-                local_cipher = Some(crate::crypto::SessionCipher::new(&session.session_key));
-                input_seq_expected = 0;
-                input_seq_initialized = false;
-                current_session_id = session.session_id;
-                pending_started_at = Some(Instant::now());
-                last_keepalive = Instant::now();
-            }
-        }
-
-        match socket.recv_from(&mut recv_buf) {
-            Ok((len, addr)) => {
-                recv_count = recv_count.wrapping_add(1);
-                if should_log_debug(recv_count) {
-                    let registered_client = *shared.client_addr.lock().unwrap();
-                    let expected_ip = *shared.expected_client_ip.lock().unwrap();
-                    crate::log_trace!(
-                        "[client] udp recv #{recv_count}: from={addr} len={len} registered_client={registered_client:?} expected_ip={expected_ip:?} has_cipher={}",
-                        local_cipher.is_some()
-                    );
-                }
-
-                // All client→daemon UDP packets are encrypted:
-                // [seq_num(4 BE)] [ciphertext] [tag(16)]
-                if len < 4 + crate::crypto::TAG_LEN {
-                    short_drop_count = short_drop_count.wrapping_add(1);
-                    if should_log_debug(short_drop_count) {
-                        crate::log_trace!(
-                            "[client] drop short udp packet #{short_drop_count}: from={addr} len={len} min_len={}",
-                            4 + crate::crypto::TAG_LEN
-                        );
-                    }
-                    continue; // too small to be valid
-                }
-
-                // Check IP and update port in one lock acquisition
-                {
-                    let mut client = shared.client_addr.lock().unwrap();
-                    let registered_client = *client;
-                    let expected_ip = *shared.expected_client_ip.lock().unwrap();
-                    let registered_ok = client.map_or(false, |r| r.ip() == addr.ip());
-                    let expected_ok = if !registered_ok {
-                        expected_ip.map_or(false, |ip| ip == addr.ip())
-                    } else {
-                        false
-                    };
-                    if !registered_ok && !expected_ok {
-                        ip_mismatch_drop_count = ip_mismatch_drop_count.wrapping_add(1);
-                        if should_log_debug(ip_mismatch_drop_count) {
-                            crate::log_trace!(
-                                "[client] drop udp packet #{ip_mismatch_drop_count}: from={addr} registered_client={registered_client:?} expected_ip={expected_ip:?} reason=ip_mismatch"
-                            );
-                        }
-                        continue;
-                    }
-                    if let Some(ref mut r) = *client {
-                        if *r != addr {
-                            crate::log_trace!("[client] udp client address updated: {r} -> {addr}");
-                            *r = addr;
-                        }
-                    }
-                }
-
-                let seq_num =
-                    u32::from_be_bytes([recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]]);
-                let nonce = crate::crypto::nonce_client(seq_num);
-
-                let cipher = match local_cipher.as_ref() {
-                    Some(c) => c,
-                    None => {
-                        no_cipher_drop_count = no_cipher_drop_count.wrapping_add(1);
-                        if should_log_debug(no_cipher_drop_count) {
-                            crate::log_trace!(
-                                "[client] drop udp packet #{no_cipher_drop_count}: from={addr} seq={seq_num} reason=no_session_cipher"
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                let aad: [u8; 4] = [recv_buf[0], recv_buf[1], recv_buf[2], recv_buf[3]];
-                let plaintext = match cipher.decrypt(&nonce, &aad, &mut recv_buf[4..len]) {
-                    Some(pt) => pt,
-                    None => {
-                        decrypt_fail_count = decrypt_fail_count.wrapping_add(1);
-                        if should_log_debug(decrypt_fail_count) {
-                            crate::log_trace!(
-                                "[client] drop udp packet #{decrypt_fail_count}: from={addr} seq={seq_num} len={len} reason=decrypt_failed"
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                last_keepalive = Instant::now();
-                if should_log_debug(recv_count) {
-                    crate::log_trace!(
-                        "[client] udp packet authenticated: from={addr} seq={seq_num} plaintext_len={}",
-                        plaintext.len()
-                    );
-                }
-
-                if input_seq_initialized && seq_is_stale(seq_num, input_seq_expected) {
-                    crate::log_trace!(
-                        "[client] drop udp packet: from={addr} seq={seq_num} expected_seq={input_seq_expected} reason=stale_out_of_order"
-                    );
-                    continue;
-                }
-                if input_seq_initialized && seq_num != input_seq_expected {
-                    crate::log_trace!(
-                        "[client] udp sequence gap: from={addr} seq={seq_num} expected_seq={input_seq_expected}"
-                    );
-                }
-                input_seq_expected = seq_num.wrapping_add(1);
-                input_seq_initialized = true;
-
-                // First authenticated packet: register the full client address
-                {
-                    let mut client = shared.client_addr.lock().unwrap();
-                    let is_new = client.is_none() || client.map_or(false, |prev| prev != addr);
-                    *client = Some(addr);
-
-                    if is_new {
-                        crate::log_detail!("[client] authenticated UDP client: {addr}");
-                        *shared.expected_client_ip.lock().unwrap() = None;
-                        shared.mark_network_session_active(current_session_id);
-                        pending_started_at = None;
-                        for stream in &shared.display_streams {
-                            let stream = stream.lock().unwrap();
-                            stream.force_idr.store(true, Ordering::Relaxed);
-                            stream.force_refresh.store(true, Ordering::Relaxed);
-                        }
-                        shared.pending_settings.1.notify_all();
-                        if !shared.has_active_client.swap(true, Ordering::SeqCst) {
-                            shared.audio_notify.notify_all();
-                            drop(client);
-                            let shared_lc = Arc::clone(&shared);
-                            std::thread::Builder::new()
-                                .name("lifecycle-connect".into())
-                                .spawn(move || {
-                                    if let Some(ref cb) =
-                                        *shared_lc.on_client_connected.lock().unwrap()
-                                    {
-                                        cb();
-                                    }
-                                })
-                                .ok();
-                        }
-
-                        // Send an immediate heartbeat so the iPad's data timeout
-                        // doesn't fire while peripherals are being created.
-                        if let Some(ref c) = local_cipher {
-                            let hb_frame_id = heartbeat_sequence.take_frame()?;
-                            let hb_flags: u8 = 0x80;
-                            let nonce = crate::crypto::nonce_server(
-                                hb_frame_id,
-                                0,
-                                hb_flags,
-                                heartbeat_sequence.generation,
-                            );
-                            let header = build_header(
-                                hb_frame_id,
-                                0,
-                                0,
-                                0,
-                                hb_flags,
-                                0,
-                                HEARTBEAT_MAGIC.len() as u16,
-                                0,
-                                heartbeat_sequence.generation,
-                            );
-                            let hb_magic_len = HEARTBEAT_MAGIC.len();
-                            let mut hb_buf = [0u8; HEADER_LEN + 64];
-                            hb_buf[..HEADER_LEN].copy_from_slice(&header);
-                            hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len]
-                                .copy_from_slice(HEARTBEAT_MAGIC);
-                            let enc_len = c.encrypt_slice(
-                                &nonce,
-                                &header,
-                                &mut hb_buf[HEADER_LEN..],
-                                hb_magic_len,
-                            );
-                            let _ = send_to_from(
-                                &socket,
-                                &hb_buf[..HEADER_LEN + enc_len],
-                                addr,
-                                session_udp_source,
-                                None,
-                            );
-                        }
-                        last_heartbeat = Instant::now();
-                    }
-                }
-
-                let pt_len = plaintext.len();
-                match plaintext.split_first() {
-                    Some((&protocol::udp::KEEPALIVE, _)) => {
-                        crate::log_trace!("[client] keepalive received: from={addr} seq={seq_num} plaintext_len={pt_len}");
-                    }
-                    Some((&protocol::udp::CAMERA, cam_data)) => {
-                        if let Some(jpeg) = cam_reassembler.feed(cam_data) {
-                            let mut cam = shared.cam_writer.lock().unwrap();
-                            if let Some(ref mut cw) = *cam {
-                                cw.write_frame(&jpeg);
-                            }
-                        }
-                    }
-                    Some((&protocol::udp::AUDIO_REPORT, body)) => {
-                        if let Some(report) = crate::audio::AudioReport::parse(body) {
-                            let mut reports = shared.audio_reports.lock().unwrap();
-                            if reports.len() >= 16 {
-                                reports.pop_front();
-                            }
-                            reports.push_back(report);
-                        }
-                    }
-                    Some((&protocol::udp::MIC, body)) if body.len() > 4 => {
-                        let mic_seq = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                        let mut mic = shared.mic_writer.lock().unwrap();
-                        if let Some(ref mut mw) = *mic {
-                            if let Err(e) = mw.write_opus_packet(mic_seq, &body[4..]) {
-                                eprintln!("[mic] write error: {e}");
-                            }
-                        }
-                    }
-                    _ => {
-                        crate::log_trace!(
-                            "[client] ignoring unknown udp payload from {addr} ({pt_len} bytes)"
-                        );
-                    }
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                eprintln!("[client] recv error: {e}");
-            }
-        }
-
-        if current_session_id != 0
-            && shared.network_session_pending.load(Ordering::SeqCst)
-            && pending_started_at
-                .map_or(false, |started| started.elapsed() > PENDING_SESSION_TIMEOUT)
-        {
-            println!(
-                "[client] pending session timed out after {:?}, dropping session",
-                PENDING_SESSION_TIMEOUT
-            );
-            local_cipher = None;
-            session_udp_source = None;
-            drop_network_client(&shared, current_session_id);
-            current_session_id = 0;
-            pending_started_at = None;
-        }
-
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            if let Some(addr) = *shared.client_addr.lock().unwrap() {
-                if let Some(ref c) = local_cipher {
-                    heartbeat_count = heartbeat_count.wrapping_add(1);
-                    let hb_frame_id = heartbeat_sequence.take_frame()?;
-                    let hb_flags: u8 = 0x80;
-                    let nonce = crate::crypto::nonce_server(
-                        hb_frame_id,
-                        0,
-                        hb_flags,
-                        heartbeat_sequence.generation,
-                    );
-                    let header = build_header(
-                        hb_frame_id,
-                        0,
-                        0,
-                        0,
-                        hb_flags,
-                        0,
-                        HEARTBEAT_MAGIC.len() as u16,
-                        0,
-                        heartbeat_sequence.generation,
-                    );
-                    let hb_magic_len = HEARTBEAT_MAGIC.len();
-                    let mut hb_buf = [0u8; HEADER_LEN + 64]; // enough for magic + tag
-                    hb_buf[..HEADER_LEN].copy_from_slice(&header);
-                    hb_buf[HEADER_LEN..HEADER_LEN + hb_magic_len].copy_from_slice(HEARTBEAT_MAGIC);
-                    let enc_len =
-                        c.encrypt_slice(&nonce, &header, &mut hb_buf[HEADER_LEN..], hb_magic_len);
-                    match send_to_from(
-                        &socket,
-                        &hb_buf[..HEADER_LEN + enc_len],
-                        addr,
-                        session_udp_source,
-                        None,
-                    ) {
-                        Ok(sent) => {
-                            if should_log_debug(heartbeat_count) {
-                                crate::log_trace!(
-                                    "[client] heartbeat sent #{heartbeat_count}: to={addr} bytes={sent} payload_len={hb_magic_len}"
-                                );
-                            }
-                        }
-                        Err(e) => eprintln!("[client] heartbeat send failed to {addr}: {e}"),
-                    }
-                }
-            }
-            last_heartbeat = Instant::now();
-        }
-
-        // Keepalive timeout check
-        if shared.client_addr.lock().unwrap().is_some()
-            && last_keepalive.elapsed() > KEEPALIVE_TIMEOUT
-        {
-            println!("[client] keepalive timeout, dropping client");
-            local_cipher = None;
-            session_udp_source = None;
-            drop_network_client(&shared, current_session_id);
-            current_session_id = 0;
-            pending_started_at = None;
-        }
-    }
-
-    crate::log_detail!("[client] manager stopped");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// UDP sender — called synchronously from the capture thread
+// QUIC datagram sender — called synchronously from the capture thread
 // ---------------------------------------------------------------------------
 
 const MAX_RS_CACHE_ENTRIES: usize = 64;
@@ -1557,14 +1115,9 @@ mod display_stream_tests {
     }
 
     #[test]
-    fn failed_video_send_does_not_reuse_the_frame_nonce() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut sender =
-            UdpSender::new(UdpSocket::bind("127.0.0.1:0").unwrap(), DisplayId::Internal);
-        sender.set_cipher(crate::crypto::SessionCipher::new(&[0x42; 32]));
+    fn video_frame_ids_advance_within_a_generation() {
+        let (media, receiver) = crate::quic_transport::MediaTransport::capture();
+        let mut sender = VideoSender::from_quic(media, DisplayId::Internal);
         let au = EncodedAccessUnit {
             is_idr: true,
             annex_b: crate::encode::AnnexB::Vec(vec![1, 2, 3, 4]),
@@ -1574,14 +1127,10 @@ mod display_stream_tests {
             idr_fec_percent: 0,
             pframe_fec_percent: 0,
         };
-        assert!(sender
-            .send_frame(&au, "127.0.0.1:0".parse().unwrap(), 0, 0, tuning)
-            .is_err());
-        sender
-            .send_frame(&au, receiver.local_addr().unwrap(), 0, 0, tuning)
-            .unwrap();
-        let mut packet = [0u8; 2048];
-        receiver.recv_from(&mut packet).unwrap();
+        sender.send_frame(&au, 0, 0, tuning).unwrap();
+        sender.send_frame(&au, 0, 0, tuning).unwrap();
+        receiver.recv().unwrap();
+        let packet = receiver.recv().unwrap();
         assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), 1);
     }
 
@@ -1616,14 +1165,7 @@ mod display_stream_tests {
     }
 
     #[test]
-    fn two_video_senders_route_and_authenticate_independently() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let target = receiver.local_addr().unwrap();
-        let key = [0x42; 32];
-        let cipher = crate::crypto::SessionCipher::new(&key);
+    fn two_video_senders_route_independently_inside_quic() {
         let mut generations = Vec::new();
         for display in [
             DisplayId::Internal,
@@ -1631,9 +1173,8 @@ mod display_stream_tests {
             DisplayId::External,
         ] {
             // The last sender represents tearing down and recreating the external worker.
-            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let mut sender = UdpSender::new(socket, display);
-            sender.set_cipher(crate::crypto::SessionCipher::new(&key));
+            let (media, receiver) = crate::quic_transport::MediaTransport::capture();
+            let mut sender = VideoSender::from_quic(media, display);
             let au = EncodedAccessUnit {
                 is_idr: true,
                 annex_b: crate::encode::AnnexB::Vec(vec![1, 2, 3, 4]),
@@ -1643,10 +1184,9 @@ mod display_stream_tests {
                 idr_fec_percent: 0,
                 pframe_fec_percent: 0,
             };
-            sender.send_frame(&au, target, 123, 1, tuning).unwrap();
-            let mut packet = [0u8; 2048];
-            let (len, _) = receiver.recv_from(&mut packet).unwrap();
-            assert_eq!(len, HEADER_LEN + 4 + crate::crypto::TAG_LEN);
+            sender.send_frame(&au, 123, 1, tuning).unwrap();
+            let packet = receiver.recv().unwrap();
+            assert_eq!(packet.len(), HEADER_LEN + 4);
             assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), 0);
             assert_eq!(
                 packet[10],
@@ -1663,73 +1203,46 @@ mod display_stream_tests {
             assert_eq!(generation, sender.generation());
             assert!(!generations.contains(&generation));
             generations.push(generation);
-            let nonce = crate::crypto::nonce_server(0, 0, packet[10], generation);
-            let header: [u8; HEADER_LEN] = packet[..HEADER_LEN].try_into().unwrap();
-            assert_eq!(
-                cipher
-                    .decrypt(&nonce, &header, &mut packet[HEADER_LEN..len])
-                    .unwrap(),
-                &[1, 2, 3, 4]
-            );
+            assert_eq!(&packet[HEADER_LEN..], &[1, 2, 3, 4]);
         }
     }
 }
 
-pub struct UdpSender {
-    socket: UdpSocket,
+pub struct VideoSender {
+    quic: crate::quic_transport::MediaTransport,
     packet_pool: Vec<[u8; MAX_PACKET_LEN]>,
     packet_lens: Vec<usize>,
-    sequence: crate::crypto::ServerPacketSequence,
+    sequence: crate::media_sequence::ServerPacketSequence,
     display_id: crate::capture::DisplayId,
     stats_start: Instant,
     stats_frames: u64,
     stats_bytes: u64,
     shard_pool: Vec<Vec<u8>>,
     rs_cache: HashMap<(usize, usize), ReedSolomon>,
-    cipher: Option<crate::crypto::SessionCipher>,
-    source: Option<UdpSource>,
-    cmsg_buf: Option<PktinfoCmsg>,
     log_sent_aus: bool,
     /// Wire time one frame is allotted, used to pace large frames.
     frame_interval: Duration,
 }
 
-impl UdpSender {
-    pub fn new(socket: UdpSocket, display_id: crate::capture::DisplayId) -> Self {
+impl VideoSender {
+    pub fn from_quic(media: crate::quic_transport::MediaTransport, display_id: crate::capture::DisplayId) -> Self {
         Self {
-            socket,
-            packet_pool: Vec::new(),
-            packet_lens: Vec::new(),
-            sequence: crate::crypto::ServerPacketSequence::new(),
-            display_id,
-            stats_start: Instant::now(),
-            stats_frames: 0,
-            stats_bytes: 0,
-            shard_pool: Vec::new(),
-            rs_cache: HashMap::new(),
-            cipher: None,
-            source: None,
-            cmsg_buf: None,
+            quic: media,
+            packet_pool: Vec::new(), packet_lens: Vec::new(),
+            sequence: crate::media_sequence::ServerPacketSequence::new(), display_id,
+            stats_start: Instant::now(), stats_frames: 0, stats_bytes: 0,
+            shard_pool: Vec::new(), rs_cache: HashMap::new(),
             log_sent_aus: std::env::var_os("SCREX_LOG_SENT_AUS").is_some(),
             frame_interval: Duration::from_micros(1_000_000 / 60),
         }
-    }
-
-    pub fn set_cipher(&mut self, cipher: crate::crypto::SessionCipher) {
-        self.cipher = Some(cipher);
     }
 
     pub fn generation(&self) -> u32 {
         self.sequence.generation
     }
 
-    pub fn replace_sequence(&mut self, sequence: crate::crypto::ServerPacketSequence) {
+    pub fn replace_sequence(&mut self, sequence: crate::media_sequence::ServerPacketSequence) {
         self.sequence = sequence;
-    }
-
-    pub fn set_source(&mut self, source: Option<UdpSource>) {
-        self.source = source;
-        self.cmsg_buf = source.map(build_pktinfo_cmsg);
     }
 
     /// Per-session parameters: the negotiated framerate (for pacing).
@@ -1767,7 +1280,6 @@ impl UdpSender {
     pub fn send_frame(
         &mut self,
         au: &EncodedAccessUnit,
-        client_addr: SocketAddr,
         timestamp_ms: u32,
         codec_id: u8,
         tuning: StreamTuning,
@@ -1889,26 +1401,10 @@ impl UdpSender {
             self.packet_pool[idx][HEADER_LEN..HEADER_LEN + actual_payload_len]
                 .copy_from_slice(&self.shard_pool[idx][..actual_payload_len]);
 
-            self.packet_lens[idx] = if let Some(ref cipher) = self.cipher {
-                let nonce = crate::crypto::nonce_server(
-                    frame_id,
-                    idx as u16,
-                    flags,
-                    self.sequence.generation,
-                );
-                let enc_len = cipher.encrypt_slice(
-                    &nonce,
-                    &header,
-                    &mut self.packet_pool[idx][HEADER_LEN..],
-                    actual_payload_len,
-                );
-                HEADER_LEN + enc_len
-            } else {
-                HEADER_LEN + actual_payload_len
-            };
+            self.packet_lens[idx] = HEADER_LEN + actual_payload_len;
         }
 
-        let frame_bytes = self.send_frame_batch(client_addr, total_shards)?;
+        let frame_bytes = self.send_frame_batch(total_shards)?;
 
         self.stats_frames += 1;
         self.stats_bytes += frame_bytes;
@@ -1935,70 +1431,20 @@ impl UdpSender {
         }
     }
 
-    fn send_frame_batch(&mut self, client_addr: SocketAddr, total_shards: usize) -> Result<u64> {
-        let mut sent = 0;
-        let mut frame_bytes = 0_u64;
-
-        // Typical P-frames go out in one burst. Large frames (keyframes,
-        // scene changes) are spread evenly across part of the frame interval
-        // in small batches: a few hundred back-to-back datagrams overflow
-        // Wi-Fi access point queues and get dropped, and they also hold up
-        // the audio packets that share this socket.
-        let paced = total_shards > PACING_THRESHOLD_SHARDS;
-        let batch_size = if paced {
-            PACING_BATCH_SIZE
-        } else {
-            SENDMMSG_BATCH_SIZE
-        };
-        let pacing_start = Instant::now();
-        let pacing_window =
-            self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
-
-        while sent < total_shards {
-            if paced && sent > 0 {
-                // Release batch k at k/n of the window. Falling behind (slow
-                // send, long sleep) just sends the next batch immediately.
-                let due = pacing_window.mul_f64(sent as f64 / total_shards as f64);
-                if let Some(wait) = due.checked_sub(pacing_start.elapsed()) {
+    fn send_frame_batch(&mut self, total_shards: usize) -> Result<u64> {
+        let started = Instant::now();
+        let window = self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
+        let mut bytes = 0;
+        for i in 0..total_shards {
+            if total_shards > PACING_THRESHOLD_SHARDS && i % PACING_BATCH_SIZE == 0 {
+                if let Some(wait) = window.mul_f64(i as f64 / total_shards as f64).checked_sub(started.elapsed()) {
                     std::thread::sleep(wait);
                 }
             }
-            let end = (sent + batch_size).min(total_shards);
-            let batch: Vec<&[u8]> = (sent..end)
-                .map(|idx| &self.packet_pool[idx][..self.packet_lens[idx]])
-                .collect();
-            match sendmmsg_batch(&self.socket, &batch, client_addr, self.source) {
-                Ok(sent_now) if sent_now > 0 => {
-                    frame_bytes += self.packet_lens[sent..sent + sent_now]
-                        .iter()
-                        .map(|len| *len as u64)
-                        .sum::<u64>();
-                    sent += sent_now;
-                }
-                Ok(_) => anyhow::bail!("sendmmsg returned 0 packets sent"),
-                Err(error) => {
-                    if sent == 0 {
-                        crate::log_trace!(
-                            "[stream] sendmmsg unavailable, falling back to send_to: {error}"
-                        );
-                    }
-                    for idx in sent..end {
-                        send_to_from(
-                            &self.socket,
-                            &self.packet_pool[idx][..self.packet_lens[idx]],
-                            client_addr,
-                            self.source,
-                            self.cmsg_buf.as_ref().map(|b| b.as_slice()),
-                        )
-                        .map_err(|e| anyhow::anyhow!("send error: {e}"))?;
-                        frame_bytes += self.packet_lens[idx] as u64;
-                    }
-                    sent = end;
-                }
-            }
+            self.quic.send_video(&self.packet_pool[i][..self.packet_lens[i]])?;
+            bytes += self.packet_lens[i] as u64;
         }
-
-        Ok(frame_bytes)
+        Ok(bytes)
     }
 }
 
@@ -2068,28 +1514,20 @@ fn build_audio_payload<'a>(
 }
 
 pub struct AudioSender {
-    socket: UdpSocket,
-    sequence: crate::crypto::ServerPacketSequence,
+    quic: crate::quic_transport::MediaTransport,
+    sequence: crate::media_sequence::ServerPacketSequence,
     send_buf: Vec<u8>,
     payload: Vec<u8>,
-    cipher: Option<crate::crypto::SessionCipher>,
-    source: Option<UdpSource>,
-    /// Pinned source (if any) plus TOS EF, for IPv4 destinations.
-    cmsg_buf: PktinfoCmsg,
     /// Recently sent packets by `frame_id % AUDIO_HISTORY`, for redundant copies.
     history: [(Option<u32>, Vec<u8>); AUDIO_HISTORY],
 }
 
 impl AudioSender {
-    pub fn new(socket: UdpSocket) -> Self {
+    pub fn from_quic(media: crate::quic_transport::MediaTransport) -> Self {
         Self {
-            socket,
-            sequence: crate::crypto::ServerPacketSequence::new(),
-            send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN],
-            payload: Vec::with_capacity(CHUNK_PAYLOAD),
-            cipher: None,
-            source: None,
-            cmsg_buf: build_ipv4_cmsg(None, TOS_EF),
+            quic: media,
+            sequence: crate::media_sequence::ServerPacketSequence::new(),
+            send_buf: vec![0; MAX_PACKET_LEN], payload: Vec::with_capacity(CHUNK_PAYLOAD),
             history: std::array::from_fn(|_| (None, Vec::new())),
         }
     }
@@ -2099,33 +1537,11 @@ impl AudioSender {
         self.sequence.generation
     }
 
-    /// Forgets sent packets, so a new speaker-card session never carries copies of audio from
-    /// before it.
-    pub fn reset_history(&mut self) {
-        for entry in &mut self.history {
-            entry.0 = None;
-        }
-    }
-
-    pub fn set_cipher(&mut self, cipher: crate::crypto::SessionCipher) {
-        self.cipher = Some(cipher);
-    }
-
-    pub fn clear_cipher(&mut self) {
-        self.cipher = None;
-    }
-
-    pub fn set_source(&mut self, source: Option<UdpSource>) {
-        self.source = source;
-        self.cmsg_buf = build_ipv4_cmsg(source, TOS_EF);
-    }
-
     /// Send one 10 ms Opus speaker packet plus copies of the packets `distances` frame IDs
-    /// before it that were sent since the last `reset_history`.
+    /// before it that this sender sent.
     pub fn send_audio(
         &mut self,
         opus: &[u8],
-        client_addr: SocketAddr,
         timestamp_ms: u32,
         distances: &[u8],
     ) -> Result<()> {
@@ -2161,22 +1577,7 @@ impl AudioSender {
         self.send_buf[..HEADER_LEN].copy_from_slice(&header);
         self.send_buf[HEADER_LEN..HEADER_LEN + payload_len].copy_from_slice(&self.payload);
 
-        let pkt_len = if let Some(ref cipher) = self.cipher {
-            let nonce =
-                crate::crypto::nonce_server(frame_id, 0, FLAG_AUDIO, self.sequence.generation);
-            let enc_len =
-                cipher.encrypt_slice(&nonce, &header, &mut self.send_buf[HEADER_LEN..], payload_len);
-            HEADER_LEN + enc_len
-        } else {
-            HEADER_LEN + payload_len
-        };
-
-        let packet = &self.send_buf[..pkt_len];
-        let sent = match client_addr {
-            SocketAddr::V4(_) => send_to_with_cmsg(&self.socket, packet, client_addr, &self.cmsg_buf),
-            SocketAddr::V6(_) => send_to_from(&self.socket, packet, client_addr, self.source, None),
-        };
-        sent.map(|_| ()).map_err(|e| anyhow::anyhow!("audio send: {e}"))
+        self.quic.send(&self.send_buf[..HEADER_LEN + payload_len])
     }
 }
 
@@ -2226,24 +1627,20 @@ mod audio_payload_tests {
     }
 
     #[test]
-    fn sender_only_copies_packets_it_sent_this_session() {
-        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut sender = AudioSender::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let addr = rx.local_addr().unwrap();
-        let mut buf = [0u8; 2048];
-        let mut recv = || {
-            let n = rx.recv(&mut buf).unwrap();
-            entries(&buf[HEADER_LEN..n])
+    fn copies_reach_back_to_earlier_packets() {
+        let (media, rx) = crate::quic_transport::MediaTransport::capture();
+        let mut sender = AudioSender::from_quic(media);
+        let recv = || {
+            let packet = rx.recv().unwrap();
+            entries(&packet[HEADER_LEN..])
         };
-        for i in 0..4u8 {
-            sender.send_audio(&[i], addr, 0, &[1, 3]).unwrap();
+        assert_eq!(sender.send_audio(&[0], 0, &[1, 3]).map(|_| recv()).unwrap(), vec![(0, vec![0])]);
+        for i in 1..4u8 {
+            sender.send_audio(&[i], 0, &[1, 3]).unwrap();
         }
-        let _ = (recv(), recv(), recv());
+        let _ = (recv(), recv());
         // Frame 3 carries frame 2 (distance 1) and frame 0 (distance 3).
         assert_eq!(recv(), vec![(0, vec![3]), (1, vec![2]), (3, vec![0])]);
-        sender.reset_history();
-        sender.send_audio(&[4], addr, 0, &[1, 3]).unwrap();
-        assert_eq!(recv(), vec![(0, vec![4])]);
     }
 }
 
