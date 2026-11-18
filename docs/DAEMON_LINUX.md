@@ -140,6 +140,7 @@ sudo ./target/release/screx unpair --all
 | `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--intra-refresh false` to keep periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
 | `-p, --port` | `9000` | QUIC port (UDP); open UDP, not TCP, in the firewall |
+| `--vaapi-async-depth` | `1` | Frames the VA-API encoder may work on at once (1–8). Higher improves throughput at the cost of up to that many frames of latency |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
 | `-v, --verbose` | off | More logging. Default output covers startup, pairing, connects/disconnects, monitor changes, warnings and errors. `-v` adds connection, device and pipeline details plus per-second capture stats; `-vv` adds per-packet diagnostics |

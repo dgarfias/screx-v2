@@ -92,6 +92,12 @@ struct Cli {
     #[arg(long)]
     no_vpp: bool,
 
+    /// Number of frames the VA-API encoder may work on at once. The default
+    /// keeps the old serialized behaviour; 2–4 can improve throughput at the
+    /// cost of up to that many frames of latency.
+    #[arg(long, default_value_t = 1)]
+    vaapi_async_depth: u32,
+
     /// Encoder backend: auto, vaapi, nvenc, software
     #[arg(short = 'e', long, default_value = "auto")]
     backend: String,
@@ -138,6 +144,7 @@ enum Commands {
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
     gpu_convert: bool,
+    vaapi_async_depth: u32,
     codec: encode::VideoCodec,
     width: u32,
     height: u32,
@@ -160,6 +167,7 @@ impl AppConfig {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
             gpu_convert: !cli.no_vpp,
+            vaapi_async_depth: cli.vaapi_async_depth.clamp(1, 8),
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.max_width,
             height: cli.max_height,

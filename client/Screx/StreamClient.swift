@@ -38,12 +38,13 @@ final class StreamClient {
 
     private static let headerLen = MediaPacketHeader.byteCount
     static let chunkPayload = QUICSession.chunkPayload
-    /// How long an incomplete frame may sit before we give up on it. Only a
-    /// loss-recovery deadline (complete frames deliver immediately), so it is
-    /// not a steady-state latency cost. 100 ms is six frames at 60 fps;
-    /// 50 ms (~3 frames) recovers sooner on loss while staying far above
-    /// Wi-Fi reorder jitter. Moonlight uses a ~10 ms reorder window.
-    private static let frameTimeout: TimeInterval = 0.050
+    /// How long an incomplete frame may sit before we give up and ask for a
+    /// keyframe. Only a loss-recovery deadline (complete frames deliver
+    /// immediately), so it is not a steady-state latency cost. 80 ms (~5
+    /// frames at 60 fps) lets shards that are merely late complete the frame;
+    /// on a link where shards are actually lost it delays recovery by the
+    /// same amount.
+    private static let frameTimeout: TimeInterval = 0.080
 
     private var audioGeneration: UInt32 = 0
     private static let audioReportInterval: TimeInterval = 0.2

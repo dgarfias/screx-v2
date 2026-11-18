@@ -33,6 +33,8 @@ impl VideoCodec {
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub bitrate_bps: u32,
+    /// VA-API frames the encoder may pipeline at once.
+    pub vaapi_async_depth: u32,
     /// Convert captured BGRA frames to NV12 on the GPU (VA-API VPP). False
     /// keeps the CPU scaler, as on a driver without video post-processing.
     pub gpu_convert: bool,
@@ -908,7 +910,12 @@ impl HwEncoder {
             match kind {
                 HwKind::Vaapi => {
                     let key = std::ffi::CString::new("async_depth").unwrap();
-                    ffi::av_opt_set_int((*ctx).priv_data, key.as_ptr(), 1, 0);
+                    ffi::av_opt_set_int(
+                        (*ctx).priv_data,
+                        key.as_ptr(),
+                        i64::from(config.vaapi_async_depth.clamp(1, 8)),
+                        0,
+                    );
                     if let VaapiHevcMode::Cqp(qp_value) = vaapi_hevc_mode {
                         let rc_mode = std::ffi::CString::new("rc_mode").unwrap();
                         let cqp = std::ffi::CString::new("CQP").unwrap();
@@ -1510,6 +1517,7 @@ mod banded_scaler_tests {
     fn vaapi_encoder_accepts_vpp_frames() {
         let config = EncoderConfig {
             bitrate_bps: 4_000_000,
+            vaapi_async_depth: 2,
             gop: 90,
             fps: 30,
             width: 256,
@@ -1525,7 +1533,11 @@ mod banded_scaler_tests {
         };
         let bgra = vec![128u8; 256 * 256 * 4];
         let capture = CaptureFrame { width: 256, height: 256, data: &bgra };
-        let units = encoder.encode_frame(&capture, true).expect("encode");
+        // async_depth pipelines, so the first packets arrive a frame later.
+        let mut units = Vec::new();
+        for index in 0..3 {
+            units.extend(encoder.encode_frame(&capture, index == 0).expect("encode"));
+        }
         assert!(!units.is_empty());
         assert!(units.iter().any(|unit| unit.is_idr));
     }
