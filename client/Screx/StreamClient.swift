@@ -15,7 +15,12 @@ enum StreamClientEvent {
 final class StreamClient {
     private let endpoint: NWEndpoint
     private var connection: NWConnection?
+    /// Receives, decrypts and dispatches every datagram, and handles audio directly. Video
+    /// reassembly, FEC recovery and decoding happen on `videoQueue`, so audio never waits behind
+    /// them.
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
+    /// Owns `videoStreams` and everything about video frames.
+    private let videoQueue = DispatchQueue(label: "screx.stream.video", qos: .userInteractive)
     private let debugId = String(UUID().uuidString.prefix(6))
     private let videoStreams: [StreamDisplayID: VideoReceiveState]
     let audioPlayer: AudioPlayer
@@ -39,8 +44,9 @@ final class StreamClient {
     private static let frameTimeout: TimeInterval = 0.050
     private static let dataTimeout: TimeInterval = 5.0
 
-    private var audioReassembly: [UInt32: AudioAssembly] = [:]
     private var audioGeneration: UInt32 = 0
+    private static let audioReportInterval: TimeInterval = 0.2
+    private var audioReportTimer: DispatchSourceTimer?
     private var hasReceivedFirstFrame = false
     private var keepaliveTimer: DispatchSourceTimer?
     private var dataTimeoutTimer: DispatchSourceTimer?
@@ -74,6 +80,11 @@ final class StreamClient {
         log("connect() endpoint=\(endpoint)")
         let params = NWParameters.udp
         params.requiredLocalEndpoint = nil
+        // Kernel receive times let the audio report separate network delay from time spent on
+        // the iPad before a datagram reaches the jitter buffer.
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.shouldCalculateReceiveTime = true
+        }
 
         let conn = NWConnection(to: endpoint, using: params)
         self.connection = conn
@@ -89,16 +100,17 @@ final class StreamClient {
                 self.startKeepalive(conn)
                 self.startDataTimeout()
                 self.startVideoRecovery()
+                self.startAudioReports(conn)
                 for (display, stream) in self.videoStreams {
                     stream.decoder.onFrameReady = { [weak self] generation in
-                        self?.queue.async { [weak self] in
+                        self?.videoQueue.async { [weak self] in
                             guard let self, self.videoStreams[display]?.timeline.generation == generation else { return }
                             self.onVideoFrameReady?(display, generation)
                         }
                     }
                     stream.decoder.sendPliRequest = { [weak self] in
                         // Decoder callbacks may originate on the render queue.
-                        self?.queue.async { [weak self] in self?.sendPli(display: display) }
+                        self?.videoQueue.async { [weak self] in self?.sendPli(display: display) }
                     }
                 }
                 self.receiveLoop(conn)
@@ -124,6 +136,8 @@ final class StreamClient {
         dataTimeoutTimer = nil
         videoRecoveryTimer?.cancel()
         videoRecoveryTimer = nil
+        audioReportTimer?.cancel()
+        audioReportTimer = nil
         connection?.cancel()
         connection = nil
     }
@@ -134,8 +148,18 @@ final class StreamClient {
         encryptAndSend(Data([ScrexMessage.Udp.keepalive]), conn: conn, label: "register")
     }
 
-    /// Encrypt plaintext with session key, prepend 4-byte seq_num, send over UDP.
-    private func encryptAndSend(_ plaintext: Data, conn: NWConnection, label: String) {
+    /// Mic datagrams ask for voice priority on the way out (WMM AC_VO on Wi-Fi).
+    private static let voiceContext: NWConnection.ContentContext = {
+        let ip = NWProtocolIP.Metadata()
+        ip.serviceClass = .interactiveVoice
+        return NWConnection.ContentContext(identifier: "voice", metadata: [ip])
+    }()
+
+    /// Encrypt plaintext with session key, prepend 4-byte seq_num, send over UDP. `verbose`
+    /// logs each send; periodic and per-packet traffic passes false.
+    private func encryptAndSend(_ plaintext: Data, conn: NWConnection, label: String,
+                                context: NWConnection.ContentContext = .defaultMessage,
+                                verbose: Bool = true) {
         guard let key = sessionKey else {
             log("\(label) send aborted: missing session key")
             return
@@ -157,14 +181,16 @@ final class StreamClient {
 
         var packet = seqData
         packet.append(encrypted)
-        log("\(label) send queued: seq=\(seq) plaintext=\(plaintext.count) packet=\(packet.count)")
+        if verbose {
+            log("\(label) send queued: seq=\(seq) plaintext=\(plaintext.count) packet=\(packet.count)")
+        }
 
-        conn.send(content: packet, completion: .contentProcessed { error in
+        conn.send(content: packet, contentContext: context, isComplete: true, completion: .contentProcessed { error in
             if let error {
                 print("[stream] \(label) send error: \(error)")
             } else {
                 self.onTraffic?(0, packet.count)
-                self.log("\(label) send completed")
+                if verbose { self.log("\(label) send completed") }
             }
         })
     }
@@ -178,6 +204,22 @@ final class StreamClient {
         }
         timer.resume()
         keepaliveTimer = timer
+    }
+
+    /// Sends the speaker playout report the daemon uses to follow the iPad's clock and pick
+    /// redundancy. Nothing is sent while speaker audio isn't playing.
+    private func startAudioReports(_ conn: NWConnection) {
+        audioReportTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.audioReportInterval, repeating: Self.audioReportInterval)
+        timer.setEventHandler { [weak self] in
+            guard let self, let report = self.audioPlayer.takeReport() else { return }
+            var packet = Data([ScrexMessage.Udp.audioReport])
+            packet.append(report.encoded())
+            self.encryptAndSend(packet, conn: conn, label: "audio report", verbose: false)
+        }
+        timer.resume()
+        audioReportTimer = timer
     }
 
     private func startDataTimeout() {
@@ -202,7 +244,7 @@ final class StreamClient {
 
     private func startVideoRecovery() {
         videoRecoveryTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let timer = DispatchSource.makeTimerSource(queue: videoQueue)
         timer.schedule(deadline: .now() + Self.frameTimeout, repeating: Self.frameTimeout)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
@@ -224,7 +266,7 @@ final class StreamClient {
     }
 
     private func receiveLoop(_ conn: NWConnection) {
-        conn.receiveMessage { [weak self] data, _, isComplete, error in
+        conn.receiveMessage { [weak self] data, context, isComplete, error in
             guard let self else { return }
 
             if let error {
@@ -242,7 +284,8 @@ final class StreamClient {
                     self.log("received UDP datagram #\(self.receiveCount): bytes=\(data.count) isComplete=\(isComplete)")
                 }
                 if data.count >= Self.headerLen {
-                    self.handlePacket(data)
+                    let ip = context?.protocolMetadata(definition: NWProtocolIP.definition) as? NWProtocolIP.Metadata
+                    self.handlePacket(data, receiveTimeNs: ip?.receiveTime ?? 0)
                 } else {
                     self.log("ignoring short inbound UDP datagram: \(data.count) bytes")
                 }
@@ -252,7 +295,8 @@ final class StreamClient {
         }
     }
 
-    private func handlePacket(_ data: Data) {
+    /// `receiveTimeNs` is the kernel receive time on `CLOCK_MONOTONIC_RAW`, 0 if unknown.
+    private func handlePacket(_ data: Data, receiveTimeNs: UInt64) {
         guard let packet = MediaPacketHeader(data) else { return }
         let frameId = packet.frameID
         let chunkIdx = packet.chunkIndex
@@ -294,25 +338,34 @@ final class StreamClient {
         }
 
         if packet.isAudio {
-            guard flags == 0x02, totalParity == 0 else { return }
-            guard totalData > 0,
-                  chunkIdx < totalData,
-                  Int(payloadLen) <= payload.count else {
-                log("ignoring invalid audio shard metadata for frameId=\(frameId)")
+            // One datagram per packet: its own Opus packet plus redundant copies of earlier ones.
+            guard flags == 0x02, totalParity == 0, totalData == 1, chunkIdx == 0 else { return }
+            guard packet.generation >= audioGeneration else { return }
+            audioGeneration = packet.generation
+            guard let entries = SpeakerAudioPayload.parse(payload) else {
+                log("ignoring malformed speaker audio payload for frameId=\(frameId)")
                 return
             }
-            guard packet.generation >= audioGeneration else { return }
-            if packet.generation != audioGeneration {
-                audioGeneration = packet.generation
-                audioReassembly.removeAll(keepingCapacity: true)
-            }
-            handleAudioPacket(frameId: frameId, chunkIdx: Int(chunkIdx),
-                              totalData: Int(totalData), payload: payload,
-                              actualLen: Int(payloadLen), timestampMs: timestampMs)
+            audioPlayer.enqueue(payload: payload, entries: entries, frameId: frameId,
+                                timestampMs: timestampMs, generation: packet.generation,
+                                receiveTimeNs: receiveTimeNs)
             return
         }
 
-        // Video path
+        videoQueue.async { [weak self] in
+            self?.handleVideoPacket(packet, payload: payload)
+        }
+    }
+
+    /// Runs on `videoQueue`.
+    private func handleVideoPacket(_ packet: MediaPacketHeader, payload: Data) {
+        let frameId = packet.frameID
+        let chunkIdx = packet.chunkIndex
+        let totalData = packet.totalData
+        let totalParity = packet.totalParity
+        let codecId = packet.codecID
+        let payloadLen = packet.payloadLength
+        let timestampMs = packet.timestampMs
         guard codecId <= 1, let stream = videoStreams[packet.displayID] else { return }
         let shardCount = Int(totalData) + Int(totalParity)
         guard totalData > 0,
@@ -374,37 +427,6 @@ final class StreamClient {
         }
 
         pruneOldFrames(display: packet.displayID)
-    }
-
-    private func handleAudioPacket(frameId: UInt32, chunkIdx: Int, totalData: Int,
-                                   payload: Data, actualLen: Int, timestampMs: UInt32) {
-        let enqueue: (Data) -> Void = { [audioPlayer] data in
-            audioPlayer.enqueueOpus(data, timestampMs: timestampMs)
-        }
-
-        if totalData == 1 {
-            enqueue(payload.prefix(actualLen))
-            return
-        }
-
-        let assembly = audioReassembly[frameId] ?? AudioAssembly(totalData: totalData)
-        audioReassembly[frameId] = assembly
-        assembly.addChunk(index: chunkIdx, payload: payload, actualLen: actualLen)
-
-        if assembly.isComplete {
-            if let audio = assembly.reassemble() {
-                enqueue(audio)
-            }
-            audioReassembly.removeValue(forKey: frameId)
-        }
-
-        // Prune stale audio assemblies (keep last 10)
-        if audioReassembly.count > 10 {
-            let sorted = audioReassembly.keys.sorted()
-            for key in sorted.prefix(audioReassembly.count - 10) {
-                audioReassembly.removeValue(forKey: key)
-            }
-        }
     }
 
     private func deliverFrame(display: StreamDisplayID, frameId: UInt32, assembly: FrameAssembly) {
@@ -500,11 +522,11 @@ final class StreamClient {
         var packet = Data([ScrexMessage.Udp.mic])
         withUnsafeBytes(of: seq.bigEndian) { packet.append(contentsOf: $0) }
         packet.append(opus)
-        encryptAndSend(packet, conn: conn, label: "mic")
+        encryptAndSend(packet, conn: conn, label: "mic", context: Self.voiceContext, verbose: false)
     }
 }
 
-/// Accessed only on the stream receive queue. No FEC, loss, or decoder state crosses displays.
+/// Accessed only on `StreamClient.videoQueue`. No FEC, loss, or decoder state crosses displays.
 private final class VideoReceiveState {
     let decoder: VideoDecoder
     var timeline = VideoStreamTimeline()
@@ -662,44 +684,5 @@ private final class FrameAssembly {
             shards[index] = recovered
         }
         return true
-    }
-}
-
-private final class AudioAssembly {
-    let totalData: Int
-    private var chunks: [Int: Data] = [:]
-    private var actualLengths: [Int: Int] = [:]
-    private var receivedCount = 0
-
-    init(totalData: Int) {
-        self.totalData = totalData
-    }
-
-    func addChunk(index: Int, payload: Data, actualLen: Int) {
-        guard chunks[index] == nil else { return }
-        chunks[index] = payload
-        actualLengths[index] = actualLen
-        receivedCount += 1
-    }
-
-    var isComplete: Bool { receivedCount >= totalData }
-
-    func reassemble() -> Data? {
-        var totalSize = 0
-        for i in 0..<totalData {
-            guard let chunk = chunks[i] else { return nil }
-            totalSize += actualLengths[i] ?? chunk.count
-        }
-        var result = Data(capacity: totalSize)
-        for i in 0..<totalData {
-            let chunk = chunks[i]!
-            let len = actualLengths[i] ?? chunk.count
-            if len == chunk.count {
-                result.append(chunk)
-            } else {
-                result.append(chunk[..<len])
-            }
-        }
-        return result
     }
 }

@@ -34,5 +34,6 @@ enum ScrexMessage {
         static let keepalive: UInt8 = 0x01
         static let camera: UInt8 = 0x02
         static let mic: UInt8 = 0x03
+        static let audioReport: UInt8 = 0x04
     }
 }

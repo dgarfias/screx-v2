@@ -61,7 +61,9 @@ sudo dkms install /usr/src/screx_snd-0.1.0
 The daemon loads the module on demand. Speaker and microphone toggles create real ALSA
 cards named after the iPad; disabling them or disconnecting removes the cards. The daemon
 does not connect to a user's audio server. PipeWire or PulseAudio can manage these cards
-like other hardware.
+like other hardware. The speaker and microphone threads keep the cards' 10 ms clocks and ask for
+real-time scheduling (`SCHED_FIFO`, priority 10); without the privilege they run at normal
+priority and `-v` logs that.
 
 Tested working on GNOME, KDE Plasma, Cinnamon and Hyprland. Other desktop environments may
 also work. Touchscreen-to-monitor mapping depends on the desktop; any manual mapping belongs

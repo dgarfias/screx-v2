@@ -602,7 +602,7 @@ final class StreamViewModel: ObservableObject {
                 : [.mixWithOthers]
             try session.setCategory(micActive ? .playAndRecord : .playback, mode: .default, options: options)
             try session.setPreferredSampleRate(48000)
-            try session.setPreferredIOBufferDuration(0.01)
+            try session.setPreferredIOBufferDuration(0.005)
             try session.setActive(true)
             print("[app] audio session configured: mic=\(micActive), options=\(options), sampleRate=\(session.sampleRate), ioBufferDuration=\(session.ioBufferDuration)")
             print("[app] audio output: \(session.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ", "))")

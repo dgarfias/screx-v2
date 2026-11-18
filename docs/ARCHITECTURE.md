@@ -239,8 +239,10 @@ Notes:
   `b`'s parity protects only block `b`'s data
 - frames larger than 48 chunks are paced: sent in batches of 8 spread across half the frame
   interval rather than as one burst
-- audio is small enough to go without FEC. Speaker audio is one 10 ms chunk per frame_id: 48 kHz
-  stereo Opus at 96, 128 (default), 192 or 256 kbps, selected in the host's settings
+- audio goes without FEC; it carries redundant copies of earlier packets instead. Speaker audio is
+  one datagram per frame_id (always `chunk_idx` 0, `total_data` 1), each holding the 10 ms Opus
+  packet with that frame_id plus copies of earlier ones: 48 kHz stereo Opus at 96, 128 (default),
+  192 or 256 kbps, selected in the host's settings. See "Speaker audio" below
 - client-to-daemon UDP packets are `seq(u32 BE) + encrypted payload`; the payload is
   `type(u8) + body`, see "Client -> daemon UDP payloads" below
 - the iPad retains incomplete video assemblies for 50 ms, then reconstructs recoverable frames
@@ -301,6 +303,7 @@ breaking protocol change: daemon and iPad client must be updated together.
 | `0x01` | KEEPALIVE | empty; the first one tells the daemon where to send media |
 | `0x02` | CAMERA | `frame_id(u32) + chunk_idx(u16) + total_chunks(u16) + jpeg_chunk` |
 | `0x03` | MIC | `seq(u32) + opus_packet` |
+| `0x04` | AUDIO_REPORT | speaker playout report, see "Speaker audio" below |
 
 ## Capability Negotiation
 
@@ -531,12 +534,93 @@ controllers) stay disabled in the iPad UI until `CAPS` arrives.
 Camera JPEGs are split into UDP `CAMERA` payloads (see above). The daemon reassembles each JPEG
 and writes it to the virtual webcam.
 
+### Speaker audio
+
+Nothing here depends on the network type: the same mechanisms settle near the minimum delay on a
+LAN and grow toward smoothness on a worse remote link, driven only by what the iPad measures.
+
+Payload of a speaker datagram (inside the encryption), integers big-endian:
+
+| Field | Size | Description |
+|---|---|---|
+| `count` | u8 | Number of entries, 1-4 |
+| entries | | `count` x (`distance(u8) + len(u16) + opus[len]`) |
+
+The first entry has distance 0 and is the packet named by the header's `frame_id` and
+`timestamp_ms`. Every further entry is a copy of packet `frame_id - distance`, whose timestamp is
+`timestamp_ms - 10 * distance`. Distances strictly increase and are at most 8. The daemon only
+includes copies of packets it actually sent in the current speaker-card session, and drops copies
+that would not fit in one datagram. Speaker frame IDs are consecutive within a generation, so a
+missing ID is a lost packet. The redundancy level follows the iPad's reports: distance 1 always,
+plus distance 3 for 10 s after the iPad reports a burst of 2 or more consecutive losses. Copies at
+distances 1 and 3 recover any burst of up to 3 lost packets.
+
+The iPad keeps a jitter buffer of Opus packets ordered by packet ID and decodes each packet when it
+is due to play, so late packets never play out of order and delay can't build up:
+
+- a packet that hasn't arrived when it is due is filled with Opus packet-loss concealment and
+  dropped if it arrives later. After 30 ms of concealment with nothing buffered, playback goes
+  silent and restarts once the buffer refills
+- the target depth adapts to measured arrival jitter (the 99th percentile of arrival delay over
+  the last 4 s, plus one packet), between 15 and 200 ms. It rises immediately and falls by at most 2 ms per
+  second. A new session starts from the initial target, not the last session's, since it may be
+  on another network. While video is flowing, the target is also capped so audio plays no more than about
+  100 ms behind the matching video, measured through the shared timestamp clock; past that, late
+  packets are concealed instead of adding delay
+- once the smoothed depth is more than 15 ms (or 20% of the target, if larger) above the target,
+  it merges two packets into 10 ms with a crossfade; that far below, it inserts 10 ms of
+  concealment. At most one such adjustment happens per 200 ms. This drains the excess left when
+  playback starts while packets are still delayed (for example behind the first keyframes)
+  within about a second; smaller errors are clock drift, which the daemon's pace follows
+- the iPad handles audio datagrams on its receive queue as soon as they are decrypted. Video
+  reassembly, FEC recovery and decoding run on a separate queue, so audio never waits behind them
+
+Every 200 ms while speakers play, the iPad sends `AUDIO_REPORT` over UDP:
+
+| Field | Size | Description |
+|---|---|---|
+| `generation` | u32 | Speaker audio generation the report is about |
+| `depth_us` | u32 | Smoothed jitter-buffer depth |
+| `target_us` | u32 | Current target depth |
+| `due` | u16 | Packets that came due for playback since the last report |
+| `primary_lost` | u16 | Of those, packets whose own datagram never arrived in time |
+| `recovered` | u16 | Of those, packets played from a redundant copy |
+| `concealed` | u16 | Of those, packets filled with concealment |
+| `late` | u16 | Datagrams that arrived after their packet was due |
+| `max_burst` | u8 | Longest run of consecutive `primary_lost` packets |
+| `jitter_us` | u32 | Jitter estimate before the render quantum and the video cap are applied |
+| `cap_us` | u32 | The video cap on the target; 0 when there is none |
+| `max_processing_us` | u32 | Longest time a speaker datagram waited on the iPad between the network stack receiving it and the jitter buffer storing it; 0 when unknown |
+
+Reports are unreliable; the daemon keeps its current settings while none arrive and ignores
+reports for other generations. The daemon uses them to:
+
+- **follow the iPad's clock.** The card has no clock of its own; the daemon's reads set its pace.
+  The daemon shortens or lengthens its 10 ms read interval, by at most 500 ppm, to hold the iPad's
+  depth at its target, acting on errors of at most 5 ms. The card then runs at the rate the iPad actually plays, and the iPad never
+  resamples. Large, fast changes are left to the iPad's merge and insert
+- choose the redundancy level (above)
+- tell the Opus encoder the measured loss rate, so packets depend less on earlier ones while
+  packets are being lost
+- log, with `-v`, a summary every 5 s: depth and target, the jitter estimate and video cap,
+  clock correction, redundancy, loss counts, the longest loss burst and the longest wait on the
+  iPad. These are diagnostics for any connection, not tuning for one
+
 ### Microphone forwarding
 
-Each UDP `MIC` payload carries one Opus packet and a mic-only sequence number. The daemon decodes
-Opus and feeds a virtual microphone source. Because the number counts mic packets only, the daemon
-can tell when one was lost: gaps of up to 5 packets are filled with Opus packet-loss concealment,
-and late or duplicate packets are dropped.
+Each UDP `MIC` payload carries one 20 ms Opus packet and a mic-only sequence number. Because the
+number counts mic packets only, the daemon can tell when one was lost. The daemon keeps a jitter
+buffer of mic packets and writes 10 ms to the microphone card on a steady timer, instead of
+whenever a packet arrives, so programs recording from it see a steady device rather than the
+network's arrival pattern:
+
+- the target depth adapts to arrival jitter like the iPad's speaker buffer, between 30 and 200 ms,
+  and is drained or refilled the same way (band of 20 ms or 20% of the target)
+- lost or late packets are filled with Opus packet-loss concealment; late packets are dropped.
+  After 60 ms of concealment with nothing buffered, the card gets silence until the buffer refills
+- the timer is shortened or lengthened, by at most 500 ppm, to hold the depth at its target, so
+  the microphone card runs at the rate the iPad's microphone records
+- the iPad marks mic datagrams for voice priority
 
 ## Input Protocol
 
@@ -593,7 +677,10 @@ stuck on the host. The daemon does the same when a session ends.
 - the daemon creates an ALSA playback card named after the iPad through `/dev/screx_audio`
 - audio is encoded as Opus and sent to the client
 - the `SPEAKER` control message attaches/detaches the card
-- the daemon reads 10 ms of PCM every 10 ms, advancing the card's playback position
+- the daemon reads 10 ms of PCM about every 10 ms, advancing the card's playback position; the
+  exact interval follows the iPad's playback clock (see "Speaker audio")
+- speaker datagrams are marked DSCP EF (voice) so Wi-Fi access points send them ahead of video
+  bursts; video keeps AF41
 
 ### Microphone
 

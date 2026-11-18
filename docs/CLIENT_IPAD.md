@@ -16,7 +16,8 @@ advertised by the daemon. Source lives in `client`.
 
 Resolved automatically by Xcode via Swift Package Manager — no manual install step:
 
-- [`swift-opus`](https://github.com/alta/swift-opus) — Opus encode/decode for microphone forwarding
+- [`swift-opus`](https://github.com/alta/swift-opus) — Opus: the wrapper encodes the microphone; speaker
+  playback calls the bundled libopus (`Copus`) directly for packet-loss concealment
 
 Everything else is a first-party Apple framework (AVFoundation, VideoToolbox, CryptoKit, Network,
 CoreImage, GameController) with no additional package manager setup required.

@@ -136,6 +136,59 @@ pub fn build_pktinfo_cmsg(source: UdpSource) -> PktinfoCmsg {
     }
 }
 
+/// DSCP EF (46) in the IPv4 TOS byte: Wi-Fi access points map it to the voice queue (WMM AC_VO),
+/// which goes ahead of video (AF41, the socket default).
+pub const TOS_EF: u8 = 0xB8;
+
+/// Control messages for one IPv4 datagram: an optional pinned source (IP_PKTINFO) plus a
+/// per-datagram TOS byte that overrides the socket's.
+pub fn build_ipv4_cmsg(source: Option<UdpSource>, tos: u8) -> PktinfoCmsg {
+    let mut cmsg = source.map(build_pktinfo_cmsg).unwrap_or_default();
+    unsafe {
+        let data_len = std::mem::size_of::<libc::c_int>() as libc::c_uint;
+        let space = libc::CMSG_SPACE(data_len) as usize;
+        assert!(cmsg.controllen + space <= PKTINFO_CMSG_SPACE, "PKTINFO_CMSG_SPACE too small");
+        // Every CMSG_SPACE is a multiple of the header alignment, so the second header is aligned.
+        let cmsg_hdr = cmsg.buf.as_mut_ptr().add(cmsg.controllen) as *mut libc::cmsghdr;
+        (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(data_len) as _;
+        (*cmsg_hdr).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg_hdr).cmsg_type = libc::IP_TOS;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg_hdr) as *mut libc::c_int, libc::c_int::from(tos));
+        cmsg.controllen += space;
+    }
+    cmsg
+}
+
+/// `sendmsg` to an IPv4 destination with prebuilt control messages (see `build_ipv4_cmsg`).
+pub fn send_to_with_cmsg(
+    socket: &UdpSocket,
+    buf: &[u8],
+    dst: SocketAddr,
+    cmsg: &PktinfoCmsg,
+) -> std::io::Result<usize> {
+    let (mut addr_storage, addr_len) = socket_addr_to_raw(dst);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let control = cmsg.as_slice();
+    let msg = libc::msghdr {
+        msg_name: (&mut addr_storage as *mut libc::sockaddr_storage).cast(),
+        msg_namelen: addr_len,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: if control.is_empty() { ptr::null_mut() } else { control.as_ptr() as *mut libc::c_void },
+        msg_controllen: control.len() as _,
+        msg_flags: 0,
+    };
+    let ret = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret as usize)
+    }
+}
+
 /// `send_to` with an optional pinned IPv4 source address (IP_PKTINFO).
 pub fn send_to_from(
     socket: &UdpSocket,
@@ -284,5 +337,51 @@ pub fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::so
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walks a control buffer and returns `(level, type, data)` for each message.
+    fn parse(cmsg: &PktinfoCmsg) -> Vec<(i32, i32, Vec<u8>)> {
+        let buf = cmsg.as_slice();
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < buf.len() {
+            let hdr = unsafe { &*(buf.as_ptr().add(off) as *const libc::cmsghdr) };
+            let header = unsafe { libc::CMSG_LEN(0) } as usize;
+            let len = hdr.cmsg_len as usize;
+            out.push((hdr.cmsg_level, hdr.cmsg_type, buf[off + header..off + len].to_vec()));
+            off += unsafe { libc::CMSG_SPACE((len - header) as u32) } as usize;
+        }
+        out
+    }
+
+    #[test]
+    fn ipv4_cmsg_carries_tos_with_or_without_a_pinned_source() {
+        let tos = libc::c_int::from(TOS_EF).to_ne_bytes().to_vec();
+
+        let only_tos = parse(&build_ipv4_cmsg(None, TOS_EF));
+        assert_eq!(only_tos, vec![(libc::IPPROTO_IP, libc::IP_TOS, tos.clone())]);
+
+        let source = UdpSource { ip: std::net::Ipv4Addr::new(10, 0, 0, 2), ifindex: 3 };
+        let both = parse(&build_ipv4_cmsg(Some(source), TOS_EF));
+        assert_eq!(both.len(), 2);
+        assert_eq!((both[0].0, both[0].1), (libc::IPPROTO_IP, libc::IP_PKTINFO));
+        assert_eq!(both[0].2.len(), std::mem::size_of::<libc::in_pktinfo>());
+        assert_eq!(both[1], (libc::IPPROTO_IP, libc::IP_TOS, tos));
+    }
+
+    #[test]
+    fn tos_cmsg_is_accepted_by_the_kernel() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sent = send_to_with_cmsg(&tx, b"ef", rx.local_addr().unwrap(), &build_ipv4_cmsg(None, TOS_EF))
+            .unwrap();
+        assert_eq!(sent, 2);
+        let mut buf = [0u8; 4];
+        assert_eq!(rx.recv(&mut buf).unwrap(), 2);
     }
 }

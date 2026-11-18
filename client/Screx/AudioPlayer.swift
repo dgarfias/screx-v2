@@ -1,8 +1,12 @@
 import AVFoundation
+import Copus
 import QuartzCore
-import Opus
 import os
 
+/// Plays the daemon's speaker stream. Packets go into `AudioJitterBuffer` as they arrive and
+/// are decoded on the render thread when they are due, so a lost or late packet becomes Opus
+/// packet-loss concealment instead of silence or added delay. See "Speaker audio" in
+/// docs/ARCHITECTURE.md.
 final class AudioPlayer {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
@@ -12,149 +16,73 @@ final class AudioPlayer {
     private var configurationObserver: NSObjectProtocol?
     private var routeObserver: NSObjectProtocol?
 
-    // NOTE: The ideal implementation here is a lock-free SPSC ring using
-    // atomics for head (render thread) and tail (network thread). Adding
-    // swift-atomics to the Xcode project was not practical in this environment,
-    // so we use OSAllocatedUnfairLock as a fast, modern fallback. The render
-    // callback never allocates inside the lock and emits silence when data is
-    // unavailable, keeping latency predictable.
+    /// Guards `jitter`, `generation` and `decoderResetPending`. The render thread holds it only
+    /// to copy out the next packet; decoding happens outside it.
     private let lock = OSAllocatedUnfairLock()
-    private static let maxBufferSize = 48000 * 2 * 2 // ~500ms at 48kHz stereo i16
+    private let jitter = AudioJitterBuffer()
+    private var generation: UInt32 = 0
+    private var decoderResetPending = false
 
-    // Circular buffer: O(1) read and discard instead of O(n) Data.removeFirst
-    private var ringStorage = UnsafeMutablePointer<UInt8>.allocate(capacity: AudioPlayer.maxBufferSize)
-    private var ringReadPos = 0
-    private var ringWritePos = 0
-    private var ringCount = 0
-    private var droppedPacketCount = 0
-    private let ringCapacity = AudioPlayer.maxBufferSize
+    /// Audio may play at most this far behind the matching video.
+    private static let maxVideoLagMs = 100.0
+    private static let sampleRate = 48000
+    private static let framesPerMs = Double(sampleRate) / 1000
+    private static let packetFrames = 480
+    /// Largest decode, in frames: room for a 20 ms packet though the daemon sends 10 ms.
+    private static let maxDecodeFrames = 960
 
-    // 48kHz stereo s16le = 192000 bytes/sec = 192 bytes/ms
-    private static let bytesPerMs = 192
-    // Target buffer: ~50ms of audio for jitter absorption. iOS render is 10ms,
-    // so this is a 5-buffer budget — deep enough to ride over a video burst
-    // (an IDR can momentarily queue a few ms of audio behind it on the shared
-    // socket) without adding perceptible latency. Moonlight/Parsec target
-    // roughly this range rather than a minimal 1-2 buffer.
-    private static let targetBufferMs = 50
-    private static let targetBufferBytes = targetBufferMs * bytesPerMs
-    // Drift thresholds (ms) before corrective action
-    private static let driftDropThresholdMs: Int32 = -40
-    private static let driftTrimThresholdMs: Int32 = 90
+    // Render thread only.
+    private let decoder: OpaquePointer?
+    private let pcm = UnsafeMutablePointer<Int16>.allocate(capacity: AudioPlayer.maxDecodeFrames * 2)
+    private let mergePcm = UnsafeMutablePointer<Int16>.allocate(capacity: AudioPlayer.maxDecodeFrames * 2)
+    private let packetA = UnsafeMutablePointer<UInt8>.allocate(capacity: AudioJitterBuffer.maxPacketBytes)
+    private let packetB = UnsafeMutablePointer<UInt8>.allocate(capacity: AudioJitterBuffer.maxPacketBytes)
+    private var pcmFrames = 0
+    private var pcmPosition = 0
 
-    // Standing-latency trim: underruns ratchet the ring depth up (silence is
-    // played, then the late audio arrives and queues behind), and timestamp
-    // drift stays ~0 so the drift logic above never corrects it. Track the
-    // minimum occupancy over a rolling window; if even the low point exceeds
-    // the threshold, that excess is standing latency — trim back to target.
-    private static let latencyTrimWindowFrames = 48000 * 3 // 3s at 48kHz
-    private static let latencyTrimThresholdBytes = (targetBufferMs + 30) * bytesPerMs
-    private var windowMinOccupancy = Int.max
-    private var windowFrames = 0
+    private static let pcmFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 48000,
+        channels: 2,
+        interleaved: true
+    )!
 
     deinit {
         if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
         engine.stop()
-        ringStorage.deallocate()
-    }
-
-    @discardableResult
-    private func ringWrite(_ src: UnsafePointer<UInt8>, count: Int) -> Bool {
-        // Drop the whole packet if it doesn't fit. Do not advance the consumer
-        // index; the render thread owns readPos/ringCount.
-        guard count <= ringCapacity - ringCount else { return false }
-        let firstChunk = min(count, ringCapacity - ringWritePos)
-        ringStorage.advanced(by: ringWritePos).update(from: src, count: firstChunk)
-        if firstChunk < count {
-            ringStorage.update(from: src.advanced(by: firstChunk), count: count - firstChunk)
-        }
-        ringWritePos = (ringWritePos + count) % ringCapacity
-        ringCount += count
-        return true
-    }
-
-    private func ringRead(into dest: UnsafeMutablePointer<UInt8>, count: Int) {
-        let toRead = min(count, ringCount)
-        let firstChunk = min(toRead, ringCapacity - ringReadPos)
-        dest.update(from: ringStorage.advanced(by: ringReadPos), count: firstChunk)
-        if firstChunk < toRead {
-            dest.advanced(by: firstChunk).update(from: ringStorage, count: toRead - firstChunk)
-        }
-        ringReadPos = (ringReadPos + toRead) % ringCapacity
-        ringCount -= toRead
-    }
-
-    private func ringDiscard(_ n: Int) {
-        let toDiscard = min(n, ringCount)
-        ringReadPos = (ringReadPos + toDiscard) % ringCapacity
-        ringCount -= toDiscard
-    }
-
-    private func ringClear() {
-        ringReadPos = 0
-        ringWritePos = 0
-        ringCount = 0
-        windowMinOccupancy = Int.max
-        windowFrames = 0
+        if let decoder { opus_decoder_destroy(decoder) }
+        pcm.deallocate()
+        mergePcm.deallocate()
+        packetA.deallocate()
+        packetB.deallocate()
     }
 
     init(avSync: AVSyncState) {
         self.avSync = avSync
+        var error: Int32 = 0
+        let created = opus_decoder_create(Int32(Self.sampleRate), 2, &error)
+        if error == 0, let created {
+            decoder = created
+        } else {
+            print("[audio] Opus decoder init failed (\(error)); speaker audio will be silent")
+            decoder = nil
+        }
 
-        let format = Self.pcmFormat
-
-        let node = AVAudioSourceNode(format: format) { [weak self] _, _, frameCount, bufferList -> OSStatus in
-            guard let self else { return noErr }
-
-            let ablPointer = UnsafeMutableAudioBufferListPointer(bufferList)
-            let bytesNeeded = Int(frameCount) * 2 * 2
-
-            self.lock.withLock {
-                // Occupancy right before a render pull is the standing latency.
-                if self.ringCount < self.windowMinOccupancy {
-                    self.windowMinOccupancy = self.ringCount
-                }
-                self.windowFrames += Int(frameCount)
-                if self.windowFrames >= Self.latencyTrimWindowFrames {
-                    if self.windowMinOccupancy > Self.latencyTrimThresholdBytes {
-                        let excess = self.windowMinOccupancy - Self.targetBufferBytes
-                        self.ringDiscard((excess / 4) * 4)
-                    }
-                    self.windowFrames = 0
-                    self.windowMinOccupancy = Int.max
-                }
-
-                var firstDest: UnsafeMutablePointer<UInt8>?
-                for i in 0..<ablPointer.count {
-                    guard let dest = ablPointer[i].mData else { continue }
-                    let ptr = dest.assumingMemoryBound(to: UInt8.self)
-                    if firstDest == nil {
-                        let bytesToRead = min(bytesNeeded, self.ringCount)
-                        self.ringRead(into: ptr, count: bytesToRead)
-                        if bytesToRead < bytesNeeded {
-                            memset(ptr.advanced(by: bytesToRead), 0, bytesNeeded - bytesToRead)
-                        }
-                        firstDest = ptr
-                    } else {
-                        memcpy(ptr, firstDest!, bytesNeeded)
-                    }
-                    ablPointer[i].mDataByteSize = UInt32(bytesNeeded)
-                }
-            }
-
+        let node = AVAudioSourceNode(format: Self.pcmFormat) { [weak self] _, _, frameCount, bufferList -> OSStatus in
+            self?.render(frameCount: Int(frameCount), bufferList: bufferList)
             return noErr
         }
 
         self.sourceNode = node
         engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
+        engine.connect(node, to: engine.mainMixerNode, format: Self.pcmFormat)
         configurationObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
                                                                         object: engine, queue: .main) { [weak self] _ in
             guard let self, self.wantsPlayback, self.isOutputEnabled, !self.engine.isRunning else { return }
             // The engine stops when the hardware route's format changes (e.g. HDMI hotplug).
             self.engine.stop()
-            self.lock.withLock { self.ringClear() }
+            self.resetPlayback(newStream: false)
             self.start()
         }
         routeObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification,
@@ -178,12 +106,10 @@ final class AudioPlayer {
 
     func stop() {
         wantsPlayback = false
-        guard engine.isRunning || ringCount > 0 else { return }
+        let wasRunning = engine.isRunning
         engine.stop()
-        lock.withLock {
-            ringClear()
-        }
-        print("[audio] playback engine stopped")
+        resetPlayback(newStream: true)
+        if wasRunning { print("[audio] playback engine stopped") }
     }
 
     func setOutputEnabled(_ enabled: Bool) {
@@ -196,94 +122,158 @@ final class AudioPlayer {
         }
     }
 
-    // Speaker audio always arrives as Opus (48 kHz stereo, 10 ms packets). The decoder is created lazily; if it fails to initialize, Opus
-    // packets are dropped rather than crashing. The decode buffer is reused for every
-    // packet; 5760 frames (120 ms) is far more than the 480-frame packets expected.
-    private static let pcmFormat = AVAudioFormat(
-        commonFormat: .pcmFormatInt16,
-        sampleRate: 48000,
-        channels: 2,
-        interleaved: true
-    )!
-    private static let opusDecodeCapacity: AVAudioFrameCount = 5760
+    /// Runs `body` holding `lock`.
+    private func locked<R>(_ body: () -> R) -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 
-    private lazy var opusDecoder: Opus.Decoder? = {
-        do {
-            return try Opus.Decoder(format: Self.pcmFormat, application: .audio)
-        } catch {
-            print("[audio] Opus decoder init failed, Opus audio will be dropped: \(error)")
-            return nil
-        }
-    }()
-    private lazy var opusDecodeBuffer: AVAudioPCMBuffer? =
-        AVAudioPCMBuffer(pcmFormat: Self.pcmFormat, frameCapacity: Self.opusDecodeCapacity)
-
-    /// Decodes one Opus packet and feeds the PCM into the jitter buffer.
-    func enqueueOpus(_ packet: Data, timestampMs: UInt32 = 0) {
-        guard isOutputEnabled, !packet.isEmpty else { return }
-        guard let opusDecoder, let opusDecodeBuffer else { return }
-
-        do {
-            try packet.withUnsafeBytes { raw in
-                try opusDecoder.decode(raw.bindMemory(to: UInt8.self), to: opusDecodeBuffer)
-            }
-        } catch {
-            print("[audio] Opus decode failed, dropping packet: \(error)")
-            return
-        }
-
-        guard opusDecodeBuffer.frameLength > 0,
-              let channelData = opusDecodeBuffer.int16ChannelData else { return }
-        let byteCount = Int(opusDecodeBuffer.frameLength) * 2 * 2 // frames * channels * bytes
-        channelData[0].withMemoryRebound(to: UInt8.self, capacity: byteCount) { ptr in
-            enqueuePCM(ptr, count: byteCount, timestampMs: timestampMs)
+    /// Empties the jitter buffer; the render thread resets the decoder before its next packet.
+    /// `newStream` also forgets the learned target, for a new session that may be on another
+    /// network; an output route change keeps it.
+    private func resetPlayback(newStream: Bool) {
+        locked {
+            jitter.reset(newStream: newStream)
+            decoderResetPending = true
         }
     }
 
-    private func enqueuePCM(_ ptr: UnsafePointer<UInt8>, count: Int, timestampMs: UInt32) {
-        if avSync.consumeGapResume() {
-            lock.withLock {
-                ringClear()
+    /// Queues the packets of one speaker datagram: the one named by `frameId` and the redundant
+    /// copies of earlier ones. Called on the stream queue. `receiveTimeNs` is when the network
+    /// stack received the datagram (`CLOCK_MONOTONIC_RAW`), 0 if unknown.
+    func enqueue(payload: Data, entries: [SpeakerAudioEntry], frameId: UInt32, timestampMs: UInt32,
+                 generation: UInt32, receiveTimeNs: UInt64) {
+        guard isOutputEnabled else { return }
+        let nowMs = CACurrentMediaTime() * 1000
+        var processingMs: Double?
+        if receiveTimeNs > 0 {
+            let nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+            if nowNs >= receiveTimeNs {
+                processingMs = Double(nowNs - receiveTimeNs) / 1_000_000
             }
         }
-
-        lock.withLock {
-            if !ringWrite(ptr, count: count) {
-                droppedPacketCount += 1
-            }
-
-            if avSync.isValid {
-                let expectedTs = avSync.expectedDaemonTimeNow()
-                let drift = Int32(bitPattern: timestampMs) &- Int32(bitPattern: expectedTs)
-
-                // Negative drift = this audio segment's nominal time is behind
-                // the video clock. That is normal after any arrival burst or
-                // pause (PacketAudio/tsched, IDR encodes) and is NOT a reason
-                // to throw audio away — the jitter buffer absorbs it. Only
-                // clip at extreme lateness (>100ms, ~10 full packets) and even
-                // then never drop more than half the ring, so a transient can
-                // never punch a hole in playback.
-                if drift < Self.driftDropThresholdMs {
-                    let lateMs = Int(-drift)
-                    if lateMs > 100 && ringCount > 0 {
-                        let dropBytes = min(ringCount / 2, lateMs * Self.bytesPerMs)
-                        let aligned = (dropBytes / 4) * 4
-                        if aligned > 0 {
-                            ringDiscard(aligned)
-                        }
-                    }
-                } else if drift > Self.driftTrimThresholdMs {
-                    let excess = ringCount - Self.targetBufferBytes
-                    if excess > 0 {
-                        let aligned = (excess / 4) * 4
-                        ringDiscard(aligned)
-                    }
+        let videoOffsetMs = avSync.videoOffsetMs()
+        payload.withUnsafeBytes { raw in
+            locked {
+                if generation != self.generation {
+                    // A new session (or a reconnect on another network): start from scratch.
+                    self.generation = generation
+                    jitter.reset(newStream: true)
+                    decoderResetPending = true
+                }
+                for entry in entries {
+                    let seq = Int64(frameId) - Int64(entry.distance)
+                    guard seq >= 0 else { continue }
+                    let start = entry.opus.lowerBound - payload.startIndex
+                    let bytes = UnsafeRawBufferPointer(rebasing: raw[start..<(start + entry.opus.count)])
+                    jitter.insert(seq: seq,
+                                  timestampMs: timestampMs &- UInt32(entry.distance) &* 10,
+                                  isPrimary: entry.distance == 0,
+                                  bytes: bytes,
+                                  nowMs: nowMs,
+                                  processingMs: processingMs)
+                }
+                // Audio and video timestamps share the daemon's clock. Audio plays about
+                // (its arrival offset - video's) + depth + one render quantum behind the
+                // picture, so cap the depth to keep that within `maxVideoLagMs`; past it, late
+                // packets are concealed instead of delaying everything.
+                if let videoOffsetMs, let audioOffsetMs = jitter.minOffsetMs {
+                    jitter.maxTargetMs = Self.maxVideoLagMs - (audioOffsetMs - videoOffsetMs) - jitter.renderQuantumMs
+                } else {
+                    jitter.maxTargetMs = .infinity
                 }
             }
+        }
+    }
 
-            if ringCount > Self.maxBufferSize {
-                let excess = ringCount - Self.maxBufferSize
-                ringDiscard(excess)
+    /// The playout report for the daemon, or nil while nothing is playing.
+    func takeReport() -> AudioPlayoutReport? {
+        guard isOutputEnabled else { return nil }
+        return locked {
+            generation == 0 ? nil : jitter.takeReport(generation: generation)
+        }
+    }
+
+    // MARK: - Render thread
+
+    private func render(frameCount: Int, bufferList: UnsafeMutablePointer<AudioBufferList>) {
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+        guard buffers.count > 0, let first = buffers[0].mData else { return }
+        let out = first.assumingMemoryBound(to: Int16.self)
+        var written = 0
+        while written < frameCount {
+            if pcmPosition >= pcmFrames {
+                refill(renderFrames: frameCount)
+            }
+            let n = min(frameCount - written, pcmFrames - pcmPosition)
+            (out + written * 2).update(from: pcm + pcmPosition * 2, count: n * 2)
+            written += n
+            pcmPosition += n
+        }
+        let byteCount = frameCount * 4
+        buffers[0].mDataByteSize = UInt32(byteCount)
+        for i in 1..<buffers.count {
+            guard let dest = buffers[i].mData else { continue }
+            memcpy(dest, first, byteCount)
+            buffers[i].mDataByteSize = UInt32(byteCount)
+        }
+    }
+
+    /// Decodes the next packet (or conceals, merges, or plays silence) into `pcm`.
+    private func refill(renderFrames: Int) {
+        let (action, resetDecoder) = locked { () -> (AudioJitterBuffer.Action, Bool) in
+            let reset = decoderResetPending
+            decoderResetPending = false
+            jitter.renderQuantumMs = Double(renderFrames) / Self.framesPerMs
+            return (jitter.pull(queuedMs: 0, a: packetA, b: packetB), reset)
+        }
+        if resetDecoder, let decoder {
+            opus_decoder_init(decoder, Int32(Self.sampleRate), 2)
+        }
+
+        var frames: Int
+        switch action {
+        case .decode(let length):
+            frames = decode(packetA, length: length, into: pcm)
+        case .conceal:
+            frames = decode(nil, length: 0, into: pcm)
+        case .merge(let first, let second):
+            let n = decode(first == nil ? nil : packetA, length: first ?? 0, into: pcm)
+            let m = decode(second == nil ? nil : packetB, length: second ?? 0, into: mergePcm)
+            frames = min(n, m)
+            crossfade(into: pcm, from: mergePcm, frames: frames)
+        case .silence:
+            frames = 0
+        }
+        if frames <= 0 {
+            frames = Self.packetFrames
+            pcm.update(repeating: 0, count: frames * 2)
+        }
+        pcmFrames = frames
+        pcmPosition = 0
+    }
+
+    /// Decodes one packet, or conceals one 10 ms packet when `packet` is nil. Returns frames.
+    private func decode(_ packet: UnsafeMutablePointer<UInt8>?, length: Int, into out: UnsafeMutablePointer<Int16>) -> Int {
+        guard let decoder else { return 0 }
+        let result: Int32
+        if let packet {
+            result = opus_decode(decoder, packet, Int32(length), out, Int32(Self.maxDecodeFrames), 0)
+        } else {
+            result = opus_decode(decoder, nil, 0, out, Int32(Self.packetFrames), 0)
+        }
+        return max(0, Int(result))
+    }
+
+    /// Crossfades `pcm` (fading out) into `other` (fading in), interleaved stereo.
+    private func crossfade(into pcm: UnsafeMutablePointer<Int16>, from other: UnsafeMutablePointer<Int16>, frames: Int) {
+        guard frames > 0 else { return }
+        for frame in 0..<frames {
+            let w = Float(frame) / Float(frames)
+            for channel in 0..<2 {
+                let i = frame * 2 + channel
+                pcm[i] = Int16(Float(pcm[i]) * (1 - w) + Float(other[i]) * w)
             }
         }
     }

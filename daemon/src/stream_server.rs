@@ -17,8 +17,8 @@ use crate::input::{
     InputBackend, KeyboardWorker,
 };
 use crate::platform::net::{
-    build_pktinfo_cmsg, send_to_from, sendmmsg_batch, udp_source_for_local_ip, PktinfoCmsg,
-    UdpSource,
+    build_ipv4_cmsg, build_pktinfo_cmsg, send_to_from, send_to_with_cmsg, sendmmsg_batch,
+    udp_source_for_local_ip, PktinfoCmsg, UdpSource, TOS_EF,
 };
 
 const CHUNK_PAYLOAD: usize = 1400;
@@ -267,6 +267,8 @@ pub struct SharedState {
     pub has_active_client: AtomicBool,
     pub audio_output_enabled: AtomicBool,
     pub audio_bitrate_bps: AtomicU32,
+    /// `AUDIO_REPORT`s from the client, drained by the speaker thread.
+    pub audio_reports: Mutex<VecDeque<crate::audio::AudioReport>>,
     /// Names the speaker and microphone cards: the iPad model the client sent in `SETTINGS`,
     /// like the monitor. Waited on with `audio_notify`.
     pub audio_device_name: Mutex<String>,
@@ -331,6 +333,7 @@ impl SharedState {
             has_active_client: AtomicBool::new(false),
             audio_output_enabled: AtomicBool::new(false),
             audio_bitrate_bps: AtomicU32::new(128_000),
+            audio_reports: Mutex::new(VecDeque::new()),
             audio_device_name: Mutex::new("iPad".into()),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
@@ -1380,6 +1383,15 @@ pub fn run_client_manager(
                             }
                         }
                     }
+                    Some((&protocol::udp::AUDIO_REPORT, body)) => {
+                        if let Some(report) = crate::audio::AudioReport::parse(body) {
+                            let mut reports = shared.audio_reports.lock().unwrap();
+                            if reports.len() >= 16 {
+                                reports.pop_front();
+                            }
+                            reports.push_back(report);
+                        }
+                    }
                     Some((&protocol::udp::MIC, body)) if body.len() > 4 => {
                         let mic_seq = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                         let mut mic = shared.mic_writer.lock().unwrap();
@@ -2014,16 +2026,58 @@ pub fn fec_block_range(total: usize, blocks: usize, index: usize) -> (usize, usi
 }
 
 // ---------------------------------------------------------------------------
-// Audio sender — separate frame_id space, no FEC (audio chunks are small)
+// Audio sender — separate frame_id space; redundant copies instead of FEC
 // ---------------------------------------------------------------------------
+
+/// Copies of earlier packets reach back at most this many frame IDs.
+pub const AUDIO_MAX_DISTANCE: u8 = 8;
+const AUDIO_HISTORY: usize = AUDIO_MAX_DISTANCE as usize + 1;
+/// Entries per datagram, the primary included.
+const AUDIO_MAX_ENTRIES: usize = 4;
+
+/// Builds a speaker datagram payload: `count(u8)` then entries of `distance(u8) + len(u16) +
+/// opus`. The primary goes first with distance 0; copies follow in the order given and are
+/// skipped once they no longer fit in `max_len`. Returns false if even the primary doesn't fit.
+fn build_audio_payload<'a>(
+    out: &mut Vec<u8>,
+    primary: &[u8],
+    copies: impl IntoIterator<Item = (u8, &'a [u8])>,
+    max_len: usize,
+) -> bool {
+    out.clear();
+    if 1 + 3 + primary.len() > max_len || primary.len() > usize::from(u16::MAX) {
+        return false;
+    }
+    out.push(1);
+    out.push(0);
+    out.extend_from_slice(&(primary.len() as u16).to_be_bytes());
+    out.extend_from_slice(primary);
+    for (distance, opus) in copies {
+        if usize::from(out[0]) == AUDIO_MAX_ENTRIES {
+            break;
+        }
+        if out.len() + 3 + opus.len() > max_len {
+            continue;
+        }
+        out.push(distance);
+        out.extend_from_slice(&(opus.len() as u16).to_be_bytes());
+        out.extend_from_slice(opus);
+        out[0] += 1;
+    }
+    true
+}
 
 pub struct AudioSender {
     socket: UdpSocket,
     sequence: crate::crypto::ServerPacketSequence,
     send_buf: Vec<u8>,
+    payload: Vec<u8>,
     cipher: Option<crate::crypto::SessionCipher>,
     source: Option<UdpSource>,
-    cmsg_buf: Option<PktinfoCmsg>,
+    /// Pinned source (if any) plus TOS EF, for IPv4 destinations.
+    cmsg_buf: PktinfoCmsg,
+    /// Recently sent packets by `frame_id % AUDIO_HISTORY`, for redundant copies.
+    history: [(Option<u32>, Vec<u8>); AUDIO_HISTORY],
 }
 
 impl AudioSender {
@@ -2032,9 +2086,24 @@ impl AudioSender {
             socket,
             sequence: crate::crypto::ServerPacketSequence::new(),
             send_buf: vec![0u8; HEADER_LEN + CHUNK_PAYLOAD + crate::crypto::TAG_LEN],
+            payload: Vec::with_capacity(CHUNK_PAYLOAD),
             cipher: None,
             source: None,
-            cmsg_buf: None,
+            cmsg_buf: build_ipv4_cmsg(None, TOS_EF),
+            history: std::array::from_fn(|_| (None, Vec::new())),
+        }
+    }
+
+    /// The generation the client's `AUDIO_REPORT`s must name.
+    pub fn generation(&self) -> u32 {
+        self.sequence.generation
+    }
+
+    /// Forgets sent packets, so a new speaker-card session never carries copies of audio from
+    /// before it.
+    pub fn reset_history(&mut self) {
+        for entry in &mut self.history {
+            entry.0 = None;
         }
     }
 
@@ -2048,72 +2117,133 @@ impl AudioSender {
 
     pub fn set_source(&mut self, source: Option<UdpSource>) {
         self.source = source;
-        self.cmsg_buf = source.map(build_pktinfo_cmsg);
+        self.cmsg_buf = build_ipv4_cmsg(source, TOS_EF);
     }
 
-    /// Send one Opus speaker-audio packet.
+    /// Send one 10 ms Opus speaker packet plus copies of the packets `distances` frame IDs
+    /// before it that were sent since the last `reset_history`.
     pub fn send_audio(
         &mut self,
         opus: &[u8],
         client_addr: SocketAddr,
         timestamp_ms: u32,
+        distances: &[u8],
     ) -> Result<()> {
         let frame_id = self.sequence.take_frame()?;
-        let data_count = (opus.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
-
-        for i in 0..data_count {
-            let start = i * CHUNK_PAYLOAD;
-            let end = (start + CHUNK_PAYLOAD).min(opus.len());
-            let chunk = &opus[start..end];
-            let payload_len = (end - start) as u16;
-
-            let header = build_header(
-                frame_id,
-                i as u16,
-                data_count as u16,
-                0,
-                FLAG_AUDIO,
-                0, // codec byte is unused for audio (always Opus)
-                payload_len,
-                timestamp_ms,
-                self.sequence.generation,
-            );
-
-            self.send_buf[..HEADER_LEN].copy_from_slice(&header);
-            let chunk_len = chunk.len();
-            self.send_buf[HEADER_LEN..HEADER_LEN + chunk_len].copy_from_slice(chunk);
-
-            let pkt_len = if let Some(ref cipher) = self.cipher {
-                let nonce = crate::crypto::nonce_server(
-                    frame_id,
-                    i as u16,
-                    FLAG_AUDIO,
-                    self.sequence.generation,
-                );
-                let enc_len = cipher.encrypt_slice(
-                    &nonce,
-                    &header,
-                    &mut self.send_buf[HEADER_LEN..],
-                    chunk_len,
-                );
-                HEADER_LEN + enc_len
-            } else {
-                HEADER_LEN + chunk_len
-            };
-
-            if let Err(e) = send_to_from(
-                &self.socket,
-                &self.send_buf[..pkt_len],
-                client_addr,
-                self.source,
-                self.cmsg_buf.as_ref().map(|b| b.as_slice()),
-            ) {
-                eprintln!("[audio] send error: {e}");
-                break;
+        let history = &self.history;
+        let copies = distances.iter().filter_map(|&distance| {
+            if distance == 0 || distance > AUDIO_MAX_DISTANCE {
+                return None;
             }
-        }
+            let id = frame_id.checked_sub(u32::from(distance))?;
+            let (stored, packet) = &history[id as usize % AUDIO_HISTORY];
+            (*stored == Some(id)).then_some((distance, packet.as_slice()))
+        });
+        let fits = build_audio_payload(&mut self.payload, opus, copies, CHUNK_PAYLOAD);
+        let slot = &mut self.history[frame_id as usize % AUDIO_HISTORY];
+        slot.0 = Some(frame_id);
+        slot.1.clear();
+        slot.1.extend_from_slice(opus);
+        anyhow::ensure!(fits, "{}-byte Opus packet does not fit in one datagram", opus.len());
 
-        Ok(())
+        let payload_len = self.payload.len();
+        let header = build_header(
+            frame_id,
+            0,
+            1,
+            0,
+            FLAG_AUDIO,
+            0, // codec byte is unused for audio (always Opus)
+            payload_len as u16,
+            timestamp_ms,
+            self.sequence.generation,
+        );
+        self.send_buf[..HEADER_LEN].copy_from_slice(&header);
+        self.send_buf[HEADER_LEN..HEADER_LEN + payload_len].copy_from_slice(&self.payload);
+
+        let pkt_len = if let Some(ref cipher) = self.cipher {
+            let nonce =
+                crate::crypto::nonce_server(frame_id, 0, FLAG_AUDIO, self.sequence.generation);
+            let enc_len =
+                cipher.encrypt_slice(&nonce, &header, &mut self.send_buf[HEADER_LEN..], payload_len);
+            HEADER_LEN + enc_len
+        } else {
+            HEADER_LEN + payload_len
+        };
+
+        let packet = &self.send_buf[..pkt_len];
+        let sent = match client_addr {
+            SocketAddr::V4(_) => send_to_with_cmsg(&self.socket, packet, client_addr, &self.cmsg_buf),
+            SocketAddr::V6(_) => send_to_from(&self.socket, packet, client_addr, self.source, None),
+        };
+        sent.map(|_| ()).map_err(|e| anyhow::anyhow!("audio send: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod audio_payload_tests {
+    use super::*;
+
+    fn entries(payload: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = 1;
+        for _ in 0..payload[0] {
+            let distance = payload[off];
+            let len = usize::from(u16::from_be_bytes([payload[off + 1], payload[off + 2]]));
+            out.push((distance, payload[off + 3..off + 3 + len].to_vec()));
+            off += 3 + len;
+        }
+        assert_eq!(off, payload.len());
+        out
+    }
+
+    #[test]
+    fn primary_first_then_copies_in_order() {
+        let mut out = Vec::new();
+        let copies: [(u8, &[u8]); 2] = [(1, &[7, 7]), (3, &[9])];
+        assert!(build_audio_payload(&mut out, &[1, 2, 3], copies, 1400));
+        assert_eq!(entries(&out), vec![(0, vec![1, 2, 3]), (1, vec![7, 7]), (3, vec![9])]);
+    }
+
+    #[test]
+    fn copies_that_do_not_fit_are_skipped() {
+        let mut out = Vec::new();
+        let big = vec![0u8; 600];
+        let copies: [(u8, &[u8]); 3] = [(1, &big), (2, &big), (3, &[5])];
+        assert!(build_audio_payload(&mut out, &big, copies, 1400));
+        assert_eq!(entries(&out).iter().map(|e| e.0).collect::<Vec<_>>(), vec![0, 1, 3]);
+        assert!(out.len() <= 1400);
+        assert!(!build_audio_payload(&mut out, &vec![0u8; 1400], [], 1400));
+    }
+
+    #[test]
+    fn at_most_four_entries() {
+        let mut out = Vec::new();
+        let data: Vec<[u8; 1]> = (1..=8).map(|d| [d]).collect();
+        let copies: Vec<(u8, &[u8])> = data.iter().map(|d| (d[0], &d[..])).collect();
+        assert!(build_audio_payload(&mut out, &[0], copies, 1400));
+        assert_eq!(out[0] as usize, AUDIO_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn sender_only_copies_packets_it_sent_this_session() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut sender = AudioSender::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let addr = rx.local_addr().unwrap();
+        let mut buf = [0u8; 2048];
+        let mut recv = || {
+            let n = rx.recv(&mut buf).unwrap();
+            entries(&buf[HEADER_LEN..n])
+        };
+        for i in 0..4u8 {
+            sender.send_audio(&[i], addr, 0, &[1, 3]).unwrap();
+        }
+        let _ = (recv(), recv(), recv());
+        // Frame 3 carries frame 2 (distance 1) and frame 0 (distance 3).
+        assert_eq!(recv(), vec![(0, vec![3]), (1, vec![2]), (3, vec![0])]);
+        sender.reset_history();
+        sender.send_audio(&[4], addr, 0, &[1, 3]).unwrap();
+        assert_eq!(recv(), vec![(0, vec![4])]);
     }
 }
 

@@ -46,6 +46,8 @@ pub mod udp {
     pub const CAMERA: u8 = 0x02;
     /// One mic Opus packet: `seq(u32) opus`.
     pub const MIC: u8 = 0x03;
+    /// Speaker playout report, see `audio::AudioReport`.
+    pub const AUDIO_REPORT: u8 = 0x04;
 }
 
 /// Fixed-layout field values shared by `CAPS` and `SETTINGS`.
