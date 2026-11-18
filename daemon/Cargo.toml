@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 opus = "0.3"
-ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec", "swscale"] }
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec", "swscale", "avfilter"] }
 libc = "0.2"
 reed-solomon-erasure = "6"
 ring = "0.17"

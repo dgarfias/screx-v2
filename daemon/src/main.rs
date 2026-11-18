@@ -73,7 +73,7 @@ struct Cli {
 
     /// Replace periodic IDR keyframes with rolling intra-refresh where the
     /// encoder supports it (software H.264 and NVENC); full IDRs are then
-    /// emitted only when a client requests one. Pass --no-intra-refresh to
+    /// emitted only when a client requests one. Pass --intra-refresh false to
     /// keep the legacy periodic keyframes.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     intra_refresh: bool,
@@ -86,6 +86,11 @@ struct Cli {
     /// QUIC streaming port (UDP only)
     #[arg(short, long, default_value_t = 9000)]
     port: u16,
+
+    /// Convert captured frames to NV12 on the CPU instead of the GPU's video
+    /// processor (for testing a driver without video post-processing)
+    #[arg(long)]
+    no_vpp: bool,
 
     /// Encoder backend: auto, vaapi, nvenc, software
     #[arg(short = 'e', long, default_value = "auto")]
@@ -132,6 +137,7 @@ enum Commands {
 #[derive(Debug, Clone)]
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
+    gpu_convert: bool,
     codec: encode::VideoCodec,
     width: u32,
     height: u32,
@@ -153,6 +159,7 @@ impl AppConfig {
     fn from_cli(cli: &Cli) -> Self {
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
+            gpu_convert: !cli.no_vpp,
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.max_width,
             height: cli.max_height,

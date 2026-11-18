@@ -33,6 +33,9 @@ impl VideoCodec {
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub bitrate_bps: u32,
+    /// Convert captured BGRA frames to NV12 on the GPU (VA-API VPP). False
+    /// keeps the CPU scaler, as on a driver without video post-processing.
+    pub gpu_convert: bool,
     pub gop: u32,
     pub fps: u32,
     pub width: u32,
@@ -546,6 +549,8 @@ struct HwEncoder {
     ctx: *mut ffi::AVCodecContext,
     hw_device_ctx: *mut ffi::AVBufferRef,
     sws: BandedScaler,
+    /// GPU colour conversion: BGRA -> NV12 through VA-API VPP.
+    vpp: Option<VppScaler>,
     sw_bgra: *mut ffi::AVFrame,
     sw_nv12: *mut ffi::AVFrame,
     hw_frame: *mut ffi::AVFrame,
@@ -558,6 +563,125 @@ struct HwEncoder {
 }
 
 unsafe impl Send for HwEncoder {}
+
+/// Converts captured BGRA frames straight into VA-API NV12 surfaces with the
+/// video processor, so the capture thread never touches pixel data. Pulled
+/// frames go to the encoder as they are; the graph uses the same VA-API device
+/// as the encoder, so its surfaces are valid there.
+struct VppScaler {
+    graph: *mut ffi::AVFilterGraph,
+    src: *mut ffi::AVFilterContext,
+    sink: *mut ffi::AVFilterContext,
+}
+
+unsafe impl Send for VppScaler {}
+
+impl VppScaler {
+    fn new(width: i32, height: i32, device: *mut ffi::AVBufferRef) -> Option<Self> {
+        unsafe {
+            let graph = ffi::avfilter_graph_alloc();
+            if graph.is_null() {
+                return None;
+            }
+            let mut scaler = Self { graph, src: ptr::null_mut(), sink: ptr::null_mut() };
+            let create = |name: &str, args: Option<&str>, label: &str| {
+                let filter = std::ffi::CString::new(name).ok()?;
+                let label = std::ffi::CString::new(label).ok()?;
+                let args = match args {
+                    Some(args) => Some(std::ffi::CString::new(args).ok()?),
+                    None => None,
+                };
+                let mut context = ptr::null_mut();
+                let ret = ffi::avfilter_graph_create_filter(
+                    &mut context,
+                    ffi::avfilter_get_by_name(filter.as_ptr()),
+                    label.as_ptr(),
+                    args.as_ref().map_or(ptr::null(), |args| args.as_ptr()),
+                    ptr::null_mut(),
+                    scaler.graph,
+                );
+                (ret >= 0).then_some(context)
+            };
+            let source = format!(
+                "video_size={width}x{height}:pix_fmt=bgra:time_base=1/90000:pixel_aspect=1/1"
+            );
+            let convert = "format=nv12".to_owned();
+            let (Some(src), Some(convert), Some(sink)) = (
+                create("buffer", Some(&source), "in"),
+                create("scale_vaapi", Some(&convert), "convert"),
+                create("buffersink", None, "out"),
+            ) else {
+                scaler.free();
+                return None;
+            };
+            // Upload into the encoder's own VA-API device: surface IDs are only
+            // valid on the device context that created them. The filter must be
+            // allocated, given the device and only then initialized.
+            let upload_filter = ffi::avfilter_get_by_name(c"hwupload".as_ptr());
+            let upload_label = c"upload".as_ptr();
+            let upload = if upload_filter.is_null() {
+                ptr::null_mut()
+            } else {
+                ffi::avfilter_graph_alloc_filter(scaler.graph, upload_filter, upload_label)
+            };
+            if upload.is_null() {
+                scaler.free();
+                return None;
+            }
+            (*upload).hw_device_ctx = ffi::av_buffer_ref(device);
+            if (*upload).hw_device_ctx.is_null()
+                || ffi::avfilter_init_str(upload, ptr::null()) < 0
+            {
+                scaler.free();
+                return None;
+            }
+            scaler.src = src;
+            scaler.sink = sink;
+            let linked = ffi::avfilter_link(src, 0, upload, 0) >= 0
+                && ffi::avfilter_link(upload, 0, convert, 0) >= 0
+                && ffi::avfilter_link(convert, 0, sink, 0) >= 0
+                && ffi::avfilter_graph_config(scaler.graph, ptr::null_mut()) >= 0;
+            if !linked {
+                scaler.free();
+                return None;
+            }
+            Some(scaler)
+        }
+    }
+
+    /// Converts one BGRA frame and moves the NV12 surface into `out`.
+    fn convert(&mut self, bgra: *mut ffi::AVFrame, out: *mut ffi::AVFrame) -> Result<()> {
+        unsafe {
+            let ret = ffi::av_buffersrc_add_frame_flags(
+                self.src,
+                bgra,
+                ffi::AV_BUFFERSRC_FLAG_KEEP_REF as libc::c_int,
+            );
+            if ret < 0 {
+                bail!("VPP input rejected (error {ret})");
+            }
+            let ret = ffi::av_buffersink_get_frame(self.sink, out);
+            if ret < 0 {
+                bail!("VPP produced no frame (error {ret})");
+            }
+            Ok(())
+        }
+    }
+
+    fn free(&mut self) {
+        unsafe {
+            if !self.graph.is_null() {
+                ffi::avfilter_graph_free(&mut self.graph);
+            }
+        }
+    }
+}
+
+impl Drop for VppScaler {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
 
 #[derive(Clone, Copy)]
 enum VaapiHevcMode {
@@ -833,6 +957,27 @@ impl HwEncoder {
 
             ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
 
+            // VA-API can convert BGRA to NV12 on the GPU, which keeps the
+            // capture thread out of the pixel path. If the driver, the filter
+            // set or the graph cannot provide it, keep the CPU scaler below.
+            let vpp = if matches!(kind, HwKind::Vaapi) && config.gpu_convert {
+                match VppScaler::new(width, height, hw_device_ctx) {
+                    Some(vpp) => {
+                        crate::log_detail!("[encode] VA-API VPP colour conversion enabled");
+                        Some(vpp)
+                    }
+                    None => {
+                        eprintln!("[encode] VA-API VPP unavailable; converting on the CPU");
+                        None
+                    }
+                }
+            } else {
+                if matches!(kind, HwKind::Vaapi) {
+                    crate::log_detail!("[encode] VA-API VPP disabled; converting on the CPU");
+                }
+                None
+            };
+
             let Some(sws) = BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_NV12)
             else {
                 ffi::av_buffer_unref(&mut hw_device_ctx);
@@ -889,6 +1034,7 @@ impl HwEncoder {
                 ctx,
                 hw_device_ctx,
                 sws,
+                vpp,
                 sw_bgra,
                 sw_nv12,
                 hw_frame,
@@ -908,71 +1054,89 @@ impl HwEncoder {
         is_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
         unsafe {
-            let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
-            if ret < 0 {
-                bail!("failed to get hw frame buffer (error {ret})");
-            }
-
-            let map_flags = (ffi::AV_HWFRAME_MAP_WRITE as libc::c_int)
-                | (ffi::AV_HWFRAME_MAP_OVERWRITE as libc::c_int);
-            let mapped = ffi::av_hwframe_map(self.mapped_frame, self.hw_frame, map_flags);
-
+            let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
             (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
+            (*self.sw_bgra).pts = pts;
 
-            if mapped >= 0 {
-                self.sws.scale(
-                    (*self.sw_bgra).data.as_ptr() as *const *const u8,
-                    (*self.sw_bgra).linesize.as_ptr(),
-                    (*self.mapped_frame).data.as_mut_ptr(),
-                    (*self.mapped_frame).linesize.as_mut_ptr(),
-                );
-                ffi::av_frame_unref(self.mapped_frame);
-            } else {
-                // Fallback for drivers that do not support direct mapping.
-                // Allocate the NV12 system buffer lazily on first use.
-                if self.sw_nv12.is_null() {
-                    eprintln!("[encode] hwframe mapping unavailable, allocating sw_nv12 fallback");
-                    self.sw_nv12 = ffi::av_frame_alloc();
-                    if self.sw_nv12.is_null() {
-                        ffi::av_frame_unref(self.mapped_frame);
-                        ffi::av_frame_unref(self.hw_frame);
-                        bail!("failed to allocate NV12 fallback frame");
-                    }
-                    (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
-                    (*self.sw_nv12).width = (*self.ctx).width;
-                    (*self.sw_nv12).height = (*self.ctx).height;
-                    let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
-                    if ret < 0 {
-                        ffi::av_frame_free(&mut self.sw_nv12);
-                        ffi::av_frame_unref(self.mapped_frame);
-                        ffi::av_frame_unref(self.hw_frame);
-                        bail!("failed to allocate NV12 fallback buffer (error {ret})");
-                    }
+            // The graph hands back an NV12 surface already on the encoder's
+            // VA-API device; nothing else to do before sending it.
+            let mut conversion_error = None;
+            if let Some(vpp) = self.vpp.as_mut() {
+                if let Err(error) = vpp.convert(self.sw_bgra, self.hw_frame) {
+                    conversion_error = Some(error);
                 }
-
-                ffi::av_frame_unref(self.mapped_frame);
+            }
+            if let Some(error) = conversion_error {
+                eprintln!("[encode] VA-API VPP conversion failed, converting on the CPU: {error:#}");
+                self.vpp = None;
                 ffi::av_frame_unref(self.hw_frame);
+            }
+            let converted = self.vpp.is_some();
 
-                self.sws.scale(
-                    (*self.sw_bgra).data.as_ptr() as *const *const u8,
-                    (*self.sw_bgra).linesize.as_ptr(),
-                    (*self.sw_nv12).data.as_mut_ptr(),
-                    (*self.sw_nv12).linesize.as_mut_ptr(),
-                );
-
+            if !converted {
                 let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
                 if ret < 0 {
                     bail!("failed to get hw frame buffer (error {ret})");
                 }
 
-                let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
-                if ret < 0 {
+                let map_flags = (ffi::AV_HWFRAME_MAP_WRITE as libc::c_int)
+                    | (ffi::AV_HWFRAME_MAP_OVERWRITE as libc::c_int);
+                let mapped = ffi::av_hwframe_map(self.mapped_frame, self.hw_frame, map_flags);
+
+                if mapped >= 0 {
+                    self.sws.scale(
+                        (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                        (*self.sw_bgra).linesize.as_ptr(),
+                        (*self.mapped_frame).data.as_mut_ptr(),
+                        (*self.mapped_frame).linesize.as_mut_ptr(),
+                    );
+                    ffi::av_frame_unref(self.mapped_frame);
+                } else {
+                    // Fallback for drivers that do not support direct mapping.
+                    // Allocate the NV12 system buffer lazily on first use.
+                    if self.sw_nv12.is_null() {
+                        eprintln!("[encode] hwframe mapping unavailable, allocating sw_nv12 fallback");
+                        self.sw_nv12 = ffi::av_frame_alloc();
+                        if self.sw_nv12.is_null() {
+                            ffi::av_frame_unref(self.mapped_frame);
+                            ffi::av_frame_unref(self.hw_frame);
+                            bail!("failed to allocate NV12 fallback frame");
+                        }
+                        (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                        (*self.sw_nv12).width = (*self.ctx).width;
+                        (*self.sw_nv12).height = (*self.ctx).height;
+                        let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
+                        if ret < 0 {
+                            ffi::av_frame_free(&mut self.sw_nv12);
+                            ffi::av_frame_unref(self.mapped_frame);
+                            ffi::av_frame_unref(self.hw_frame);
+                            bail!("failed to allocate NV12 fallback buffer (error {ret})");
+                        }
+                    }
+
+                    ffi::av_frame_unref(self.mapped_frame);
                     ffi::av_frame_unref(self.hw_frame);
-                    bail!("failed to upload frame to hw surface (error {ret})");
+
+                    self.sws.scale(
+                        (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                        (*self.sw_bgra).linesize.as_ptr(),
+                        (*self.sw_nv12).data.as_mut_ptr(),
+                        (*self.sw_nv12).linesize.as_mut_ptr(),
+                    );
+
+                    let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
+                    if ret < 0 {
+                        bail!("failed to get hw frame buffer (error {ret})");
+                    }
+
+                    let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
+                    if ret < 0 {
+                        ffi::av_frame_unref(self.hw_frame);
+                        bail!("failed to upload frame to hw surface (error {ret})");
+                    }
                 }
             }
 
-            let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
             (*self.hw_frame).pts = pts;
             (*self.hw_frame).pict_type = if is_idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
@@ -1339,6 +1503,102 @@ impl Drop for SwEncoder {
 #[cfg(test)]
 mod banded_scaler_tests {
     use super::*;
+
+    /// Encodes a frame through the full VA-API path, which also checks that the
+    /// encoder accepts surfaces produced by the VPP graph.
+    #[test]
+    fn vaapi_encoder_accepts_vpp_frames() {
+        let config = EncoderConfig {
+            bitrate_bps: 4_000_000,
+            gop: 90,
+            fps: 30,
+            width: 256,
+            height: 256,
+            backend: EncoderBackend::Vaapi,
+            codec: VideoCodec::H264,
+            intra_refresh: false,
+            gpu_convert: true,
+        };
+        let Ok(mut encoder) = Encoder::new(config) else {
+            eprintln!("skipping: VA-API encoding unavailable");
+            return;
+        };
+        let bgra = vec![128u8; 256 * 256 * 4];
+        let capture = CaptureFrame { width: 256, height: 256, data: &bgra };
+        let units = encoder.encode_frame(&capture, true).expect("encode");
+        assert!(!units.is_empty());
+        assert!(units.iter().any(|unit| unit.is_idr));
+    }
+
+    /// Exercises the VA-API VPP path on a real device: converts a BGRA frame
+    /// to an NV12 surface and maps it back to check the pixels arrived.
+    #[test]
+    fn vaapi_vpp_converts_bgra_to_nv12() {
+        let mut device = ptr::null_mut();
+        let device_name = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        if unsafe {
+            ffi::av_hwdevice_ctx_create(
+                &mut device,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                device_name.as_ptr(),
+                ptr::null_mut(),
+                0,
+            )
+        } < 0
+        {
+            eprintln!("skipping: no VA-API device for VPP");
+            return;
+        }
+        let Some(mut vpp) = VppScaler::new(64, 48, device) else {
+            eprintln!("skipping: VPP graph unavailable");
+            unsafe { ffi::av_buffer_unref(&mut device) };
+            return;
+        };
+        let width: i32 = 64;
+        let stride = width * 4;
+        let mut bgra = vec![0u8; (stride * 48) as usize];
+        for row in 0..48 {
+            for column in 0..width {
+                let pixel = ((row * width + column) * 4) as usize;
+                bgra[pixel] = 40;
+                bgra[pixel + 1] = 200;
+                bgra[pixel + 2] = 90;
+                bgra[pixel + 3] = 255;
+            }
+        }
+        unsafe {
+            let input = ffi::av_frame_alloc();
+            (*input).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+            (*input).width = width;
+            (*input).height = 48;
+            (*input).linesize[0] = stride;
+            (*input).data[0] = bgra.as_mut_ptr();
+            let output = ffi::av_frame_alloc();
+            vpp.convert(input, output).expect("VPP conversion");
+            assert_eq!((*output).format, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32);
+            assert_eq!((*output).width, width);
+            assert_eq!((*output).height, 48);
+
+            let mut readback = ffi::av_frame_alloc();
+            assert!(ffi::av_hwframe_map(readback, output, ffi::AV_HWFRAME_MAP_READ as _) >= 0);
+            let luma = (*readback).data[0];
+            let rows = (*readback).linesize[0] as usize;
+            let values: Vec<u8> = (0..48)
+                .flat_map(|row| (0..width as usize).map(move |column| row * rows + column))
+                .map(|index| *luma.add(index))
+                .collect();
+            assert!(
+                values.iter().any(|&value| value > 16),
+                "expected image data in the NV12 luma plane"
+            );
+            ffi::av_frame_free(&mut readback);
+            ffi::av_buffer_unref(&mut device);
+            let mut output = output;
+            ffi::av_frame_free(&mut output);
+            let mut input = input;
+            ffi::av_frame_free(&mut input);
+        }
+    }
 
     fn test_pattern(width: usize, height: usize) -> Vec<u8> {
         let mut bgra = vec![0u8; width * height * 4];

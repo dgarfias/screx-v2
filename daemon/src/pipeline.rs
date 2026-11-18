@@ -99,6 +99,7 @@ impl CaptureWorker {
             bitrate_bps: settings.bitrate_bps,
             codec: settings.codec,
             backend: config.encoder_backend,
+            gpu_convert: config.gpu_convert,
             gop: config.gop,
             intra_refresh: config.intra_refresh,
         };
