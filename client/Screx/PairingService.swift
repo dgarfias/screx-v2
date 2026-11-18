@@ -35,7 +35,7 @@ final class PairingService {
             timeout = task
             session.queue.asyncAfter(deadline: .now() + 8, execute: task)
             session.start { [weak self] control in
-                guard let self else { return }
+                guard let self, !self.completed else { return }
                 var hello = Data([0xe0])
                 hello.append(deviceId)
                 hello.append(signing.publicKey.rawRepresentation)
@@ -48,6 +48,7 @@ final class PairingService {
                 control.send(content: QUICFrame.encode(hello), completion: .contentProcessed { [self] error in
                     if let error { self.finish(.error(error.localizedDescription)); return }
                     QUICFrame.read(control) { result in
+                        guard !self.completed else { return }
                         do {
                             let challenge = try result.get()
                             guard challenge.count >= 82, challenge[0] == 0xe1 else {
@@ -96,6 +97,7 @@ final class PairingService {
                                                 control.send(content: QUICFrame.encode(proof), completion: .contentProcessed { error in
                                                     if let error { self.finish(.error(error.localizedDescription)); return }
                                                     QUICFrame.read(control) { result in
+                                                        guard !self.completed else { return }
                                                         do {
                                                             let reply = try result.get()
                                                             guard reply.count == 33, reply[0] == 0xe4 else {
@@ -130,7 +132,7 @@ final class PairingService {
         timeout = task
         session.queue.asyncAfter(deadline: .now() + 8, execute: task)
         QUICFrame.read(control) { [weak self] result in
-            guard let self else { return }
+            guard let self, !self.completed else { return }
             do {
                 switch try result.get() {
                 case Data([0xe5]):
@@ -144,10 +146,14 @@ final class PairingService {
         }
     }
     func cancel() {
-        completed = true
-        timeout?.cancel()
-        session?.close()
-        session = nil
+        // The session reference is set before starting the connection and is
+        // not replaced. Its queue owns the pairing state once started.
+        guard let session else { return }
+        session.queue.async { [self] in
+            completed = true
+            timeout?.cancel()
+            session.close()
+        }
     }
     private func finish(_ result: PairingResult) {
         guard !completed else { return }

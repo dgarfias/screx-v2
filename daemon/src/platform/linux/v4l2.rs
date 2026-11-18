@@ -75,7 +75,12 @@ impl CameraBackend for V4l2Camera {
 
     fn write_jpeg(&mut self, jpeg: &[u8]) -> Result<()> {
         if let Some(ref mut f) = self.file {
-            f.write_all(jpeg).context("v4l2 write failed")?;
+            match f.write(jpeg) {
+                Ok(n) if n == jpeg.len() => {}
+                Ok(_) => anyhow::bail!("short v4l2 frame write"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e).context("v4l2 write failed"),
+            }
         }
         Ok(())
     }

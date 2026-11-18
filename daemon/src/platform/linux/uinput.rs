@@ -283,6 +283,20 @@ impl InputBackend for LinuxInput {
         Ok(())
     }
 
+    fn release_touches(&mut self) {
+        if let Some(ref mut ts) = self.touch {
+            let mut events = Vec::new();
+            for slot in 0..MAX_SLOTS as usize {
+                if ts.active_slots[slot] {
+                    ts.send_touch(&mut events, slot as u8, TOUCH_UP, 0, 0);
+                }
+            }
+            if !events.is_empty() {
+                ts.sync(&mut events);
+            }
+        }
+    }
+
     fn key_special(&mut self, code: u8, modifiers: u8) -> Result<()> {
         if let Some(ref mut kb) = self.keyboard {
             if modifiers != 0 {
@@ -387,6 +401,7 @@ pub struct VirtualTouchscreen {
     width: i32,
     height: i32,
     current_slot: i32,
+    active_slots: [bool; MAX_SLOTS as usize],
 }
 
 /// Touch units per mm when the monitor's physical size is known.
@@ -479,6 +494,7 @@ impl VirtualTouchscreen {
             width: range_w + 1,
             height: range_h + 1,
             current_slot: 0,
+            active_slots: [false; MAX_SLOTS as usize],
         })
     }
 
@@ -494,6 +510,17 @@ impl VirtualTouchscreen {
         let x = (x as i32).min(self.width - 1);
         let y = (y as i32).min(self.height - 1);
 
+        let had_touches = self.active_slots.iter().any(|&active| active);
+        match event_type {
+            TOUCH_DOWN => self.active_slots[slot as usize] = true,
+            TOUCH_UP => self.active_slots[slot as usize] = false,
+            _ => {}
+        }
+        let has_touches = self.active_slots.iter().any(|&active| active);
+        if had_touches != has_touches {
+            events.push(input_event(EV_KEY, BTN_TOUCH, i32::from(has_touches)));
+        }
+
         if self.current_slot != slot {
             events.push(input_event(EV_ABS, ABS_MT_SLOT, slot));
             self.current_slot = slot;
@@ -504,7 +531,6 @@ impl VirtualTouchscreen {
                 events.push(input_event(EV_ABS, ABS_MT_TRACKING_ID, slot));
                 events.push(input_event(EV_ABS, ABS_MT_POSITION_X, x));
                 events.push(input_event(EV_ABS, ABS_MT_POSITION_Y, y));
-                events.push(input_event(EV_KEY, BTN_TOUCH, 1));
                 events.push(input_event(EV_ABS, ABS_X, x));
                 events.push(input_event(EV_ABS, ABS_Y, y));
             }
@@ -794,10 +820,10 @@ impl VirtualGamepad {
         events.push(input_event(EV_ABS, ABS_Y, ly as i32));
         events.push(input_event(EV_ABS, ABS_RX, rx as i32));
         events.push(input_event(EV_ABS, ABS_RY, ry as i32));
-        events.push(input_event(EV_ABS, ABS_Z, lt as i32));
-        events.push(input_event(EV_ABS, ABS_RZ, rt as i32));
-        events.push(input_event(EV_ABS, ABS_HAT0X, hat_x as i32));
-        events.push(input_event(EV_ABS, ABS_HAT0Y, hat_y as i32));
+        events.push(input_event(EV_ABS, ABS_Z, i32::from(lt.min(1023))));
+        events.push(input_event(EV_ABS, ABS_RZ, i32::from(rt.min(1023))));
+        events.push(input_event(EV_ABS, ABS_HAT0X, i32::from(hat_x.clamp(-1, 1))));
+        events.push(input_event(EV_ABS, ABS_HAT0Y, i32::from(hat_y.clamp(-1, 1))));
         events.push(input_event(EV_SYN, SYN_REPORT, 0));
         emit_batch(&mut self.file, &events);
     }

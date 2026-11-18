@@ -7,10 +7,8 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-opus-decoder = "0.1"
 opus = "0.3"
-ffmpeg-next = "9"
-ffmpeg-sys-next = "9"
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec", "swscale"] }
 libc = "0.2"
 reed-solomon-erasure = "6"
 ring = "0.17"
@@ -18,12 +16,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 clap = { version = "4.6.0", features = ["derive"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 bytes = "1"
 socket2 = "0.6"
-quinn = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio", "log"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 
 [build-dependencies]
 cc = "1"

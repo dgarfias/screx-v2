@@ -53,3 +53,6 @@ pub const CODEC_H264: u8 = 0x00;
 pub const CODEC_H265: u8 = 0x01;
 /// `SETTINGS` codec value meaning "use the daemon's default codec".
 pub const CODEC_DEFAULT: u8 = 0xFF;
+
+/// Daemon-to-client media datagram header size.
+pub const MEDIA_HEADER_LEN: usize = 22;

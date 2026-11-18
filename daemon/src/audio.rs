@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use opus_decoder::OpusDecoder;
+use anyhow::Context;
+use opus::Decoder as OpusDecoder;
 
 use crate::platform::linux::screx_snd::{self, Card, Direction};
 use crate::stream_server::{AudioSender, SharedState};
@@ -189,7 +190,7 @@ fn wait_for_tick(next: &mut Instant, period: Duration, label: &str) {
 // Speakers — reads the iPad's speaker card, sends it to the iPad
 // ---------------------------------------------------------------------------
 
-/// The iPad's speaker playout report (UDP `AUDIO_REPORT`), see docs/ARCHITECTURE.md.
+/// The iPad's `AUDIO_REPORT` datagram; see docs/ARCHITECTURE.md.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioReport {
     pub generation: u32,
@@ -734,7 +735,7 @@ pub struct MicWriter {
 impl MicWriter {
     fn start(sink: Box<dyn MicSink>) -> Result<Self> {
         // Fail here rather than in the thread if Opus can't initialize.
-        drop(OpusDecoder::new(MIC_RATE, 1).map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?);
+        let decoder = OpusDecoder::new(MIC_RATE, opus::Channels::Mono).context("opus decoder init")?;
         let jitter = Arc::new(Mutex::new(MicJitter::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
@@ -742,7 +743,7 @@ impl MicWriter {
             .spawn({
                 let jitter = Arc::clone(&jitter);
                 let stop = Arc::clone(&stop);
-                move || run_mic(jitter, sink, stop)
+                move || run_mic(jitter, sink, stop, decoder)
             })?;
         Ok(Self {
             jitter,
@@ -782,6 +783,18 @@ fn decode_mic(decoder: &mut OpusDecoder, opus: Option<&[u8]>, pcm: &mut [i16]) -
     }
 }
 
+#[cfg(test)]
+#[test]
+fn libopus_decodes_mic_and_conceals_a_missing_packet() {
+    let mut encoder = opus::Encoder::new(MIC_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let mut decoder = OpusDecoder::new(MIC_RATE, opus::Channels::Mono).unwrap();
+    let mut packet = [0; 1024];
+    let mut pcm = [0; 960];
+    let len = encoder.encode(&pcm, &mut packet).unwrap();
+    assert_eq!(decode_mic(&mut decoder, Some(&packet[..len]), &mut pcm), 960);
+    assert_eq!(decode_mic(&mut decoder, None, &mut pcm), 960);
+}
+
 /// Crossfades `a` into `b` over their common length, writing into `a`.
 fn crossfade(a: &mut [i16], b: &[i16]) -> usize {
     let n = a.len().min(b.len());
@@ -794,15 +807,8 @@ fn crossfade(a: &mut [i16], b: &[i16]) -> usize {
 
 /// The paced mic loop: writes 10 ms to the card per tick, on a schedule that follows the
 /// iPad's microphone clock by holding the jitter buffer at its target.
-fn run_mic(jitter: Arc<Mutex<MicJitter>>, mut sink: Box<dyn MicSink>, stop: Arc<AtomicBool>) {
+fn run_mic(jitter: Arc<Mutex<MicJitter>>, mut sink: Box<dyn MicSink>, stop: Arc<AtomicBool>, mut decoder: OpusDecoder) {
     make_realtime("mic");
-    let mut decoder = match OpusDecoder::new(MIC_RATE, 1) {
-        Ok(decoder) => decoder,
-        Err(e) => {
-            eprintln!("[mic] opus decoder init: {e:?}");
-            return;
-        }
-    };
     let mut pcm = vec![0i16; MIC_MAX_FRAME];
     let mut second = vec![0i16; MIC_MAX_FRAME];
     let mut queued: VecDeque<i16> = VecDeque::with_capacity(MIC_MAX_FRAME * 2);

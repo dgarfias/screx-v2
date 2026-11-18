@@ -2,10 +2,8 @@ use std::ops::Deref;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use libc;
 
 use anyhow::{bail, Context, Result};
-use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
 
 use crate::capture::CaptureFrame;
@@ -171,7 +169,6 @@ fn encoder_name_resolves(name: &str) -> bool {
 /// encoder-construction time supports, since the one that actually wins is
 /// only known once real hardware probing happens in `Encoder::new`.
 pub fn probe_available_codecs(backend: EncoderBackend) -> Vec<VideoCodec> {
-    let _ = ffmpeg::init();
 
     let candidates: Vec<EncoderBackend> = match backend {
         EncoderBackend::Auto => {
@@ -241,7 +238,6 @@ impl Encoder {
     }
 
     pub fn new(config: EncoderConfig) -> Result<Self> {
-        ffmpeg::init().context("ffmpeg init")?;
 
         let inner = match config.backend {
             EncoderBackend::Vaapi => {

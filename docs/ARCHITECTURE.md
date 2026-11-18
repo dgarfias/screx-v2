@@ -152,10 +152,10 @@ input messages on the control stream.
    `CAPS` on the control stream.
 5. The first decoded video frame moves the client into the streaming state.
 
-The daemon runs each connection in its own task. Only one authentication runs at a time, so at
-most one PIN is ever shown, and the daemon admits at most one new connection per second in total,
-regardless of source address. Rotating addresses therefore can't turn the eight-digit PIN into
-an unlimited guessing oracle.
+The daemon runs each connection in its own task. It validates the source address with QUIC Retry
+and limits concurrent authentication attempts both globally and per source. A separate global
+limit allows only one PIN exchange at a time and at most one new PIN attempt per second.
+Already-paired devices can authenticate while someone is entering a PIN.
 
 ## Pairing Protocol
 

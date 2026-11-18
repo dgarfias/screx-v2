@@ -17,7 +17,7 @@ use crate::input::{
 };
 
 const CHUNK_PAYLOAD: usize = crate::quic_transport::CHUNK_PAYLOAD;
-const HEADER_LEN: usize = 22;
+use crate::protocol::MEDIA_HEADER_LEN as HEADER_LEN;
 use crate::protocol;
 
 /// Validation/clamping bounds for client-proposed `SETTINGS`. The bitrate
@@ -153,7 +153,7 @@ impl AdaptiveStreamState {
             .take_while(|ts| now.duration_since(**ts) <= ADAPTIVE_SHORT_WINDOW)
             .count();
         let long_pli = self.pli_events.len();
-        let min_bitrate_bps = (self.base_bitrate_bps / 3).max(2_000_000);
+        let min_bitrate_bps = (self.base_bitrate_bps / 3).max(2_000_000).min(self.base_bitrate_bps);
         let old_bitrate = self.current_bitrate_bps;
         let old_idr_fec = self.idr_fec_percent;
         let old_pframe_fec = self.pframe_fec_percent;
@@ -224,10 +224,12 @@ impl DisplayStreamControl {
         if generation == 0 || self.generation.load(Ordering::Acquire) != generation {
             return;
         }
-        self.adaptive_stream
-            .lock()
-            .unwrap()
-            .note_pli(Instant::now());
+        let mut adaptive = self.adaptive_stream.lock().unwrap();
+        let now = Instant::now();
+        if adaptive.pli_events.back().is_some_and(|last| now - *last < Duration::from_millis(250)) {
+            return;
+        }
+        adaptive.note_pli(now);
         self.force_idr.store(true, Ordering::Relaxed);
         self.force_refresh.store(true, Ordering::Relaxed);
     }
@@ -245,7 +247,6 @@ pub struct SharedState {
     pub camera_exclusive_caps: bool,
     pub mic_writer: Mutex<Option<MicWriter>>,
     pub start_time: Instant,
-    pub on_client_connected: Mutex<Option<LifecycleCallback>>,
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
     pub audio_output_enabled: AtomicBool,
@@ -305,7 +306,6 @@ impl SharedState {
             }),
             camera_exclusive_caps,
             mic_writer: Mutex::new(None),
-            on_client_connected: Mutex::new(None),
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
             audio_output_enabled: AtomicBool::new(false),
@@ -762,7 +762,7 @@ const PERIPH_KEYBOARD: u8 = 0x02;
 const PERIPH_ATTACHED: u8 = 0x01;
 const PERIPH_DETACHED: u8 = 0x00;
 
-pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
+fn handle_periph_packet_data(shared: &Arc<SharedState>, session: u64, data: &[u8]) {
     if data.len() < 2 {
         return;
     }
@@ -788,7 +788,7 @@ pub fn handle_periph_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
             // Same for keys: go through the keyboard worker so the release
             // lands after any key events still queued ahead of it.
             if let Some(ref worker) = *shared.keyboard_worker.lock().unwrap() {
-                worker.send(crate::input::KeyboardEvent::ReleaseAll);
+                worker.send(session, crate::input::KeyboardEvent::ReleaseAll);
             }
             crate::log_detail!("[periph] physical keyboard detached, keys released");
         }
@@ -860,10 +860,14 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
             let enabled = width > 0 && height > 0 && fps > 0;
             if enabled && !shared.features.camera {
                 println!("[camera] ignoring camera enable: disabled with --no-camera");
-            } else if enabled {
+            } else if enabled && width <= shared.max_width.min(4096)
+                && height <= shared.max_height.min(4096) && fps <= shared.max_fps.min(120)
+            {
                 enable_camera(shared, CameraConfig { width, height, fps });
-            } else {
+            } else if width == 0 && height == 0 && fps == 0 {
                 disable_camera(shared);
+            } else {
+                crate::log_detail!("[camera] ignoring invalid camera dimensions or frame rate");
             }
         }
         client::TOUCH => {
@@ -880,7 +884,7 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
             };
             if let Some(event) = event {
                 if let Some(ref worker) = *shared.keyboard_worker.lock().unwrap() {
-                    worker.send(event);
+                    worker.send(session, event);
                 } else {
                     eprintln!("[control] key event dropped: no input backend available");
                 }
@@ -893,7 +897,7 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
                 }
             }
         }
-        client::PERIPH => handle_periph_packet_data(shared, body),
+        client::PERIPH => handle_periph_packet_data(shared, session, body),
         client::GAMEPAD => {
             if shared.features.gamepad {
                 handle_gamepad_packet_data(shared, body);
@@ -943,6 +947,9 @@ pub fn handle_gamepad_packet_data(shared: &Arc<SharedState>, data: &[u8]) {
     }
 
     let controller_id = data[0];
+    if controller_id >= crate::input::MAX_GAMEPADS {
+        return;
+    }
     let msg_type = data[1];
 
     match msg_type {
@@ -1209,6 +1216,7 @@ mod display_stream_tests {
 }
 
 pub struct VideoSender {
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     quic: crate::quic_transport::MediaTransport,
     packet_pool: Vec<[u8; MAX_PACKET_LEN]>,
     packet_lens: Vec<usize>,
@@ -1227,6 +1235,7 @@ pub struct VideoSender {
 impl VideoSender {
     pub fn from_quic(media: crate::quic_transport::MediaTransport, display_id: crate::capture::DisplayId) -> Self {
         Self {
+            stop: None,
             quic: media,
             packet_pool: Vec::new(), packet_lens: Vec::new(),
             sequence: crate::media_sequence::ServerPacketSequence::new(), display_id,
@@ -1235,6 +1244,10 @@ impl VideoSender {
             log_sent_aus: std::env::var_os("SCREX_LOG_SENT_AUS").is_some(),
             frame_interval: Duration::from_micros(1_000_000 / 60),
         }
+    }
+
+    pub fn set_stop_flag(&mut self, stop: Arc<std::sync::atomic::AtomicBool>) {
+        self.stop = Some(stop);
     }
 
     pub fn generation(&self) -> u32 {
@@ -1300,7 +1313,8 @@ impl VideoSender {
             );
         }
 
-        let data_count = (payload.len() + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+        let data_count = payload.len().div_ceil(CHUNK_PAYLOAD);
+        anyhow::ensure!((1..=MAX_SHARDS_PER_FRAME).contains(&data_count), "invalid video shard count: {data_count}");
 
         let parity_percent = if is_idr {
             tuning.idr_fec_percent
@@ -1441,7 +1455,7 @@ impl VideoSender {
                     std::thread::sleep(wait);
                 }
             }
-            self.quic.send_video(&self.packet_pool[i][..self.packet_lens[i]])?;
+            self.quic.send_video(&self.packet_pool[i][..self.packet_lens[i]], self.stop.as_deref())?;
             bytes += self.packet_lens[i] as u64;
         }
         Ok(bytes)
@@ -1556,10 +1570,6 @@ impl AudioSender {
             (*stored == Some(id)).then_some((distance, packet.as_slice()))
         });
         let fits = build_audio_payload(&mut self.payload, opus, copies, CHUNK_PAYLOAD);
-        let slot = &mut self.history[frame_id as usize % AUDIO_HISTORY];
-        slot.0 = Some(frame_id);
-        slot.1.clear();
-        slot.1.extend_from_slice(opus);
         anyhow::ensure!(fits, "{}-byte Opus packet does not fit in one datagram", opus.len());
 
         let payload_len = self.payload.len();
@@ -1577,7 +1587,12 @@ impl AudioSender {
         self.send_buf[..HEADER_LEN].copy_from_slice(&header);
         self.send_buf[HEADER_LEN..HEADER_LEN + payload_len].copy_from_slice(&self.payload);
 
-        self.quic.send(&self.send_buf[..HEADER_LEN + payload_len])
+        self.quic.send(&self.send_buf[..HEADER_LEN + payload_len])?;
+        let slot = &mut self.history[frame_id as usize % AUDIO_HISTORY];
+        slot.0 = Some(frame_id);
+        slot.1.clear();
+        slot.1.extend_from_slice(opus);
+        Ok(())
     }
 }
 

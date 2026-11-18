@@ -67,11 +67,13 @@ pub fn probe_gamepad_max_controllers() -> Option<u8> {
     // controller_id range (0..4) the rest of the protocol assumes (see
     // the disconnect cleanup loop in main.rs).
     if std::path::Path::new("/dev/uinput").exists() {
-        Some(4)
+        Some(MAX_GAMEPADS)
     } else {
         None
     }
 }
+
+pub const MAX_GAMEPADS: u8 = 4;
 
 /// Backend-specific input injection.
 pub trait InputBackend: Send {
@@ -84,6 +86,7 @@ pub trait InputBackend: Send {
     fn set_display_size(&mut self, _size_mm: Option<(u16, u16)>) {}
 
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;
+    fn release_touches(&mut self) {}
     fn key_text(&mut self, text: &str) -> anyhow::Result<()>;
     fn key_special(&mut self, code: u8, modifiers: u8) -> anyhow::Result<()>;
     fn key_text_with_modifiers(&mut self, text: &str, modifiers: u8) -> anyhow::Result<()>;
@@ -121,20 +124,38 @@ pub enum KeyboardEvent {
 
 /// Owned handle to a background thread that executes keyboard events.
 pub struct KeyboardWorker {
-    sender: std::sync::mpsc::SyncSender<KeyboardEvent>,
+    sender: std::sync::mpsc::SyncSender<(u64, KeyboardEvent)>,
 }
 
 impl KeyboardWorker {
     /// Spawn a thread that executes keyboard events sequentially against a
     /// shared backend.
-    pub fn new(backend: Arc<std::sync::Mutex<dyn InputBackend>>) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<KeyboardEvent>(32);
+    pub fn new(shared: &Arc<crate::stream_server::SharedState>) -> Self {
+        let shared = Arc::downgrade(shared);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, KeyboardEvent)>(32);
         std::thread::Builder::new()
             .name("keyboard-input".into())
             .spawn(move || {
-                while let Ok(event) = receiver.recv() {
-                    if let Ok(mut backend) = backend.lock() {
-                        dispatch_event(&mut *backend, &event);
+                while let Ok((session, event)) = receiver.recv() {
+                    let Some(shared) = shared.upgrade() else { break };
+                    let dispatch = |event: &KeyboardEvent| {
+                        let Ok(mut backend) = shared.input_backend.lock() else { return false };
+                        if !shared.is_current_network_session(session)
+                            || shared.quic_media.lock().unwrap().as_ref().is_some_and(|media| media.is_closed())
+                        {
+                            return false;
+                        }
+                        dispatch_event(&mut *backend, event);
+                        true
+                    };
+                    if let KeyboardEvent::Text(text) = &event {
+                        // A Unicode keystroke may sleep. Release the lock between
+                        // characters and recheck the session before injecting each one.
+                        for ch in text.chars() {
+                            if !dispatch(&KeyboardEvent::Text(ch.to_string())) { break }
+                        }
+                    } else {
+                        dispatch(&event);
                     }
                 }
             })
@@ -142,11 +163,9 @@ impl KeyboardWorker {
         Self { sender }
     }
 
-    /// Send an event to the keyboard worker. Non-blocking; drops on full/disconnect.
-    pub fn send(&self, event: KeyboardEvent) {
-        if self.sender.try_send(event).is_err() {
-            crate::log_trace!("[keyboard] worker event dropped (backpressure or stopped)");
-        }
+    /// Called on a blocking worker. Preserve ordering and never drop key releases.
+    pub fn send(&self, session: u64, event: KeyboardEvent) {
+        let _ = self.sender.send((session, event));
     }
 }
 
@@ -178,7 +197,7 @@ fn dispatch_event<B: InputBackend + ?Sized>(backend: &mut B, event: &KeyboardEve
 /// Parse a batch of touch contacts from a raw buffer.
 pub fn parse_touch_packet(data: &[u8]) -> Vec<TouchContact> {
     let mut out = Vec::new();
-    if data.is_empty() {
+    if data.is_empty() || data.len() > 1024 {
         return out;
     }
     let count = data[0] as usize;
@@ -276,6 +295,9 @@ pub fn parse_rawkey_event(data: &[u8]) -> Option<KeyboardEvent> {
         return None;
     }
     let usage = u16::from_be_bytes([data[0], data[1]]);
+    if usage > u16::from(u8::MAX) {
+        return None;
+    }
     let state = data[2] as i32;
     Some(KeyboardEvent::Raw { usage, state })
 }

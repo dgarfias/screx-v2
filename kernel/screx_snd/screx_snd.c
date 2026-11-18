@@ -169,6 +169,18 @@ static void screx_transfer(struct screx_snd *chip, snd_pcm_uframes_t frames)
 		/* The rest of the bounce buffer stays silent. */
 		screx_copy(chip, min_t(snd_pcm_uframes_t, frames, queued));
 	} else {
+		/* A single copy can wrap once. Keep the newest frames if the
+		 * capture ring is smaller than this transfer.
+		 */
+		if (frames > runtime->buffer_size) {
+			snd_pcm_uframes_t skipped = frames - runtime->buffer_size;
+			size_t bytes = frames_to_bytes(runtime, runtime->buffer_size);
+
+			memmove(chip->bounce, chip->bounce + frames_to_bytes(runtime, skipped), bytes);
+			chip->pos = (chip->pos + skipped) % runtime->boundary;
+			chip->period_pos += skipped;
+			frames = runtime->buffer_size;
+		}
 		screx_copy(chip, frames);
 	}
 

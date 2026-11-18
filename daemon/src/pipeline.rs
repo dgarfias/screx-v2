@@ -74,6 +74,7 @@ impl CaptureWorker {
         let error = Arc::new(Mutex::new(None));
         let next_sequence = Arc::new(Mutex::new(None));
         let mut sender = VideoSender::from_quic(media, display);
+        sender.set_stop_flag(Arc::clone(&stop));
         sender.set_session(settings.fps);
         control
             .generation
@@ -183,6 +184,9 @@ impl CaptureWorker {
                                 Ok(())
                             })();
                             if let Err(e) = result {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
                                 eprintln!("[pipeline/{display:?}] frame failed: {e:#}");
                                 control.force_idr.store(true, Ordering::Relaxed);
                                 control.force_refresh.store(true, Ordering::Relaxed);

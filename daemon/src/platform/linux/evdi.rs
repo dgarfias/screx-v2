@@ -106,7 +106,6 @@ extern "C" {
 
 struct CallbackState {
     update_ready: bool,
-    mode: Option<EvdiMode>,
 }
 
 extern "C" fn on_update_ready(_buf_id: c_int, user_data: *mut c_void) {
@@ -114,15 +113,13 @@ extern "C" fn on_update_ready(_buf_id: c_int, user_data: *mut c_void) {
     state.update_ready = true;
 }
 
-extern "C" fn on_mode_changed(mode: EvdiMode, user_data: *mut c_void) {
-    let state = unsafe { &mut *(user_data as *mut CallbackState) };
+extern "C" fn on_mode_changed(mode: EvdiMode, _user_data: *mut c_void) {
     crate::log_detail!(
         "[capture] EVDI mode changed: {}x{}@{}Hz",
         mode.width,
         mode.height,
         mode.refresh_rate
     );
-    state.mode = Some(mode);
 }
 
 extern "C" fn on_dpms(mode: c_int, _user_data: *mut c_void) {
@@ -248,7 +245,6 @@ impl DisplayBackend for EvdiDisplay {
 
         let mut cb_state = CallbackState {
             update_ready: false,
-            mode: None,
         };
 
         let mut evtctx = EvdiEventContext {

@@ -3,14 +3,29 @@ import QuartzCore
 
 final class StreamClient {
     private let session: QUICSession
-    /// Set between `connect()` and `disconnect()`; read on `queue` and the capture threads.
-    private var running = false
+    private let lifecycleLock = NSLock()
+    private var isRunning = false
+    private var running: Bool {
+        get {
+            lifecycleLock.lock()
+            defer { lifecycleLock.unlock() }
+            return isRunning
+        }
+        set {
+            lifecycleLock.lock()
+            isRunning = newValue
+            lifecycleLock.unlock()
+        }
+    }
     /// Dispatches authenticated QUIC datagrams and handles audio directly. Video
     /// reassembly, FEC recovery and decoding happen on `videoQueue`, so audio never waits behind
     /// them.
     private let queue = DispatchQueue(label: "screx.stream", qos: .userInteractive)
+    private let pendingDatagrams = DispatchSemaphore(value: 512)
     /// Owns `videoStreams` and everything about video frames.
     private let videoQueue = DispatchQueue(label: "screx.stream.video", qos: .userInteractive)
+    private let pendingVideo = DispatchSemaphore(value: 512)
+    private static let maxPendingFrames = 8
     private let debugId = String(UUID().uuidString.prefix(6))
     private let videoStreams: [StreamDisplayID: VideoReceiveState]
     let audioPlayer: AudioPlayer
@@ -60,7 +75,11 @@ final class StreamClient {
         log("connect()")
         running = true
         session.setDatagramHandler { [weak self] packet in
-            self?.queue.async { [weak self] in
+            guard let self else { return }
+            let pending = self.pendingDatagrams
+            guard pending.wait(timeout: .now()) == .success else { return }
+            self.queue.async { [weak self] in
+                defer { pending.signal() }
                 guard let self, self.running else { return }
                 self.onTraffic?(packet.count, 0)
                 self.receiveCount += 1
@@ -83,13 +102,13 @@ final class StreamClient {
     }
 
     func disconnect() {
-        log("disconnect() receives=\(receiveCount)")
+        running = false
+        log("disconnect()")
         videoRecoveryTimer?.cancel()
         videoRecoveryTimer = nil
         audioReportTimer?.cancel()
         audioReportTimer = nil
         session.setDatagramHandler(nil)
-        running = false
     }
 
     private func sendMedia(_ packet: Data) {
@@ -163,8 +182,12 @@ final class StreamClient {
             return
         }
 
+        let pendingVideo = self.pendingVideo
+        guard pendingVideo.wait(timeout: .now()) == .success else { return }
         videoQueue.async { [weak self] in
-            self?.handleVideoPacket(packet, payload: payload)
+            defer { pendingVideo.signal() }
+            guard let self, self.running else { return }
+            self.handleVideoPacket(packet, payload: payload)
         }
     }
 
@@ -182,6 +205,7 @@ final class StreamClient {
         guard totalData > 0,
               shardCount <= 4096,
               Int(chunkIdx) < shardCount,
+              payloadLen > 0,
               Int(payloadLen) <= Self.chunkPayload,
               Int(payloadLen) <= payload.count else {
             log("ignoring invalid video shard metadata for frameId=\(frameId)")
@@ -217,6 +241,11 @@ final class StreamClient {
             }
             assembly = existing
         } else {
+            if stream.reassembly.count >= Self.maxPendingFrames {
+                guard let oldest = stream.reassembly.keys.min(), frameId > oldest else { return }
+                stream.reassembly.removeValue(forKey: oldest)
+                sendPli(display: packet.displayID)
+            }
             guard let created = FrameAssembly(
                 totalData: Int(totalData),
                 totalParity: Int(totalParity),
@@ -237,7 +266,6 @@ final class StreamClient {
             deliverFrame(display: packet.displayID, frameId: frameId, assembly: assembly)
         }
 
-        pruneOldFrames(display: packet.displayID)
     }
 
     private func deliverFrame(display: StreamDisplayID, frameId: UInt32, assembly: FrameAssembly) {

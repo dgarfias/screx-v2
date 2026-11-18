@@ -1,4 +1,6 @@
 #include <fcntl.h>
+#include <errno.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -7,7 +9,12 @@
 /* Opens a v4l2loopback device as VIDEO_OUTPUT and sets MJPEG format.
    Returns the open fd on success, or a negative error code. */
 int screx_v4l2_open_output(const char *device, int width, int height, int fps) {
-    int fd = open(device, O_RDWR);
+    if (width <= 0 || height <= 0 || fps <= 0 ||
+        (uint64_t)width * height * 2 > UINT32_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return -1;
 
@@ -18,10 +25,12 @@ int screx_v4l2_open_output(const char *device, int width, int height, int fps) {
     fmt.fmt.pix.height = height;
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    fmt.fmt.pix.sizeimage = width * height * 2;
+    fmt.fmt.pix.sizeimage = (uint32_t)((uint64_t)width * height * 2);
 
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        int saved_errno = errno;
         close(fd);
+        errno = saved_errno;
         return -2;
     }
 
@@ -33,7 +42,9 @@ int screx_v4l2_open_output(const char *device, int width, int height, int fps) {
         parm.parm.output.timeperframe.denominator = fps;
 
         if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+            int saved_errno = errno;
             close(fd);
+            errno = saved_errno;
             return -3;
         }
     }

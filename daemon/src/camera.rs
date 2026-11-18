@@ -95,15 +95,20 @@ impl CamReassembler {
         let total = u16::from_be_bytes([data[6], data[7]]);
         let payload = &data[8..];
 
-        if total == 0 || total > MAX_CAM_CHUNKS {
+        if total == 0 || total > MAX_CAM_CHUNKS || chunk_idx >= usize::from(total)
+            || payload.is_empty() || payload.len() > crate::quic_transport::CHUNK_PAYLOAD
+        {
             return None;
         }
 
-        if frame_id != self.current_frame_id || total != self.total_chunks {
+        let ahead = frame_id.wrapping_sub(self.current_frame_id);
+        if self.total_chunks == 0 || (ahead != 0 && ahead < 1 << 31) {
             self.current_frame_id = frame_id;
             self.total_chunks = total;
             self.received = vec![None; total as usize];
             self.received_count = 0;
+        } else if ahead != 0 || total != self.total_chunks || self.received.is_empty() {
+            return None;
         }
 
         if chunk_idx < self.received.len() && self.received[chunk_idx].is_none() {
@@ -124,5 +129,29 @@ impl CamReassembler {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(frame: u32, index: u16, count: u16, payload: &[u8]) -> Vec<u8> {
+        let mut data = frame.to_be_bytes().to_vec();
+        data.extend(index.to_be_bytes());
+        data.extend(count.to_be_bytes());
+        data.extend(payload);
+        data
+    }
+
+    #[test]
+    fn stale_chunks_do_not_reset_current_frame_even_at_wraparound() {
+        let mut camera = CamReassembler::new();
+        assert!(camera.feed(&chunk(u32::MAX, 0, 2, b"x")).is_none());
+        assert!(camera.feed(&chunk(0, 0, 2, b"a")).is_none());
+        assert!(camera.feed(&chunk(u32::MAX, 1, 2, b"y")).is_none());
+        assert_eq!(camera.feed(&chunk(0, 1, 2, b"b")), Some(b"ab".to_vec()));
+        assert!(camera.feed(&chunk(0, 1, 2, b"b")).is_none());
+        assert_eq!(camera.feed(&chunk(1, 0, 1, b"c")), Some(b"c".to_vec()));
     }
 }

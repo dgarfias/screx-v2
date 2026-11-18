@@ -2,6 +2,7 @@
 //! before `authenticate` succeeds. TLS encrypts the connection; CPace binds a new
 //! client's signing identity to the actual TLS server certificate and exporter.
 use crate::cpace;
+use crate::protocol::MEDIA_HEADER_LEN;
 use anyhow::{ensure, Context, Result};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use ring::{digest, signature};
@@ -19,7 +20,6 @@ pub const ALPN: &[u8] = b"screx-quic-1";
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-screx-quic-pair-v1";
 pub const MAX_FRAME: usize = 65536;
 pub const CHUNK_PAYLOAD: usize = 1000;
-pub const MEDIA_HEADER: usize = 22;
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -160,8 +160,12 @@ pub async fn write_frame(stream: &mut SendStream, body: &[u8]) -> Result<()> {
         !body.is_empty() && body.len() <= MAX_FRAME,
         "invalid frame length"
     );
-    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    stream.write_all(body).await?;
+    tokio::time::timeout(AUTH_TIMEOUT, async {
+        stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+        stream.write_all(body).await
+    })
+    .await
+    .context("QUIC frame write timed out")??;
     Ok(())
 }
 pub async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
@@ -219,6 +223,7 @@ pub async fn authenticate(
     identity: &Identity,
     pairings: &mut Pairings,
     hello: Option<Vec<u8>>,
+    pin_admission: &PinAdmission,
     show_pin: impl FnOnce(&str),
 ) -> Result<Authenticated> {
     let hello = match hello {
@@ -262,14 +267,17 @@ pub async fn authenticate(
             )
             .map_err(|_| anyhow::anyhow!("client identity proof failed"))?;
     } else {
+        let _pin_slot = pin_admission.acquire()?;
+        // Another pairing may have completed after this connection loaded the file.
+        *pairings = Pairings::load(pairings.path.parent().context("missing pairing directory")?)?;
         // A challenge gets exactly one PAKE share and confirmation attempt.
         // Failure/expiry ends this connection and consumes this PIN.
         let pin = cpace::pin();
         let exchange = cpace::Exchange::new(pin.as_bytes(), &context, &sid);
         let yb = exchange.share;
         challenge.extend_from_slice(&yb);
-        show_pin(&pin);
         write_frame(send, &challenge).await?;
+        show_pin(&pin);
         let proof = tokio::time::timeout(PAIR_TIMEOUT, read_frame(recv)).await??;
         ensure!(
             proof.len() == 65 && proof[0] == PAIR,
@@ -294,7 +302,7 @@ pub async fn authenticate(
         pairings.save()?;
     }
     ensure!(
-        connection.max_datagram_size().unwrap_or(0) >= CHUNK_PAYLOAD + MEDIA_HEADER,
+        connection.max_datagram_size().unwrap_or(0) >= CHUNK_PAYLOAD + MEDIA_HEADER_LEN,
         "peer QUIC datagram limit is too small"
     );
     // The caller answers READY or BUSY once it knows whether the session is free.
@@ -380,9 +388,18 @@ impl MediaTransport {
     /// Capture workers run on dedicated OS threads. Backpressure them rather
     /// than evicting earlier shards from the QUIC send buffer. Reserve room for
     /// audio; sound must not wait behind an entire keyframe.
-    pub fn send_video(&self, body: &[u8]) -> Result<()> {
+    pub fn send_video(&self, body: &[u8], stop: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+        let check_stop = || {
+            ensure!(
+                !stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+                "video sender stopped"
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        check_stop()?;
         if let Some(connection) = &self.connection {
             while connection.datagram_send_buffer_space() < body.len() + 8192 {
+                check_stop()?;
                 if let Some(error) = connection.close_reason() {
                     return Err(error.into());
                 }
@@ -396,10 +413,33 @@ impl MediaTransport {
             connection.close(0u32.into(), b"session ended");
         }
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.connection.as_ref().is_some_and(|c| c.close_reason().is_some())
+    }
 }
 
 /// The live session's device and connection, so the same device can replace it.
 type ActiveSession = Arc<std::sync::Mutex<Option<(String, Connection)>>>;
+
+pub struct PinAdmission {
+    slot: std::sync::Mutex<Option<tokio::time::Instant>>,
+    pending: tokio::sync::Semaphore,
+}
+
+impl PinAdmission {
+    fn new() -> Self {
+        Self { slot: Default::default(), pending: tokio::sync::Semaphore::new(1) }
+    }
+
+    fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        let permit = self.pending.try_acquire().context("another PIN pairing is pending")?;
+        let mut last = self.slot.lock().unwrap();
+        ensure!(last.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)), "PIN pairing rate limited");
+        *last = Some(tokio::time::Instant::now());
+        Ok(permit)
+    }
+}
 
 pub async fn serve(
     endpoint: Endpoint,
@@ -414,22 +454,30 @@ pub async fn serve(
         endpoint.local_addr()?
     );
     let identity = Arc::new(identity);
-    // One authentication at a time, so at most one PIN is ever shown.
-    let authenticating = Arc::new(tokio::sync::Semaphore::new(1));
+    let authenticating = Arc::new(tokio::sync::Semaphore::new(16));
+    let pairing = Arc::new(PinAdmission::new());
+    let mut sources = HashMap::<_, std::sync::Weak<tokio::sync::Semaphore>>::new();
     let active = ActiveSession::default();
-    let mut last_attempt = tokio::time::Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
         let Some(incoming) = endpoint.accept().await else {
             break;
         };
-        // Global admission limit, not per source address: spoofing/rotating addresses
-        // must not turn the eight-digit code into an unlimited online oracle.
-        if last_attempt.elapsed() < Duration::from_secs(1) {
-            incoming.refuse();
+        if !incoming.remote_address_validated() && incoming.may_retry() {
+            let _ = incoming.retry();
             continue;
         }
-        last_attempt = tokio::time::Instant::now();
         let Ok(permit) = Arc::clone(&authenticating).try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
+        sources.retain(|_, source| source.strong_count() != 0);
+        let ip = incoming.remote_address().ip();
+        let source = sources.get(&ip).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| {
+            let source = Arc::new(tokio::sync::Semaphore::new(2));
+            sources.insert(ip, Arc::downgrade(&source));
+            source
+        });
+        let Ok(source_permit) = source.try_acquire_owned() else {
             incoming.refuse();
             continue;
         };
@@ -437,7 +485,8 @@ pub async fn serve(
         // device from hearing "busy", or the same device from reconnecting.
         tokio::spawn(connection(
             incoming,
-            permit,
+            (permit, source_permit),
+            Arc::clone(&pairing),
             Arc::clone(&identity),
             directory.clone(),
             Arc::clone(&shared),
@@ -450,7 +499,8 @@ pub async fn serve(
 
 async fn connection(
     incoming: quinn::Incoming,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permits: (tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit),
+    pairing: Arc<PinAdmission>,
     identity: Arc<Identity>,
     directory: PathBuf,
     shared: Arc<crate::stream_server::SharedState>,
@@ -466,7 +516,7 @@ async fn connection(
         let mut send = send;
         let mut pairings = Pairings::load(&directory)?;
         let auth = authenticate(
-            &connection, &mut send, &mut recv, &identity, &mut pairings, Some(hello),
+            &connection, &mut send, &mut recv, &identity, &mut pairings, Some(hello), &pairing,
             |pin| println!(
                 "\n[pairing] Enter this eight-digit PIN on the iPad: {}-{}\n[pairing] One attempt; expires in 120 seconds.\n",
                 &pin[..4], &pin[4..]
@@ -476,7 +526,7 @@ async fn connection(
         Ok::<_, anyhow::Error>((auth, send, recv, _placeholder))
     }
     .await;
-    drop(permit);
+    drop(permits);
     let (auth, mut send, recv, _placeholder) = match authenticated {
         Ok(value) => value,
         Err(error) => {
@@ -487,16 +537,22 @@ async fn connection(
     };
     let label = format!("{} ({})", auth.name, &auth.device_id[..5]);
 
-    let Some(session) = claim_session(&shared, &active, &auth.device_id, &label).await else {
-        println!("[quic] {label} rejected: another device is connected");
-        // Let the client read BUSY and close the connection itself.
-        if write_frame(&mut send, &[BUSY]).await.is_ok() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
+    let session = match claim_session(&shared, &active, &auth.device_id, &connection).await {
+        SessionClaim::Reserved(session) => session,
+        SessionClaim::Busy => {
+            println!("[quic] {label} rejected: another device is connected");
+            if write_frame(&mut send, &[BUSY]).await.is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
+            }
+            connection.close(1u32.into(), b"busy");
+            return;
         }
-        connection.close(1u32.into(), b"busy");
-        return;
+        SessionClaim::CleanupTimedOut => {
+            println!("[quic] {label}: session cleanup timed out");
+            connection.close(1u32.into(), b"session cleanup timed out");
+            return;
+        }
     };
-    *active.lock().unwrap() = Some((auth.device_id.clone(), connection.clone()));
     println!("[quic] session started with {label}");
 
     let result = async {
@@ -504,9 +560,6 @@ async fn connection(
         *shared.quic_media.lock().unwrap() = Some(MediaTransport::new(connection.clone()));
         shared.has_active_client.store(true, Ordering::Release);
         shared.audio_notify.notify_all();
-        if let Some(callback) = &*shared.on_client_connected.lock().unwrap() {
-            callback();
-        }
         application(&connection, &shared, session, send, recv).await
     }
     .await;
@@ -515,47 +568,58 @@ async fn connection(
         Err(error) => println!("[quic] session with {label} ended: {error:#}"),
     }
     connection.close(0u32.into(), b"session ended");
-    {
-        let mut active = active.lock().unwrap();
-        if active.as_ref().is_some_and(|(_, c)| c.stable_id() == connection.stable_id()) {
-            *active = None;
-        }
-    }
     // Cleanup removes devices and joins worker threads; keep it off the async workers.
     let cleanup = Arc::clone(&shared);
     let _ = tokio::task::spawn_blocking(move || {
         crate::stream_server::drop_network_client(&cleanup, session)
     })
     .await;
+    let mut active = active.lock().unwrap();
+    if active.as_ref().is_some_and(|(_, c)| c.stable_id() == connection.stable_id()) {
+        *active = None;
+    }
 }
 
-/// Reserves the session. A device that already holds it (app restarted, network changed)
-/// replaces its own stale session instead of waiting for the idle timeout; any other device
-/// gets `None`.
+enum SessionClaim {
+    Reserved(u64),
+    Busy,
+    CleanupTimedOut,
+}
+
+/// Reserve and publish the owner together. Only the owner can request takeover.
 async fn claim_session(
     shared: &crate::stream_server::SharedState,
     active: &ActiveSession,
     device_id: &str,
-    label: &str,
-) -> Option<u64> {
-    if let Some(session) = shared.reserve_network_session() {
-        return Some(session);
-    }
-    let previous = active
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|(id, _)| id == device_id)
-        .map(|(_, connection)| connection.clone())?;
-    println!("[quic] {label} reconnected; replacing its previous session");
+    connection: &Connection,
+) -> SessionClaim {
+    let reserve = |owner: &mut Option<(String, Connection)>| {
+        shared.reserve_network_session().map(|session| {
+            *owner = Some((device_id.to_owned(), connection.clone()));
+            SessionClaim::Reserved(session)
+        })
+    };
+    let previous = {
+        let mut owner = active.lock().unwrap();
+        if let Some(claim) = reserve(&mut owner) {
+            return claim;
+        }
+        match owner.as_ref() {
+            Some((id, previous)) if id == device_id => previous.clone(),
+            _ => return SessionClaim::Busy,
+        }
+    };
     previous.close(0u32.into(), b"replaced by a new connection");
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some(session) = shared.reserve_network_session() {
-            return Some(session);
+        if connection.close_reason().is_some() {
+            break;
+        }
+        if let Some(claim) = reserve(&mut active.lock().unwrap()) {
+            return claim;
         }
     }
-    None
+    SessionClaim::CleanupTimedOut
 }
 
 async fn application(
@@ -591,7 +655,10 @@ async fn application(
                         matches!(message[0], 0x10..=0x15),
                         "non-input message on input stream"
                     );
-                    crate::stream_server::handle_control_message_data(&shared, session, &message);
+                    let shared = Arc::clone(&shared);
+                    tokio::task::spawn_blocking(move || {
+                        crate::stream_server::handle_control_message_data(&shared, session, &message);
+                    }).await?;
                 }
                 #[allow(unreachable_code)]
                 Ok::<(), anyhow::Error>(())
@@ -617,8 +684,10 @@ async fn application(
                 match kind {
                     protocol::datagram::MIC if body.len() > 4 => {
                         let seq = u32::from_be_bytes(body[..4].try_into().unwrap());
-                        if let Some(writer) = shared.mic_writer.lock().unwrap().as_mut() {
-                            let _ = writer.write_opus_packet(seq, &body[4..]);
+                        if let Ok(mut writer) = shared.mic_writer.try_lock() {
+                            if let Some(writer) = writer.as_mut() {
+                                let _ = writer.write_opus_packet(seq, &body[4..]);
+                            }
                         }
                     }
                     protocol::datagram::CAMERA => {
@@ -653,7 +722,12 @@ async fn application(
                         protocol::client::DISCONNECT => break,
                         protocol::client::PING => write_frame(&mut send, &[protocol::daemon::PONG]).await?,
                         0x10..=0x15 => anyhow::bail!("input must use the input stream"),
-                        _ => crate::stream_server::handle_control_message_data(shared, session, &message),
+                        _ => {
+                            let shared = Arc::clone(shared);
+                            tokio::task::spawn_blocking(move || {
+                                crate::stream_server::handle_control_message_data(&shared, session, &message);
+                            }).await?;
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -680,9 +754,12 @@ async fn application(
         }
         Ok(())
     }.await;
+    connection.close(0u32.into(), b"session ended");
     reader.abort();
-    input.abort();
     datagrams.abort();
+    // Wait for in-flight input before the disconnect callback releases device state.
+    let _ = input.await;
+    let _ = datagrams.await;
     result
 }
 
@@ -727,7 +804,7 @@ mod tests {
             let AuthenticationStream { mut send, mut recv, hello, _placeholder } =
                 authentication_stream(&connection).await.unwrap();
             let mut pairings = Pairings::load(&directory).unwrap();
-            authenticate(&connection, &mut send, &mut recv, &identity, &mut pairings, Some(hello),
+            authenticate(&connection, &mut send, &mut recv, &identity, &mut pairings, Some(hello), &PinAdmission::new(),
                 |pin| println!("INTEROP_PIN {pin}")).await.unwrap();
             write_frame(&mut send, &[READY]).await.unwrap();
             assert_eq!(read_frame(&mut recv).await.unwrap(), b"ping");
@@ -851,15 +928,21 @@ mod tests {
         let shared = crate::test_support::shared_state();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task = tokio::spawn(serve(server, identity, directory, Arc::clone(&shared), stop));
-        // Admission is limited to one connection attempt per second.
-        let pause = || tokio::time::sleep(Duration::from_millis(1100));
+        // Leave a legitimate PIN prompt open while testing known-device admission.
+        let pairing = endpoint.connect(address, "screx.local").unwrap().await.unwrap();
+        let (mut pending_send, mut pending_recv) = pairing.open_bi().await.unwrap();
+        let mut hello = vec![HELLO];
+        hello.extend([3; 16]);
+        hello.extend(a.public_key().as_ref());
+        hello.extend(b"New iPad");
+        write_frame(&mut pending_send, &hello).await.unwrap();
+        let challenge = read_frame(&mut pending_recv).await.unwrap();
+        assert_eq!(challenge[..2], [CHALLENGE, 0]);
 
         let (first, reply, _s1, _r1) = reconnect(&endpoint, address, [1; 16], &a).await;
         assert_eq!(reply, [READY]);
-        pause().await;
         let (_other, reply, _s2, _r2) = reconnect(&endpoint, address, [2; 16], &b).await;
         assert_eq!(reply, [BUSY], "another device must hear busy, not time out");
-        pause().await;
         let (_second, reply, _s3, _r3) = reconnect(&endpoint, address, [1; 16], &a).await;
         assert_eq!(reply, [READY], "the same device replaces its own session");
         tokio::time::timeout(Duration::from_secs(5), first.closed()).await.unwrap();
@@ -891,6 +974,7 @@ mod tests {
                     &identity,
                     &mut pairings,
                     Some(hello),
+                    &PinAdmission::new(),
                     move |pin| {
                         tx.try_send(pin.to_owned()).unwrap();
                     },
@@ -985,7 +1069,7 @@ mod tests {
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         write_frame(&mut send, b"input").await.unwrap();
         assert_eq!(read_frame(&mut recv).await.unwrap(), b"input");
-        let media = vec![0x5a; CHUNK_PAYLOAD + MEDIA_HEADER];
+        let media = vec![0x5a; CHUNK_PAYLOAD + MEDIA_HEADER_LEN];
         connection.send_datagram(media.clone().into()).unwrap();
         assert_eq!(connection.read_datagram().await.unwrap().as_ref(), &media);
     }
@@ -1009,6 +1093,7 @@ mod tests {
                 &identity,
                 &mut pairings,
                 None,
+                &PinAdmission::new(),
                 |pin| {
                     let _ = pin_tx.send(pin.to_owned());
                 },

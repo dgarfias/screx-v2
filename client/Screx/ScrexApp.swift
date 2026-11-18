@@ -996,6 +996,8 @@ final class StreamViewModel: ObservableObject {
         closeNetworkControl(gracefully: false)
         pairingService?.cancel()
         pairingService = nil
+        pendingPinCompletion = nil
+        showPinEntry = false
         decoder.setSuspended(false)
         audioPlayer.stop()
         micCapture.stop()
@@ -1393,8 +1395,8 @@ final class StreamViewModel: ObservableObject {
         self.pairingService = ps
         log("starting PairingService for host=\(host) port=\(port)")
 
-        ps.onResult = { [weak self] result in
-            guard let self else { return }
+        ps.onResult = { [weak self, weak ps] result in
+            guard let self, let ps, self.pairingService === ps else { return }
             switch result {
             case .sessionEstablished(let session):
                 self.log("PairingService result: session established")
@@ -1451,11 +1453,15 @@ final class StreamViewModel: ObservableObject {
 
             case .rejected(let reason):
                 self.log("PairingService result: rejected (\(reason))")
+                self.pendingPinCompletion = nil
+                self.showPinEntry = false
                 self.pairingService = nil
                 self.applyConnectionFailure("Pairing rejected: \(reason)", transport: .none)
 
             case .error(let msg):
                 self.log("PairingService result: error (\(msg))")
+                self.pendingPinCompletion = nil
+                self.showPinEntry = false
                 self.pairingService = nil
                 self.applyConnectionFailure("Pairing error: \(msg)", transport: .none)
             }
@@ -1465,7 +1471,7 @@ final class StreamViewModel: ObservableObject {
     }
 
     func submitPin() {
-        guard let completion = pendingPinCompletion else { return }
+        guard pairingService != nil, let completion = pendingPinCompletion else { return }
         let pin = normalizedPairingPin
         guard pin.utf8.count == 8, pin.utf8.allSatisfy({ (48...57).contains($0) }) else {
             pairingStatus = "PIN must be exactly 8 digits"
@@ -2129,11 +2135,13 @@ final class StreamViewModel: ObservableObject {
             sendCameraDisable()
         } else {
             sendCameraEnable()
-            cameraCapture.onJPEG = { [weak self] jpeg in
-                guard let self else { return }
-                let fid = self.camFrameId
-                self.camFrameId = self.camFrameId &+ 1
-                self.stream?.sendCameraFrame(jpeg, frameId: fid)
+            cameraCapture.onJPEG = { [weak self, weak stream = self.stream] jpeg in
+                DispatchQueue.main.async {
+                    guard let self, let stream, self.stream === stream, self.cameraCapture.isRunning else { return }
+                    let fid = self.camFrameId
+                    self.camFrameId = self.camFrameId &+ 1
+                    stream.sendCameraFrame(jpeg, frameId: fid)
+                }
             }
             cameraCapture.start()
         }
@@ -2180,12 +2188,13 @@ final class StreamViewModel: ObservableObject {
         } else {
             configureAudioSession(micActive: true)
             sendMicEnable()
-            micCapture.onOpusPacket = { [weak self] opusData in
-                guard let self else { return }
-                let seq = self.micSeq
-                self.micSeq = self.micSeq &+ 1
-
-                self.stream?.sendMicPacket(opusData, seq: seq)
+            micCapture.onOpusPacket = { [weak self, weak stream = self.stream] opusData in
+                DispatchQueue.main.async {
+                    guard let self, let stream, self.stream === stream, self.micCapture.isRunning else { return }
+                    let seq = self.micSeq
+                    self.micSeq = self.micSeq &+ 1
+                    stream.sendMicPacket(opusData, seq: seq)
+                }
             }
             micCapture.start()
             if !micCapture.isRunning {

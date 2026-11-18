@@ -224,32 +224,20 @@ async fn main() -> Result<()> {
         config.features,
     ));
 
-    *shared.keyboard_worker.lock().unwrap() = Some(crate::input::KeyboardWorker::new(Arc::clone(
-        &input_backend,
-    )));
+    *shared.keyboard_worker.lock().unwrap() = Some(crate::input::KeyboardWorker::new(&shared));
 
     let config_directory = platform::shim::config_dir();
     let identity = quic_transport::Identity::load(&config_directory)?;
     let endpoint = identity.endpoint(format!("[::]:{}", config.stream_port).parse()?)?;
 
     // -----------------------------------------------------------------------
-    // Lifecycle callbacks — create peripherals on connect, remove on disconnect
+    // Remove peripherals on disconnect.
     // -----------------------------------------------------------------------
 
     {
-        let shared_c = Arc::clone(&shared);
-        *shared.on_client_connected.lock().unwrap() = Some(Box::new(move || {
-            crate::log_detail!("[lifecycle] client connected");
-            // Peripherals (camera, mic, speaker) are now created on-demand
-            // when the client sends the corresponding enable signal (CAMCFG,
-            // MICCFG, SPKR). Nothing to create eagerly here.
-            let _ = &shared_c; // keep the Arc alive for future use
-        }));
-    }
-
-    {
-        let shared_d = Arc::clone(&shared);
+        let shared_d = Arc::downgrade(&shared);
         *shared.on_client_disconnected.lock().unwrap() = Some(Box::new(move || {
+            let Some(shared_d) = shared_d.upgrade() else { return };
             println!("[lifecycle] client disconnected — removing peripherals");
 
             // Camera
@@ -262,9 +250,10 @@ async fn main() -> Result<()> {
             // dropped session can't leave a button or key stuck on the host,
             // and remove virtual gamepads.
             if let Ok(mut backend) = shared_d.input_backend.lock() {
+                backend.release_touches();
                 backend.release_mouse_buttons();
                 backend.release_keys();
-                for id in 0..4 {
+                for id in 0..crate::input::MAX_GAMEPADS {
                     backend.gamepad_detach(id);
                 }
             }
