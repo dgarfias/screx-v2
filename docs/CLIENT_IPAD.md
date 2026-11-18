@@ -56,11 +56,20 @@ its first successful connection, and typing the address of an existing tile conn
 tile. Each tile's **⋯** menu (or a long press) has **Settings…**, **Pin** and **Remove**; the **⋯**
 next to **+** clears unpinned hosts or all hosts.
 
-**Settings are per host:** the address, resolution, framerate, codec and bitrate. After a host has
+**Settings are per host:** the address, resolution, framerate, codec, video bitrate and audio bitrate. After a host has
 connected once, its settings only offer what it supports. A new host starts at this iPad's
-resolution, 60 fps, the host's codec and 8 Mbps. Settings are validated against the daemon's
+resolution, 60 fps, the host's codec, 8 Mbps video and Medium (128 kbps) audio. Settings are validated against the daemon's
 advertised capabilities and sent during connection setup. For the wire protocol, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Video targets are Low (3 Mbps), Medium (8 Mbps), High (15 Mbps) and Very high (20 Mbps),
+with Host default and Custom also available. Targets apply per display, do not scale with
+resolution or frame rate, and may adapt downward on network loss.
+
+Audio offers Low (96 kbps), Medium (128 kbps), High (192 kbps) and Very high (256 kbps).
+This controls Opus speaker audio only, not the microphone. Like video settings, the choice is
+saved per host and sent on connection; existing hosts default to Medium. Updating the app and
+daemon together is required because the settings message layout has changed.
 
 **Pairing is per host tile.** Removing a tile forgets its pairing, so adding the host back asks for
 the PIN again; editing the address in Settings keeps it. TCP establishment fails after 8 seconds if the daemon cannot be reached, and an

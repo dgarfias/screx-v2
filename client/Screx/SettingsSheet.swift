@@ -88,12 +88,12 @@ struct HostSettingsSheet: View, Equatable {
                 }
 
                 Section {
-                    Picker("Codec", selection: $settings.codec) {
+                    Picker("Video codec", selection: $settings.codec) {
                         ForEach(options(StreamCodecPreset.allCases, selected: settings.codec) {
                             limits?.supports($0) ?? true
                         }) { Text($0.label).tag($0) }
                     }
-                    Picker("Bitrate", selection: $settings.bitrate) {
+                    Picker("Video bitrate", selection: $settings.bitrate) {
                         ForEach(options(StreamBitratePreset.allCases, selected: settings.bitrate) {
                             $0 == .custom || $0 == .daemonDefault || (limits?.supports(bitrateBps: $0.bitrateBps) ?? true)
                         }) { Text($0.label).tag($0) }
@@ -112,12 +112,15 @@ struct HostSettingsSheet: View, Equatable {
                             if let value = customBitrateMbps { settings.customBitrateMbps = value }
                         }
                     }
+                    Picker("Audio bitrate", selection: $settings.audioBitrate) {
+                        ForEach(AudioBitratePreset.allCases) { Text($0.label).tag($0) }
+                    }
                 } header: {
                     Text("Encoding")
                 } footer: {
                     VStack(alignment: .leading, spacing: 6) {
                         warning(unsupportedEncoding)
-                        Text("Higher bitrates look sharper but need a stronger Wi-Fi connection.")
+                        Text("Higher bitrates require a stronger network connection.")
                     }
                 }
             }

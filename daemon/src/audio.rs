@@ -23,20 +23,19 @@ const MIC_MAX_CONCEALED_PACKETS: u32 = 5;
 /// How late the speaker loop may fall behind its 10 ms schedule before it
 /// gives up catching up and restarts the schedule from now.
 const SPEAKER_MAX_LAG: Duration = Duration::from_millis(100);
-/// Speaker audio Opus bitrate (48 kHz stereo, 10 ms frames).
-const OPUS_SPEAKER_BITRATE: i32 = 128_000;
 /// libopus' recommended worst-case output buffer for one encode call.
 const OPUS_MAX_PACKET: usize = 4000;
 
 /// Speaker-audio Opus encoder plus its reusable scratch buffers.
 struct SpeakerOpus {
     encoder: opus::Encoder,
+    bitrate_bps: u32,
     pcm: Vec<i16>,
     out: Vec<u8>,
 }
 
 impl SpeakerOpus {
-    fn new() -> Result<Self> {
+    fn new(bitrate_bps: u32) -> Result<Self> {
         let mut encoder = opus::Encoder::new(
             SAMPLE_RATE,
             opus::Channels::Stereo,
@@ -44,7 +43,7 @@ impl SpeakerOpus {
         )
         .map_err(|e| anyhow::anyhow!("opus encoder init: {e:?}"))?;
         encoder
-            .set_bitrate(opus::Bitrate::Bits(OPUS_SPEAKER_BITRATE))
+            .set_bitrate(opus::Bitrate::Bits(bitrate_bps as i32))
             .map_err(|e| anyhow::anyhow!("opus set_bitrate: {e:?}"))?;
         // No in-band FEC: the iPad decoder can't use it. No DTX: the client's
         // jitter buffer expects a packet every 10 ms.
@@ -52,9 +51,20 @@ impl SpeakerOpus {
         let _ = encoder.set_dtx(false);
         Ok(Self {
             encoder,
+            bitrate_bps,
             pcm: vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize],
             out: vec![0u8; OPUS_MAX_PACKET],
         })
+    }
+
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<()> {
+        if self.bitrate_bps != bitrate_bps {
+            self.encoder
+                .set_bitrate(opus::Bitrate::Bits(bitrate_bps as i32))
+                .map_err(|e| anyhow::anyhow!("opus set_bitrate: {e:?}"))?;
+            self.bitrate_bps = bitrate_bps;
+        }
+        Ok(())
     }
 
     /// Encode one 10 ms chunk of little-endian s16 stereo PCM.
@@ -143,7 +153,7 @@ pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<Atomic
             name.clone()
         };
 
-        let mut speaker_opus = match SpeakerOpus::new() {
+        let mut speaker_opus = match SpeakerOpus::new(shared.audio_bitrate_bps.load(Ordering::Relaxed)) {
             Ok(opus) => opus,
             Err(e) => {
                 eprintln!("[audio] {e:#}; speaker forwarding unavailable");
@@ -192,7 +202,8 @@ pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<Atomic
                 // Stamped with when the chunk was due to play, on the video timestamps' clock.
                 let ts = next.saturating_duration_since(shared.start_time).as_millis() as u32;
                 let result = speaker_opus
-                    .encode(&chunk)
+                    .set_bitrate(shared.audio_bitrate_bps.load(Ordering::Relaxed))
+                    .and_then(|()| speaker_opus.encode(&chunk))
                     .and_then(|packet| sender.send_audio(packet, addr, ts));
                 if let Err(e) = result {
                     eprintln!("[audio] send error: {e:#}");
@@ -299,7 +310,7 @@ mod tests {
 
     #[test]
     fn speaker_opus_encodes_10ms_chunks_that_decode_to_480_frames() {
-        let mut opus = SpeakerOpus::new().unwrap();
+        let mut opus = SpeakerOpus::new(128_000).unwrap();
         let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
         let mut chunk = vec![0u8; BYTES_PER_CHUNK];
         for (i, sample) in chunk.chunks_exact_mut(2).enumerate() {
@@ -307,7 +318,9 @@ mod tests {
             sample.copy_from_slice(&v.to_le_bytes());
         }
         let mut pcm = vec![0i16; SAMPLES_PER_CHUNK * CHANNELS as usize];
-        for _ in 0..5 {
+        for bitrate in [96_000, 128_000, 192_000, 256_000, 96_000] {
+            opus.set_bitrate(bitrate).unwrap();
+            assert_eq!(opus.bitrate_bps, bitrate);
             let packet = opus.encode(&chunk).unwrap().to_vec();
             assert!(packet.len() < 1400, "fits in one UDP chunk");
             let frames = decoder.decode(&packet, &mut pcm, false).unwrap();

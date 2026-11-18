@@ -266,6 +266,7 @@ pub struct SharedState {
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
     pub audio_output_enabled: AtomicBool,
+    pub audio_bitrate_bps: AtomicU32,
     /// Names the speaker and microphone cards: the iPad model the client sent in `SETTINGS`,
     /// like the monitor. Waited on with `audio_notify`.
     pub audio_device_name: Mutex<String>,
@@ -329,6 +330,7 @@ impl SharedState {
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
             audio_output_enabled: AtomicBool::new(false),
+            audio_bitrate_bps: AtomicU32::new(128_000),
             audio_device_name: Mutex::new("iPad".into()),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
@@ -466,6 +468,7 @@ pub struct RequestedSettings {
     pub internal_display_name: Option<[u8; 13]>,
     /// The iPad panel's width and height in mm; `None` when the client doesn't know them.
     pub internal_size_mm: Option<(u16, u16)>,
+    pub audio_bitrate_bps: u32,
     pub revision: u32,
 }
 
@@ -546,18 +549,23 @@ fn clamp_u32(value: u32, floor: u32, ceiling: u32) -> u32 {
 }
 
 /// Length of a `SETTINGS` body (after the type byte).
-const SETTINGS_BODY_LEN: usize = 37;
+const SETTINGS_BODY_LEN: usize = 41;
 /// Panel sizes outside this range (mm) are treated as unknown.
 const PANEL_MM_RANGE: std::ops::RangeInclusive<u16> = 50..=1000;
 
 /// Parse a `SETTINGS` body: internal width/height/FPS, shared codec/bitrate, enabled mask,
 /// external width/height, revision, external FPS, internal EDID name, internal panel
-/// width/height in mm, big-endian. A zero (or `CODEC_DEFAULT` for the codec) means "use the
+/// width/height in mm, speaker audio bitrate in bps, big-endian. A zero (or `CODEC_DEFAULT` for the codec) means "use the
 /// daemon's default" for that field; a zero panel size means unknown.
 fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
     if body.len() != SETTINGS_BODY_LEN || !(1..=3).contains(&body[10]) {
         return None;
     }
+    let audio_bitrate_bps = match u32::from_be_bytes(body[37..41].try_into().unwrap()) {
+        0 => 128_000,
+        value @ (96_000 | 128_000 | 192_000 | 256_000) => value,
+        _ => return None,
+    };
     let revision = u32::from_be_bytes(body[15..19].try_into().unwrap());
     if revision == 0 {
         return None;
@@ -608,6 +616,7 @@ fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
         external_fps: nonzero(u32::from(body[19])),
         internal_display_name: Some(name),
         internal_size_mm,
+        audio_bitrate_bps,
         revision,
     })
 }
@@ -678,6 +687,7 @@ fn apply_requested_settings(shared: &Arc<SharedState>, session: u64, body: &[u8]
     };
 
     let clamped = clamp_requested_settings(shared, parsed);
+    shared.audio_bitrate_bps.store(clamped.audio_bitrate_bps, Ordering::Relaxed);
     crate::log_detail!("[control] received display SETTINGS: {clamped:?}");
 
     if let Some(name) = clamped.internal_display_name {
@@ -2197,6 +2207,23 @@ mod settings_tests {
     use super::*;
 
     #[test]
+    fn accepts_only_supported_audio_bitrates_and_zero_default() {
+        let mut body = vec![0u8; SETTINGS_BODY_LEN];
+        body[20..33].copy_from_slice(b"Screx        ");
+        body[10] = 1;
+        body[18] = 1;
+        for bitrate in [0u32, 96_000, 128_000, 192_000, 256_000] {
+            body[37..41].copy_from_slice(&bitrate.to_be_bytes());
+            let parsed = parse_settings_body(&body).unwrap();
+            assert_eq!(parsed.audio_bitrate_bps, if bitrate == 0 { 128_000 } else { bitrate });
+        }
+        for bitrate in [1u32, 64_000, 500_000, u32::MAX] {
+            body[37..41].copy_from_slice(&bitrate.to_be_bytes());
+            assert!(parse_settings_body(&body).is_none());
+        }
+    }
+
+    #[test]
     fn parses_explicit_settings() {
         let mut body = Vec::new();
         body.extend_from_slice(&1920u16.to_be_bytes());
@@ -2212,6 +2239,7 @@ mod settings_tests {
         body.extend_from_slice(b"iPad A16 11\" ");
         body.extend_from_slice(&235u16.to_be_bytes());
         body.extend_from_slice(&163u16.to_be_bytes());
+        body.extend_from_slice(&192_000u32.to_be_bytes());
         let s = parse_settings_body(&body).unwrap();
         assert_eq!((s.width, s.height), (Some(1920), Some(1080)));
         assert_eq!(s.fps, Some(60));
@@ -2226,6 +2254,7 @@ mod settings_tests {
         assert_eq!(s.external_fps, Some(30));
         assert_eq!(s.internal_display_name, Some(*b"iPad A16 11\" "));
         assert_eq!(s.internal_size_mm, Some((235, 163)));
+        assert_eq!(s.audio_bitrate_bps, 192_000);
     }
 
     #[test]

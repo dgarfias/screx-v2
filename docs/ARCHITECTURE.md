@@ -240,7 +240,7 @@ Notes:
 - frames larger than 48 chunks are paced: sent in batches of 8 spread across half the frame
   interval rather than as one burst
 - audio is small enough to go without FEC. Speaker audio is one 10 ms chunk per frame_id: 48 kHz
-  stereo Opus at 128 kbps
+  stereo Opus at 96, 128 (default), 192 or 256 kbps, selected in the host's settings
 - client-to-daemon UDP packets are `seq(u32 BE) + encrypted payload`; the payload is
   `type(u8) + body`, see "Client -> daemon UDP payloads" below
 - the iPad retains incomplete video assemblies for 50 ms, then reconstructs recoverable frames
@@ -347,11 +347,12 @@ Offsets are within the body, after the type byte.
 | 20 | internal_display_name | 13 ASCII bytes | space-padded EDID name, required |
 | 33 | internal_width_mm | u16 | 0 = unknown physical panel size |
 | 35 | internal_height_mm | u16 | 0 = unknown physical panel size |
+| 37 | audio_bitrate | u32 (bps) | 0 = 128000; otherwise 96000, 128000, 192000 or 256000 |
 
 The iPad's "Daemon default" options map to these values; the daemon then uses its CLI-configured
 default for that field.
 
-The body is exactly 37 bytes. Width/height/FPS at offsets 0/2/4 describe the internal display.
+The body is exactly 41 bytes. Width/height/FPS at offsets 0/2/4 describe the internal display.
 External FPS is independent, inheriting internal FPS only when omitted. Codec and the base bitrate
 target are shared settings; the target applies to **each** enabled video pipeline. Each pipeline
 adapts bitrate/FEC independently from that target. Both
@@ -360,6 +361,8 @@ pair must either be specified together or uses daemon defaults. Masks outside 1â
 revisions, and legacy 10-/19-/20-byte bodies are rejected. The daemon's maximum FPS applies per output.
 Monitor names must be nonempty printable ASCII, without single quotes or backslashes.
 Panel dimensions are in mm; both must be in 50â€“1000 mm or the size is treated as unknown.
+Audio bitrate controls speaker Opus encoding only; microphone encoding is unchanged.
+Unsupported audio bitrates are rejected.
 
 ### Runtime Display Topology
 

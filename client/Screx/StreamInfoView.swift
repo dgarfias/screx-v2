@@ -53,7 +53,7 @@ struct StreamInfoView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(maxWidth: 300, alignment: .leading)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .screxGlassBackground(in: RoundedRectangle(cornerRadius: 12))
     }
 }
 

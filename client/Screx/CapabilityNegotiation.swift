@@ -123,13 +123,15 @@ struct DaemonCapabilities: Equatable {
 /// "use the daemon's own default" and goes on the wire as 0 (`codecDefault` for the codec).
 ///
 /// Body: internal width/height/FPS, shared codec/bitrate, mask, external width/height, revision,
-/// external FPS, internal EDID name, internal panel width/height in mm (0 = unknown).
+/// external FPS, internal EDID name, internal panel width/height in mm (0 = unknown),
+/// speaker audio bitrate in bps.
 struct StreamSettings: Equatable {
     var width: Int?
     var height: Int?
     var fps: Int?
     var codecId: UInt8?
     var bitrateBps: UInt32?
+    var audioBitrateBps: UInt32 = 128_000
     var enabledDisplayMask: UInt8 = 1
     var externalWidth: Int?
     var externalHeight: Int?
@@ -178,6 +180,7 @@ struct StreamSettings: Equatable {
         let mm = { (v: Int?) -> UInt16 in UInt16(v.map { $0 > 0 && $0 <= Int(UInt16.max) ? $0 : 0 } ?? 0) }
         withUnsafeBytes(of: mm(internalPanelSize?.widthMm).bigEndian) { body.append(contentsOf: $0) }
         withUnsafeBytes(of: mm(internalPanelSize?.heightMm).bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: audioBitrateBps.bigEndian) { body.append(contentsOf: $0) }
         return body
     }
 }

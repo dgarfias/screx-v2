@@ -2381,7 +2381,7 @@ struct ContentView: View {
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .screxGlassBackground(in: Capsule())
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         .padding(.top, showOverlay && model.isConnected ? 92 : 16)
@@ -2644,7 +2644,7 @@ struct ContentView: View {
             }
         }
         .padding(4)
-        .background(.ultraThinMaterial, in: Capsule())
+        .screxGlassBackground(in: Capsule())
         .contentShape(Capsule())
         .opacity(isDragging ? 0.8 : 1)
         .background(

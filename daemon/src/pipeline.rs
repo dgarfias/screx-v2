@@ -476,6 +476,7 @@ mod tests {
                 external_fps: Some(30),
                 internal_display_name: None,
                 internal_size_mm: None,
+                audio_bitrate_bps: 128_000,
                 fps: Some(60),
                 codec: Some(crate::encode::VideoCodec::H265),
                 bitrate_bps: Some(15_000_000),

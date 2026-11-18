@@ -52,12 +52,37 @@ struct RecentConnection: Codable, Identifiable, Equatable {
     }
 }
 
+/// Speaker-audio presets, persisted and sent by the iPad like video bitrate presets.
+enum AudioBitratePreset: String, CaseIterable, Identifiable {
+    case low, medium, high
+    case veryHigh = "veryhigh"
+
+    var id: String { rawValue }
+    var bitrateBps: UInt32 {
+        switch self {
+        case .low: return 96_000
+        case .medium: return 128_000
+        case .high: return 192_000
+        case .veryHigh: return 256_000
+        }
+    }
+    var label: String {
+        switch self {
+        case .low: return "Low (96 kbps)"
+        case .medium: return "Medium (128 kbps)"
+        case .high: return "High (192 kbps)"
+        case .veryHigh: return "Very high (256 kbps)"
+        }
+    }
+}
+
 /// Stream settings chosen for one host.
 struct HostStreamSettings: Codable, Equatable {
     var resolution: StreamResolutionPreset
     var framerate: StreamFrameratePreset
     var codec: StreamCodecPreset
     var bitrate: StreamBitratePreset
+    var audioBitrate: AudioBitratePreset = .medium
     /// Used when `bitrate == .custom`.
     var customBitrateMbps: Double
 
@@ -77,7 +102,7 @@ struct HostStreamSettings: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case resolution, framerate, codec, bitrate, customBitrateMbps
+        case resolution, framerate, codec, bitrate, audioBitrate, customBitrateMbps
     }
 
     func encode(to encoder: Encoder) throws {
@@ -86,6 +111,7 @@ struct HostStreamSettings: Codable, Equatable {
         try container.encode(framerate.rawValue, forKey: .framerate)
         try container.encode(codec.rawValue, forKey: .codec)
         try container.encode(bitrate.rawValue, forKey: .bitrate)
+        try container.encode(audioBitrate.rawValue, forKey: .audioBitrate)
         try container.encode(customBitrateMbps, forKey: .customBitrateMbps)
     }
 
@@ -101,6 +127,7 @@ struct HostStreamSettings: Codable, Equatable {
         framerate = StreamFrameratePreset(rawValue: raw(.framerate)) ?? fallback.framerate
         codec = StreamCodecPreset(rawValue: raw(.codec)) ?? fallback.codec
         bitrate = StreamBitratePreset(rawValue: raw(.bitrate)) ?? fallback.bitrate
+        audioBitrate = AudioBitratePreset(rawValue: raw(.audioBitrate)) ?? .medium
         let custom = (try? container.decode(Double.self, forKey: .customBitrateMbps)) ?? fallback.customBitrateMbps
         customBitrateMbps = custom.isFinite && custom > 0 ? custom : fallback.customBitrateMbps
     }
@@ -111,6 +138,7 @@ struct HostStreamSettings: Codable, Equatable {
         let size = resolution.resolution
         var settings = StreamSettings(width: size?.width, height: size?.height, fps: framerate.fps,
                                       codecId: codec.codecId, bitrateBps: bitrateBps)
+        settings.audioBitrateBps = audioBitrate.bitrateBps
         let native = StreamResolutionPreset.nativeResolution
         settings.internalPanelSize = DeviceDisplayIdentity.current.panelSizeMm(
             nativePixels: (long: native.width, short: native.height))
