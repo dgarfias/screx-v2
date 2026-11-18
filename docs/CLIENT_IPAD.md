@@ -1,7 +1,7 @@
 # iPad Client
 
-Native iPadOS app that connects to the [Linux daemon](DAEMON_LINUX.md) over the network
-(Wi-Fi). Decodes the video/audio stream and forwards touch, keyboard, mouse, controller,
+Native iPadOS app that connects to the [Linux daemon](DAEMON_LINUX.md) over the network.
+Decodes the video/audio stream and forwards touch, keyboard, mouse, controller,
 microphone, and camera input back to the host. Peripheral controls are gated by the capabilities
 advertised by the daemon. Source lives in `client`.
 
@@ -78,7 +78,7 @@ allow Keychain writes from an SSH session.
 
 The app requests these on first use:
 
-- **Local Network** — to discover/connect to the daemon over Wi-Fi
+- **Local Network** — to connect to the daemon on the local network
 - **Camera** — to forward video as a virtual webcam on the host
 - **Microphone** — to forward audio as a virtual microphone on the host
 

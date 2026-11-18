@@ -1,8 +1,8 @@
 # Screx
 
-Screx turns a Linux machine into a low-latency wireless display for an iPad.
+Screx turns a Linux machine into a low-latency network display for an iPad.
 
-You run a daemon on the Linux host that creates a virtual monitor, then connect to it from the iPad app over Wi-Fi. The iPad forwards touch, keyboard, mouse, game controller, microphone, and camera input back to the host, and plays the host's audio.
+You run a daemon on the Linux host that creates a virtual monitor, then connect to it from the iPad app over the network. The iPad forwards touch, keyboard, mouse, game controller, microphone, and camera input back to the host, and plays the host's audio.
 
 For implementation details and protocol documentation, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 

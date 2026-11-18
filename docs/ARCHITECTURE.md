@@ -15,7 +15,7 @@ At a high level:
 
 See [DAEMON_LINUX.md](DAEMON_LINUX.md) and [CLIENT_IPAD.md](CLIENT_IPAD.md) for build/run details.
 
-All traffic goes over the network (Wi-Fi):
+All traffic goes over the network:
 
 - one QUIC connection over UDP, with separate reliable control and input streams
 - unreliable QUIC datagrams for media
