@@ -44,9 +44,12 @@ struct DisplayTopologyTests {
         let encoded = settings.encode()
         precondition(encoded.prefix(20) == Data([7, 0x80, 4, 0x38, 60, 1, 0, 0xe4, 0xe1, 0xc0,
                                                 3, 0x0f, 0, 8, 0x70, 0, 0, 0, 7, 30]))
-        precondition(encoded.suffix(13) == Data("iPad A16 11\" ".utf8))
+        precondition(encoded.dropFirst(20).prefix(13) == Data("iPad A16 11\" ".utf8))
+        precondition(encoded.suffix(4) == Data([0, 0, 0, 0]), "An unknown panel size goes on the wire as 0x0")
+        settings.internalPanelSize = PanelSize(widthMm: 235, heightMm: 163)
+        precondition(settings.encode().suffix(4) == Data([0, 235, 0, 163]))
         let defaults = StreamSettings().encode()
-        precondition(defaults.count == 33 && defaults[5] == 0xff && defaults[10] == 1 && defaults[18] == 1 && defaults[19] == 0)
+        precondition(defaults.count == 37 && defaults[5] == 0xff && defaults[10] == 1 && defaults[18] == 1 && defaults[19] == 0)
         let caps = DaemonCapabilities(camera: false, microphone: false, speaker: false, gamepadMaxControllers: nil,
                                       codecs: [0, 1], maxWidth: 3840, maxHeight: 2160, maxFps: 60,
                                       bitrateMinBps: 500_000, bitrateMaxBps: 20_000_000, hostname: "test")

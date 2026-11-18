@@ -2,7 +2,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::mem;
 use std::os::unix::io::AsRawFd;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 
@@ -170,6 +169,11 @@ fn emit_batch(file: &mut File, events: &[InputEvent]) {
 }
 
 unsafe fn set_abs(fd: i32, code: u16, min: i32, max: i32) -> Result<()> {
+    set_abs_res(fd, code, min, max, 0)
+}
+
+/// `resolution` is in units per mm (0 = unknown).
+unsafe fn set_abs_res(fd: i32, code: u16, min: i32, max: i32, resolution: i32) -> Result<()> {
     let setup = UinputAbsSetup {
         code,
         absinfo: InputAbsinfo {
@@ -178,7 +182,7 @@ unsafe fn set_abs(fd: i32, code: u16, min: i32, max: i32) -> Result<()> {
             maximum: max,
             fuzz: 0,
             flat: 0,
-            resolution: 0,
+            resolution,
         },
     };
     ioctl_check(libc::ioctl(fd, ioctl_ui_abs_setup(), &setup))
@@ -200,22 +204,19 @@ pub struct LinuxInput {
     /// if the keyboard detaches or the session ends mid-press.
     held_keys: std::collections::HashSet<u16>,
     /// Negotiated per-session stream resolution, in wire coordinate space.
-    /// `None` until the first `set_stream_size` call. The virtual
-    /// touchscreen itself is created once at startup sized to the CLI/config
-    /// ceiling (recreating it per session would re-trigger the ~800ms
-    /// gsettings output-mapping sleep and device churn in GNOME), so when
-    /// this differs from the touchscreen's own dimensions, incoming touch
-    /// coordinates need to be rescaled onto the touchscreen's fixed ABS
-    /// range before injection.
+    /// `None` until the first `set_stream_size` call. When this differs from
+    /// the touchscreen's ABS range, incoming touch coordinates are rescaled
+    /// onto that range before injection.
     session_size: Option<(u32, u32)>,
-    mapped_display_name: Option<String>,
+    /// Touchscreen ABS range used while the monitor's physical size is unknown.
+    default_touch_range: (u32, u32),
+    /// Physical size the touchscreen was last created with.
+    display_size_mm: Option<(u16, u16)>,
 }
 
 impl LinuxInput {
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        // Mapping is deferred to the first session, whose SETTINGS carries the EDID name. Doing it
-        // here would repeat the ~800 ms gsettings work with a name the session then replaces.
-        let touch = VirtualTouchscreen::new(width, height).ok();
+        let touch = VirtualTouchscreen::new(width, height, None).ok();
         let keyboard = VirtualKeyboard::new().ok();
         Ok(Self {
             touch,
@@ -224,28 +225,31 @@ impl LinuxInput {
             gamepads: std::collections::HashMap::new(),
             held_keys: std::collections::HashSet::new(),
             session_size: None,
-            mapped_display_name: None,
+            default_touch_range: (width, height),
+            display_size_mm: None,
         })
     }
 }
 
 impl InputBackend for LinuxInput {
-    fn set_display_name(&mut self, name: &str) {
-        if self.mapped_display_name.as_deref() == Some(name) {
+    fn set_display_size(&mut self, size_mm: Option<(u16, u16)>) {
+        if self.display_size_mm == size_mm {
             return;
         }
-        if let Some(ref touch) = self.touch {
-            touch.map_to_output(name);
-        }
-        self.mapped_display_name = Some(name.into());
+        // A device's size is fixed when it is created, so replace the touchscreen.
+        let (width, height) = self.default_touch_range;
+        self.touch = None;
+        self.touch = VirtualTouchscreen::new(width, height, size_mm)
+            .map_err(|e| eprintln!("[touch] {e:#}"))
+            .ok();
+        self.display_size_mm = size_mm;
     }
 
     fn set_stream_size(&mut self, width: u32, height: u32) {
-        // The gsettings tablet->EVDI-output mapping (see `map_to_output`)
-        // confines the fixed-size virtual touchscreen to the captured
-        // output. What changes per session is the resolution touch
-        // coordinates are expressed in on the wire, which we need in order
-        // to scale them onto the touchscreen's ABS range.
+        // The compositor confines the touchscreen to the iPad monitor (see
+        // `TOUCHSCREEN_NAME`). What changes per session is the resolution touch
+        // coordinates are expressed in on the wire, which we need in order to
+        // scale them onto the touchscreen's ABS range.
         if let Some(ref ts) = self.touch {
             crate::log_detail!(
                 "[touch] session stream resolution {width}x{height}, tablet ABS range {}x{}",
@@ -385,8 +389,28 @@ pub struct VirtualTouchscreen {
     current_slot: i32,
 }
 
+/// Touch units per mm when the monitor's physical size is known.
+const TOUCH_UNITS_PER_MM: i32 = 20;
+
+/// Compositors match a touchscreen to a monitor by hints on the device itself, like a real
+/// touch monitor: Mutter by the monitor's EDID vendor and serial in the device name (`SRX`,
+/// `001` for the iPad monitor; deliberately no model words, which Muffin would weigh toward
+/// "iPad External"), and Mutter, Muffin and KWin by an equal physical size.
+const TOUCHSCREEN_NAME: &[u8] = b"Screx Touchscreen SRX 001";
+
 impl VirtualTouchscreen {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    /// With `size_mm`, the ABS range spans exactly the monitor's size as its EDID reports it
+    /// (whole cm); otherwise it is `width` x `height` units with no physical size. The
+    /// `width`/`height` fields hold the number of positions per axis (max + 1).
+    pub fn new(width: u32, height: u32, size_mm: Option<(u16, u16)>) -> Result<Self> {
+        let (range_w, range_h, resolution) = match size_mm.map(crate::capture::edid_size_cm) {
+            Some((w_cm, h_cm)) => (
+                i32::from(w_cm) * 10 * TOUCH_UNITS_PER_MM,
+                i32::from(h_cm) * 10 * TOUCH_UNITS_PER_MM,
+                TOUCH_UNITS_PER_MM,
+            ),
+            None => (width as i32 - 1, height as i32 - 1, 0),
+        };
         let file = OpenOptions::new()
             .write(true)
             .open("/dev/uinput")
@@ -419,88 +443,43 @@ impl VirtualTouchscreen {
                 ABS_MT_POSITION_Y as libc::c_int,
             ))?;
 
-            let w = width as i32;
-            let h = height as i32;
-            set_abs(fd, ABS_X, 0, w - 1)?;
-            set_abs(fd, ABS_Y, 0, h - 1)?;
+            // libinput's size is (max - min) / resolution, so max = range gives exact mm.
+            set_abs_res(fd, ABS_X, 0, range_w, resolution)?;
+            set_abs_res(fd, ABS_Y, 0, range_h, resolution)?;
             set_abs(fd, ABS_MT_SLOT, 0, MAX_SLOTS - 1)?;
             set_abs(fd, ABS_MT_TRACKING_ID, 0, 0xffff)?;
-            set_abs(fd, ABS_MT_POSITION_X, 0, w - 1)?;
-            set_abs(fd, ABS_MT_POSITION_Y, 0, h - 1)?;
+            set_abs_res(fd, ABS_MT_POSITION_X, 0, range_w, resolution)?;
+            set_abs_res(fd, ABS_MT_POSITION_Y, 0, range_h, resolution)?;
 
             let mut setup: UinputSetup = mem::zeroed();
             setup.id.bustype = 0x03;
             setup.id.vendor = SCREX_VENDOR;
             setup.id.product = SCREX_PRODUCT;
             setup.id.version = 1;
-            let name = b"Screx Virtual Touchscreen";
-            setup.name[..name.len()].copy_from_slice(name);
+            setup.name[..TOUCHSCREEN_NAME.len()].copy_from_slice(TOUCHSCREEN_NAME);
 
             ioctl_check(libc::ioctl(fd, ioctl_ui_dev_setup(), &setup))?;
             ioctl_check(libc::ioctl(fd, ioctl_ui_dev_create()))?;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        crate::log_detail!(
-            "[touch] virtual touchscreen created: {width}x{height} ({MAX_SLOTS} slots)"
-        );
+        match size_mm {
+            Some(_) => crate::log_detail!(
+                "[touch] virtual touchscreen created: {} x {} mm ({MAX_SLOTS} slots)",
+                range_w / TOUCH_UNITS_PER_MM,
+                range_h / TOUCH_UNITS_PER_MM
+            ),
+            None => crate::log_detail!(
+                "[touch] virtual touchscreen created: {range_w}x{range_h}, size unknown ({MAX_SLOTS} slots)"
+            ),
+        }
 
         Ok(Self {
             file,
-            width: width as i32,
-            height: height as i32,
+            width: range_w + 1,
+            height: range_h + 1,
             current_slot: 0,
         })
-    }
-
-    pub fn map_to_output(&self, display_name: &str) {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let vendor_product = format!("{:04x}:{:04x}", SCREX_VENDOR, SCREX_PRODUCT);
-        let schema_path = format!(
-            "org.gnome.desktop.peripherals.touchscreen:/org/gnome/desktop/peripherals/touchscreens/{vendor_product}/"
-        );
-        let output_value = format!("['SRX', '{display_name}', '001']");
-        let (sudo_user, sudo_uid) = (
-            std::env::var("SUDO_USER").ok(),
-            std::env::var("SUDO_UID").ok(),
-        );
-        let result = if let (Some(ref user), Some(ref uid)) = (sudo_user, sudo_uid) {
-            let runtime_dir = format!("/run/user/{uid}");
-            let dbus_addr = format!("unix:path={runtime_dir}/bus");
-            crate::log_detail!(
-                "[touch] running gsettings as user '{user}' (uid={uid}) to map {vendor_product} -> EVDI output"
-            );
-            Command::new("runuser")
-                .args(["-u", user, "--"])
-                .arg("env")
-                .arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_addr}"))
-                .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-                .arg("gsettings")
-                .arg("set")
-                .arg(&schema_path)
-                .arg("output")
-                .arg(&output_value)
-                .output()
-        } else {
-            crate::log_detail!("[touch] running gsettings directly (not under sudo)");
-            Command::new("gsettings")
-                .args(["set", &schema_path, "output", &output_value])
-                .output()
-        };
-        match result {
-            Ok(output) if output.status.success() => {
-                crate::log_detail!(
-                    "[touch] mapped touchscreen {vendor_product} to EVDI output via gsettings"
-                );
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("[touch] gsettings mapping failed: {stderr}");
-            }
-            Err(e) => {
-                eprintln!("[touch] could not run gsettings/runuser: {e}");
-            }
-        }
     }
 
     fn send_touch(

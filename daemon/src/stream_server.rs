@@ -266,7 +266,9 @@ pub struct SharedState {
     pub on_client_disconnected: Mutex<Option<LifecycleCallback>>,
     pub has_active_client: AtomicBool,
     pub audio_output_enabled: AtomicBool,
-    pub audio_module_id: Mutex<u32>,
+    /// Names the speaker and microphone cards: the iPad model the client sent in `SETTINGS`,
+    /// like the monitor. Waited on with `audio_notify`.
+    pub audio_device_name: Mutex<String>,
     pub network_session_busy: AtomicBool,
     pub network_session_pending: AtomicBool,
     pub network_session_id: AtomicU64,
@@ -327,7 +329,7 @@ impl SharedState {
             on_client_disconnected: Mutex::new(None),
             has_active_client: AtomicBool::new(false),
             audio_output_enabled: AtomicBool::new(false),
-            audio_module_id: Mutex::new(0),
+            audio_device_name: Mutex::new("iPad".into()),
             network_session_busy: AtomicBool::new(false),
             network_session_pending: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
@@ -462,6 +464,8 @@ pub struct RequestedSettings {
     pub external_height: Option<u32>,
     pub external_fps: Option<u32>,
     pub internal_display_name: Option<[u8; 13]>,
+    /// The iPad panel's width and height in mm; `None` when the client doesn't know them.
+    pub internal_size_mm: Option<(u16, u16)>,
     pub revision: u32,
 }
 
@@ -542,11 +546,14 @@ fn clamp_u32(value: u32, floor: u32, ceiling: u32) -> u32 {
 }
 
 /// Length of a `SETTINGS` body (after the type byte).
-const SETTINGS_BODY_LEN: usize = 33;
+const SETTINGS_BODY_LEN: usize = 37;
+/// Panel sizes outside this range (mm) are treated as unknown.
+const PANEL_MM_RANGE: std::ops::RangeInclusive<u16> = 50..=1000;
 
 /// Parse a `SETTINGS` body: internal width/height/FPS, shared codec/bitrate, enabled mask,
-/// external width/height, revision, external FPS, big-endian. A zero (or `CODEC_DEFAULT` for the codec)
-/// means "use the daemon's default" for that field.
+/// external width/height, revision, external FPS, internal EDID name, internal panel
+/// width/height in mm, big-endian. A zero (or `CODEC_DEFAULT` for the codec) means "use the
+/// daemon's default" for that field; a zero panel size means unknown.
 fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
     if body.len() != SETTINGS_BODY_LEN || !(1..=3).contains(&body[10]) {
         return None;
@@ -571,6 +578,11 @@ fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
     let fps = u32::from(body[4]);
     let bitrate = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
     let nonzero = |v: u32| (v != 0).then_some(v);
+    let width_mm = u16::from_be_bytes(body[33..35].try_into().unwrap());
+    let height_mm = u16::from_be_bytes(body[35..37].try_into().unwrap());
+    let internal_size_mm = (PANEL_MM_RANGE.contains(&width_mm)
+        && PANEL_MM_RANGE.contains(&height_mm))
+    .then_some((width_mm, height_mm));
     let (width, height) = if width != 0 && height != 0 {
         (Some(width), Some(height))
     } else {
@@ -595,6 +607,7 @@ fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
         external_height: (ew > 0 && eh > 0).then_some(eh),
         external_fps: nonzero(u32::from(body[19])),
         internal_display_name: Some(name),
+        internal_size_mm,
         revision,
     })
 }
@@ -666,6 +679,12 @@ fn apply_requested_settings(shared: &Arc<SharedState>, session: u64, body: &[u8]
 
     let clamped = clamp_requested_settings(shared, parsed);
     crate::log_detail!("[control] received display SETTINGS: {clamped:?}");
+
+    if let Some(name) = clamped.internal_display_name {
+        // Cards plugged in from now on are named like the monitor.
+        *shared.audio_device_name.lock().unwrap() =
+            String::from_utf8_lossy(&name).trim_end().to_string();
+    }
 
     let (lock, cvar) = &*shared.pending_settings;
     let mut pending = lock.lock().unwrap();
@@ -835,20 +854,15 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
             let enabled = body[0] != 0;
             if enabled && !shared.features.speaker {
                 println!("[audio] ignoring speaker enable: disabled with --no-speaker");
-            } else if enabled {
-                crate::log_detail!("[audio] client enabled speaker passthrough");
-                // Create the sink BEFORE setting the flag so the audio capture
-                // thread never sees "enabled" without a ready PulseAudio sink.
-                ensure_virtual_sink(shared);
-                shared.audio_output_enabled.store(true, Ordering::SeqCst);
             } else {
-                crate::log_detail!("[audio] client disabled speaker passthrough");
-                // Clear the flag BEFORE removing the sink so the capture thread
-                // stops trying to read from the monitor source.
-                shared.audio_output_enabled.store(false, Ordering::SeqCst);
-                disable_virtual_sink(shared);
+                crate::log_detail!(
+                    "[audio] client turned speakers {}",
+                    if enabled { "on" } else { "off" }
+                );
+                // The speaker thread plugs the card in or out.
+                shared.audio_output_enabled.store(enabled, Ordering::SeqCst);
+                shared.audio_notify.notify_all();
             }
-            shared.audio_notify.notify_all();
         }
         client::MIC if body.len() == 1 => {
             let enabled = body[0] != 0;
@@ -915,57 +929,29 @@ pub fn handle_control_message_data(shared: &Arc<SharedState>, session: u64, msg:
     }
 }
 
-pub fn ensure_virtual_sink(shared: &Arc<SharedState>) {
-    let current_id = *shared.audio_module_id.lock().unwrap();
-    if current_id > 0 {
-        return; // already loaded
-    }
-
-    match crate::audio::create_virtual_sink() {
-        Ok(id) => {
-            *shared.audio_module_id.lock().unwrap() = id;
-            crate::log_detail!("[lifecycle] audio: virtual sink ready (module {id})");
-        }
-        Err(e) => eprintln!("[lifecycle] audio: {e:#}"),
-    }
-}
-
-pub fn disable_virtual_sink(shared: &Arc<SharedState>) {
+/// Turns speakers off; the speaker thread unplugs the card.
+pub fn disable_speakers(shared: &SharedState) {
     shared.audio_output_enabled.store(false, Ordering::SeqCst);
-    shared.audio_notify.notify_all();
-    std::thread::sleep(Duration::from_millis(200));
-
-    let mut module_id = shared.audio_module_id.lock().unwrap();
-    if *module_id > 0 {
-        crate::audio::remove_virtual_sink(*module_id);
-        *module_id = 0;
-    }
     shared.audio_notify.notify_all();
 }
 
 pub fn enable_virtual_mic(shared: &Arc<SharedState>) {
-    {
-        let existing = shared.mic_writer.lock().unwrap();
-        if existing.is_some() {
-            return; // already active
-        }
+    let mut mic = shared.mic_writer.lock().unwrap();
+    if mic.is_some() {
+        return; // already active
     }
-    match crate::audio::create_virtual_mic() {
-        Ok(writer) => {
-            *shared.mic_writer.lock().unwrap() = Some(writer);
-            crate::log_detail!("[mic] client enabled virtual microphone");
-        }
-        Err(e) => eprintln!("[mic] failed to create virtual microphone: {e:#}"),
+    let name = shared.audio_device_name.lock().unwrap().clone();
+    match crate::audio::create_virtual_mic(&name) {
+        Ok(writer) => *mic = Some(writer),
+        Err(e) => eprintln!("[mic] failed to create microphone: {e:#}"),
     }
 }
 
-pub fn disable_virtual_mic(shared: &Arc<SharedState>) {
-    let mut mic = shared.mic_writer.lock().unwrap();
-    if let Some(ref mut writer) = *mic {
-        crate::audio::remove_virtual_mic(writer);
-        crate::log_detail!("[mic] client disabled virtual microphone");
+/// Unplugs the microphone card, if any.
+pub fn disable_virtual_mic(shared: &SharedState) {
+    if shared.mic_writer.lock().unwrap().take().is_some() {
+        crate::log_detail!("[mic] microphone card unplugged");
     }
-    *mic = None;
 }
 
 const GPAD_DETACHED: u8 = 0x00;
@@ -2224,6 +2210,8 @@ mod settings_tests {
         body.extend_from_slice(&7u32.to_be_bytes());
         body.push(30);
         body.extend_from_slice(b"iPad A16 11\" ");
+        body.extend_from_slice(&235u16.to_be_bytes());
+        body.extend_from_slice(&163u16.to_be_bytes());
         let s = parse_settings_body(&body).unwrap();
         assert_eq!((s.width, s.height), (Some(1920), Some(1080)));
         assert_eq!(s.fps, Some(60));
@@ -2237,6 +2225,20 @@ mod settings_tests {
         assert_eq!(s.revision, 7);
         assert_eq!(s.external_fps, Some(30));
         assert_eq!(s.internal_display_name, Some(*b"iPad A16 11\" "));
+        assert_eq!(s.internal_size_mm, Some((235, 163)));
+    }
+
+    #[test]
+    fn zero_or_implausible_panel_sizes_are_unknown() {
+        let mut body = vec![0u8; SETTINGS_BODY_LEN];
+        body[20..33].copy_from_slice(b"Screx        ");
+        body[10] = 1;
+        body[18] = 1;
+        for (w, h) in [(0, 0), (235, 0), (10, 10), (5000, 3000)] {
+            body[33..35].copy_from_slice(&u16::to_be_bytes(w));
+            body[35..37].copy_from_slice(&u16::to_be_bytes(h));
+            assert_eq!(parse_settings_body(&body).unwrap().internal_size_mm, None);
+        }
     }
 
     #[test]

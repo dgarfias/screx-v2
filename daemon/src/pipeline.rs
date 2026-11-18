@@ -115,6 +115,7 @@ impl CaptureWorker {
                             capture::create_display_backend(&capture::CaptureConfig {
                                 display_id: display,
                                 monitor_name: settings.monitor_name,
+                                physical_size_mm: settings.physical_size_mm,
                                 width: settings.width,
                                 height: settings.height,
                                 fps: settings.fps,
@@ -279,6 +280,7 @@ fn dump_count(name: &str) -> u32 {
 fn resolve(request: RequestedSettings, config: &crate::AppConfig) -> TopologyRequest {
     let common = OutputSettings {
         monitor_name: request.internal_display_name.unwrap_or(*b"Screx        "),
+        physical_size_mm: request.internal_size_mm,
         width: request.width.unwrap_or(config.width),
         height: request.height.unwrap_or(config.height),
         fps: request.fps.unwrap_or(config.fps),
@@ -287,6 +289,8 @@ fn resolve(request: RequestedSettings, config: &crate::AppConfig) -> TopologyReq
     };
     let external = OutputSettings {
         monitor_name: *b"iPad External",
+        // The iPad can't know the size of a display plugged into it.
+        physical_size_mm: None,
         width: request.external_width.unwrap_or(config.width),
         height: request.external_height.unwrap_or(config.height),
         fps: request.external_fps.unwrap_or(common.fps),
@@ -357,11 +361,7 @@ pub fn run(
                     let outputs = resolve(request, &config);
                     if let Some(settings) = outputs.outputs[0] {
                         if let Ok(mut input) = shared.input_backend.lock() {
-                            input.set_display_name(
-                                std::str::from_utf8(&settings.monitor_name)
-                                    .unwrap()
-                                    .trim_end(),
-                            );
+                            input.set_display_size(settings.physical_size_mm);
                         }
                     }
                     let events = manager.request(
@@ -475,6 +475,7 @@ mod tests {
                 external_height: Some(2160),
                 external_fps: Some(30),
                 internal_display_name: None,
+                internal_size_mm: None,
                 fps: Some(60),
                 codec: Some(crate::encode::VideoCodec::H265),
                 bitrate_bps: Some(15_000_000),

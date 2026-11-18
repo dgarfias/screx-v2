@@ -18,9 +18,7 @@ sudo pacman -S --needed \
 
 # Runtime
 sudo pacman -S --needed \
-  libpulse \
-  pipewire-pulse \
-  pipewire \
+  dkms \
   v4l2loopback-dkms \
   systemd
 
@@ -40,9 +38,7 @@ sudo apt-get install -y \
 
 # Runtime
 sudo apt-get install -y \
-  pulseaudio-utils \
-  pipewire-pulse \
-  pipewire-bin \
+  dkms \
   v4l2loopback-dkms \
   evdi-dkms libevdi1 \
   udev
@@ -50,6 +46,26 @@ sudo apt-get install -y \
 
 `v4l2loopback` is loaded automatically via `modprobe` the first time the virtual webcam is used —
 having `v4l2loopback-dkms` installed is enough, no manual module load needed.
+
+### Speaker and microphone driver
+
+Install the bundled `screx_snd` ALSA driver before using speaker or microphone forwarding.
+Matching kernel headers and DKMS are required. From the repository root:
+
+```bash
+sudo install -d /usr/src/screx_snd-0.1.0
+sudo install -m644 kernel/screx_snd/{Makefile,dkms.conf,screx_snd.c,screx_snd_uapi.h} /usr/src/screx_snd-0.1.0/
+sudo dkms install /usr/src/screx_snd-0.1.0
+```
+
+The daemon loads the module on demand. Speaker and microphone toggles create real ALSA
+cards named after the iPad; disabling them or disconnecting removes the cards. The daemon
+does not connect to a user's audio server. PipeWire or PulseAudio can manage these cards
+like other hardware.
+
+Tested working on GNOME, KDE Plasma, Cinnamon and Hyprland. Other desktop environments may
+also work. Touchscreen-to-monitor mapping depends on the desktop; any manual mapping belongs
+in the desktop's configuration, not the daemon.
 
 ## Build
 

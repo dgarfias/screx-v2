@@ -79,8 +79,9 @@ pub trait InputBackend: Send {
     /// touch/mouse coordinates are 0..width/0..height in negotiated stream
     /// space; the backend scales them onto its fixed-size virtual devices.
     fn set_stream_size(&mut self, width: u32, height: u32);
-    /// Update the compositor's absolute-touch mapping when a session changes monitor identity.
-    fn set_display_name(&mut self, _name: &str) {}
+    /// Gives the touchscreen the iPad monitor's physical size (mm, `None` when unknown), which
+    /// compositors use to match the touchscreen to that monitor.
+    fn set_display_size(&mut self, _size_mm: Option<(u16, u16)>) {}
 
     fn touch(&mut self, contacts: &[TouchContact]) -> anyhow::Result<()>;
     fn key_text(&mut self, text: &str) -> anyhow::Result<()>;

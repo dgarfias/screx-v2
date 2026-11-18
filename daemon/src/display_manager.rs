@@ -12,6 +12,8 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputSettings {
     pub monitor_name: [u8; 13],
+    /// Panel size the client reported, in mm; `None` when unknown.
+    pub physical_size_mm: Option<(u16, u16)>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -560,6 +562,7 @@ mod tests {
     fn request(revision: u32, mask: u8) -> TopologyRequest {
         let settings = OutputSettings {
             monitor_name: *b"Screx        ",
+            physical_size_mm: None,
             width: 1920,
             height: 1080,
             fps: 60,
@@ -867,6 +870,7 @@ mod tests {
             generation: 0x01020304,
             settings: Some(OutputSettings {
                 monitor_name: *b"Screx        ",
+                physical_size_mm: None,
                 width: 3840,
                 height: 2160,
                 fps: 60,

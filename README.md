@@ -19,10 +19,13 @@ For implementation details and protocol documentation, see [`docs/ARCHITECTURE.m
 - Host speaker audio played on the iPad
 - iPad microphone exposed as a virtual microphone on the host
 - iPad camera exposed as a virtual webcam (`v4l2loopback`) on the host
+- Speaker and microphone devices use the bundled `screx_snd` ALSA kernel driver, without selecting a user's audio session
 - External displays connected to the iPad: Internal only, External only, or Both as two independent Linux monitors
 - Laptop mode for External only: a drawn laptop keyboard with the trackpad below it
 
 ## Use
+
+Tested working on GNOME, KDE Plasma, Cinnamon and Hyprland. It may also work on other desktop environments.
 
 1. Start the daemon on the Linux host.
 2. Open Screx on the iPad, tap **+**, enter the host/IP, and tap `Connect`.

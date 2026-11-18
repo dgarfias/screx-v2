@@ -122,7 +122,8 @@ struct DaemonCapabilities: Equatable {
 /// Client-proposed stream settings, sent to the daemon as `SETTINGS`. A `nil` field means
 /// "use the daemon's own default" and goes on the wire as 0 (`codecDefault` for the codec).
 ///
-/// Body: internal width/height/FPS, shared codec/bitrate, mask, external width/height, revision, external FPS.
+/// Body: internal width/height/FPS, shared codec/bitrate, mask, external width/height, revision,
+/// external FPS, internal EDID name, internal panel width/height in mm (0 = unknown).
 struct StreamSettings: Equatable {
     var width: Int?
     var height: Int?
@@ -135,6 +136,9 @@ struct StreamSettings: Equatable {
     var externalFps: Int?
     var revision: UInt32 = 1
     var internalDisplayName = DeviceDisplayIdentity.current.edidName
+    /// Gives the Linux monitor a real size, so the desktop scales it and maps touch to it
+    /// like a real touch monitor. nil sends "unknown".
+    var internalPanelSize: PanelSize?
 
     private static let codecDefault: UInt8 = 0xFF
 
@@ -171,6 +175,9 @@ struct StreamSettings: Equatable {
         let name = Array(internalDisplayName.utf8.prefix(13))
         body.append(contentsOf: name)
         body.append(Data(repeating: 0x20, count: 13 - name.count))
+        let mm = { (v: Int?) -> UInt16 in UInt16(v.map { $0 > 0 && $0 <= Int(UInt16.max) ? $0 : 0 } ?? 0) }
+        withUnsafeBytes(of: mm(internalPanelSize?.widthMm).bigEndian) { body.append(contentsOf: $0) }
+        withUnsafeBytes(of: mm(internalPanelSize?.heightMm).bigEndian) { body.append(contentsOf: $0) }
         return body
     }
 }

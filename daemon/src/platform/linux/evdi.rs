@@ -143,6 +143,7 @@ extern "C" fn on_crtc_state(state: c_int, _user_data: *mut c_void) {
 pub struct EvdiDisplay {
     display_id: DisplayId,
     monitor_name: [u8; 13],
+    physical_size_mm: Option<(u16, u16)>,
     width: u32,
     height: u32,
     fps: u32,
@@ -156,6 +157,7 @@ impl EvdiDisplay {
     pub fn new(
         display_id: DisplayId,
         monitor_name: [u8; 13],
+        physical_size_mm: Option<(u16, u16)>,
         width: u32,
         height: u32,
         fps: u32,
@@ -163,6 +165,7 @@ impl EvdiDisplay {
         Ok(Self {
             display_id,
             monitor_name,
+            physical_size_mm,
             width,
             height,
             fps,
@@ -193,7 +196,13 @@ impl DisplayBackend for EvdiDisplay {
         self.handle = Some(handle);
         self.device_lease = Some(lease);
 
-        let mut edid = generate_edid(self.display_id, self.width, self.height, self.fps.max(1));
+        let mut edid = generate_edid(
+            self.display_id,
+            self.width,
+            self.height,
+            self.fps.max(1),
+            self.physical_size_mm.map(crate::capture::edid_size_cm),
+        );
         set_monitor_name(&mut edid, &self.monitor_name);
         let area_limit = self.width * self.height;
         unsafe {
@@ -415,7 +424,15 @@ impl Drop for EvdiDisplay {
     }
 }
 
-fn generate_edid(display_id: DisplayId, width: u32, height: u32, refresh_hz: u32) -> [u8; 128] {
+/// `size_cm` is the panel's real size. Without it (the external display) the EDID carries
+/// the 16x10 cm "aspect ratio, size unknown" marker instead.
+fn generate_edid(
+    display_id: DisplayId,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    size_cm: Option<(u8, u8)>,
+) -> [u8; 128] {
     let mut edid = [0u8; 128];
 
     edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
@@ -430,13 +447,14 @@ fn generate_edid(display_id: DisplayId, width: u32, height: u32, refresh_hz: u32
     edid[18] = 0x01;
     edid[19] = 0x04;
     edid[20] = 0xA5;
-    // Physical size is unknown, and pixel counts do not determine a diagonal. EDID defines
-    // 16x10 cm as the marker for "aspect ratio encoded instead of size" (16:9 is 16x9 cm).
-    // Mutter/gnome-control-center recognize exactly this marker and then name the output from
-    // the product descriptor; with the size left at zero it shows only the 3-letter vendor ID.
-    // It also keeps Mutter at 100% scale, which is correct for a virtual monitor.
-    edid[21] = 16;
-    edid[22] = 10;
+    // A real size behaves like a real monitor: compositors derive DPI and scale from it and
+    // match the touchscreen (same size) to this monitor. GNOME then names it vendor + diagonal
+    // ("SRX 11\"") rather than by model. Without a size, EDID's 16x10 cm marker means "aspect
+    // ratio encoded instead of size"; Mutter then names the output from the product descriptor
+    // and stays at 100% scale.
+    let (width_cm, height_cm) = size_cm.unwrap_or((16, 10));
+    edid[21] = width_cm;
+    edid[22] = height_cm;
     edid[23] = 120;
     edid[24] = 0x2E;
     edid[25..35].copy_from_slice(&[0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
@@ -458,8 +476,11 @@ fn generate_edid(display_id: DisplayId, width: u32, height: u32, refresh_hz: u32
     let pixel_clock_khz = (h_total as u64 * v_total as u64 * refresh_hz as u64) / 1000;
     let pixel_clock_10khz = (pixel_clock_khz / 10) as u16;
 
-    let h_image = edid[21];
-    let v_image = edid[22];
+    // The detailed timing's image size is in mm; keep it equal to the base block's cm.
+    let (h_image, v_image) = match size_cm {
+        Some((w, h)) => (u32::from(w) * 10, u32::from(h) * 10),
+        None => (u32::from(width_cm), u32::from(height_cm)),
+    };
     let d = &mut edid[54..72];
     d[0] = (pixel_clock_10khz & 0xFF) as u8;
     d[1] = (pixel_clock_10khz >> 8) as u8;
@@ -473,9 +494,9 @@ fn generate_edid(display_id: DisplayId, width: u32, height: u32, refresh_hz: u32
     d[9] = (h_sync_width & 0xFF) as u8;
     d[10] = (((v_sync_offset & 0x0F) << 4) | (v_sync_width & 0x0F)) as u8;
     d[11] = 0x00;
-    d[12] = h_image;
-    d[13] = v_image;
-    d[14] = 0x00;
+    d[12] = (h_image & 0xFF) as u8;
+    d[13] = (v_image & 0xFF) as u8;
+    d[14] = (((h_image >> 8) & 0x0F) << 4 | ((v_image >> 8) & 0x0F)) as u8;
     d[15] = 0x00;
     d[16] = 0x00;
     d[17] = 0x1E;
@@ -625,7 +646,7 @@ mod tests {
 
     #[test]
     fn model_names_preserve_stable_product_and_serial_identity() {
-        let mut edid = generate_edid(DisplayId::Internal, 1920, 1080, 60);
+        let mut edid = generate_edid(DisplayId::Internal, 1920, 1080, 60, None);
         set_monitor_name(&mut edid, b"iPad A16 11\" ");
         assert_eq!(&edid[8..16], &[0x4e, 0x58, 1, 0, 1, 0, 0, 0]);
         assert_eq!(&edid[77..90], b"iPad A16 11\"\n");
@@ -634,33 +655,46 @@ mod tests {
         assert_eq!(
             &edid[21..23],
             &[16, 10],
-            "Must use EDID's aspect-as-size marker so desktop environments show the model name"
+            "Without a known size, use EDID's aspect-as-size marker"
         );
     }
 
     #[test]
     fn physical_size_is_never_derived_from_stream_resolution() {
         for (width, height) in [(1280, 720), (2360, 1640), (3840, 2160)] {
-            let edid = generate_edid(DisplayId::Internal, width, height, 60);
+            let edid = generate_edid(DisplayId::Internal, width, height, 60, None);
             assert_eq!(&edid[21..23], &[16, 10]);
         }
     }
 
     #[test]
+    fn real_size_is_the_same_in_the_base_block_and_the_detailed_timing() {
+        let size = crate::capture::edid_size_cm((235, 163));
+        assert_eq!(size, (24, 16));
+        let edid = generate_edid(DisplayId::Internal, 2360, 1640, 60, Some(size));
+        assert_eq!(&edid[21..23], &[24, 16]);
+        // Detailed timing image size: 240 x 160 mm, 12 bits each.
+        let h_mm = u32::from(edid[66]) | (u32::from(edid[68] >> 4) << 8);
+        let v_mm = u32::from(edid[67]) | (u32::from(edid[68] & 0x0F) << 8);
+        assert_eq!((h_mm, v_mm), (240, 160));
+        assert_eq!(edid.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
+    }
+
+    #[test]
     fn displays_have_distinct_stable_identities_and_valid_checksums() {
-        let internal = generate_edid(DisplayId::Internal, 1920, 1080, 60);
-        let external = generate_edid(DisplayId::External, 1920, 1080, 60);
+        let internal = generate_edid(DisplayId::Internal, 1920, 1080, 60, None);
+        let external = generate_edid(DisplayId::External, 1920, 1080, 60, None);
         assert_ne!(&internal[10..16], &external[10..16]);
         assert_ne!(&internal[72..108], &external[72..108]);
         for id in [DisplayId::Internal, DisplayId::External] {
             for (width, height) in [(1920, 1080), (2360, 1640), (3840, 2160)] {
-                let edid = generate_edid(id, width, height, 60);
+                let edid = generate_edid(id, width, height, 60, None);
                 assert_eq!(
                     edid.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
                     0
                 );
-                assert_eq!(&edid[8..16], &generate_edid(id, 1280, 720, 30)[8..16]);
-                assert_eq!(&edid[72..108], &generate_edid(id, 1280, 720, 30)[72..108]);
+                assert_eq!(&edid[8..16], &generate_edid(id, 1280, 720, 30, None)[8..16]);
+                assert_eq!(&edid[72..108], &generate_edid(id, 1280, 720, 30, None)[72..108]);
                 assert_eq!(u32::from(edid[56]) | (u32::from(edid[58] >> 4) << 8), width);
                 assert_eq!(
                     u32::from(edid[59]) | (u32::from(edid[61] >> 4) << 8),
@@ -672,7 +706,7 @@ mod tests {
 
     #[test]
     fn short_monitor_name_does_not_corrupt_the_edid_header() {
-        let edid = generate_edid(DisplayId::External, 1920, 1080, 60);
+        let edid = generate_edid(DisplayId::External, 1920, 1080, 60, None);
         assert_eq!(&edid[..8], &[0, 255, 255, 255, 255, 255, 255, 0]);
         assert_eq!(&edid[77..90], b"iPad External");
     }

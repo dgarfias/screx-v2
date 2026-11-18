@@ -33,7 +33,7 @@ Host desktop/compositor
 Client input/peripherals
     -> control transport
     -> daemon
-    -> uinput + PipeWire/PulseAudio + v4l2loopback
+    -> uinput + screx_snd ALSA cards + v4l2loopback
 ```
 
 The iPad sends **relative** pointer deltas under pointer lock when an external mouse/trackpad is
@@ -69,7 +69,7 @@ Responsibilities:
 ### Daemon (Linux backends)
 
 Host-specific code lives in `daemon/src/platform/linux/`: EVDI virtual display (`evdi.rs`),
-`uinput` virtual input devices (`uinput.rs`), PipeWire/PulseAudio (`pulse.rs`), the
+`uinput` virtual input devices (`uinput.rs`), ALSA sound cards (`screx_snd.rs` and `kernel/screx_snd/`), the
 `v4l2loopback` webcam (`v4l2.rs`), and UDP socket tuning (`net.rs`). See
 [DAEMON_LINUX.md](DAEMON_LINUX.md) for the dependencies each backend needs.
 
@@ -345,19 +345,21 @@ Offsets are within the body, after the type byte.
 | 15 | revision | u32 | nonzero, monotonically increasing within the session |
 | 19 | external_fps | u8 | 0 = follow internal FPS |
 | 20 | internal_display_name | 13 ASCII bytes | space-padded EDID name, required |
+| 33 | internal_width_mm | u16 | 0 = unknown physical panel size |
+| 35 | internal_height_mm | u16 | 0 = unknown physical panel size |
 
 The iPad's "Daemon default" options map to these values; the daemon then uses its CLI-configured
 default for that field.
 
-The body is exactly 33 bytes. Width/height/FPS at offsets 0/2/4 describe the internal display.
+The body is exactly 37 bytes. Width/height/FPS at offsets 0/2/4 describe the internal display.
 External FPS is independent, inheriting internal FPS only when omitted. Codec and the base bitrate
 target are shared settings; the target applies to **each** enabled video pipeline. Each pipeline
 adapts bitrate/FEC independently from that target. Both
 resolutions are independently clamped against the same advertised limits. Each width/height
 pair must either be specified together or uses daemon defaults. Masks outside 1–3, zero
 revisions, and legacy 10-/19-/20-byte bodies are rejected. The daemon's maximum FPS applies per output.
-Monitor names must be nonempty printable ASCII, without single quotes or backslashes, so the same
-validated identity can safely be used in both EDID and GNOME's touchscreen output mapping.
+Monitor names must be nonempty printable ASCII, without single quotes or backslashes.
+Panel dimensions are in mm; both must be in 50–1000 mm or the size is treated as unknown.
 
 ### Runtime Display Topology
 
@@ -474,13 +476,16 @@ snapshot 2026-11-15) to full marketing names, known diagonal sizes, and 13-byte 
 Sources are Apple's model/specification pages and the IPSW hardware-ID catalog, referenced in the
 file. Unknown identifiers and other device families use Screx. For example, iPad (A16) 11″ uses
 `iPad A16 11"` in EDID. The external monitor is always `iPad External`, exactly 13 ASCII characters.
-UIKit supplies no physical external diagonal, so no inch suffix is inferred from pixels. Instead of
-guessing DPI, the EDID sets 16×10 cm, the specification's marker for "aspect ratio encoded instead
-of size". Mutter/gnome-control-center recognize that marker, keep the output at 100% scale, and
-name it `<three-letter vendor> <product descriptor>`, so GNOME shows `SRX iPad A16 11"` and
-`SRX iPad External`. With the size fields left at zero (the previous behavior), Mutter ignores the
-product descriptor and shows only `SRX`. Product IDs and serials remain stable and distinct; the
-internal touchscreen's GNOME mapping is updated to the session's EDID name before capture starts.
+The iPad estimates its panel dimensions from its model's marketing diagonal and native pixel aspect
+ratio, independently of stream resolution. The daemon stores that size in EDID, rounded to whole
+centimetres, and gives the touchscreen the same size. Desktops can then choose scaling from DPI
+and match touch to the display. GNOME displays the vendor and diagonal rather than the model
+when a real size is supplied.
+
+UIKit supplies no physical external diagonal, so no size is inferred from external pixels. Unknown
+sizes retain the 16×10 cm compatibility marker. Product IDs and serials remain stable and distinct.
+The touchscreen is named `Screx Touchscreen SRX 001` to identify the internal monitor to compositors
+that match by vendor and serial. The daemon writes no per-user touchscreen settings or udev rules.
 
 The compact connection overlay is four short lines: hostname, ↓/↑ transfer rates, RTT and jitter,
 then a plain Disconnect button. It shows no codec or display-mode row; display selection belongs
@@ -582,14 +587,20 @@ stuck on the host. The daemon does the same when a session ends.
 
 ### Speakers
 
-- the daemon creates a virtual sink named `screx_ipad` and captures from `screx_ipad.monitor`
+- the daemon creates an ALSA playback card named after the iPad through `/dev/screx_audio`
 - audio is encoded as Opus and sent to the client
-- the `SPEAKER` control message attaches/detaches the virtual sink
+- the `SPEAKER` control message attaches/detaches the card
+- the daemon reads 10 ms of PCM every 10 ms, advancing the card's playback position
 
 ### Microphone
 
 - the client captures microphone audio and encodes it as Opus
-- the daemon decodes it and exposes a virtual microphone source via PipeWire/PulseAudio
+- the daemon decodes it and writes PCM to an ALSA capture card named after the iPad
+- the `MIC` control message attaches/detaches this microphone card
+
+The `screx_snd` kernel module owns these cards. Closing the daemon's device files removes them,
+including on daemon exit or crash. Desktop audio servers discover them as normal sound hardware;
+the daemon does not select a user or access a user's audio server.
 
 ### Camera
 
@@ -622,8 +633,8 @@ The daemon may create:
 - `uinput` virtual mouse
 - up to 4 `uinput` virtual gamepads
 - `v4l2loopback` virtual webcam
-- PipeWire / PulseAudio virtual sink for client speakers
-- PipeWire virtual source for client microphone
+- `screx_snd` ALSA playback card for iPad speakers
+- `screx_snd` ALSA capture card for the iPad microphone
 
 ## Notes on Compatibility
 

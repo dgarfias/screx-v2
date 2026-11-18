@@ -6,6 +6,12 @@ import Darwin
 /// Marketing names/sizes, not measurements inferred from pixels. Updated 2026-11-15.
 /// Models: https://support.apple.com/108043 (including mini A20 Pro, specs /149482).
 /// Hardware IDs cross-checked against https://api.ipsw.me/v4/devices and DeviceKit's model table.
+/// A panel's physical size in landscape orientation.
+struct PanelSize: Equatable {
+    var widthMm: Int
+    var heightMm: Int
+}
+
 struct DeviceDisplayIdentity: Equatable {
     let name: String
     let edidName: String
@@ -72,6 +78,18 @@ struct DeviceDisplayIdentity: Equatable {
         model("iPad17,1 iPad17,2", "iPad Pro (M5) 11″", "Pro M5 11\"", 11),
         model("iPad17,3 iPad17,4", "iPad Pro (M5) 13″", "Pro M5 13\"", 13)
     ]
+
+    /// The panel's width and height in mm (width along `pixels.long`), from the marketing
+    /// diagonal and the native pixel shape. Marketing diagonals are rounded, so this can be a
+    /// few percent off; the daemon gives the monitor and its touchscreen the same value, so
+    /// matching them doesn't depend on it being exact. nil for unknown models.
+    func panelSizeMm(nativePixels pixels: (long: Int, short: Int)) -> PanelSize? {
+        guard let diagonalInches, pixels.long > 0, pixels.short > 0 else { return nil }
+        let long = Double(pixels.long), short = Double(pixels.short)
+        let mmPerPixel = diagonalInches * 25.4 / (long * long + short * short).squareRoot()
+        return PanelSize(widthMm: Int((long * mmPerPixel).rounded()),
+                         heightMm: Int((short * mmPerPixel).rounded()))
+    }
 
     static func lookup(_ identifier: String) -> DeviceDisplayIdentity {
         models.first { $0.identifiers.contains(identifier) }?.identity

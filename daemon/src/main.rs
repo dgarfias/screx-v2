@@ -260,9 +260,6 @@ async fn main() -> Result<()> {
             .context("failed to spawn pairing thread")?
     };
 
-    // Clean up stale audio modules from a previous crash
-    audio::cleanup_stale_modules();
-
     // -----------------------------------------------------------------------
     // Lifecycle callbacks — create peripherals on connect, remove on disconnect
     // -----------------------------------------------------------------------
@@ -287,10 +284,7 @@ async fn main() -> Result<()> {
             *shared_d.cam_writer.lock().unwrap() = None;
 
             // Mic
-            if let Some(ref mut mic) = *shared_d.mic_writer.lock().unwrap() {
-                audio::remove_virtual_mic(mic);
-            }
-            *shared_d.mic_writer.lock().unwrap() = None;
+            crate::stream_server::disable_virtual_mic(&shared_d);
 
             // Input backend cleanup: release anything still held so a
             // dropped session can't leave a button or key stuck on the host,
@@ -303,12 +297,8 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Reset audio output flag first so the loopback capture stops
-            // before the virtual sink is removed.
-            shared_d.audio_output_enabled.store(false, Ordering::SeqCst);
-
-            // Audio sink
-            crate::stream_server::disable_virtual_sink(&shared_d);
+            // Speakers
+            crate::stream_server::disable_speakers(&shared_d);
         }));
     }
 
@@ -349,7 +339,7 @@ async fn main() -> Result<()> {
         .context("failed to spawn capture thread")?;
 
     // -----------------------------------------------------------------------
-    // Audio capture thread (runs continuously, but only captures when sink exists)
+    // Speaker thread (runs continuously; the card exists while speakers are on)
     // -----------------------------------------------------------------------
 
     let audio_socket = socket.try_clone().context("clone socket for audio")?;
@@ -358,8 +348,8 @@ async fn main() -> Result<()> {
     let audio_thread = thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
-            if let Err(e) = audio::run_audio_capture(audio_socket, audio_shared, audio_stop) {
-                eprintln!("[audio] capture error: {e:#}");
+            if let Err(e) = audio::run_speaker(audio_socket, audio_shared, audio_stop) {
+                eprintln!("[audio] speaker error: {e:#}");
             }
         })
         .context("failed to spawn audio thread")?;
@@ -375,11 +365,8 @@ async fn main() -> Result<()> {
         // Cleanup remaining resources
         *shared.keyboard_worker.lock().unwrap() = None;
         *shared.cam_writer.lock().unwrap() = None;
-        if let Some(ref mut mic) = *shared.mic_writer.lock().unwrap() {
-            audio::remove_virtual_mic(mic);
-        }
-        *shared.mic_writer.lock().unwrap() = None;
-        crate::stream_server::disable_virtual_sink(&shared);
+        crate::stream_server::disable_virtual_mic(&shared);
+        crate::stream_server::disable_speakers(&shared);
 
         let _ = capture_thread.join();
         if let Err(err) = audio_thread.join() {

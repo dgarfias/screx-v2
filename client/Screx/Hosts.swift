@@ -109,8 +109,12 @@ struct HostStreamSettings: Codable, Equatable {
     /// setting that doesn't fit fails the connection instead of being adjusted.
     var streamSettings: StreamSettings {
         let size = resolution.resolution
-        return StreamSettings(width: size?.width, height: size?.height, fps: framerate.fps,
-                              codecId: codec.codecId, bitrateBps: bitrateBps)
+        var settings = StreamSettings(width: size?.width, height: size?.height, fps: framerate.fps,
+                                      codecId: codec.codecId, bitrateBps: bitrateBps)
+        let native = StreamResolutionPreset.nativeResolution
+        settings.internalPanelSize = DeviceDisplayIdentity.current.panelSizeMm(
+            nativePixels: (long: native.width, short: native.height))
+        return settings
     }
 
     /// nil means the host's default. A custom value is capped only to fit the wire field.

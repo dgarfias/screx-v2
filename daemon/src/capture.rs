@@ -57,9 +57,19 @@ pub trait DisplayBackend {
 pub struct CaptureConfig {
     pub display_id: DisplayId,
     pub monitor_name: [u8; 13],
+    /// Panel size the client reported; `None` when unknown (the external display).
+    pub physical_size_mm: Option<(u16, u16)>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+}
+
+/// The monitor's size as EDID stores it: whole centimetres, 1..=255. Compositors read the
+/// size back from the kernel as these centimetres times ten, so anything that must match the
+/// monitor's size (the touchscreen) has to use `cm * 10` mm, not the client's exact mm.
+pub fn edid_size_cm((width_mm, height_mm): (u16, u16)) -> (u8, u8) {
+    let cm = |mm: u16| ((mm + 5) / 10).clamp(1, 255) as u8;
+    (cm(width_mm), cm(height_mm))
 }
 
 /// Create the EVDI virtual-display backend.
@@ -67,6 +77,7 @@ pub fn create_display_backend(config: &CaptureConfig) -> Result<Box<dyn DisplayB
     Ok(Box::new(crate::platform::linux::evdi::EvdiDisplay::new(
         config.display_id,
         config.monitor_name,
+        config.physical_size_mm,
         config.width,
         config.height,
         config.fps,

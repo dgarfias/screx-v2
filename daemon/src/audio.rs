@@ -1,11 +1,12 @@
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use opus_decoder::OpusDecoder;
 
+use crate::platform::linux::screx_snd::{self, Card, Direction};
 use crate::stream_server::{AudioSender, SharedState};
 
 pub const SAMPLE_RATE: u32 = 48000;
@@ -19,9 +20,9 @@ const MIC_MAX_FRAME: usize = 5760;
 /// concealment. Longer gaps (a stall, or the client restarting its counter)
 /// are not worth synthesizing; decoding just resumes.
 const MIC_MAX_CONCEALED_PACKETS: u32 = 5;
-/// How far the audio sample clock may drift from the wall clock before it is
-/// re-anchored (see `run_audio_capture`).
-const AUDIO_CLOCK_REANCHOR_MS: u32 = 200;
+/// How late the speaker loop may fall behind its 10 ms schedule before it
+/// gives up catching up and restarts the schedule from now.
+const SPEAKER_MAX_LAG: Duration = Duration::from_millis(100);
 /// Speaker audio Opus bitrate (48 kHz stereo, 10 ms frames).
 const OPUS_SPEAKER_BITRATE: i32 = 128_000;
 /// libopus' recommended worst-case output buffer for one encode call.
@@ -69,125 +70,79 @@ impl SpeakerOpus {
     }
 }
 
-/// Platform-specific audio backend.
-pub trait AudioBackend: Send {
-    fn create_sink(&mut self) -> Result<()>;
-    fn destroy_sink(&mut self);
-    fn run_loopback(&mut self, stop: &AtomicBool, on_chunk: &mut dyn FnMut(&[u8])) -> Result<()>;
-    fn create_mic(&mut self) -> Result<Box<dyn MicSink>>;
-}
-
 /// Sink for decoded microphone PCM.
 pub trait MicSink: Send {
     fn write_pcm(&mut self, s16_mono_48k: &[i16]);
 }
 
-/// Create the platform audio backend.
-pub fn create_audio_backend() -> Box<dyn AudioBackend> {
-    Box::new(crate::platform::linux::pulse::PulseAudioBackend::new())
-}
-
-/// Cheap capability probe: is virtual-microphone forwarding likely to work
-/// right now? Linux: PipeWire/PulseAudio mic support is always available
-/// when the daemon can run at all.
+/// Speakers and microphone need the `screx_snd` kernel module.
 pub fn probe_mic_available() -> bool {
-    true
+    screx_snd::probe_available()
 }
 
-/// Cheap capability probe: is speaker/system-audio forwarding likely to
-/// work right now? Always available (PulseAudio null-sink).
 pub fn probe_speaker_available() -> bool {
-    true
+    screx_snd::probe_available()
 }
 
-/// Remove any leftover audio state from a previous crash.
-pub fn cleanup_stale_modules() {
-    crate::platform::linux::pulse::cleanup_stale_modules();
-}
-
-/// Create the virtual speaker sink.
-pub fn create_virtual_sink() -> Result<u32> {
-    let mut backend = create_audio_backend();
-    backend.create_sink()?;
-    // The Linux backend stores the module id internally; for the existing API
-    // we return a placeholder id. Newer code should hold the backend directly.
-    Ok(1)
-}
-
-/// Remove the virtual speaker sink.
-pub fn remove_virtual_sink(_module_id: u32) {
-    let mut backend = create_audio_backend();
-    backend.destroy_sink();
-}
-
-/// Create the virtual microphone.
-pub fn create_virtual_mic() -> Result<MicWriter> {
-    let mut backend = create_audio_backend();
-    let sink = backend.create_mic()?;
+/// Plugs in the iPad's microphone, named after the iPad.
+pub fn create_virtual_mic(name: &str) -> Result<MicWriter> {
+    let card = Card::create(&format!("{name} Microphone"), 1, Direction::Microphone)?;
+    crate::log_detail!("[mic] microphone card plugged in");
     let decoder =
         OpusDecoder::new(MIC_RATE, 1).map_err(|e| anyhow::anyhow!("opus decoder init: {e:?}"))?;
     Ok(MicWriter {
         decoder,
-        sink,
+        sink: Box::new(MicCard {
+            card,
+            bytes: Vec::with_capacity(MIC_MAX_FRAME * 2),
+        }),
         pcm_buf: vec![0i16; MIC_MAX_FRAME],
         next_seq: None,
     })
 }
 
-/// Remove the virtual microphone.
-pub fn remove_virtual_mic(mic: &mut MicWriter) {
-    let _ = mic;
+struct MicCard {
+    card: Card,
+    bytes: Vec<u8>,
+}
+
+impl MicSink for MicCard {
+    fn write_pcm(&mut self, s16_mono_48k: &[i16]) {
+        self.bytes.clear();
+        self.bytes
+            .extend(s16_mono_48k.iter().flat_map(|s| s.to_le_bytes()));
+        if let Err(e) = self.card.write(&self.bytes) {
+            eprintln!("[mic] {e:#}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Audio capture — reads from virtual sink monitor, sends to iPad
+// Speakers — reads the iPad's speaker card, sends it to the iPad
 // ---------------------------------------------------------------------------
 
-pub fn run_audio_capture(
-    socket: UdpSocket,
-    shared: Arc<SharedState>,
-    stop: Arc<AtomicBool>,
-) -> Result<()> {
+/// While a client has speakers on, plugs in a speaker card named after the iPad,
+/// reads 10 ms of what applications play into it every 10 ms, and sends it to the
+/// iPad as Opus. Unplugs the card when speakers go off or the client leaves.
+pub fn run_speaker(socket: UdpSocket, shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()> {
     let mut sender = AudioSender::new(socket);
-    let mut backend = create_audio_backend();
+    let speakers_on = || {
+        shared.has_active_client.load(Ordering::Relaxed)
+            && shared.audio_output_enabled.load(Ordering::SeqCst)
+    };
 
     while !stop.load(Ordering::Relaxed) {
-        {
-            let guard = shared.audio_module_id.lock().unwrap();
-            if !shared.has_active_client.load(Ordering::Relaxed)
-                || !shared.audio_output_enabled.load(Ordering::SeqCst)
-                || *guard == 0
-            {
+        let name = {
+            let name = shared.audio_device_name.lock().unwrap();
+            if !speakers_on() {
                 let _ = shared
                     .audio_notify
-                    .wait_timeout(guard, std::time::Duration::from_millis(200));
+                    .wait_timeout(name, Duration::from_millis(200));
                 continue;
             }
-        }
+            name.clone()
+        };
 
-        let mut active_session_key = *shared.session_key.lock().unwrap();
-        if let Some(key) = active_session_key {
-            sender.set_cipher(crate::crypto::SessionCipher::new(&key));
-        } else {
-            sender.clear_cipher();
-        }
-        sender.set_source(*shared.udp_source.lock().unwrap());
-
-        let session_key = &shared.session_key;
-        let udp_source = &shared.udp_source;
-        let client_addr = &shared.client_addr;
-        let start_time = shared.start_time;
-
-        // Monotonic sample clock in the same epoch as the video timestamps.
-        // PulseAudio (tsched) can hand over several 10 ms chunks at once, and
-        // stamping each with the wall clock produces a staircase of identical
-        // timestamps that the iPad's A/V sync misreads as drift, discarding
-        // ring data (audible crackle at IDR times). Advance 10 ms per chunk
-        // instead, re-anchoring to the wall clock only if the two diverge by
-        // more than AUDIO_CLOCK_REANCHOR_MS (capture stall or restart).
-        let mut sample_clock_ms: Option<u32> = None;
-
-        // Created once per capture session, not per chunk.
         let mut speaker_opus = match SpeakerOpus::new() {
             Ok(opus) => opus,
             Err(e) => {
@@ -196,88 +151,64 @@ pub fn run_audio_capture(
                 continue;
             }
         };
-
-        let mut on_chunk = |chunk: &[u8]| {
-            if chunk.len() != BYTES_PER_CHUNK {
-                return;
+        let mut card = match Card::create(&name, u32::from(CHANNELS), Direction::Speakers) {
+            Ok(card) => card,
+            Err(e) => {
+                eprintln!("[audio] {e:#}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
-            let wall_ms = start_time.elapsed().as_millis() as u32;
-            let ts = match sample_clock_ms {
-                Some(clock)
-                    if (wall_ms.wrapping_sub(clock) as i32).unsigned_abs()
-                        <= AUDIO_CLOCK_REANCHOR_MS =>
-                {
-                    clock
-                }
-                _ => wall_ms,
-            };
-            sample_clock_ms = Some(ts.wrapping_add(CHUNK_DURATION_MS));
+        };
+        crate::log_detail!("[audio] speaker card '{name}' plugged in");
 
-            let current_session_key = *session_key.lock().unwrap();
-            if current_session_key != active_session_key {
-                active_session_key = current_session_key;
-                sender.set_source(*udp_source.lock().unwrap());
-                if let Some(key) = active_session_key {
-                    sender.set_cipher(crate::crypto::SessionCipher::new(&key));
-                } else {
-                    sender.clear_cipher();
-                }
+        let mut active_session_key = None;
+        let mut chunk = [0u8; BYTES_PER_CHUNK];
+        let mut next = Instant::now();
+        while speakers_on() && !stop.load(Ordering::Relaxed) {
+            // This schedule is the card's clock.
+            next += Duration::from_millis(u64::from(CHUNK_DURATION_MS));
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            } else if now - next > SPEAKER_MAX_LAG {
+                crate::log_detail!("[audio] speaker loop stalled {:?}; resuming", now - next);
+                next = now;
+            }
+            if let Err(e) = card.read(&mut chunk) {
+                eprintln!("[audio] {e:#}");
+                break;
             }
 
-            if let Some(addr) = *client_addr.lock().unwrap() {
+            let session_key = *shared.session_key.lock().unwrap();
+            if session_key != active_session_key {
+                active_session_key = session_key;
+                sender.set_source(*shared.udp_source.lock().unwrap());
+                match active_session_key {
+                    Some(key) => sender.set_cipher(crate::crypto::SessionCipher::new(&key)),
+                    None => sender.clear_cipher(),
+                }
+            }
+            if let Some(addr) = *shared.client_addr.lock().unwrap() {
+                // Stamped with when the chunk was due to play, on the video timestamps' clock.
+                let ts = next.saturating_duration_since(shared.start_time).as_millis() as u32;
                 let result = speaker_opus
-                    .encode(chunk)
+                    .encode(&chunk)
                     .and_then(|packet| sender.send_audio(packet, addr, ts));
                 if let Err(e) = result {
                     eprintln!("[audio] send error: {e:#}");
                 }
             }
-        };
-
-        crate::log_detail!("[audio] starting platform audio loopback capture");
-        let loopback_stop = Arc::new(AtomicBool::new(false));
-        let watchdog_done = Arc::new(AtomicBool::new(false));
-
-        let result = std::thread::scope(|scope| {
-            let watchdog_stop = Arc::clone(&loopback_stop);
-            let watchdog_done_for_thread = Arc::clone(&watchdog_done);
-            let global_stop = &stop;
-            let shared_state = &shared;
-            scope.spawn(move || {
-                while !watchdog_done_for_thread.load(Ordering::Relaxed) {
-                    if global_stop.load(Ordering::Relaxed)
-                        || !shared_state.has_active_client.load(Ordering::Relaxed)
-                        || !shared_state.audio_output_enabled.load(Ordering::SeqCst)
-                    {
-                        watchdog_stop.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
-
-            let result = backend.run_loopback(&loopback_stop, &mut on_chunk);
-            watchdog_done.store(true, Ordering::Relaxed);
-            result
-        });
-
-        if let Err(e) = result {
-            eprintln!("[audio] loopback error: {e:#}");
         }
-
-        crate::log_detail!("[audio] capture session stopped, waiting for next client...");
-        if !shared.audio_output_enabled.load(Ordering::SeqCst) {
-            continue;
-        }
-        std::thread::sleep(Duration::from_millis(500));
+        drop(card);
+        crate::log_detail!("[audio] speaker card unplugged");
     }
 
-    crate::log_detail!("[audio] capture thread exiting");
+    crate::log_detail!("[audio] speaker thread exiting");
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Virtual microphone — receives Opus from iPad, decodes, feeds to platform sink
+// Microphone — receives Opus from iPad, decodes, feeds the microphone card
 // ---------------------------------------------------------------------------
 
 pub struct MicWriter {

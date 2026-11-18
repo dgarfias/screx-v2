@@ -33,10 +33,15 @@ struct DeviceDisplayIdentityTests {
         }
         precondition(DeviceDisplayIdentity.lookup("iPad15,7").name == "iPad (A16) 11″")
         precondition(DeviceDisplayIdentity.lookup("iPad19,1").diagonalInches == 8.5)
+        // iPad (A16) 11″, 2360x1640: 279.4 mm diagonal.
+        let a16 = DeviceDisplayIdentity.lookup("iPad15,7").panelSizeMm(nativePixels: (long: 2360, short: 1640))
+        precondition(a16 == PanelSize(widthMm: 229, heightMm: 159), "\(String(describing: a16))")
+        precondition(DeviceDisplayIdentity.lookup("").panelSizeMm(nativePixels: (long: 2360, short: 1640)) == nil)
         for unknown in ["iPhone17,1", "Mac15,1", "iPad99,99", "arm64", ""] {
             precondition(DeviceDisplayIdentity.lookup(unknown).name == "Screx")
             precondition(DeviceDisplayIdentity.lookup(unknown).edidName == "Screx")
             precondition(DeviceDisplayIdentity.lookup(unknown).diagonalInches == nil)
+            precondition(DeviceDisplayIdentity.lookup(unknown).panelSizeMm(nativePixels: (long: 2360, short: 1640)) == nil)
         }
         print("Device display identity tests passed: 107 hardware identifiers")
     }

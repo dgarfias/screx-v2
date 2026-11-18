@@ -162,7 +162,7 @@ enum StreamResolutionPreset: String, CaseIterable, Identifiable {
     /// derived once from `UIScreen.main.nativeBounds` (a pixel size, not points).
     /// Cached because `UIScreen.main` access and the width/height normalization never
     /// change for the lifetime of the process.
-    private static let nativeResolution: (width: Int, height: Int) = {
+    static let nativeResolution: (width: Int, height: Int) = {
         let bounds = UIScreen.main.nativeBounds
         let long = Int(max(bounds.width, bounds.height))
         let short = Int(min(bounds.width, bounds.height))
@@ -1299,8 +1299,6 @@ final class StreamViewModel: ObservableObject {
         cameraCapture.compressionQuality = networkCameraCompressionQuality
     }
 
-    /// Starts connecting to a typed address. Returns false with the reason in `status` when the
-    /// address is invalid.
     /// Connects to an address from New Host with the settings chosen there. An address that
     /// matches a saved tile connects through that tile (and its pairing), taking the new
     /// settings; anything else starts a new tile, saved after its first successful connection.
