@@ -693,10 +693,9 @@ async fn application(
                         matches!(message[0], 0x10..=0x15),
                         "non-input message on input stream"
                     );
-                    let shared = Arc::clone(&shared);
-                    tokio::task::spawn_blocking(move || {
-                        crate::stream_server::handle_control_message_data(&shared, session, &message);
-                    }).await?;
+                    // Input handlers only write to non-blocking uinput fds or enqueue onto
+                    // KeyboardWorker; running inline avoids per-event spawn_blocking jitter.
+                    crate::stream_server::handle_control_message_data(&shared, session, &message);
                 }
                 #[allow(unreachable_code)]
                 Ok::<(), anyhow::Error>(())

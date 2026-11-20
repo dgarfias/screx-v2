@@ -124,7 +124,7 @@ final class NetworkControlClient {
             guard let self, !self.isClosed, let control = self.session.control else { return }
             control.send(content: QUICFrame.encode(payload), completion: .contentProcessed { [weak self] error in
                 if error != nil { self?.session.close(); self?.handleDisconnect() }
-                else { self?.onTraffic?(payload.count + 4, 0) }
+                else { self?.onTraffic?(0, payload.count + 4) }
             })
         }
     }

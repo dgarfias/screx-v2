@@ -414,6 +414,8 @@ pub struct SharedState {
     /// Names the speaker and microphone cards: the iPad model the client sent in `SETTINGS`,
     /// like the monitor. Waited on with `audio_notify`.
     pub audio_device_name: Mutex<String>,
+    /// Network session ID for which `SETTINGS` has populated `audio_device_name`.
+    pub audio_device_name_session: AtomicU64,
     pub network_session_busy: AtomicBool,
     pub network_session_id: AtomicU64,
     network_session_closing: AtomicBool,
@@ -470,6 +472,7 @@ impl SharedState {
             audio_bitrate_bps: AtomicU32::new(128_000),
             audio_reports: Mutex::new(VecDeque::new()),
             audio_device_name: Mutex::new("iPad".into()),
+            audio_device_name_session: AtomicU64::new(0),
             network_session_busy: AtomicBool::new(false),
             network_session_id: AtomicU64::new(0),
             network_session_closing: AtomicBool::new(false),
@@ -821,6 +824,8 @@ fn apply_requested_settings(shared: &Arc<SharedState>, session: u64, body: &[u8]
         // Cards plugged in from now on are named like the monitor.
         *shared.audio_device_name.lock().unwrap() =
             String::from_utf8_lossy(&name).trim_end().to_string();
+        shared.audio_device_name_session.store(session, Ordering::Release);
+        shared.audio_notify.notify_all();
     }
 
     let (lock, cvar) = &*shared.pending_settings;

@@ -74,24 +74,14 @@ enum ReedSolomonDecoder {
             presentData.append(shards[idx]!)
         }
 
-        // Recover missing data shards (indices < dataCount)
+        // Recover missing data shards (indices < dataCount).
+        // Callers only consume data shards, so skip reconstructing missing parity shards.
         for missingIdx in missingIndices where missingIdx < dataCount {
             var recovered = Data(repeating: 0, count: shardSize)
             for j in 0..<dataCount {
                 let coeff = invMatrix[missingIdx][j]
                 if coeff == 0 { continue }
                 gf_mul_add(&recovered, presentData[j], coeff)
-            }
-            shards[missingIdx] = recovered
-        }
-
-        // Recover missing parity shards (indices >= dataCount) — reconstruct from data
-        for missingIdx in missingIndices where missingIdx >= dataCount {
-            var recovered = Data(repeating: 0, count: shardSize)
-            for j in 0..<dataCount {
-                let coeff = codingMatrix[missingIdx][j]
-                if coeff == 0 { continue }
-                gf_mul_add(&recovered, shards[j]!, coeff)
             }
             shards[missingIdx] = recovered
         }
@@ -171,6 +161,7 @@ enum ReedSolomonDecoder {
     // MARK: - Coding matrix (Vandermonde / Cauchy, compatible with reed-solomon-erasure)
 
     private static var matrixCache: [UInt64: [[UInt8]]] = [:]
+    private static let matrixCacheMaxEntries = 64
 
     /// Cache key for an inverted decode sub-matrix.
     /// `usedIndices` is the ordered set of present data shards used to build the
@@ -191,6 +182,9 @@ enum ReedSolomonDecoder {
         let key = UInt64(dataCount) << 32 | UInt64(parityCount)
         if let cached = matrixCache[key] { return cached }
         let matrix = buildCodingMatrix(dataCount: dataCount, parityCount: parityCount)
+        if matrixCache.count >= matrixCacheMaxEntries {
+            matrixCache.removeAll(keepingCapacity: true)
+        }
         matrixCache[key] = matrix
         return matrix
     }

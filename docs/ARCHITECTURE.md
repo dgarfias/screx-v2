@@ -124,11 +124,11 @@ UDP 9000.
 - RFC 9221 datagrams carry video, speaker audio, microphone, camera and audio reports. They are
   never retransmitted.
 - QUIC owns encryption, replay protection, retransmission of stream data, flow and congestion
-  control, path validation and liveness. The daemon sends a keep-alive every 2 s and both sides
+  control (BBR on the daemon), path validation and liveness. The daemon sends a keep-alive every 2 s and both sides
   close the connection after 15 s without traffic. Zero-RTT is disabled.
 - A stream is ordered, so a lost packet still delays later messages **on the same stream**.
-- QUIC's congestion controller is not a video rate controller; per-display encoder adaptation
-  stays PLI-driven.
+- Per-display encoder adaptation combines QUIC transport feedback (RTT inflation, `cwnd`/BDP, congestion
+  events, and send-buffer backpressure) with PLI recovery signals to adapt bitrate (down to 500 Kbps) and FPS.
 
 Network.framework opens an unused bootstrap stream before the control and input streams. The
 daemon allows three bidirectional streams, keeps that placeholder open, and authenticates the
@@ -248,26 +248,25 @@ Notes:
 - internal video uses display ID 0 and external video uses display ID 1 (flag `0x10`). Each
   has independent FEC, frame completion, PLI throttling, codec parameters, and decoder state.
   Only authenticated newer generations may reset those states; retired generations are ignored
-- video is split into chunks of 1000 bytes, so a full datagram is 1022 bytes; this fits QUIC's
-  1200-byte minimum path size with room for its overhead, and both peers check at connection
-  setup that the negotiated datagram limit can carry it. Every data chunk except a frame's last is full-size,
-  and parity chunks are always full-size (receivers zero-pad short chunks before FEC recovery)
+- video is split into chunks sized to the negotiated datagram limit (between 1000 and 1350 bytes);
+  1000 + 22 = 1022 bytes is the minimum required path size, checked at connection setup. Every data chunk except a frame's last is full-size,
+  and parity chunks are always full-size (receivers infer the frame's shard size and zero-pad short chunks before FEC recovery)
 - optional Reed-Solomon parity is added for video
 - a frame that fits in 255 data+parity chunks is one Reed-Solomon block. Larger frames (usually
   keyframes) are split into `n = ceil((total_data + total_parity) / 254)` blocks. Data chunks `0..total_data` and parity chunks `total_data..` are each divided
   into `n` contiguous runs as evenly as possible (earlier blocks take the extra chunk), and block
   `b`'s parity protects only block `b`'s data
-- frames larger than 48 chunks are paced: sent in batches of 8 spread across half the frame
-  interval rather than as one burst
+- large frames (and medium frames below 10 Mbps) are paced in small batches rather than sent as one burst
 - the daemon's QUIC datagram send buffer is 64 KB. When it fills, video waits (backpressure)
   instead of dropping chunks already queued, and part of the buffer is kept free for audio
-- audio goes without FEC; it carries redundant copies of earlier packets instead. Speaker audio is
+- audio goes without FEC; it carries adaptive redundant copies of earlier packets when loss is observed. Speaker audio is
   one datagram per frame_id (always `chunk_idx` 0, `total_data` 1), each holding the 10 ms Opus
-  packet with that frame_id plus copies of earlier ones: 48 kHz stereo Opus at 96, 128 (default),
+  packet with that frame_id plus optional copies of earlier ones: 48 kHz stereo Opus at 48, 64, 96, 128 (default),
   192 or 256 kbps, selected in the host's settings. See "Speaker audio" below
 - client-to-daemon datagrams are `type(u8) + body`
-- the iPad retains incomplete video assemblies for 50 ms, then reconstructs recoverable frames
-  from parity or discards them and requests recovery
+- the iPad retains incomplete video assemblies with an adaptive inactivity timeout (minimum 80 ms,
+  scaling with measured RTT and jitter) and briefly holds out-of-order frames before declaring a gap,
+  then reconstructs recoverable frames from parity or discards them and requests recovery via a `PLI` datagram
 
 ### Network Control and Input Transport (QUIC streams)
 
@@ -323,6 +322,7 @@ bitrate/FEC tuning is independent per display.
 | `0x02` | CAMERA | `frame_id(u32) + chunk_idx(u16) + total_chunks(u16) + jpeg_chunk` |
 | `0x03` | MIC | `seq(u32) + opus_packet` |
 | `0x04` | AUDIO_REPORT | speaker playout report, see "Speaker audio" below |
+| `0x05` | PLI | `display_id(u8) + generation(u32)` (preferred over control-stream `PLI`) |
 
 ## Capability Negotiation
 
@@ -369,7 +369,7 @@ Offsets are within the body, after the type byte.
 | 20 | internal_display_name | 13 ASCII bytes | space-padded EDID name, required |
 | 33 | internal_width_mm | u16 | 0 = unknown physical panel size |
 | 35 | internal_height_mm | u16 | 0 = unknown physical panel size |
-| 37 | audio_bitrate | u32 (bps) | 0 = 128000; otherwise 96000, 128000, 192000 or 256000 |
+| 37 | audio_bitrate | u32 (bps) | 0 = 128000; otherwise 48000, 64000, 96000, 128000, 192000 or 256000 |
 
 The iPad's "Daemon default" options map to these values; the daemon then uses its CLI-configured
 default for that field.
@@ -570,9 +570,9 @@ The first entry has distance 0 and is the packet named by the header's `frame_id
 `timestamp_ms - 10 * distance`. Distances strictly increase and are at most 8. The daemon only
 includes copies of packets it actually sent in the current speaker-card session (each one starts a new
 generation), and drops copies that would not fit in one datagram. Speaker frame IDs are consecutive within a generation, so a
-missing ID is a lost packet. The redundancy level follows the iPad's reports: distance 1 always,
-plus distance 3 for 10 s after the iPad reports a burst of 2 or more consecutive losses. Copies at
-distances 1 and 3 recover any burst of up to 3 lost packets.
+missing ID is a lost packet. The redundancy level follows the iPad's reports: none on a clean link,
+distance 1 for 10 s after any primary packet loss, and distances 1 and 3 for 10 s after a burst of 2
+or more consecutive losses. Copies at distances 1 and 3 recover any burst of up to 3 lost packets.
 
 The iPad keeps a jitter buffer of Opus packets ordered by packet ID and decodes each packet when it
 is due to play, so late packets never play out of order and delay can't build up:

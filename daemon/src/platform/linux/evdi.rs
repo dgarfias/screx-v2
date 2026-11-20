@@ -338,19 +338,21 @@ impl DisplayBackend for EvdiDisplay {
                     evdi_grab_pixels(handle, rects.as_mut_ptr(), &mut num_rects);
                 }
 
-                let frame = CaptureFrame {
-                    width: self.width,
-                    height: self.height,
-                    data: &pixel_buf,
-                };
+                if num_rects > 0 || !has_first_frame || refresh_retries > 0 {
+                    let frame = CaptureFrame {
+                        width: self.width,
+                        height: self.height,
+                        data: &pixel_buf,
+                    };
 
-                on_frame(frame);
-                stats_frames += 1;
-                has_first_frame = true;
+                    on_frame(frame);
+                    stats_frames += 1;
+                    has_first_frame = true;
 
-                if refresh_retries > 0 {
-                    crate::log_detail!("[capture] force refresh: got real frame from compositor");
-                    refresh_retries = 0;
+                    if refresh_retries > 0 {
+                        crate::log_detail!("[capture] force refresh: got real frame from compositor");
+                        refresh_retries = 0;
+                    }
                 }
             } else {
                 no_update_count += 1;

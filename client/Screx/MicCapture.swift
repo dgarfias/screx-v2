@@ -8,7 +8,10 @@ final class MicCapture {
     private let opusFrameSize: Int = 960 // 20ms at 48kHz
 
     private var sampleAccumulator: [Float] = []
+    private var accumulatorReadIndex: Int = 0
     private let accumulatorLock = NSLock()
+    private var encodeBuffer: AVAudioPCMBuffer?
+    private var encodedScratch = Data(count: 4000)
 
     var onOpusPacket: ((Data) -> Void)?
 
@@ -31,6 +34,10 @@ final class MicCapture {
             )!
 
             opusEncoder = try Opus.Encoder(format: opusFormat, application: .voip)
+            encodeBuffer = AVAudioPCMBuffer(pcmFormat: opusFormat, frameCapacity: AVAudioFrameCount(opusFrameSize))
+            encodeBuffer?.frameLength = AVAudioFrameCount(opusFrameSize)
+            sampleAccumulator.reserveCapacity(opusFrameSize * 4)
+            accumulatorReadIndex = 0
 
             // Tap format: mono Float32 at hardware sample rate
             // (iOS requires tap sample rate == hardware sample rate)
@@ -67,9 +74,11 @@ final class MicCapture {
         captureEngine.stop()
         isRunning = false
         accumulatorLock.lock()
-        sampleAccumulator.removeAll()
+        sampleAccumulator.removeAll(keepingCapacity: true)
+        accumulatorReadIndex = 0
         accumulatorLock.unlock()
         opusEncoder = nil
+        encodeBuffer = nil
         print("[mic] capture stopped")
     }
 
@@ -108,40 +117,35 @@ final class MicCapture {
         accumulatorLock.lock()
         sampleAccumulator.append(contentsOf: samples)
 
-        while sampleAccumulator.count >= opusFrameSize {
-            let frame = Array(sampleAccumulator.prefix(opusFrameSize))
-            sampleAccumulator.removeFirst(opusFrameSize)
+        while sampleAccumulator.count - accumulatorReadIndex >= opusFrameSize {
+            let start = accumulatorReadIndex
+            accumulatorReadIndex += opusFrameSize
+            if let buffer = encodeBuffer, let channelData = buffer.floatChannelData?[0] {
+                sampleAccumulator.withUnsafeBufferPointer { raw in
+                    if let base = raw.baseAddress {
+                        channelData.update(from: base + start, count: opusFrameSize)
+                    }
+                }
+            }
+            if accumulatorReadIndex >= opusFrameSize * 4 {
+                sampleAccumulator.removeFirst(accumulatorReadIndex)
+                accumulatorReadIndex = 0
+            }
             accumulatorLock.unlock()
 
-            encodeAndSend(frame)
+            encodeAndSend()
 
             accumulatorLock.lock()
         }
         accumulatorLock.unlock()
     }
 
-    private func encodeAndSend(_ samples: [Float]) {
-        guard let encoder = opusEncoder else { return }
-
-        let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: opusSampleRate,
-            channels: 1,
-            interleaved: false
-        )!
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(opusFrameSize)) else { return }
-        buffer.frameLength = AVAudioFrameCount(opusFrameSize)
-
-        let channelData = buffer.floatChannelData![0]
-        for i in 0..<opusFrameSize {
-            channelData[i] = samples[i]
-        }
-
-        var encodedData = Data(count: 4000)
+    private func encodeAndSend() {
+        guard let encoder = opusEncoder, let buffer = encodeBuffer else { return }
+        if encodedScratch.count < 4000 { encodedScratch.count = 4000 }
         do {
-            let encodedLen = try encoder.encode(buffer, to: &encodedData)
-            onOpusPacket?(encodedData.prefix(encodedLen))
+            let encodedLen = try encoder.encode(buffer, to: &encodedScratch)
+            onOpusPacket?(Data(encodedScratch.prefix(encodedLen)))
         } catch {
             print("[mic] opus encode error: \(error)")
         }

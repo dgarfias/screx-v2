@@ -35,8 +35,10 @@ impl V4l2Camera {
 
 impl CameraBackend for V4l2Camera {
     fn start(&mut self, w: u32, h: u32, fps: u32) -> Result<()> {
-        ensure_v4l2loopback(self.exclusive_caps)?;
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if ensure_v4l2loopback(self.exclusive_caps)? {
+            // Give udev a moment only when we just loaded the module.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
 
         let device = std::ffi::CString::new(VIDEO_DEVICE).unwrap();
         let fd = unsafe {
@@ -90,9 +92,10 @@ impl CameraBackend for V4l2Camera {
     }
 }
 
-fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
+/// Returns `true` if the module was freshly loaded, `false` if already present.
+fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<bool> {
     if std::path::Path::new(VIDEO_DEVICE).exists() {
-        return Ok(());
+        return Ok(false);
     }
 
     let exclusive_caps_arg = if exclusive_caps {
@@ -129,5 +132,5 @@ fn ensure_v4l2loopback(exclusive_caps: bool) -> Result<()> {
     }
 
     crate::log_detail!("[camera] v4l2loopback loaded, {VIDEO_DEVICE} ready");
-    Ok(())
+    Ok(true)
 }

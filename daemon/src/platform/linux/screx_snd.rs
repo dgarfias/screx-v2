@@ -29,6 +29,9 @@ struct CreateRequest {
 /// `_IOW('X', 0x01, struct screx_snd_create)`.
 const IOC_CREATE: u32 =
     (1 << 30) | ((std::mem::size_of::<CreateRequest>() as u32) << 16) | ((b'X' as u32) << 8) | 0x01;
+/// `_IOW('X', 0x02, __u32)`.
+const IOC_SET_DELAY: u32 =
+    (1 << 30) | ((std::mem::size_of::<u32>() as u32) << 16) | ((b'X' as u32) << 8) | 0x02;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Direction {
@@ -70,6 +73,18 @@ impl Card {
     /// Microphone: supplies audio for applications to record. Dropped if nobody records.
     pub fn write(&mut self, buf: &[u8]) -> Result<()> {
         self.file.write_all(buf).context("write microphone audio")
+    }
+
+    /// Reports additional downstream delay (network + client playout buffer), in frames,
+    /// so desktop video players can maintain accurate A/V lip-sync.
+    pub fn set_delay_frames(&self, frames: u32) -> Result<()> {
+        let clamped = frames.min(10 * RATE);
+        // SAFETY: `clamped` is a plain u32 matching `SCREX_SND_IOC_SET_DELAY`.
+        let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), IOC_SET_DELAY as _, &clamped) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("set speaker delay");
+        }
+        Ok(())
     }
 }
 
@@ -117,6 +132,8 @@ mod tests {
         // _IOW('X', 0x01, struct screx_snd_create) with a 92-byte struct.
         assert_eq!(std::mem::size_of::<CreateRequest>(), 92);
         assert_eq!(IOC_CREATE, 0x405c_5801);
+        // _IOW('X', 0x02, __u32) with a 4-byte u32.
+        assert_eq!(IOC_SET_DELAY, 0x4004_5802);
     }
 
     #[test]

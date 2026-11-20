@@ -419,7 +419,10 @@ pub fn run_speaker(shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()
     while !stop.load(Ordering::Relaxed) {
         let name = {
             let name = shared.audio_device_name.lock().unwrap();
-            if !speakers_on() {
+            let current_session = shared.network_session_id.load(Ordering::Acquire);
+            let name_ready = current_session != 0
+                && shared.audio_device_name_session.load(Ordering::Acquire) == current_session;
+            if !speakers_on() || !name_ready {
                 let _ = shared
                     .audio_notify
                     .wait_timeout(name, Duration::from_millis(200));
@@ -453,9 +456,10 @@ pub fn run_speaker(shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()
         };
         crate::log_detail!("[audio] speaker card '{name}' plugged in");
         // A fresh sender per card session: a new generation, and no copies of earlier audio.
-        let mut sender = AudioSender::from_quic(media);
+        let mut sender = AudioSender::from_quic(media.clone());
         shared.audio_reports.lock().unwrap().clear();
         let mut control = SpeakerControl::default();
+        let mut last_delay_frames: u32 = 0;
         let mut last_log = Instant::now();
         let mut chunk = [0u8; BYTES_PER_CHUNK];
         let mut next = Instant::now();
@@ -472,9 +476,22 @@ pub fn run_speaker(shared: Arc<SharedState>, stop: Arc<AtomicBool>) -> Result<()
 
             let now = Instant::now();
             let generation = sender.generation();
+            let mut latest_depth_us = None;
             for report in shared.audio_reports.lock().unwrap().drain(..) {
                 if report.generation == generation {
+                    latest_depth_us = Some(report.depth_us);
                     control.on_report(&report, now);
+                }
+            }
+            if let Some(depth_us) = latest_depth_us {
+                let one_way_s = media
+                    .transport_feedback()
+                    .map_or(0.0, |fb| fb.rtt.as_secs_f64() * 0.5);
+                let total_s = f64::from(depth_us) / 1_000_000.0 + one_way_s;
+                let frames = (total_s * f64::from(SAMPLE_RATE)).round().clamp(0.0, f64::from(10 * SAMPLE_RATE)) as u32;
+                if frames.abs_diff(last_delay_frames) >= 48 {
+                    let _ = card.set_delay_frames(frames);
+                    last_delay_frames = frames;
                 }
             }
             if now - last_log >= Duration::from_secs(5) {
