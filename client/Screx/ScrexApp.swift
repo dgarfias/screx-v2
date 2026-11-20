@@ -287,6 +287,7 @@ enum StreamCodecPreset: String, CaseIterable, Identifiable {
 /// `HostStreamSettings.customBitrateMbps` instead (see `HostStreamSettings.bitrateBps`).
 enum StreamBitratePreset: String, CaseIterable, Identifiable {
     case daemonDefault = "default"
+    case veryLow = "verylow"
     case low = "low"
     case medium = "medium"
     case high = "high"
@@ -298,6 +299,7 @@ enum StreamBitratePreset: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .daemonDefault: return "Host default"
+        case .veryLow: return "Very low (1 Mbps)"
         case .low: return "Low (3 Mbps)"
         case .medium: return "Medium (8 Mbps)"
         case .high: return "High (15 Mbps)"
@@ -309,6 +311,7 @@ enum StreamBitratePreset: String, CaseIterable, Identifiable {
     var bitrateBps: UInt32? {
         switch self {
         case .daemonDefault: return nil
+        case .veryLow: return 1_000_000
         case .low: return 3_000_000
         case .medium: return 8_000_000
         case .high: return 15_000_000
@@ -1434,6 +1437,10 @@ final class StreamViewModel: ObservableObject {
                         guard let self, let control else { return }
                         guard self.networkControl === control else { return }
                         self.stats.setLatency(rtt: Self.formatLatency(rttMs), jitter: Self.formatLatency(jitterMs))
+                        self.stream?.updateNetworkStats(rttMs: rttMs, jitterMs: jitterMs)
+                        let constrained = rttMs > 60 || jitterMs > 25
+                        self.cameraCapture.compressionQuality = constrained ? 0.25 : networkCameraCompressionQuality
+                        self.cameraCapture.frameSkipFactor = constrained ? 2 : 1
                     }
                 }
                 self.beginCapabilityNegotiation(transport: .network)

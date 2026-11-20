@@ -62,6 +62,11 @@ struct VideoStreamTimeline {
         lastCompletedFrameID.map { frameID > $0 } ?? true
     }
 
+    /// True if delivering `frameID` now would skip at least one earlier frame ID.
+    func wouldSkip(_ frameID: UInt32) -> Bool {
+        lastCompletedFrameID.map { frameID > $0 + 1 } ?? false
+    }
+
     /// Call only for a successfully reassembled, newer frame. Returns whether frames were lost.
     mutating func complete(_ frameID: UInt32) -> Bool {
         let gap = lastCompletedFrameID.map { frameID > $0 && frameID - $0 > 1 } ?? false

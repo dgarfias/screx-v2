@@ -84,6 +84,9 @@ impl Identity {
         transport.datagram_receive_buffer_size(Some(256 * 1024));
         // Keep the datagram send backlog small: obsolete video must not accumulate.
         transport.datagram_send_buffer_size(64 * 1024);
+        // BBR tolerates random cellular packet loss without halving cwnd and avoids
+        // filling bottleneck queues (bufferbloat), while saturating LAN links cleanly.
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         server.transport_config(Arc::new(transport));
         let socket = socket2::Socket::new(
             socket2::Domain::for_address(address),
@@ -337,6 +340,16 @@ async fn authentication_stream(connection: &Connection) -> Result<Authentication
     }
 }
 
+/// Snapshot of QUIC path metrics used by adaptive video rate control.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportFeedback {
+    pub rtt: Duration,
+    pub min_rtt: Duration,
+    pub cwnd: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+}
+
 /// Session-bound handle for synchronous capture/audio workers.
 /// QUIC owns the socket, TLS keys, congestion control and connection migration.
 #[derive(Clone)]
@@ -369,6 +382,17 @@ impl MediaTransport {
             .as_ref()
             .map_or(1200, |c| c.max_datagram_size().unwrap_or(0))
     }
+    pub fn transport_feedback(&self) -> Option<TransportFeedback> {
+        let connection = self.connection.as_ref()?;
+        let stats = connection.stats();
+        Some(TransportFeedback {
+            rtt: stats.path.rtt,
+            min_rtt: stats.path.min_rtt,
+            cwnd: stats.path.cwnd,
+            lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events,
+        })
+    }
     pub fn send(&self, body: &[u8]) -> Result<()> {
         ensure!(
             body.len() <= self.max_datagram_size(),
@@ -387,8 +411,13 @@ impl MediaTransport {
     }
     /// Capture workers run on dedicated OS threads. Backpressure them rather
     /// than evicting earlier shards from the QUIC send buffer. Reserve room for
-    /// audio; sound must not wait behind an entire keyframe.
-    pub fn send_video(&self, body: &[u8], stop: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    /// audio; sound must not wait behind an entire keyframe. Returns how long
+    /// the call blocked waiting for send buffer space.
+    pub fn send_video(
+        &self,
+        body: &[u8],
+        stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Duration> {
         let check_stop = || {
             ensure!(
                 !stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
@@ -397,16 +426,25 @@ impl MediaTransport {
             Ok::<_, anyhow::Error>(())
         };
         check_stop()?;
+        let mut waited = Duration::ZERO;
         if let Some(connection) = &self.connection {
+            let mut wait_start: Option<std::time::Instant> = None;
             while connection.datagram_send_buffer_space() < body.len() + 8192 {
+                if wait_start.is_none() {
+                    wait_start = Some(std::time::Instant::now());
+                }
                 check_stop()?;
                 if let Some(error) = connection.close_reason() {
                     return Err(error.into());
                 }
                 std::thread::sleep(Duration::from_micros(200));
             }
+            if let Some(start) = wait_start {
+                waited = start.elapsed();
+            }
         }
-        self.send(body)
+        self.send(body)?;
+        Ok(waited)
     }
     pub fn close(&self) {
         if let Some(connection) = &self.connection {
@@ -704,6 +742,12 @@ async fn application(
                                 reports.pop_front();
                             }
                             reports.push_back(report);
+                        }
+                    }
+                    protocol::datagram::PLI if body.len() == 5 => {
+                        if let Some(display) = crate::capture::DisplayId::from_wire(body[0]) {
+                            let generation = u32::from_be_bytes(body[1..5].try_into().unwrap());
+                            shared.display_stream(display).request_keyframe(generation);
                         }
                     }
                     _ => {}

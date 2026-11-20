@@ -132,13 +132,18 @@ nonisolated final class QUICSession: @unchecked Sendable {
         media.start(queue: queue)
     }
 
-    func sendInput(_ payload: Data) {
+    func sendInput(_ payload: Data, completion: (() -> Void)? = nil) {
         queue.async { [weak self] in
-            guard let self, !self.closed, let input = self.input else { return }
+            guard let self, !self.closed, let input = self.input else {
+                completion?()
+                return
+            }
             guard !payload.isEmpty, payload.count <= QUICFrame.maxLength else {
+                completion?()
                 self.fail("Input message exceeds the protocol limit"); return
             }
             input.send(content: QUICFrame.encode(payload), completion: .contentProcessed { [weak self] error in
+                completion?()
                 if let error { self?.fail(error.localizedDescription) }
             })
         }

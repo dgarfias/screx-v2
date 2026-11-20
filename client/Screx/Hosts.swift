@@ -54,12 +54,16 @@ struct RecentConnection: Codable, Identifiable, Equatable {
 
 /// Speaker-audio presets, persisted and sent by the iPad like video bitrate presets.
 enum AudioBitratePreset: String, CaseIterable, Identifiable {
+    case ultraLow = "ultralow"
+    case veryLow = "verylow"
     case low, medium, high
     case veryHigh = "veryhigh"
 
     var id: String { rawValue }
     var bitrateBps: UInt32 {
         switch self {
+        case .ultraLow: return 48_000
+        case .veryLow: return 64_000
         case .low: return 96_000
         case .medium: return 128_000
         case .high: return 192_000
@@ -68,6 +72,8 @@ enum AudioBitratePreset: String, CaseIterable, Identifiable {
     }
     var label: String {
         switch self {
+        case .ultraLow: return "Ultra low (48 kbps)"
+        case .veryLow: return "Very low (64 kbps)"
         case .low: return "Low (96 kbps)"
         case .medium: return "Medium (128 kbps)"
         case .high: return "High (192 kbps)"

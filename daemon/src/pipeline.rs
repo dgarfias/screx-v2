@@ -27,6 +27,10 @@ impl FrameRateGate {
         }
     }
 
+    fn set_fps(&mut self, fps: u32) {
+        self.interval = Duration::from_nanos(1_000_000_000 / u64::from(fps.clamp(1, 1_000_000_000)));
+    }
+
     fn admit(&mut self, now: Instant, force: bool) -> bool {
         if force || self.next.is_none() {
             self.next = Some(now + self.interval);
@@ -68,7 +72,12 @@ impl CaptureWorker {
         settings: OutputSettings,
         config: &crate::AppConfig,
     ) -> Result<Self> {
-        let control = Arc::new(DisplayStreamControl::new(settings.bitrate_bps));
+        let control = Arc::new(DisplayStreamControl::with_output(
+            settings.bitrate_bps,
+            settings.fps,
+            settings.width,
+            settings.height,
+        ));
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
@@ -128,6 +137,7 @@ impl CaptureWorker {
                         let mut dump_capture = dump_count("SCREX_DUMP_CAPTURE_FRAMES");
                         let mut dump_au = dump_count("SCREX_DUMP_SENT_AUS");
                         let mut frame_gate = FrameRateGate::new(settings.fps);
+                        let mut current_fps = settings.fps;
                         let mut consecutive_errors = 0;
                         let mut pipeline_error = None;
                         backend.run_capture_loop(&stop, &control.force_refresh, &mut |frame| {
@@ -154,6 +164,11 @@ impl CaptureWorker {
                             let force_idr = control.force_idr.swap(false, Ordering::Relaxed);
                             let timestamp = shared.start_time.elapsed().as_millis() as u32;
                             let tuning = control.tuning();
+                            if tuning.target_fps != current_fps {
+                                current_fps = tuning.target_fps;
+                                frame_gate.set_fps(current_fps);
+                                sender.set_session(current_fps);
+                            }
                             if tuning.bitrate_bps != encoder.bitrate_bps() {
                                 if let Err(e) = encoder.reconfigure_bitrate(tuning.bitrate_bps) {
                                     eprintln!(
@@ -177,7 +192,12 @@ impl CaptureWorker {
                                             );
                                             dump_au -= 1;
                                         }
-                                        sender.send_frame(unit, timestamp, codec, tuning)?;
+                                        let (_, send_wait) =
+                                            sender.send_frame(unit, timestamp, codec, tuning)?;
+                                        control.note_transport(
+                                            sender.transport_feedback(),
+                                            send_wait,
+                                        );
                                         if unit.is_idr {
                                             ready.store(true, Ordering::Release);
                                         }

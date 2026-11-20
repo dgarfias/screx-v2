@@ -67,8 +67,8 @@ struct Cli {
     #[arg(short = 'f', long = "max-framerate", default_value_t = 60)]
     max_framerate: u32,
 
-    /// Keyframe interval (in frames)
-    #[arg(short, long, default_value_t = 90)]
+    /// Keyframe interval in frames (0 = PLI-only / infinite GOP, recommended)
+    #[arg(short, long, default_value_t = 0)]
     keyframe: u32,
 
     /// Replace periodic IDR keyframes with rolling intra-refresh where the
@@ -172,7 +172,7 @@ impl AppConfig {
             width: cli.max_width,
             height: cli.max_height,
             fps: cli.max_framerate,
-            gop: cli.keyframe.max(10),
+            gop: if cli.keyframe == 0 { 0 } else { cli.keyframe.max(10) },
             bitrate_bps: cli.max_bitrate,
             intra_refresh: cli.intra_refresh,
             stream_port: cli.port,

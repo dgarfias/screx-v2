@@ -46,6 +46,9 @@ pub mod datagram {
     pub const MIC: u8 = 0x03;
     /// Speaker playout report, see `audio::AudioReport`.
     pub const AUDIO_REPORT: u8 = 0x04;
+    /// Keyframe request (PLI) over datagram to avoid control-stream HoL blocking:
+    /// `display_id(u8) + generation(u32)`.
+    pub const PLI: u8 = 0x05;
 }
 
 /// Fixed-layout field values shared by `CAPS` and `SETTINGS`.

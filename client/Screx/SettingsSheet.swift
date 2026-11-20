@@ -120,7 +120,7 @@ struct HostSettingsSheet: View, Equatable {
                 } footer: {
                     VStack(alignment: .leading, spacing: 6) {
                         warning(unsupportedEncoding)
-                        Text("Higher bitrates require a stronger network connection.")
+                        Text("Used as the target bitrate; adapts down automatically on weaker connections.")
                     }
                 }
             }

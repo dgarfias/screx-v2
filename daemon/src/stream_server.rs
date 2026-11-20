@@ -17,6 +17,7 @@ use crate::input::{
 };
 
 const CHUNK_PAYLOAD: usize = crate::quic_transport::CHUNK_PAYLOAD;
+const MAX_CHUNK_PAYLOAD: usize = 1350;
 use crate::protocol::MEDIA_HEADER_LEN as HEADER_LEN;
 use crate::protocol;
 
@@ -42,7 +43,7 @@ const PACING_BATCH_SIZE: usize = 8;
 /// rest of the interval for the next frame's capture/encode.
 const PACING_SPREAD_NUM: u64 = 1;
 const PACING_SPREAD_DEN: u64 = 2;
-const MAX_PACKET_LEN: usize = HEADER_LEN + CHUNK_PAYLOAD;
+const MAX_PACKET_LEN: usize = HEADER_LEN + MAX_CHUNK_PAYLOAD;
 const IDR_FEC_PERCENT: usize = 10;
 const PFRAME_FEC_PERCENT: usize = 5;
 const MODERATE_IDR_FEC_PERCENT: usize = 14;
@@ -82,6 +83,7 @@ pub fn take_session_messages<T>(queue: &mut VecDeque<(u64, T)>, session: u64) ->
 #[derive(Debug, Clone, Copy)]
 pub struct StreamTuning {
     pub bitrate_bps: u32,
+    pub target_fps: u32,
     pub idr_fec_percent: usize,
     pub pframe_fec_percent: usize,
 }
@@ -90,35 +92,102 @@ pub struct StreamTuning {
 struct AdaptiveStreamState {
     base_bitrate_bps: u32,
     current_bitrate_bps: u32,
+    base_fps: u32,
+    current_fps: u32,
+    width: u32,
+    height: u32,
     idr_fec_percent: usize,
     pframe_fec_percent: usize,
     pli_events: VecDeque<Instant>,
     last_adjust_at: Instant,
+    // Transport feedback accumulated between adjustment ticks.
+    has_transport_baseline: bool,
+    last_congestion_events: u64,
+    last_lost_packets: u64,
+    window_congestion_events: u64,
+    window_lost_packets: u64,
+    window_max_send_wait_ms: f64,
+    window_max_rtt_inflation_ms: f64,
+    last_bdp_bps: Option<u32>,
 }
 
 impl AdaptiveStreamState {
-    fn new(base_bitrate_bps: u32) -> Self {
+    fn new(base_bitrate_bps: u32, base_fps: u32, width: u32, height: u32) -> Self {
+        let fps = base_fps.max(SETTINGS_FPS_FLOOR);
         Self {
             base_bitrate_bps,
             current_bitrate_bps: base_bitrate_bps,
+            base_fps: fps,
+            current_fps: fps,
+            width: width.max(1),
+            height: height.max(1),
             idr_fec_percent: IDR_FEC_PERCENT,
             pframe_fec_percent: PFRAME_FEC_PERCENT,
             pli_events: VecDeque::new(),
             last_adjust_at: Instant::now(),
+            has_transport_baseline: false,
+            last_congestion_events: 0,
+            last_lost_packets: 0,
+            window_congestion_events: 0,
+            window_lost_packets: 0,
+            window_max_send_wait_ms: 0.0,
+            window_max_rtt_inflation_ms: 0.0,
+            last_bdp_bps: None,
         }
     }
 
     fn reset(&mut self) {
         self.current_bitrate_bps = self.base_bitrate_bps;
+        self.current_fps = self.base_fps;
         self.idr_fec_percent = IDR_FEC_PERCENT;
         self.pframe_fec_percent = PFRAME_FEC_PERCENT;
         self.pli_events.clear();
         self.last_adjust_at = Instant::now();
+        self.has_transport_baseline = false;
+        self.window_congestion_events = 0;
+        self.window_lost_packets = 0;
+        self.window_max_send_wait_ms = 0.0;
+        self.window_max_rtt_inflation_ms = 0.0;
+        self.last_bdp_bps = None;
     }
 
     fn note_pli(&mut self, now: Instant) {
         self.pli_events.push_back(now);
         self.prune(now);
+    }
+
+    fn note_transport(
+        &mut self,
+        feedback: Option<crate::quic_transport::TransportFeedback>,
+        send_wait: Duration,
+    ) {
+        let wait_ms = send_wait.as_secs_f64() * 1000.0;
+        if wait_ms > self.window_max_send_wait_ms {
+            self.window_max_send_wait_ms = wait_ms;
+        }
+        let Some(fb) = feedback else { return };
+        if self.has_transport_baseline {
+            self.window_congestion_events +=
+                fb.congestion_events.saturating_sub(self.last_congestion_events);
+            self.window_lost_packets += fb.lost_packets.saturating_sub(self.last_lost_packets);
+        } else {
+            self.has_transport_baseline = true;
+        }
+        self.last_congestion_events = fb.congestion_events;
+        self.last_lost_packets = fb.lost_packets;
+
+        if !fb.min_rtt.is_zero() && fb.rtt >= fb.min_rtt {
+            let inflation_ms = (fb.rtt - fb.min_rtt).as_secs_f64() * 1000.0;
+            if inflation_ms > self.window_max_rtt_inflation_ms {
+                self.window_max_rtt_inflation_ms = inflation_ms;
+            }
+        }
+        if !fb.rtt.is_zero() && fb.cwnd > 0 {
+            let bdp_bps = ((fb.cwnd as f64) * 8.0 / fb.rtt.as_secs_f64())
+                .clamp(f64::from(SETTINGS_BITRATE_FLOOR_BPS), f64::from(u32::MAX))
+                as u32;
+            self.last_bdp_bps = Some(bdp_bps);
+        }
     }
 
     fn current_tuning(&mut self, now: Instant) -> StreamTuning {
@@ -130,6 +199,7 @@ impl AdaptiveStreamState {
 
         StreamTuning {
             bitrate_bps: self.current_bitrate_bps,
+            target_fps: self.current_fps,
             idr_fec_percent: self.idr_fec_percent,
             pframe_fec_percent: self.pframe_fec_percent,
         }
@@ -153,24 +223,61 @@ impl AdaptiveStreamState {
             .take_while(|ts| now.duration_since(**ts) <= ADAPTIVE_SHORT_WINDOW)
             .count();
         let long_pli = self.pli_events.len();
-        let min_bitrate_bps = (self.base_bitrate_bps / 3).max(2_000_000).min(self.base_bitrate_bps);
+        let min_bitrate_bps = SETTINGS_BITRATE_FLOOR_BPS.min(self.base_bitrate_bps);
         let old_bitrate = self.current_bitrate_bps;
+        let old_fps = self.current_fps;
         let old_idr_fec = self.idr_fec_percent;
         let old_pframe_fec = self.pframe_fec_percent;
 
-        if recent_pli >= 2 || long_pli >= 4 {
-            self.current_bitrate_bps = (self.current_bitrate_bps.saturating_mul(80))
+        let send_wait_ms = self.window_max_send_wait_ms;
+        let rtt_inflation_ms = self.window_max_rtt_inflation_ms;
+        let congestion_events = self.window_congestion_events;
+        let lost_packets = self.window_lost_packets;
+        self.window_max_send_wait_ms = 0.0;
+        self.window_max_rtt_inflation_ms = 0.0;
+        self.window_congestion_events = 0;
+        self.window_lost_packets = 0;
+
+        let severe_congestion =
+            send_wait_ms >= 25.0 || (congestion_events > 0 && rtt_inflation_ms >= 30.0) || rtt_inflation_ms >= 80.0;
+        let mild_congestion =
+            send_wait_ms >= 8.0 || congestion_events > 0 || rtt_inflation_ms >= 40.0;
+
+        if severe_congestion {
+            // Bandwidth/queue exhaustion: cut bitrate aggressively and do NOT inflate FEC
+            // (adding parity onto a full pipe makes congestion worse).
+            let mut next = (self.current_bitrate_bps.saturating_mul(75))
+                .div_ceil(100)
+                .max(min_bitrate_bps);
+            if send_wait_ms >= 25.0 {
+                if let Some(bdp) = self.last_bdp_bps {
+                    let cap = (u64::from(bdp) * 85 / 100) as u32;
+                    next = next.min(cap.max(min_bitrate_bps));
+                }
+            }
+            self.current_bitrate_bps = next;
+            self.idr_fec_percent = if next <= 1_500_000 { 5 } else { IDR_FEC_PERCENT };
+            self.pframe_fec_percent = if next <= 1_500_000 { 0 } else { PFRAME_FEC_PERCENT };
+        } else if recent_pli >= 2 || long_pli >= 4 {
+            // Loss without heavy queue buildup: moderate bitrate drop + higher FEC for random loss.
+            self.current_bitrate_bps = (self.current_bitrate_bps.saturating_mul(85))
                 .div_ceil(100)
                 .max(min_bitrate_bps);
             self.idr_fec_percent = SEVERE_IDR_FEC_PERCENT;
             self.pframe_fec_percent = SEVERE_PFRAME_FEC_PERCENT;
+        } else if mild_congestion {
+            self.current_bitrate_bps = (self.current_bitrate_bps.saturating_mul(90))
+                .div_ceil(100)
+                .max(min_bitrate_bps);
+            self.idr_fec_percent = IDR_FEC_PERCENT;
+            self.pframe_fec_percent = PFRAME_FEC_PERCENT;
         } else if recent_pli >= 1 || long_pli >= 2 {
             self.current_bitrate_bps = (self.current_bitrate_bps.saturating_mul(90))
                 .div_ceil(100)
                 .max(min_bitrate_bps);
             self.idr_fec_percent = MODERATE_IDR_FEC_PERCENT;
             self.pframe_fec_percent = MODERATE_PFRAME_FEC_PERCENT;
-        } else {
+        } else if lost_packets == 0 {
             self.current_bitrate_bps = ((u64::from(self.current_bitrate_bps) * 110) / 100)
                 .min(u64::from(self.base_bitrate_bps))
                 as u32;
@@ -178,17 +285,48 @@ impl AdaptiveStreamState {
             self.pframe_fec_percent = PFRAME_FEC_PERCENT;
         }
 
+        // Dynamic FPS scaling under sustained low bits-per-pixel or send-buffer stalls.
+        // Never touches good connections where bitrate stays near base_bitrate_bps.
+        let pixels_per_frame = f64::from(self.width) * f64::from(self.height);
+        let bpp = f64::from(self.current_bitrate_bps) / (pixels_per_frame * f64::from(self.current_fps));
+        if (severe_congestion && (send_wait_ms >= 35.0 || bpp < 0.025))
+            || (mild_congestion && bpp < 0.015)
+        {
+            self.current_fps = match self.current_fps {
+                f if f > 30 => 30,
+                f if f > 20 => 20,
+                _ => SETTINGS_FPS_FLOOR,
+            }
+            .min(self.base_fps);
+        } else if !mild_congestion
+            && recent_pli == 0
+            && self.current_fps < self.base_fps
+            && (bpp > 0.045 || self.current_bitrate_bps >= self.base_bitrate_bps * 7 / 10)
+        {
+            self.current_fps = match self.current_fps {
+                f if f < 20 => 20,
+                f if f < 30 => 30,
+                _ => self.base_fps,
+            }
+            .min(self.base_fps);
+        }
+
         self.last_adjust_at = now;
 
         if self.current_bitrate_bps != old_bitrate
+            || self.current_fps != old_fps
             || self.idr_fec_percent != old_idr_fec
             || self.pframe_fec_percent != old_pframe_fec
         {
             crate::log_detail!(
-                "[stream/adapt] pli_short={} pli_long={} bitrate={} idr_fec={} p_fec={}",
+                "[stream/adapt] pli_short={} pli_long={} wait={:.1}ms rtt_inf={:.1}ms cong={} bitrate={} fps={} idr_fec={} p_fec={}",
                 recent_pli,
                 long_pli,
+                send_wait_ms,
+                rtt_inflation_ms,
+                congestion_events,
                 self.current_bitrate_bps,
+                self.current_fps,
                 self.idr_fec_percent,
                 self.pframe_fec_percent
             );
@@ -205,12 +343,32 @@ pub struct DisplayStreamControl {
 
 impl DisplayStreamControl {
     pub fn new(base_bitrate_bps: u32) -> Self {
+        Self::with_output(base_bitrate_bps, 60, 1920, 1080)
+    }
+
+    pub fn with_output(base_bitrate_bps: u32, base_fps: u32, width: u32, height: u32) -> Self {
         Self {
             force_idr: AtomicBool::new(false),
             force_refresh: Arc::new(AtomicBool::new(false)),
             generation: AtomicU32::new(0),
-            adaptive_stream: Mutex::new(AdaptiveStreamState::new(base_bitrate_bps)),
+            adaptive_stream: Mutex::new(AdaptiveStreamState::new(
+                base_bitrate_bps,
+                base_fps,
+                width,
+                height,
+            )),
         }
+    }
+
+    pub fn note_transport(
+        &self,
+        feedback: Option<crate::quic_transport::TransportFeedback>,
+        send_wait: Duration,
+    ) {
+        self.adaptive_stream
+            .lock()
+            .unwrap()
+            .note_transport(feedback, send_wait);
     }
 
     pub fn tuning(&self) -> StreamTuning {
@@ -220,7 +378,7 @@ impl DisplayStreamControl {
             .current_tuning(Instant::now())
     }
 
-    fn request_keyframe(&self, generation: u32) {
+    pub fn request_keyframe(&self, generation: u32) {
         if generation == 0 || self.generation.load(Ordering::Acquire) != generation {
             return;
         }
@@ -532,7 +690,7 @@ fn parse_settings_body(body: &[u8]) -> Option<RequestedSettings> {
     }
     let audio_bitrate_bps = match u32::from_be_bytes(body[37..41].try_into().unwrap()) {
         0 => 128_000,
-        value @ (96_000 | 128_000 | 192_000 | 256_000) => value,
+        value @ (48_000 | 64_000 | 96_000 | 128_000 | 192_000 | 256_000) => value,
         _ => return None,
     };
     let revision = u32::from_be_bytes(body[15..19].try_into().unwrap());
@@ -1131,6 +1289,7 @@ mod display_stream_tests {
         };
         let tuning = StreamTuning {
             bitrate_bps: 20_000_000,
+            target_fps: 60,
             idr_fec_percent: 0,
             pframe_fec_percent: 0,
         };
@@ -1188,6 +1347,7 @@ mod display_stream_tests {
             };
             let tuning = StreamTuning {
                 bitrate_bps: 20_000_000,
+                target_fps: 60,
                 idr_fec_percent: 0,
                 pframe_fec_percent: 0,
             };
@@ -1290,13 +1450,17 @@ impl VideoSender {
         parity
     }
 
+    pub fn transport_feedback(&self) -> Option<crate::quic_transport::TransportFeedback> {
+        self.quic.transport_feedback()
+    }
+
     pub fn send_frame(
         &mut self,
         au: &EncodedAccessUnit,
         timestamp_ms: u32,
         codec_id: u8,
         tuning: StreamTuning,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Duration)> {
         let frame_id = self.sequence.take_frame()?;
         let payload: &[u8] = &*au.annex_b;
         let is_idr = au.is_idr;
@@ -1313,7 +1477,15 @@ impl VideoSender {
             );
         }
 
-        let data_count = payload.len().div_ceil(CHUNK_PAYLOAD);
+        // Use the path's negotiated datagram limit (between 1000 and 1350 bytes) to reduce
+        // per-packet overhead and PPS without ever exceeding small VPN/cellular MTUs.
+        let chunk_payload = self
+            .quic
+            .max_datagram_size()
+            .saturating_sub(HEADER_LEN)
+            .clamp(CHUNK_PAYLOAD, MAX_CHUNK_PAYLOAD);
+
+        let data_count = payload.len().div_ceil(chunk_payload);
         anyhow::ensure!((1..=MAX_SHARDS_PER_FRAME).contains(&data_count), "invalid video shard count: {data_count}");
 
         let parity_percent = if is_idr {
@@ -1337,17 +1509,22 @@ impl VideoSender {
 
         // Grow shard pool if needed (buffers persist across frames)
         while self.shard_pool.len() < total_shards {
-            self.shard_pool.push(vec![0u8; CHUNK_PAYLOAD]);
+            self.shard_pool.push(vec![0u8; chunk_payload]);
+        }
+        for shard in &mut self.shard_pool[..total_shards] {
+            if shard.len() != chunk_payload {
+                shard.resize(chunk_payload, 0);
+            }
         }
 
         // Fill data shards (zero-pad for RS alignment)
         for i in 0..data_count {
             let shard = &mut self.shard_pool[i];
-            let start = i * CHUNK_PAYLOAD;
-            let end = (start + CHUNK_PAYLOAD).min(payload.len());
+            let start = i * chunk_payload;
+            let end = (start + chunk_payload).min(payload.len());
             let actual = end - start;
             shard[..actual].copy_from_slice(&payload[start..end]);
-            if actual < CHUNK_PAYLOAD {
+            if actual < chunk_payload {
                 shard[actual..].fill(0);
             }
         }
@@ -1392,11 +1569,11 @@ impl VideoSender {
             // short); the receiver zero-pads before FEC recovery. Parity
             // shards are always full-size.
             let actual_payload_len = if idx < data_count {
-                let start = idx * CHUNK_PAYLOAD;
-                let end = (start + CHUNK_PAYLOAD).min(payload.len());
+                let start = idx * chunk_payload;
+                let end = (start + chunk_payload).min(payload.len());
                 end - start
             } else {
-                CHUNK_PAYLOAD
+                chunk_payload
             };
 
             let header = build_header(
@@ -1418,7 +1595,7 @@ impl VideoSender {
             self.packet_lens[idx] = HEADER_LEN + actual_payload_len;
         }
 
-        let frame_bytes = self.send_frame_batch(total_shards)?;
+        let (frame_bytes, send_wait) = self.send_frame_batch(total_shards, tuning.bitrate_bps)?;
 
         self.stats_frames += 1;
         self.stats_bytes += frame_bytes;
@@ -1435,7 +1612,7 @@ impl VideoSender {
             self.stats_start = Instant::now();
         }
 
-        Ok(frame_bytes)
+        Ok((frame_bytes, send_wait))
     }
 
     fn ensure_packet_capacity(&mut self, total_shards: usize) {
@@ -1445,20 +1622,31 @@ impl VideoSender {
         }
     }
 
-    fn send_frame_batch(&mut self, total_shards: usize) -> Result<u64> {
+    fn send_frame_batch(&mut self, total_shards: usize, bitrate_bps: u32) -> Result<(u64, Duration)> {
         let started = Instant::now();
-        let window = self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32;
+        let total_bytes: u64 = self.packet_lens[..total_shards].iter().map(|&n| n as u64).sum();
+        let low_bw = bitrate_bps < 10_000_000;
+        let threshold = if low_bw { 12 } else { PACING_THRESHOLD_SHARDS };
+        let batch_size = if low_bw { 4 } else { PACING_BATCH_SIZE };
+        let window = if low_bw {
+            let target_rate_bps = (u64::from(bitrate_bps.max(SETTINGS_BITRATE_FLOOR_BPS)) * 5) / 4;
+            let wire_time = Duration::from_secs_f64((total_bytes as f64 * 8.0) / target_rate_bps as f64);
+            wire_time.min(self.frame_interval * 3 / 4)
+        } else {
+            self.frame_interval * PACING_SPREAD_NUM as u32 / PACING_SPREAD_DEN as u32
+        };
         let mut bytes = 0;
+        let mut total_wait = Duration::ZERO;
         for i in 0..total_shards {
-            if total_shards > PACING_THRESHOLD_SHARDS && i % PACING_BATCH_SIZE == 0 {
+            if total_shards > threshold && i % batch_size == 0 {
                 if let Some(wait) = window.mul_f64(i as f64 / total_shards as f64).checked_sub(started.elapsed()) {
                     std::thread::sleep(wait);
                 }
             }
-            self.quic.send_video(&self.packet_pool[i][..self.packet_lens[i]], self.stop.as_deref())?;
+            total_wait += self.quic.send_video(&self.packet_pool[i][..self.packet_lens[i]], self.stop.as_deref())?;
             bytes += self.packet_lens[i] as u64;
         }
-        Ok(bytes)
+        Ok((bytes, total_wait))
     }
 }
 
@@ -1754,12 +1942,12 @@ mod settings_tests {
         body[20..33].copy_from_slice(b"Screx        ");
         body[10] = 1;
         body[18] = 1;
-        for bitrate in [0u32, 96_000, 128_000, 192_000, 256_000] {
+        for bitrate in [0u32, 48_000, 64_000, 96_000, 128_000, 192_000, 256_000] {
             body[37..41].copy_from_slice(&bitrate.to_be_bytes());
             let parsed = parse_settings_body(&body).unwrap();
             assert_eq!(parsed.audio_bitrate_bps, if bitrate == 0 { 128_000 } else { bitrate });
         }
-        for bitrate in [1u32, 64_000, 500_000, u32::MAX] {
+        for bitrate in [1u32, 32_000, 500_000, u32::MAX] {
             body[37..41].copy_from_slice(&bitrate.to_be_bytes());
             assert!(parse_settings_body(&body).is_none());
         }

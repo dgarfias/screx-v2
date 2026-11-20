@@ -10,6 +10,13 @@ final class NetworkControlClient {
     private var pingTimer: DispatchSourceTimer?
     private var pendingPingSentAt: TimeInterval?
     private var latencySamples: [Double] = []
+    /// Coalesces relative mouse moves while an input send is in flight, preventing
+    /// 120 Hz pointer updates from building a backlog on high-latency/lossy links.
+    /// Accessed only on `session.queue`.
+    private var inputSendInFlight = false
+    private var pendingMouseDx: Int = 0
+    private var pendingMouseDy: Int = 0
+    private var hasPendingMouseMove = false
     var onDisconnect: (() -> Void)?
     var onTraffic: ((Int, Int) -> Void)?
     var onCapabilities: ((DaemonCapabilities) -> Void)?
@@ -88,11 +95,31 @@ final class NetworkControlClient {
         }
     }
     private func send(_ type: UInt8, _ body: Data = Data()) {
-        let payload = Data([type]) + body
         if (0x10...0x15).contains(type) {
-            session.sendInput(payload)
+            session.queue.async { [weak self] in
+                guard let self, !self.isClosed else { return }
+                // Relative mouse move: `type=0x13`, `body=[0x01, dx_hi, dx_lo, dy_hi, dy_lo]`.
+                if type == ScrexMessage.Client.mouse, body.count == 5, body[body.startIndex] == 0x01 {
+                    let i = body.startIndex
+                    let dx = Int(Int16(bitPattern: UInt16(body[i + 1]) << 8 | UInt16(body[i + 2])))
+                    let dy = Int(Int16(bitPattern: UInt16(body[i + 3]) << 8 | UInt16(body[i + 4])))
+                    if self.inputSendInFlight {
+                        self.pendingMouseDx += dx
+                        self.pendingMouseDy += dy
+                        self.hasPendingMouseMove = true
+                        return
+                    }
+                    self.sendInputTracked(Data([type]) + body)
+                    return
+                }
+                // Flush any coalesced mouse delta before a button/key/scroll/touch event
+                // so clicks always land at the latest cursor position.
+                self.flushPendingMouseMove()
+                self.sendInputTracked(Data([type]) + body)
+            }
             return
         }
+        let payload = Data([type]) + body
         session.queue.async { [weak self] in
             guard let self, !self.isClosed, let control = self.session.control else { return }
             control.send(content: QUICFrame.encode(payload), completion: .contentProcessed { [weak self] error in
@@ -100,6 +127,29 @@ final class NetworkControlClient {
                 else { self?.onTraffic?(payload.count + 4, 0) }
             })
         }
+    }
+
+    private func sendInputTracked(_ payload: Data) {
+        inputSendInFlight = true
+        session.sendInput(payload) { [weak self] in
+            guard let self, !self.isClosed else { return }
+            self.inputSendInFlight = false
+            self.flushPendingMouseMove()
+        }
+    }
+
+    private func flushPendingMouseMove() {
+        guard hasPendingMouseMove else { return }
+        let dx = Int16(clamping: pendingMouseDx)
+        let dy = Int16(clamping: pendingMouseDy)
+        pendingMouseDx = 0
+        pendingMouseDy = 0
+        hasPendingMouseMove = false
+        guard dx != 0 || dy != 0 else { return }
+        var payload = Data([ScrexMessage.Client.mouse, 0x01])
+        withUnsafeBytes(of: dx.bigEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: dy.bigEndian) { payload.append(contentsOf: $0) }
+        sendInputTracked(payload)
     }
     func sendPli(display: StreamDisplayID, generation: UInt32) {
         var body = Data([display.rawValue])

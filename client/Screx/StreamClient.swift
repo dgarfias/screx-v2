@@ -25,7 +25,7 @@ final class StreamClient {
     /// Owns `videoStreams` and everything about video frames.
     private let videoQueue = DispatchQueue(label: "screx.stream.video", qos: .userInteractive)
     private let pendingVideo = DispatchSemaphore(value: 512)
-    private static let maxPendingFrames = 8
+    private static let maxPendingFrames = 16
     private let debugId = String(UUID().uuidString.prefix(6))
     private let videoStreams: [StreamDisplayID: VideoReceiveState]
     let audioPlayer: AudioPlayer
@@ -38,13 +38,15 @@ final class StreamClient {
 
     private static let headerLen = MediaPacketHeader.byteCount
     static let chunkPayload = QUICSession.chunkPayload
-    /// How long an incomplete frame may sit before we give up and ask for a
-    /// keyframe. Only a loss-recovery deadline (complete frames deliver
-    /// immediately), so it is not a steady-state latency cost. 80 ms (~5
-    /// frames at 60 fps) lets shards that are merely late complete the frame;
-    /// on a link where shards are actually lost it delays recovery by the
-    /// same amount.
+    static let maxChunkPayload = 1350
+    /// Minimum inactivity timeout for incomplete frames (used on low-latency LANs).
+    /// On higher-RTT / jittery links this scales dynamically with measured RTT and jitter.
     private static let frameTimeout: TimeInterval = 0.080
+    private static let recoveryTickInterval: TimeInterval = 0.025
+    /// Measured network latency/jitter fed from `NetworkControlClient.onLatency`.
+    /// Accessed only on `videoQueue`.
+    private var measuredRttMs: Double = 0
+    private var measuredJitterMs: Double = 0
 
     private var audioGeneration: UInt32 = 0
     private static let audioReportInterval: TimeInterval = 0.2
@@ -133,10 +135,26 @@ final class StreamClient {
         audioReportTimer = timer
     }
 
+    func updateNetworkStats(rttMs: Double, jitterMs: Double) {
+        videoQueue.async { [weak self] in
+            guard let self else { return }
+            self.measuredRttMs = max(0, rttMs)
+            self.measuredJitterMs = max(0, jitterMs)
+        }
+    }
+
+    private var adaptiveFrameTimeout: TimeInterval {
+        max(Self.frameTimeout, min(0.400, (measuredRttMs * 1.5 + measuredJitterMs * 3.0) / 1000.0))
+    }
+
+    private var reorderHoldTimeout: TimeInterval {
+        min(adaptiveFrameTimeout, max(0.030, (measuredJitterMs * 2.0) / 1000.0))
+    }
+
     private func startVideoRecovery() {
         videoRecoveryTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: videoQueue)
-        timer.schedule(deadline: .now() + Self.frameTimeout, repeating: Self.frameTimeout)
+        timer.schedule(deadline: .now() + Self.recoveryTickInterval, repeating: Self.recoveryTickInterval)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             for display in StreamDisplayID.allCases {
@@ -207,7 +225,7 @@ final class StreamClient {
               shardCount <= 4096,
               Int(chunkIdx) < shardCount,
               payloadLen > 0,
-              Int(payloadLen) <= Self.chunkPayload,
+              Int(payloadLen) <= Self.maxChunkPayload,
               Int(payloadLen) <= payload.count else {
             log("ignoring invalid video shard metadata for frameId=\(frameId)")
             return
@@ -261,12 +279,29 @@ final class StreamClient {
         }
         stream.reassembly[frameId] = assembly
 
-        assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen))
+        let now = CACurrentMediaTime()
+        assembly.addChunk(index: Int(chunkIdx), payload: payload, actualLen: Int(payloadLen), now: now)
 
         if assembly.isComplete {
-            deliverFrame(display: packet.displayID, frameId: frameId, assembly: assembly)
+            let hasOlderInFlight = stream.timeline.wouldSkip(frameId)
+                && stream.reassembly.keys.contains(where: { $0 < frameId && stream.timeline.isNewFrame($0) })
+            if !hasOlderInFlight {
+                deliverFrame(display: packet.displayID, frameId: frameId, assembly: assembly)
+                drainCompletedFrames(display: packet.displayID)
+            }
         }
 
+    }
+
+    /// Delivers any buffered frames that are already complete and strictly consecutive
+    /// after `lastCompletedFrameID` (used after an out-of-order earlier frame arrives).
+    private func drainCompletedFrames(display: StreamDisplayID) {
+        guard let stream = videoStreams[display] else { return }
+        while let last = stream.timeline.lastCompletedFrameID {
+            let nextId = last &+ 1
+            guard let nextAssembly = stream.reassembly[nextId], nextAssembly.isComplete else { break }
+            deliverFrame(display: display, frameId: nextId, assembly: nextAssembly)
+        }
     }
 
     private func deliverFrame(display: StreamDisplayID, frameId: UInt32, assembly: FrameAssembly) {
@@ -296,6 +331,12 @@ final class StreamClient {
     private func pruneOldFrames(display: StreamDisplayID) {
         guard let stream = videoStreams[display] else { return }
         let now = CACurrentMediaTime()
+        let timeout = adaptiveFrameTimeout
+        let reorderHold = reorderHoldTimeout
+        let newestCompleted = stream.reassembly
+            .filter { $0.value.isComplete && stream.timeline.isNewFrame($0.key) }
+            .map(\.key)
+            .max()
         var recoverable: [(UInt32, FrameAssembly)] = []
         var expired: [UInt32] = []
         var superseded: [UInt32] = []
@@ -304,7 +345,13 @@ final class StreamClient {
                 superseded.append(fid)
                 continue
             }
-            if now - assembly.createdAt > Self.frameTimeout {
+            if assembly.isComplete { continue }
+            let idle = now - assembly.lastShardAt
+            let age = now - assembly.createdAt
+            let maxAge = assembly.isIdr ? max(1.0, timeout * 4.0) : max(0.250, timeout * 2.0)
+            let blockingNewer = newestCompleted.map { fid < $0 } ?? false
+            let stalled = idle > timeout || age > maxAge || (blockingNewer && idle > reorderHold)
+            if stalled {
                 if assembly.canRecover {
                     recoverable.append((fid, assembly))
                 } else {
@@ -326,6 +373,16 @@ final class StreamClient {
             }
             sendPli(display: display)
         }
+        // Deliver any completed frames that were waiting behind an expired/recovered frame.
+        let ready = stream.reassembly
+            .filter { $0.value.isComplete && stream.timeline.isNewFrame($0.key) }
+            .sorted { $0.key < $1.key }
+        for (fid, assembly) in ready {
+            let stillBlocked = stream.timeline.wouldSkip(fid)
+                && stream.reassembly.keys.contains(where: { $0 < fid && stream.timeline.isNewFrame($0) })
+            if stillBlocked { break }
+            deliverFrame(display: display, frameId: fid, assembly: assembly)
+        }
     }
 
     private func sendPli(display: StreamDisplayID) {
@@ -333,7 +390,11 @@ final class StreamClient {
         let now = CACurrentMediaTime()
         if let last = stream.lastPliTime, now - last < Self.pliMinInterval { return }
         stream.lastPliTime = now
-        sendPliRequest?(display, generation)
+        // Send PLI over a QUIC datagram so recovery never stalls behind control-stream
+        // retransmissions on lossy links; if lost, the next recovery tick retries after 1 s.
+        var packet = Data([ScrexMessage.Datagram.pli, display.rawValue])
+        withUnsafeBytes(of: generation.bigEndian) { packet.append(contentsOf: $0) }
+        sendMedia(packet)
     }
 
     func sendCameraFrame(_ jpeg: Data, frameId: UInt32) {
@@ -406,6 +467,7 @@ private final class FrameAssembly {
     let totalShards: Int
     let isIdr: Bool
     let createdAt: TimeInterval
+    private(set) var lastShardAt: TimeInterval
     let timestampMs: UInt32
 
     private let blockCount: Int
@@ -430,6 +492,7 @@ private final class FrameAssembly {
         self.totalShards = totalData + totalParity
         self.isIdr = isIdr
         self.createdAt = createdAt
+        self.lastShardAt = createdAt
         self.timestampMs = timestampMs
         let dataRanges = (0..<blocks).map { FECBlockLayout.range(total: totalData, blocks: blocks, index: $0) }
         let parityRanges = (0..<blocks).map { FECBlockLayout.range(total: totalParity, blocks: blocks, index: $0) }
@@ -455,8 +518,9 @@ private final class FrameAssembly {
         return dataReceived[block] == needed || shardsReceived[block] >= needed
     }
 
-    func addChunk(index: Int, payload: Data, actualLen: Int) {
+    func addChunk(index: Int, payload: Data, actualLen: Int, now: TimeInterval) {
         guard shards[index] == nil else { return }
+        lastShardAt = now
         shards[index] = payload
         actualLengths[index] = actualLen
 
@@ -471,16 +535,25 @@ private final class FrameAssembly {
 
     var canRecover: Bool { isComplete }
 
+    /// Full shard size for this frame. All parity shards and all non-last data shards are full-size.
+    private var inferredShardSize: Int {
+        for i in 0..<totalShards where i < totalData - 1 || i >= totalData {
+            if let len = shards[i]?.count, len > 0 { return len }
+        }
+        return StreamClient.chunkPayload
+    }
+
     func reassemble() -> Data? {
         guard isComplete else { return nil }
+        let shardSize = inferredShardSize
 
         for block in 0..<blockCount where dataReceived[block] < dataRanges[block].count {
-            guard recoverBlock(block) else { return nil }
+            guard recoverBlock(block, shardSize: shardSize) else { return nil }
         }
 
         var totalSize = 0
         for i in 0..<totalData {
-            totalSize += actualLengths[i] ?? StreamClient.chunkPayload
+            totalSize += actualLengths[i] ?? shardSize
         }
         var result = Data(capacity: totalSize)
         for i in 0..<totalData {
@@ -496,8 +569,7 @@ private final class FrameAssembly {
     }
 
     /// Runs Reed-Solomon recovery for one block and stores the recovered data shards.
-    private func recoverBlock(_ block: Int) -> Bool {
-        let shardSize = StreamClient.chunkPayload
+    private func recoverBlock(_ block: Int, shardSize: Int) -> Bool {
         let dataRange = dataRanges[block]
         let parityRange = parityRanges[block]
         let indices = Array(dataRange) + parityRange.map { totalData + $0 }

@@ -327,13 +327,14 @@ impl Encoder {
             ActiveEncoder::Software(enc) => enc.supports_intra_refresh(),
         };
         let intra_refresh_active = self.config.intra_refresh && intra_idr_supported;
-        let is_idr = if intra_refresh_active {
-            // Rolling intra-refresh replaces periodic IDRs; only an explicit
-            // request (PLI / reconnect) forces a full IDR, so the pipeline
-            // never takes a recurring keyframe spike.
-            pli_idr
+        let is_idr = if intra_refresh_active || self.config.gop == 0 {
+            // Rolling intra-refresh or infinite-GOP (PLI-only) mode: emit an IDR
+            // on the very first frame and on explicit client PLIs, avoiding
+            // periodic keyframe spikes on constrained links.
+            self.frame_count == 0 || pli_idr
         } else {
-            pli_idr
+            self.frame_count == 0
+                || pli_idr
                 || self.frame_count % u64::from(self.config.gop.max(1)) == 0
                 || self.last_idr_at.elapsed() >= self.max_idr_interval
         };
@@ -548,8 +549,12 @@ impl Drop for BandedScaler {
 
 struct HwEncoder {
     kind: HwKind,
+    config: EncoderConfig,
+    vaapi_rc_mode: VaapiHevcMode,
+    last_reopen_at: Instant,
     ctx: *mut ffi::AVCodecContext,
     hw_device_ctx: *mut ffi::AVBufferRef,
+    hw_frames_ctx: *mut ffi::AVBufferRef,
     sws: BandedScaler,
     /// GPU colour conversion: BGRA -> NV12 through VA-API VPP.
     vpp: Option<VppScaler>,
@@ -685,15 +690,19 @@ impl Drop for VppScaler {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VaapiHevcMode {
+    Cbr,
     Bitrate,
     Cqp(i64),
 }
 
+const INFINITE_GOP_FRAMES: i32 = 600_000;
+const REOPEN_COOLDOWN: Duration = Duration::from_millis(2500);
+
 /// Whether the given encoder exposes FFmpeg's `intra-refresh` private option.
 /// Verified against FFmpeg 9: NVENC (H.264/H.265) exposes it; VA-API does
-/// not, so it keeps periodic full IDRs.
+/// not, so it relies on infinite GOP (PLI-only) by default.
 fn hw_supports_intra_refresh(kind: HwKind) -> bool {
     matches!(kind, HwKind::Nvenc)
 }
@@ -715,25 +724,187 @@ fn vaapi_hevc_qp(config: &EncoderConfig) -> i64 {
         27
     } else if bits_per_pixel >= 0.03 {
         30
+    } else if bits_per_pixel >= 0.015 {
+        34
+    } else if bits_per_pixel >= 0.008 {
+        37
     } else {
-        33
+        40
     }
 }
 
+fn significant_bitrate_change(current: u32, target: u32) -> bool {
+    let diff = current.abs_diff(target);
+    diff * 5 >= current.max(1) // >= 20% change
+}
+
 impl HwEncoder {
+    /// Opens a fresh `AVCodecContext` on an existing `hw_device_ctx` + `hw_frames_ctx`.
+    /// Used both at initial open and for VA-API live bitrate/QP reconfiguration.
+    unsafe fn open_codec_context(
+        config: &EncoderConfig,
+        kind: HwKind,
+        vaapi_mode: VaapiHevcMode,
+        hw_device_ctx: *mut ffi::AVBufferRef,
+        hw_frames_ctx: *mut ffi::AVBufferRef,
+    ) -> Result<(*mut ffi::AVCodecContext, Vec<u8>)> {
+        let (codec_name, hw_pix_fmt) = match (kind, config.codec) {
+            (HwKind::Vaapi, VideoCodec::H264) => ("h264_vaapi", ffi::AVPixelFormat::AV_PIX_FMT_VAAPI),
+            (HwKind::Vaapi, VideoCodec::H265) => ("hevc_vaapi", ffi::AVPixelFormat::AV_PIX_FMT_VAAPI),
+            (HwKind::Nvenc, VideoCodec::H264) => ("h264_nvenc", ffi::AVPixelFormat::AV_PIX_FMT_CUDA),
+            (HwKind::Nvenc, VideoCodec::H265) => ("hevc_nvenc", ffi::AVPixelFormat::AV_PIX_FMT_CUDA),
+        };
+        let use_intra_refresh = config.intra_refresh && hw_supports_intra_refresh(kind);
+        let codec_cstr = std::ffi::CString::new(codec_name).unwrap();
+        let codec = ffi::avcodec_find_encoder_by_name(codec_cstr.as_ptr());
+        if codec.is_null() {
+            bail!("{codec_name} encoder not found");
+        }
+        let ctx = ffi::avcodec_alloc_context3(codec);
+        if ctx.is_null() {
+            bail!("failed to allocate codec context");
+        }
+
+        (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
+        (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
+        (*ctx).pix_fmt = hw_pix_fmt;
+        (*ctx).sw_pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*ctx).width = config.width as i32;
+        (*ctx).height = config.height as i32;
+        (*ctx).time_base = ffi::AVRational { num: 1, den: 90_000 };
+        (*ctx).framerate = ffi::AVRational { num: config.fps.max(1) as i32, den: 1 };
+        (*ctx).gop_size = if use_intra_refresh || config.gop == 0 {
+            INFINITE_GOP_FRAMES
+        } else {
+            config.gop as i32
+        };
+        (*ctx).max_b_frames = 0;
+
+        let is_vaapi_cqp = matches!((kind, vaapi_mode), (HwKind::Vaapi, VaapiHevcMode::Cqp(_)));
+        if is_vaapi_cqp {
+            (*ctx).bit_rate = 0;
+            (*ctx).rc_max_rate = 0;
+            (*ctx).rc_buffer_size = 0;
+        } else {
+            (*ctx).bit_rate = config.bitrate_bps as i64;
+            (*ctx).rc_max_rate = config.bitrate_bps as i64;
+            (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
+        }
+
+        match kind {
+            HwKind::Vaapi => {
+                let key = std::ffi::CString::new("async_depth").unwrap();
+                ffi::av_opt_set_int(
+                    (*ctx).priv_data,
+                    key.as_ptr(),
+                    i64::from(config.vaapi_async_depth.clamp(1, 8)),
+                    0,
+                );
+                match vaapi_mode {
+                    VaapiHevcMode::Cbr => {
+                        let rc_mode = std::ffi::CString::new("rc_mode").unwrap();
+                        let cbr = std::ffi::CString::new("CBR").unwrap();
+                        ffi::av_opt_set((*ctx).priv_data, rc_mode.as_ptr(), cbr.as_ptr(), 0);
+                    }
+                    VaapiHevcMode::Bitrate => {}
+                    VaapiHevcMode::Cqp(qp_value) => {
+                        let rc_mode = std::ffi::CString::new("rc_mode").unwrap();
+                        let cqp = std::ffi::CString::new("CQP").unwrap();
+                        ffi::av_opt_set((*ctx).priv_data, rc_mode.as_ptr(), cqp.as_ptr(), 0);
+                        let qp = std::ffi::CString::new("qp").unwrap();
+                        ffi::av_opt_set_int((*ctx).priv_data, qp.as_ptr(), qp_value, 0);
+                    }
+                }
+            }
+            HwKind::Nvenc => {
+                let set = |k: &str, v: &str| {
+                    let kc = std::ffi::CString::new(k).unwrap();
+                    let vc = std::ffi::CString::new(v).unwrap();
+                    ffi::av_opt_set((*ctx).priv_data, kc.as_ptr(), vc.as_ptr(), 0);
+                };
+                set("preset", "p4");
+                set("tune", "ull");
+                set("rc", "cbr");
+                set("zerolatency", "1");
+                set("forced-idr", "1");
+                set("no-scenecut", "1");
+                let delay = std::ffi::CString::new("delay").unwrap();
+                ffi::av_opt_set_int((*ctx).priv_data, delay.as_ptr(), 0, 0);
+                if use_intra_refresh {
+                    set("intra-refresh", "1");
+                }
+            }
+        }
+
+        let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+        if ret < 0 {
+            ffi::avcodec_free_context(&mut (ctx as *mut _));
+            bail!("failed to open {codec_name} encoder (error {ret})");
+        }
+
+        let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
+            std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok((ctx, extradata))
+    }
+
     fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
         unsafe {
             let ctx = self.ctx;
             if ctx.is_null() {
                 bail!("encoder context is null");
             }
-            (*ctx).bit_rate = bps as i64;
-            (*ctx).rc_max_rate = bps as i64;
-            (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
-
-            if matches!(self.kind, HwKind::Vaapi) && !self.is_cqp {
-                let key = std::ffi::CString::new("b").unwrap();
-                ffi::av_opt_set_int((*ctx).priv_data, key.as_ptr(), bps as i64, 0);
+            match self.kind {
+                HwKind::Nvenc => {
+                    // FFmpeg's nvenc backend calls nvEncReconfigureEncoder() automatically
+                    // on the next frame when bit_rate / rc_max_rate / rc_buffer_size change.
+                    (*ctx).bit_rate = bps as i64;
+                    (*ctx).rc_max_rate = bps as i64;
+                    (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
+                    self.config.bitrate_bps = bps;
+                }
+                HwKind::Vaapi => {
+                    // FFmpeg's vaapi_encode only emits VAEncMiscParameterRateControl at
+                    // avcodec_open2() time, and CQP mode ignores bit_rate altogether.
+                    // Re-open only the codec context (reusing hw_device_ctx, hw_frames_ctx,
+                    // and VppScaler) with hysteresis so we don't thrash.
+                    if self.last_reopen_at.elapsed() < REOPEN_COOLDOWN {
+                        return Ok(());
+                    }
+                    let mut next_config = self.config.clone();
+                    next_config.bitrate_bps = bps;
+                    let next_mode = if self.is_cqp {
+                        let new_qp = vaapi_hevc_qp(&next_config);
+                        if self.vaapi_rc_mode == VaapiHevcMode::Cqp(new_qp) {
+                            return Ok(());
+                        }
+                        VaapiHevcMode::Cqp(new_qp)
+                    } else {
+                        if !significant_bitrate_change(self.config.bitrate_bps, bps) {
+                            return Ok(());
+                        }
+                        self.vaapi_rc_mode
+                    };
+                    let (new_ctx, new_extradata) = Self::open_codec_context(
+                        &next_config,
+                        self.kind,
+                        next_mode,
+                        self.hw_device_ctx,
+                        self.hw_frames_ctx,
+                    )?;
+                    ffi::avcodec_free_context(&mut self.ctx);
+                    self.ctx = new_ctx;
+                    self.extradata = new_extradata;
+                    self.config.bitrate_bps = bps;
+                    self.vaapi_rc_mode = next_mode;
+                    self.last_reopen_at = Instant::now();
+                    crate::log_detail!(
+                        "[encode] VA-API context reopened for bitrate={bps} (cqp={})",
+                        self.is_cqp
+                    );
+                }
             }
         }
         Ok(())
@@ -744,27 +915,28 @@ impl HwEncoder {
     }
 
     fn new_vaapi(config: &EncoderConfig) -> Result<Self> {
-        if config.codec == VideoCodec::H265 {
-            match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
-                Ok(enc) => {
-                    crate::log_detail!("[encode] VA-API HEVC using bitrate-based rate control");
-                    Ok(enc)
-                }
-                Err(primary_err) => {
-                    let qp = vaapi_hevc_qp(config);
-                    eprintln!(
-                        "[encode] VA-API HEVC bitrate mode unavailable, retrying with CQP (qp={qp}): {primary_err:#}"
-                    );
-                    Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Cqp(qp))
-                        .with_context(|| {
-                            format!(
-                                "VA-API HEVC init failed in bitrate mode and CQP fallback; bitrate mode error: {primary_err:#}"
-                            )
-                        })
-                }
+        if let Ok(enc) = Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Cbr) {
+            crate::log_detail!("[encode] VA-API using CBR rate control");
+            return Ok(enc);
+        }
+        match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
+            Ok(enc) => {
+                crate::log_detail!("[encode] VA-API using auto bitrate rate control");
+                Ok(enc)
             }
-        } else {
-            Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate)
+            Err(primary_err) if config.codec == VideoCodec::H265 => {
+                let qp = vaapi_hevc_qp(config);
+                eprintln!(
+                    "[encode] VA-API HEVC bitrate mode unavailable, retrying with CQP (qp={qp}): {primary_err:#}"
+                );
+                Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Cqp(qp))
+                    .with_context(|| {
+                        format!(
+                            "VA-API HEVC init failed in bitrate mode and CQP fallback; bitrate mode error: {primary_err:#}"
+                        )
+                    })
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -780,27 +952,13 @@ impl HwEncoder {
         let width = config.width as i32;
         let height = config.height as i32;
 
-        let (codec_name, hw_type, hw_pix_fmt, device_path) = match (kind, config.codec) {
-            (HwKind::Vaapi, VideoCodec::H264) => (
-                "h264_vaapi",
+        let (hw_type, hw_pix_fmt, device_path) = match kind {
+            HwKind::Vaapi => (
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
                 ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
                 "/dev/dri/renderD128",
             ),
-            (HwKind::Vaapi, VideoCodec::H265) => (
-                "hevc_vaapi",
-                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
-                "/dev/dri/renderD128",
-            ),
-            (HwKind::Nvenc, VideoCodec::H264) => (
-                "h264_nvenc",
-                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
-                ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
-                "0",
-            ),
-            (HwKind::Nvenc, VideoCodec::H265) => (
-                "hevc_nvenc",
+            HwKind::Nvenc => (
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
                 ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
                 "0",
@@ -815,154 +973,57 @@ impl HwEncoder {
         let use_intra_refresh = config.intra_refresh && hw_supports_intra_refresh(kind);
 
         unsafe {
-            let codec_cstr = std::ffi::CString::new(codec_name).unwrap();
-            let codec = ffi::avcodec_find_encoder_by_name(codec_cstr.as_ptr());
-            if codec.is_null() {
-                bail!("{codec_name} encoder not found");
-            }
-
-            let ctx = ffi::avcodec_alloc_context3(codec);
-            if ctx.is_null() {
-                bail!("failed to allocate codec context");
-            }
-
             let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-            let hw_frames_ref: *mut ffi::AVBufferRef;
-
-            {
-                let device_cstr = std::ffi::CString::new(device_path).unwrap();
-                let device = if device_path.is_empty() {
-                    ptr::null()
-                } else {
-                    device_cstr.as_ptr()
-                };
-                let ret = ffi::av_hwdevice_ctx_create(
-                    &mut hw_device_ctx,
-                    hw_type,
-                    device,
-                    ptr::null_mut(),
-                    0,
-                );
-                if ret < 0 {
-                    ffi::avcodec_free_context(&mut (ctx as *mut _));
-                    bail!("failed to create {kind_name} device context (error {ret})");
-                }
-
-                hw_frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
-                if hw_frames_ref.is_null() {
-                    ffi::av_buffer_unref(&mut hw_device_ctx);
-                    ffi::avcodec_free_context(&mut (ctx as *mut _));
-                    bail!("failed to allocate hw frames context");
-                }
-                let frames_ctx = (*hw_frames_ref).data as *mut ffi::AVHWFramesContext;
-                (*frames_ctx).format = hw_pix_fmt;
-                (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-                (*frames_ctx).width = width;
-                (*frames_ctx).height = height;
-                (*frames_ctx).initial_pool_size = 20;
-
-                let ret = ffi::av_hwframe_ctx_init(hw_frames_ref);
-                if ret < 0 {
-                    ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
-                    ffi::av_buffer_unref(&mut hw_device_ctx);
-                    ffi::avcodec_free_context(&mut (ctx as *mut _));
-                    bail!("failed to init hw frames context (error {ret})");
-                }
-
-                (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
-                (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ref);
-                (*ctx).pix_fmt = hw_pix_fmt;
-                (*ctx).sw_pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-            }
-
-            (*ctx).width = width;
-            (*ctx).height = height;
-            (*ctx).time_base = ffi::AVRational {
-                num: 1,
-                den: 90_000,
-            };
-            (*ctx).framerate = ffi::AVRational {
-                num: config.fps.max(1) as i32,
-                den: 1,
-            };
-            (*ctx).gop_size = if use_intra_refresh {
-                10_000
+            let device_cstr = std::ffi::CString::new(device_path).unwrap();
+            let device = if device_path.is_empty() {
+                ptr::null()
             } else {
-                config.gop as i32
+                device_cstr.as_ptr()
             };
-            (*ctx).max_b_frames = 0;
-
-            let is_vaapi_cqp = matches!(
-                (kind, config.codec, vaapi_hevc_mode),
-                (HwKind::Vaapi, VideoCodec::H265, VaapiHevcMode::Cqp(_))
+            let ret = ffi::av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                hw_type,
+                device,
+                ptr::null_mut(),
+                0,
             );
-
-            if is_vaapi_cqp {
-                (*ctx).bit_rate = 0;
-                (*ctx).rc_max_rate = 0;
-                (*ctx).rc_buffer_size = 0;
-            } else {
-                (*ctx).bit_rate = config.bitrate_bps as i64;
-                (*ctx).rc_max_rate = config.bitrate_bps as i64;
-                (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
-            }
-
-            match kind {
-                HwKind::Vaapi => {
-                    let key = std::ffi::CString::new("async_depth").unwrap();
-                    ffi::av_opt_set_int(
-                        (*ctx).priv_data,
-                        key.as_ptr(),
-                        i64::from(config.vaapi_async_depth.clamp(1, 8)),
-                        0,
-                    );
-                    if let VaapiHevcMode::Cqp(qp_value) = vaapi_hevc_mode {
-                        let rc_mode = std::ffi::CString::new("rc_mode").unwrap();
-                        let cqp = std::ffi::CString::new("CQP").unwrap();
-                        ffi::av_opt_set((*ctx).priv_data, rc_mode.as_ptr(), cqp.as_ptr(), 0);
-
-                        let qp = std::ffi::CString::new("qp").unwrap();
-                        ffi::av_opt_set_int((*ctx).priv_data, qp.as_ptr(), qp_value, 0);
-                        crate::log_detail!(
-                            "[encode] VA-API HEVC using CQP mode (qp={qp_value}) to support Intel drivers"
-                        );
-                    }
-                }
-                HwKind::Nvenc => {
-                    let preset = std::ffi::CString::new("preset").unwrap();
-                    let p4 = std::ffi::CString::new("p4").unwrap();
-                    ffi::av_opt_set((*ctx).priv_data, preset.as_ptr(), p4.as_ptr(), 0);
-                    let tune = std::ffi::CString::new("tune").unwrap();
-                    let ull = std::ffi::CString::new("ull").unwrap();
-                    ffi::av_opt_set((*ctx).priv_data, tune.as_ptr(), ull.as_ptr(), 0);
-                    let delay = std::ffi::CString::new("delay").unwrap();
-                    ffi::av_opt_set_int((*ctx).priv_data, delay.as_ptr(), 0, 0);
-                    let zerolatency = std::ffi::CString::new("zerolatency").unwrap();
-                    let one = std::ffi::CString::new("1").unwrap();
-                    ffi::av_opt_set((*ctx).priv_data, zerolatency.as_ptr(), one.as_ptr(), 0);
-                    if use_intra_refresh {
-                        let intra_refresh = std::ffi::CString::new("intra-refresh").unwrap();
-                        ffi::av_opt_set((*ctx).priv_data, intra_refresh.as_ptr(), one.as_ptr(), 0);
-                    }
-                }
-            }
-
-            let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
-                ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
-                ffi::av_buffer_unref(&mut hw_device_ctx);
-                ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to open {codec_name} encoder (error {ret})");
+                bail!("failed to create {kind_name} device context (error {ret})");
             }
 
-            let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
-                std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize)
-                    .to_vec()
-            } else {
-                Vec::new()
-            };
+            let hw_frames_ctx = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
+            if hw_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut hw_device_ctx);
+                bail!("failed to allocate hw frames context");
+            }
+            let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
+            (*frames_ctx).format = hw_pix_fmt;
+            (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*frames_ctx).width = width;
+            (*frames_ctx).height = height;
+            (*frames_ctx).initial_pool_size = 20;
 
-            ffi::av_buffer_unref(&mut (hw_frames_ref as *mut _));
+            let ret = ffi::av_hwframe_ctx_init(hw_frames_ctx);
+            if ret < 0 {
+                ffi::av_buffer_unref(&mut (hw_frames_ctx as *mut _));
+                ffi::av_buffer_unref(&mut hw_device_ctx);
+                bail!("failed to init hw frames context (error {ret})");
+            }
+
+            let (ctx, extradata) = match Self::open_codec_context(
+                config,
+                kind,
+                vaapi_hevc_mode,
+                hw_device_ctx,
+                hw_frames_ctx,
+            ) {
+                Ok(opened) => opened,
+                Err(err) => {
+                    ffi::av_buffer_unref(&mut (hw_frames_ctx as *mut _));
+                    ffi::av_buffer_unref(&mut hw_device_ctx);
+                    return Err(err);
+                }
+            };
 
             // VA-API can convert BGRA to NV12 on the GPU, which keeps the
             // capture thread out of the pixel path. If the driver, the filter
@@ -987,8 +1048,9 @@ impl HwEncoder {
 
             let Some(sws) = BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_NV12)
             else {
-                ffi::av_buffer_unref(&mut hw_device_ctx);
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
+                ffi::av_buffer_unref(&mut (hw_frames_ctx as *mut _));
+                ffi::av_buffer_unref(&mut hw_device_ctx);
                 bail!("failed to create swscale context");
             };
 
@@ -1038,8 +1100,12 @@ impl HwEncoder {
 
             Ok(Self {
                 kind,
+                config: config.clone(),
+                vaapi_rc_mode: vaapi_hevc_mode,
+                last_reopen_at: Instant::now(),
                 ctx,
                 hw_device_ctx,
+                hw_frames_ctx,
                 sws,
                 vpp,
                 sw_bgra,
@@ -1229,6 +1295,9 @@ impl Drop for HwEncoder {
             if !self.ctx.is_null() {
                 ffi::avcodec_free_context(&mut self.ctx);
             }
+            if !self.hw_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.hw_frames_ctx);
+            }
             if !self.hw_device_ctx.is_null() {
                 ffi::av_buffer_unref(&mut self.hw_device_ctx);
             }
@@ -1241,6 +1310,8 @@ impl Drop for HwEncoder {
 // ---------------------------------------------------------------------------
 
 struct SwEncoder {
+    config: EncoderConfig,
+    last_reopen_at: Instant,
     ctx: *mut ffi::AVCodecContext,
     sws: BandedScaler,
     sw_bgra: *mut ffi::AVFrame,
@@ -1255,15 +1326,118 @@ struct SwEncoder {
 unsafe impl Send for SwEncoder {}
 
 impl SwEncoder {
+    unsafe fn open_codec_context(
+        config: &EncoderConfig,
+    ) -> Result<(*mut ffi::AVCodecContext, Vec<u8>, &'static str, bool)> {
+        let use_intra_refresh = config.intra_refresh && config.codec == VideoCodec::H264;
+        let (enc_name, opts): (&str, Vec<(&str, &str)>) = match config.codec {
+            VideoCodec::H264 => {
+                let mut opts = vec![
+                    ("preset", "ultrafast"),
+                    ("tune", "zerolatency"),
+                    ("forced-idr", "1"),
+                    ("profile", "main"),
+                ];
+                if use_intra_refresh {
+                    opts.push(("intra-refresh", "1"));
+                }
+                if config.gop == 0 {
+                    opts.push(("x264-params", "scenecut=0"));
+                }
+                ("libx264", opts)
+            }
+            VideoCodec::H265 => {
+                let mut opts = vec![
+                    ("preset", "ultrafast"),
+                    ("tune", "zerolatency"),
+                    ("forced-idr", "1"),
+                ];
+                if config.gop == 0 {
+                    opts.push(("x265-params", "scenecut=0"));
+                }
+                ("libx265", opts)
+            }
+        };
+
+        let codec_name = std::ffi::CString::new(enc_name).unwrap();
+        let codec = ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
+        if codec.is_null() {
+            bail!("{enc_name} encoder not found");
+        }
+        let ctx = ffi::avcodec_alloc_context3(codec);
+        if ctx.is_null() {
+            bail!("failed to allocate codec context");
+        }
+
+        (*ctx).width = config.width as i32;
+        (*ctx).height = config.height as i32;
+        (*ctx).time_base = ffi::AVRational { num: 1, den: 90_000 };
+        (*ctx).framerate = ffi::AVRational { num: config.fps.max(1) as i32, den: 1 };
+        (*ctx).bit_rate = config.bitrate_bps as i64;
+        (*ctx).rc_max_rate = config.bitrate_bps as i64;
+        (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
+        (*ctx).gop_size = if use_intra_refresh || config.gop == 0 {
+            INFINITE_GOP_FRAMES
+        } else {
+            config.gop as i32
+        };
+        (*ctx).max_b_frames = 0;
+        (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+        (*ctx).thread_count = 1;
+        (*ctx).flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+
+        for (k, v) in &opts {
+            let key = std::ffi::CString::new(*k).unwrap();
+            let val = std::ffi::CString::new(*v).unwrap();
+            ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), val.as_ptr(), 0);
+        }
+
+        let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+        if ret < 0 {
+            ffi::avcodec_free_context(&mut (ctx as *mut _));
+            bail!("failed to open {enc_name} encoder (error {ret})");
+        }
+
+        let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
+            std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize).to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok((ctx, extradata, enc_name, use_intra_refresh))
+    }
+
     fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
         unsafe {
             let ctx = self.ctx;
             if ctx.is_null() {
                 bail!("encoder context is null");
             }
-            (*ctx).bit_rate = bps as i64;
-            (*ctx).rc_max_rate = bps as i64;
-            (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
+            match self.codec {
+                VideoCodec::H264 => {
+                    // FFmpeg's libx264 calls x264_encoder_reconfig() live on bitrate changes.
+                    (*ctx).bit_rate = bps as i64;
+                    (*ctx).rc_max_rate = bps as i64;
+                    (*ctx).rc_buffer_size = (bps / self.fps.max(1) * 2).max(1) as i32;
+                    self.config.bitrate_bps = bps;
+                }
+                VideoCodec::H265 => {
+                    // FFmpeg's libx265 does not reconfigure bitrate live; reopen with hysteresis.
+                    if self.last_reopen_at.elapsed() < REOPEN_COOLDOWN
+                        || !significant_bitrate_change(self.config.bitrate_bps, bps)
+                    {
+                        return Ok(());
+                    }
+                    let mut next_config = self.config.clone();
+                    next_config.bitrate_bps = bps;
+                    let (new_ctx, new_extradata, _, _) = Self::open_codec_context(&next_config)?;
+                    ffi::avcodec_free_context(&mut self.ctx);
+                    self.ctx = new_ctx;
+                    self.extradata = new_extradata;
+                    self.config.bitrate_bps = bps;
+                    self.last_reopen_at = Instant::now();
+                }
+            }
         }
         Ok(())
     }
@@ -1276,86 +1450,8 @@ impl SwEncoder {
         let width = config.width as i32;
         let height = config.height as i32;
 
-        let use_intra_refresh = config.intra_refresh && config.codec == VideoCodec::H264;
-
-        let (enc_name, opts): (&str, Vec<(&str, &str)>) = match config.codec {
-            VideoCodec::H264 => {
-                let mut opts = vec![
-                    ("preset", "ultrafast"),
-                    ("tune", "zerolatency"),
-                    ("forced-idr", "1"),
-                    ("profile", "baseline"),
-                ];
-                if use_intra_refresh {
-                    opts.push(("intra-refresh", "1"));
-                }
-                ("libx264", opts)
-            }
-            VideoCodec::H265 => (
-                "libx265",
-                vec![
-                    ("preset", "ultrafast"),
-                    ("tune", "zerolatency"),
-                    ("forced-idr", "1"),
-                ],
-            ),
-        };
-
         unsafe {
-            let codec_name = std::ffi::CString::new(enc_name).unwrap();
-            let codec = ffi::avcodec_find_encoder_by_name(codec_name.as_ptr());
-            if codec.is_null() {
-                bail!("{enc_name} encoder not found");
-            }
-
-            let ctx = ffi::avcodec_alloc_context3(codec);
-            if ctx.is_null() {
-                bail!("failed to allocate codec context");
-            }
-
-            (*ctx).width = width;
-            (*ctx).height = height;
-            (*ctx).time_base = ffi::AVRational {
-                num: 1,
-                den: 90_000,
-            };
-            (*ctx).framerate = ffi::AVRational {
-                num: config.fps.max(1) as i32,
-                den: 1,
-            };
-            (*ctx).bit_rate = config.bitrate_bps as i64;
-            (*ctx).rc_max_rate = config.bitrate_bps as i64;
-            (*ctx).rc_buffer_size = (config.bitrate_bps / config.fps.max(1) * 2).max(1) as i32;
-            // Intra-refresh replaces periodic IDRs with a rolling intra column,
-            // so a near-infinite GOP is safe (full IDRs are only PLI-triggered).
-            (*ctx).gop_size = if use_intra_refresh {
-                10_000
-            } else {
-                config.gop as i32
-            };
-            (*ctx).max_b_frames = 0;
-            (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
-            (*ctx).thread_count = 1;
-            (*ctx).flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
-
-            for (k, v) in &opts {
-                let key = std::ffi::CString::new(*k).unwrap();
-                let val = std::ffi::CString::new(*v).unwrap();
-                ffi::av_opt_set((*ctx).priv_data, key.as_ptr(), val.as_ptr(), 0);
-            }
-
-            let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
-            if ret < 0 {
-                ffi::avcodec_free_context(&mut (ctx as *mut _));
-                bail!("failed to open {enc_name} encoder (error {ret})");
-            }
-
-            let extradata = if !(*ctx).extradata.is_null() && (*ctx).extradata_size > 0 {
-                std::slice::from_raw_parts((*ctx).extradata, (*ctx).extradata_size as usize)
-                    .to_vec()
-            } else {
-                Vec::new()
-            };
+            let (ctx, extradata, enc_name, use_intra_refresh) = Self::open_codec_context(config)?;
 
             let Some(sws) =
                 BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_YUV420P)
@@ -1396,6 +1492,8 @@ impl SwEncoder {
             );
 
             Ok(Self {
+                config: config.clone(),
+                last_reopen_at: Instant::now(),
                 ctx,
                 sws,
                 sw_bgra,

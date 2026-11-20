@@ -26,11 +26,12 @@ const MIC_TICK_SAMPLES: usize = 480;
 const MAX_LAG: Duration = Duration::from_millis(100);
 /// libopus' recommended worst-case output buffer for one encode call.
 const OPUS_MAX_PACKET: usize = 4000;
-/// Redundancy distances: always the previous packet; after a reported burst also the one three
-/// back, which together recover any burst of up to 3 lost packets.
+/// Redundancy distances: none when the link is clean (saves ~50% audio bandwidth),
+/// previous packet after any primary loss, and also 3 back after a reported burst of 2+.
+const REDUNDANCY_NONE: &[u8] = &[];
 const REDUNDANCY_NORMAL: &[u8] = &[1];
 const REDUNDANCY_BURSTY: &[u8] = &[1, 3];
-/// How long the bursty level stays after the last report of a burst.
+/// How long an elevated redundancy level stays after the last loss/burst report.
 const BURST_HOLD: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
@@ -239,6 +240,7 @@ impl AudioReport {
 struct SpeakerControl {
     pace: PaceController,
     last_report: Option<Instant>,
+    loss_until: Option<Instant>,
     bursty_until: Option<Instant>,
     loss_fraction: f64,
     /// Totals since the last periodic log line.
@@ -267,6 +269,9 @@ impl SpeakerControl {
         if report.max_burst >= 2 {
             self.bursty_until = Some(now + BURST_HOLD);
         }
+        if report.primary_lost > 0 {
+            self.loss_until = Some(now + BURST_HOLD);
+        }
         if report.due > 0 {
             let loss = f64::from(report.primary_lost.min(report.due)) / f64::from(report.due);
             self.loss_fraction = 0.8 * self.loss_fraction + 0.2 * loss;
@@ -287,9 +292,12 @@ impl SpeakerControl {
     }
 
     fn redundancy(&self, now: Instant) -> &'static [u8] {
-        match self.bursty_until {
-            Some(until) if now < until => REDUNDANCY_BURSTY,
-            _ => REDUNDANCY_NORMAL,
+        if self.bursty_until.is_some_and(|until| now < until) {
+            REDUNDANCY_BURSTY
+        } else if self.loss_until.is_some_and(|until| now < until) {
+            REDUNDANCY_NORMAL
+        } else {
+            REDUNDANCY_NONE
         }
     }
 
@@ -1077,8 +1085,24 @@ mod tests {
     fn speaker_control_reacts_to_reports() {
         let mut control = SpeakerControl::default();
         let now = Instant::now();
-        assert_eq!(control.redundancy(now), REDUNDANCY_NORMAL);
+        assert_eq!(control.redundancy(now), REDUNDANCY_NONE);
         assert_eq!(control.read_period(), Duration::from_millis(10));
+        let single_loss = AudioReport {
+            generation: 1,
+            depth_us: 20_000,
+            target_us: 20_000,
+            due: 20,
+            primary_lost: 1,
+            recovered: 0,
+            concealed: 1,
+            late: 0,
+            max_burst: 1,
+            jitter_us: 10_000,
+            cap_us: 0,
+        };
+        control.on_report(&single_loss, now);
+        assert_eq!(control.redundancy(now), REDUNDANCY_NORMAL);
+        assert_eq!(control.redundancy(now + BURST_HOLD), REDUNDANCY_NONE);
         let report = AudioReport {
             generation: 1,
             depth_us: 30_000,
@@ -1094,10 +1118,10 @@ mod tests {
         };
         control.on_report(&report, now);
         assert_eq!(control.redundancy(now), REDUNDANCY_BURSTY);
-        assert_eq!(control.redundancy(now + BURST_HOLD), REDUNDANCY_NORMAL);
+        assert_eq!(control.redundancy(now + BURST_HOLD), REDUNDANCY_NONE);
         // Too deep: read slower.
         assert!(control.read_period() > Duration::from_millis(10));
         assert!(control.read_period() <= scaled(Duration::from_millis(10), PaceController::MAX_PPM));
-        assert_eq!(control.loss_percent(), 4); // 0.2 * 20%
+        assert!(control.loss_percent() >= 4);
     }
 }

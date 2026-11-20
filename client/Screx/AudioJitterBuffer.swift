@@ -298,7 +298,8 @@ final class AudioJitterBuffer {
 
         if depth == 0 {
             concealedRun += 1
-            if concealedRun > Self.maxConcealedRun {
+            let maxConcealed = target > 60 ? 6 : Self.maxConcealedRun
+            if concealedRun > maxConcealed {
                 next = nil
                 return .silence
             }

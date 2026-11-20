@@ -24,6 +24,8 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private(set) var usingFront = false
     private var configuredFps: Int32 = CaptureProfile.network.targetFps
     var compressionQuality: CGFloat = CameraCapture.defaultCompressionQuality
+    /// 1 = send every frame (LAN); 2 = send every second frame (~15 fps on constrained links).
+    var frameSkipFactor: Int = 1
     let captureProfile: CaptureProfile = .network
 
     var onJPEG: ((Data) -> Void)?
@@ -117,6 +119,9 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let onJPEG else { return }
+        frameCount &+= 1
+        let skip = max(1, frameSkipFactor)
+        if skip > 1 && Int(frameCount % UInt32(skip)) != 0 { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         applyOrientation(to: connection)
 
