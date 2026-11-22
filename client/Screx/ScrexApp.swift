@@ -337,6 +337,7 @@ final class StreamViewModel: ObservableObject {
     private var controllerObservers: [Any] = []
     private var controllerSlots: [ObjectIdentifier: UInt8] = [:]
     private var physicalMouseButtonMask: UInt8 = 0
+    private var physicalMouseMotionRemainder: CGSize = .zero
     private var physicalMouseScrollAccumulator: Float = 0
     private var trackpadButtonMask: UInt8 = 0
     private var trackpadMotionRemainder: CGSize = .zero
@@ -1510,6 +1511,7 @@ final class StreamViewModel: ObservableObject {
         if !wasConnected {
             physicalMouseConnected = true
             physicalMouseButtonMask = 0
+            physicalMouseMotionRemainder = .zero
             physicalMouseScrollAccumulator = 0
             sendPeripheral(Data([0x01, 0x01])) // PERIPH_MOUSE, ATTACHED
         }
@@ -1518,12 +1520,7 @@ final class StreamViewModel: ObservableObject {
 
         input.mouseMovedHandler = { [weak self] _, dx, dy in
             guard let self else { return }
-            var data = Data([0x01]) // MOUSE_MOVE
-            let idx = Int16(clamping: Int(dx)).bigEndian
-            let idy = Int16(clamping: -Int(dy)).bigEndian
-            withUnsafeBytes(of: idx) { data.append(contentsOf: $0) }
-            withUnsafeBytes(of: idy) { data.append(contentsOf: $0) }
-            Task { @MainActor in self.sendMouse(data) }
+            Task { @MainActor in self.handlePhysicalMouseMove(dx: dx, dy: dy) }
         }
 
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
@@ -1567,6 +1564,7 @@ final class StreamViewModel: ObservableObject {
               connectedMice.isEmpty, physicalMouseConnected else { return }
         let previousMask = physicalMouseButtonMask | trackpadButtonMask
         physicalMouseButtonMask = 0
+        physicalMouseMotionRemainder = .zero
         physicalMouseScrollAccumulator = 0
         physicalMouseConnected = false
         sendMouseButtonChanges(from: previousMask)
@@ -1574,6 +1572,24 @@ final class StreamViewModel: ObservableObject {
             sendPeripheral(Data([0x01, 0x00])) // PERIPH_MOUSE, DETACHED
         }
         print("[periph] mouse detached")
+    }
+
+    private func handlePhysicalMouseMove(dx: Float, dy: Float) {
+        // GCMouse reports deltas in UIKit points (often fractional on slow movement).
+        // Scale by the panel's point-to-pixel factor and accumulate sub-pixel remainders
+        // so slow movement isn't truncated to 0 and speed matches the high-DPI display.
+        let scale = max(UIScreen.main.scale, 1.0)
+        physicalMouseMotionRemainder.width += CGFloat(dx) * scale
+        physicalMouseMotionRemainder.height += CGFloat(-dy) * scale
+        let x = Int16(clamping: Int(physicalMouseMotionRemainder.width.rounded(.towardZero)))
+        let y = Int16(clamping: Int(physicalMouseMotionRemainder.height.rounded(.towardZero)))
+        physicalMouseMotionRemainder.width -= CGFloat(x)
+        physicalMouseMotionRemainder.height -= CGFloat(y)
+        guard x != 0 || y != 0 else { return }
+        var data = Data([0x01]) // MOUSE_MOVE
+        withUnsafeBytes(of: x.bigEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: y.bigEndian) { data.append(contentsOf: $0) }
+        sendMouse(data)
     }
 
     private func updatePhysicalMouseButton(button: UInt8, pressed: Bool) {
