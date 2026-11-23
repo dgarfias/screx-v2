@@ -48,8 +48,10 @@ Key files:
 - `daemon/src/main.rs`
 - `daemon/src/capture.rs`
 - `daemon/src/display_manager.rs` — transactional topology and presentation acknowledgement
-- `daemon/src/pipeline.rs` — independently owned capture/encode/send workers
-- `daemon/src/encode.rs`
+- `daemon/src/pipeline.rs` — independently owned capture/encode workers with a decoupled per-display sender thread
+- `daemon/src/encode.rs` — hardware (VA-API, NVENC) and software (libx264/libx265) encoding, BT.709 color conversion, 10-bit HEVC Main10 with NV12 fallback
+- `daemon/csrc/drm_helper.c` — DRM PRIME DMA-BUF export for EVDI primary & cursor planes and zero-copy vblank ack
+- `daemon/csrc/vaapi_vpp_helper.c` — single-pass VA-API VPP BT.709 conversion and premultiplied-alpha GPU cursor compositing
 - `daemon/src/stream_server.rs`
 - `daemon/src/quic_transport.rs` — QUIC/TLS, authentication, session admission, streams and datagrams
 - `daemon/src/cpace.rs` — CPace and the eight-digit PIN
@@ -80,10 +82,11 @@ Host-specific code lives in `daemon/src/platform/linux/`: EVDI virtual display (
 
 Key files:
 
-- `client/Screx/ScrexApp.swift`
+- `client/Screx/ScrexApp.swift`, `ContentView.swift`, `StreamPresets.swift`
 - `client/Screx/PairingService.swift`
 - `client/Screx/NetworkControlClient.swift`
 - `client/Screx/StreamClient.swift`
+- `client/Screx/FEC.swift`, `GF256Kernel.c`, `GF256Kernel.h` — flat-matrix Reed-Solomon recovery with ARM64 NEON SIMD GF(2^8) kernels
 - `client/Screx/Decoder.swift`
 - `client/Screx/DisplayView.swift`
 - `client/Screx/AudioPlayer.swift`
@@ -266,7 +269,33 @@ Notes:
 - client-to-daemon datagrams are `type(u8) + body`
 - the iPad retains incomplete video assemblies with an adaptive inactivity timeout (minimum 80 ms,
   scaling with measured RTT and jitter) and briefly holds out-of-order frames before declaring a gap,
-  then reconstructs recoverable frames from parity or discards them and requests recovery via a `PLI` datagram
+  then reconstructs recoverable frames from parity (using flat contiguous matrices and an ARM64 NEON
+  SIMD GF(2^8) kernel in `GF256Kernel.c`) or discards them and requests recovery via a `PLI` datagram
+
+### Video Capture & Encoding Pipeline
+
+Each enabled display runs two decoupled threads in `daemon/src/pipeline.rs`:
+
+1. **Capture + encode thread (`capture-{id}`):**
+   - **Zero-copy DRM PRIME path (default on VA-API):** When the compositor commits a frame to EVDI,
+     `evdi.rs` + `drm_helper.c` export the active CRTC primary framebuffer (and, when active, the
+     standard KMS `DRM_PLANE_TYPE_CURSOR` plane with its `CRTC_X/Y/W/H` atomic properties) as
+     DMA-BUF file descriptors, immediately closing temporary GEM handles. `DmaBufVppScaler` maps
+     them directly into VA-API surfaces (`av_hwframe_map`), runs a single-pass `VAEntrypointVideoProc`
+     blit (`vaapi_vpp_helper.c`) to convert sRGB → BT.709 limited-range YUV and alpha-blend the
+     hardware cursor straight into the encoder's surface pool, and then acknowledges EVDI's vblank
+     without CPU pixel readback.
+   - **Automatic CPU fallback:** On non-VA-API backends (NVENC, software), `--no-vpp`,
+     `--no-zero-copy` (`SCREX_ZEROCOPY=0`), or if DRM export / VA-API import fails, capture falls
+     back transparently to `evdi_grab_pixels` + VA-API VPP `hwupload` or multi-band CPU `swscale`.
+   - **Encoding:** VA-API H.265 prefers 10-bit `P010` (`HEVC Main10`) with silent fallback to 8-bit
+     `NV12` on unsupported GPUs; H.264 uses 8-bit `NV12`. All converter and encoder paths signal
+     matching BT.709 limited-range (`MPEG`) color metadata. The default GOP is infinite (`--keyframe 0`,
+     PLI-only IDRs) to avoid periodic bitrate spikes on constrained links.
+2. **Sender thread (`send-{id}`):**
+   - Fed by a bounded 2-slot `sync_channel` carrying zero-copy `EncodedAccessUnit` buffers (plus
+     ordered sequence/FPS control updates). Reed-Solomon FEC encoding and paced QUIC datagram sends
+     overlap with the next frame's capture and GPU encode.
 
 ### Network Control and Input Transport (QUIC streams)
 

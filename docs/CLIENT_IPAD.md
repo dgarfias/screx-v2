@@ -49,6 +49,9 @@ swiftc Screx/MediaPacket.swift Tests/MediaPacketTests.swift -o /tmp/screx-media-
 clang -c Screx/CPacePrimitives.c -o /tmp/cpace-primitives.o
 swiftc -import-objc-header Screx/Screx-Bridging-Header.h \
   Screx/CPace.swift Tests/CPaceTests.swift /tmp/cpace-primitives.o -o /tmp/cpace-tests && /tmp/cpace-tests
+clang -O2 -c Screx/GF256Kernel.c -o /tmp/gf256-kernel.o
+swiftc -O -import-objc-header Screx/Screx-Bridging-Header.h \
+  Screx/FEC.swift Tests/FECTests.swift /tmp/gf256-kernel.o -o /tmp/fec-tests && /tmp/fec-tests
 ```
 
 `Tests/QUICInteropSmoke.swift` pairs with a daemon test server over real QUIC (see
@@ -67,11 +70,11 @@ allow Keychain writes from an SSH session.
 
 ## App Store notes
 
-- Only public Network.framework, Security and CryptoKit APIs are used; TLS comes from
-  Network.framework.
+- Only public Network.framework, Security, CryptoKit, and standard `<arm_neon.h>` C intrinsics
+  (`GF256Kernel.c` for Reed-Solomon FEC) are used; TLS comes from Network.framework.
 - The bundled Monocypher code is used only for pairing; its license must ship with the binary.
-- `ITSAppUsesNonExemptEncryption` is not set. Answer the export-compliance questions for all of
-  the app's cryptography, including the bundled pairing code, before submitting.
+- `ITSAppUsesNonExemptEncryption` is set to `true` in `Info.plist`. Answer the App Store Connect
+  export-compliance questions for the app's cryptography (QUIC/TLS and CPace pairing) before submitting.
 - The security design has not been independently audited.
 
 ## Permissions
@@ -104,7 +107,8 @@ Video targets are Low (3 Mbps), Medium (8 Mbps), High (15 Mbps) and Very high (2
 with Host default and Custom also available. Targets apply per display, do not scale with
 resolution or frame rate, and may adapt downward on network loss.
 
-Audio offers Low (96 kbps), Medium (128 kbps), High (192 kbps) and Very high (256 kbps).
+Audio offers Very low (48 kbps), Mobile (64 kbps), Low (96 kbps), Medium (128 kbps), High (192 kbps)
+and Very high (256 kbps).
 This controls Opus speaker audio only, not the microphone. Like video settings, the choice is
 saved per host and sent on connection.
 

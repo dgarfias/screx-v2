@@ -89,8 +89,9 @@ cargo test
 ```
 
 They cover the published CPace vectors, wrong PINs, low-order shares, pairing persistence, pinned
-TLS, reconnects with a saved identity, busy and same-device takeover, both streams and 1022-byte
-datagrams.
+TLS, reconnects with a saved identity, busy and same-device takeover, both streams, 1022-byte
+datagrams, and (when `/dev/dri/renderD128` is available) VA-API VPP and DRM PRIME zero-copy
+capture/cursor-blend encoding.
 
 To check interoperability with Apple's QUIC stack, run the ignored test on this host:
 
@@ -136,10 +137,12 @@ sudo ./target/release/screx unpair --all
 | `-w, --max-width` | `3840` | Maximum display width clients may request (also the default when a client doesn't ask) |
 | `-H, --max-height` | `2160` | Maximum display height clients may request (also the default when a client doesn't ask) |
 | `-f, --max-framerate` | `60` | Maximum framerate clients may request (also the default when a client doesn't ask) |
-| `-k, --keyframe` | `90` | Keyframe interval (frames) |
+| `-k, --keyframe` | `0` | Keyframe interval in frames (`0` = PLI-only / infinite GOP, recommended) |
 | `--intra-refresh` | on | Replace periodic IDR keyframes with rolling intra-refresh where the encoder supports it (software H.264, NVENC); full IDRs are then only emitted on client PLI. Use `--intra-refresh false` to keep periodic keyframes |
 | `-b, --max-bitrate` | `20M` | Maximum encoder bitrate clients may request (also the default when a client doesn't ask); e.g. `20000000`, `20M`, `500K` |
 | `-p, --port` | `9000` | QUIC port (UDP); open UDP, not TCP, in the firewall |
+| `--no-vpp` | off | Convert captured frames to NV12 on the CPU instead of the GPU's VA-API video processor |
+| `--no-zero-copy` | off | Disable DRM PRIME DMA-BUF zero-copy capture and fall back to CPU pixel readback via `evdi_grab_pixels` (also disabled by `SCREX_ZEROCOPY=0`) |
 | `--vaapi-async-depth` | `1` | Frames the VA-API encoder may work on at once (1–8). Higher improves throughput at the cost of up to that many frames of latency |
 | `-e, --backend` | `auto` | Encoder backend: `auto`, `vaapi`, `nvenc`, `software` |
 | `-c, --codec` | `h264` | Default video codec: `h264`, `h265` (clients may request either, if the daemon can encode it) |
