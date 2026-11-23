@@ -1,4 +1,5 @@
 use std::ops::Deref;
+use std::os::fd::AsRawFd;
 use std::ptr;
 use std::time::{Duration, Instant};
 
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use ffmpeg_sys_next as ffi;
 
-use crate::capture::CaptureFrame;
+use crate::capture::{CaptureFrame, DmaBufFrame, FrameData};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -227,6 +228,14 @@ impl Encoder {
 
     pub fn bitrate_bps(&self) -> u32 {
         self.config.bitrate_bps
+    }
+
+    pub fn supports_dmabuf(&self) -> bool {
+        self.config.gpu_convert
+            && matches!(
+                &self.inner,
+                ActiveEncoder::HwAccel(enc) if matches!(enc.kind, HwKind::Vaapi)
+            )
     }
 
     pub fn reconfigure_bitrate(&mut self, bps: u32) -> Result<()> {
@@ -556,8 +565,11 @@ struct HwEncoder {
     hw_device_ctx: *mut ffi::AVBufferRef,
     hw_frames_ctx: *mut ffi::AVBufferRef,
     sws: BandedScaler,
-    /// GPU colour conversion: BGRA -> NV12 through VA-API VPP.
+    /// GPU colour conversion: CPU BGRA -> VA-API NV12 via hwupload + scale_vaapi.
     vpp: Option<VppScaler>,
+    /// True zero-copy GPU conversion: DRM_PRIME DMA-BUF -> VA-API NV12 via
+    /// av_hwframe_map + scale_vaapi (no CPU readback or hwupload).
+    dmabuf_vpp: Option<DmaBufVppScaler>,
     sw_bgra: *mut ffi::AVFrame,
     sw_nv12: *mut ffi::AVFrame,
     hw_frame: *mut ffi::AVFrame,
@@ -687,6 +699,499 @@ impl VppScaler {
 impl Drop for VppScaler {
     fn drop(&mut self) {
         self.free();
+    }
+}
+
+fn drm_fourcc_to_sw_pix_fmt(fourcc: u32) -> Option<ffi::AVPixelFormat> {
+    const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
+        (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+    }
+    const DRM_FORMAT_XRGB8888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
+    const DRM_FORMAT_ARGB8888: u32 = fourcc_code(b'A', b'R', b'2', b'4');
+    const DRM_FORMAT_XBGR8888: u32 = fourcc_code(b'X', b'B', b'2', b'4');
+    const DRM_FORMAT_ABGR8888: u32 = fourcc_code(b'A', b'B', b'2', b'4');
+
+    match fourcc {
+        DRM_FORMAT_XRGB8888 => Some(ffi::AVPixelFormat::AV_PIX_FMT_BGR0),
+        DRM_FORMAT_ARGB8888 => Some(ffi::AVPixelFormat::AV_PIX_FMT_BGRA),
+        DRM_FORMAT_XBGR8888 => Some(ffi::AVPixelFormat::AV_PIX_FMT_RGB0),
+        DRM_FORMAT_ABGR8888 => Some(ffi::AVPixelFormat::AV_PIX_FMT_RGBA),
+        _ => None,
+    }
+}
+
+unsafe extern "C" fn free_drm_frame_descriptor(_opaque: *mut libc::c_void, data: *mut u8) {
+    if data.is_null() {
+        return;
+    }
+    let desc = Box::from_raw(data as *mut ffi::AVDRMFrameDescriptor);
+    let n = (desc.nb_objects as usize).min(desc.objects.len());
+    for obj in &desc.objects[..n] {
+        if obj.fd >= 0 {
+            libc::close(obj.fd);
+        }
+    }
+}
+
+#[repr(C)]
+struct ScrexVaVpp {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn screx_va_vpp_create(
+        va_display: *mut libc::c_void,
+        width: libc::c_int,
+        height: libc::c_int,
+    ) -> *mut ScrexVaVpp;
+    fn screx_va_vpp_destroy(vpp: *mut ScrexVaVpp);
+    fn screx_va_vpp_compose(
+        vpp: *mut ScrexVaVpp,
+        dst_surface: u32,
+        primary_surface: u32,
+        frame_w: libc::c_int,
+        frame_h: libc::c_int,
+        has_cursor: libc::c_int,
+        cursor_surface: u32,
+        cursor_x: libc::c_int,
+        cursor_y: libc::c_int,
+        cursor_src_w: libc::c_int,
+        cursor_src_h: libc::c_int,
+        cursor_dst_w: libc::c_int,
+        cursor_dst_h: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// Imports a DRM PRIME DMA-BUF directly into a VA-API surface via
+/// `av_hwframe_map` and runs single-pass VA-API VPP (`VAEntrypointVideoProc`)
+/// directly into the encoder's NV12 surface pool, alpha-blending the DRM
+/// hardware cursor plane on the GPU when present.
+struct DmaBufVppScaler {
+    width: i32,
+    height: i32,
+    sw_format: ffi::AVPixelFormat,
+    vaapi_device_ctx: *mut ffi::AVBufferRef,
+    drm_device_ctx: *mut ffi::AVBufferRef,
+    drm_frames_ctx: *mut ffi::AVBufferRef,
+    vaapi_in_frames_ctx: *mut ffi::AVBufferRef,
+    va_vpp: *mut ScrexVaVpp,
+    drm_frame: *mut ffi::AVFrame,
+    vaapi_in_frame: *mut ffi::AVFrame,
+    cursor_key: Option<(i32, i32, ffi::AVPixelFormat)>,
+    cursor_drm_frames_ctx: *mut ffi::AVBufferRef,
+    cursor_vaapi_frames_ctx: *mut ffi::AVBufferRef,
+    cursor_drm_frame: *mut ffi::AVFrame,
+    cursor_vaapi_frame: *mut ffi::AVFrame,
+}
+
+unsafe impl Send for DmaBufVppScaler {}
+
+impl DmaBufVppScaler {
+    fn new(
+        width: i32,
+        height: i32,
+        sw_format: ffi::AVPixelFormat,
+        vaapi_device_ctx: *mut ffi::AVBufferRef,
+    ) -> Result<Self> {
+        unsafe {
+            let mut scaler = Self {
+                width,
+                height,
+                sw_format,
+                vaapi_device_ctx: ffi::av_buffer_ref(vaapi_device_ctx),
+                drm_device_ctx: ptr::null_mut(),
+                drm_frames_ctx: ptr::null_mut(),
+                vaapi_in_frames_ctx: ptr::null_mut(),
+                va_vpp: ptr::null_mut(),
+                drm_frame: ptr::null_mut(),
+                vaapi_in_frame: ptr::null_mut(),
+                cursor_key: None,
+                cursor_drm_frames_ctx: ptr::null_mut(),
+                cursor_vaapi_frames_ctx: ptr::null_mut(),
+                cursor_drm_frame: ptr::null_mut(),
+                cursor_vaapi_frame: ptr::null_mut(),
+            };
+            if scaler.vaapi_device_ctx.is_null() {
+                bail!("failed to ref VA-API device context");
+            }
+
+            let va_dev_ctx = (*vaapi_device_ctx).data as *mut ffi::AVHWDeviceContext;
+            let va_hwctx = (*va_dev_ctx).hwctx as *mut ffi::AVVAAPIDeviceContext;
+            let va_vpp = screx_va_vpp_create((*va_hwctx).display, width, height);
+            if va_vpp.is_null() {
+                bail!("screx_va_vpp_create failed for {width}x{height}");
+            }
+            scaler.va_vpp = va_vpp;
+
+            let drm_dev = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM);
+            if drm_dev.is_null() {
+                bail!("failed to allocate DRM hwdevice context");
+            }
+            scaler.drm_device_ctx = drm_dev;
+            let dev_ctx = (*drm_dev).data as *mut ffi::AVHWDeviceContext;
+            let drm_hwctx = (*dev_ctx).hwctx as *mut ffi::AVDRMDeviceContext;
+            (*drm_hwctx).fd = -1;
+            let ret = ffi::av_hwdevice_ctx_init(drm_dev);
+            if ret < 0 {
+                bail!("av_hwdevice_ctx_init(DRM) failed (error {ret})");
+            }
+
+            let drm_frames = ffi::av_hwframe_ctx_alloc(drm_dev);
+            if drm_frames.is_null() {
+                bail!("failed to allocate DRM hwframes context");
+            }
+            scaler.drm_frames_ctx = drm_frames;
+            let fc = (*drm_frames).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
+            (*fc).sw_format = sw_format;
+            (*fc).width = width;
+            (*fc).height = height;
+            (*fc).initial_pool_size = 0;
+            let ret = ffi::av_hwframe_ctx_init(drm_frames);
+            if ret < 0 {
+                bail!("av_hwframe_ctx_init(DRM_PRIME) failed (error {ret})");
+            }
+
+            let ret = ffi::av_hwframe_ctx_create_derived(
+                &mut scaler.vaapi_in_frames_ctx,
+                ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                vaapi_device_ctx,
+                drm_frames,
+                0,
+            );
+            if ret < 0 || scaler.vaapi_in_frames_ctx.is_null() {
+                bail!("av_hwframe_ctx_create_derived(VAAPI <- DRM_PRIME) failed (error {ret})");
+            }
+
+            scaler.drm_frame = ffi::av_frame_alloc();
+            scaler.vaapi_in_frame = ffi::av_frame_alloc();
+            scaler.cursor_drm_frame = ffi::av_frame_alloc();
+            scaler.cursor_vaapi_frame = ffi::av_frame_alloc();
+            if scaler.drm_frame.is_null()
+                || scaler.vaapi_in_frame.is_null()
+                || scaler.cursor_drm_frame.is_null()
+                || scaler.cursor_vaapi_frame.is_null()
+            {
+                bail!("failed to allocate zero-copy VPP scratch frames");
+            }
+
+            crate::log_detail!(
+                "[encode] VA-API zero-copy DMA-BUF VPP initialized ({width}x{height} sw_fmt={sw_format:?}, GPU cursor blend enabled)"
+            );
+            Ok(scaler)
+        }
+    }
+
+    fn matches(&self, width: i32, height: i32, sw_format: ffi::AVPixelFormat) -> bool {
+        self.width == width && self.height == height && self.sw_format == sw_format
+    }
+
+    unsafe fn ensure_cursor_frames(
+        &mut self,
+        width: i32,
+        height: i32,
+        sw_format: ffi::AVPixelFormat,
+    ) -> Result<()> {
+        let key = (width, height, sw_format);
+        if self.cursor_key == Some(key)
+            && !self.cursor_drm_frames_ctx.is_null()
+            && !self.cursor_vaapi_frames_ctx.is_null()
+        {
+            return Ok(());
+        }
+        if !self.cursor_vaapi_frames_ctx.is_null() {
+            ffi::av_buffer_unref(&mut self.cursor_vaapi_frames_ctx);
+        }
+        if !self.cursor_drm_frames_ctx.is_null() {
+            ffi::av_buffer_unref(&mut self.cursor_drm_frames_ctx);
+        }
+        self.cursor_key = None;
+
+        let drm_frames = ffi::av_hwframe_ctx_alloc(self.drm_device_ctx);
+        if drm_frames.is_null() {
+            bail!("failed to allocate cursor DRM hwframes context");
+        }
+        self.cursor_drm_frames_ctx = drm_frames;
+        let fc = (*drm_frames).data as *mut ffi::AVHWFramesContext;
+        (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
+        (*fc).sw_format = sw_format;
+        (*fc).width = width;
+        (*fc).height = height;
+        (*fc).initial_pool_size = 0;
+        let ret = ffi::av_hwframe_ctx_init(drm_frames);
+        if ret < 0 {
+            ffi::av_buffer_unref(&mut self.cursor_drm_frames_ctx);
+            bail!("av_hwframe_ctx_init(cursor DRM_PRIME) failed (error {ret})");
+        }
+
+        let ret = ffi::av_hwframe_ctx_create_derived(
+            &mut self.cursor_vaapi_frames_ctx,
+            ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+            self.vaapi_device_ctx,
+            drm_frames,
+            0,
+        );
+        if ret < 0 || self.cursor_vaapi_frames_ctx.is_null() {
+            ffi::av_buffer_unref(&mut self.cursor_vaapi_frames_ctx);
+            ffi::av_buffer_unref(&mut self.cursor_drm_frames_ctx);
+            bail!("av_hwframe_ctx_create_derived(cursor VAAPI) failed (error {ret})");
+        }
+
+        self.cursor_key = Some(key);
+        Ok(())
+    }
+
+    fn convert(
+        &mut self,
+        dmabuf: &DmaBufFrame,
+        pts: i64,
+        enc_hw_frames_ctx: *mut ffi::AVBufferRef,
+        out: *mut ffi::AVFrame,
+    ) -> Result<()> {
+        if dmabuf.objects.is_empty() || dmabuf.objects.len() > 4 {
+            bail!("invalid DMA-BUF object count: {}", dmabuf.objects.len());
+        }
+        if dmabuf.planes.is_empty() || dmabuf.planes.len() > 4 {
+            bail!("invalid DMA-BUF plane count: {}", dmabuf.planes.len());
+        }
+
+        unsafe {
+            // 1. Import primary plane DMA-BUF into VA-API surface.
+            let mut desc = Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
+            for obj in &mut desc.objects {
+                obj.fd = -1;
+            }
+            desc.nb_objects = dmabuf.objects.len() as i32;
+            for (i, obj) in dmabuf.objects.iter().enumerate() {
+                let dup_fd = libc::fcntl(obj.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+                if dup_fd < 0 {
+                    for prev in &desc.objects[..i] {
+                        if prev.fd >= 0 {
+                            libc::close(prev.fd);
+                        }
+                    }
+                    bail!("F_DUPFD_CLOEXEC failed for DMA-BUF object {i}");
+                }
+                desc.objects[i] = ffi::AVDRMObjectDescriptor {
+                    fd: dup_fd,
+                    size: obj.size as usize,
+                    format_modifier: obj.modifier,
+                };
+            }
+
+            desc.nb_layers = 1;
+            desc.layers[0].format = dmabuf.pixel_format;
+            desc.layers[0].nb_planes = dmabuf.planes.len() as i32;
+            for (p, plane) in dmabuf.planes.iter().enumerate() {
+                desc.layers[0].planes[p] = ffi::AVDRMPlaneDescriptor {
+                    object_index: plane.object_index as i32,
+                    offset: plane.offset as isize,
+                    pitch: plane.pitch as isize,
+                };
+            }
+
+            let desc_ptr = Box::into_raw(desc);
+            let buf_ref = ffi::av_buffer_create(
+                desc_ptr as *mut u8,
+                std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+                Some(free_drm_frame_descriptor),
+                ptr::null_mut(),
+                ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
+            );
+            if buf_ref.is_null() {
+                free_drm_frame_descriptor(ptr::null_mut(), desc_ptr as *mut u8);
+                bail!("av_buffer_create failed for AVDRMFrameDescriptor");
+            }
+
+            ffi::av_frame_unref(self.drm_frame);
+            (*self.drm_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*self.drm_frame).width = self.width;
+            (*self.drm_frame).height = self.height;
+            (*self.drm_frame).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames_ctx);
+            (*self.drm_frame).buf[0] = buf_ref;
+            (*self.drm_frame).data[0] = (*buf_ref).data;
+            (*self.drm_frame).pts = pts;
+
+            ffi::av_frame_unref(self.vaapi_in_frame);
+            (*self.vaapi_in_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+            (*self.vaapi_in_frame).hw_frames_ctx = ffi::av_buffer_ref(self.vaapi_in_frames_ctx);
+
+            let map_ret = ffi::av_hwframe_map(
+                self.vaapi_in_frame,
+                self.drm_frame,
+                ffi::AV_HWFRAME_MAP_READ as libc::c_int,
+            );
+            ffi::av_frame_unref(self.drm_frame);
+            if map_ret < 0 {
+                ffi::av_frame_unref(self.vaapi_in_frame);
+                bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed (error {map_ret})");
+            }
+            let primary_surface = (*self.vaapi_in_frame).data[3] as usize as u32;
+
+            // 2. Best-effort import of hardware cursor plane DMA-BUF.
+            let mut has_cursor = 0;
+            let mut cursor_surface = 0u32;
+            let mut cursor_x = 0i32;
+            let mut cursor_y = 0i32;
+            let mut cursor_src_w = 0i32;
+            let mut cursor_src_h = 0i32;
+            let mut cursor_dst_w = 0i32;
+            let mut cursor_dst_h = 0i32;
+
+            if let Some(cursor) = &dmabuf.cursor {
+                if let Some(c_sw_fmt) = drm_fourcc_to_sw_pix_fmt(cursor.pixel_format) {
+                    let cw = cursor.width as i32;
+                    let ch = cursor.height as i32;
+                    if self.ensure_cursor_frames(cw, ch, c_sw_fmt).is_ok() {
+                        let dup_fd = libc::fcntl(cursor.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+                        if dup_fd >= 0 {
+                            let mut cdesc =
+                                Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
+                            for obj in &mut cdesc.objects {
+                                obj.fd = -1;
+                            }
+                            cdesc.nb_objects = 1;
+                            cdesc.objects[0] = ffi::AVDRMObjectDescriptor {
+                                fd: dup_fd,
+                                size: cursor.size as usize,
+                                format_modifier: cursor.modifier,
+                            };
+                            cdesc.nb_layers = 1;
+                            cdesc.layers[0].format = cursor.pixel_format;
+                            cdesc.layers[0].nb_planes = 1;
+                            cdesc.layers[0].planes[0] = ffi::AVDRMPlaneDescriptor {
+                                object_index: 0,
+                                offset: cursor.offset as isize,
+                                pitch: cursor.pitch as isize,
+                            };
+
+                            let cdesc_ptr = Box::into_raw(cdesc);
+                            let cbuf = ffi::av_buffer_create(
+                                cdesc_ptr as *mut u8,
+                                std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+                                Some(free_drm_frame_descriptor),
+                                ptr::null_mut(),
+                                ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
+                            );
+                            if !cbuf.is_null() {
+                                ffi::av_frame_unref(self.cursor_drm_frame);
+                                (*self.cursor_drm_frame).format =
+                                    ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+                                (*self.cursor_drm_frame).width = cw;
+                                (*self.cursor_drm_frame).height = ch;
+                                (*self.cursor_drm_frame).hw_frames_ctx =
+                                    ffi::av_buffer_ref(self.cursor_drm_frames_ctx);
+                                (*self.cursor_drm_frame).buf[0] = cbuf;
+                                (*self.cursor_drm_frame).data[0] = (*cbuf).data;
+
+                                ffi::av_frame_unref(self.cursor_vaapi_frame);
+                                (*self.cursor_vaapi_frame).format =
+                                    ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+                                (*self.cursor_vaapi_frame).hw_frames_ctx =
+                                    ffi::av_buffer_ref(self.cursor_vaapi_frames_ctx);
+
+                                let cmap = ffi::av_hwframe_map(
+                                    self.cursor_vaapi_frame,
+                                    self.cursor_drm_frame,
+                                    ffi::AV_HWFRAME_MAP_READ as libc::c_int,
+                                );
+                                ffi::av_frame_unref(self.cursor_drm_frame);
+                                if cmap >= 0 {
+                                    has_cursor = 1;
+                                    cursor_surface =
+                                        (*self.cursor_vaapi_frame).data[3] as usize as u32;
+                                    cursor_x = cursor.x;
+                                    cursor_y = cursor.y;
+                                    cursor_src_w = cw;
+                                    cursor_src_h = ch;
+                                    cursor_dst_w = cursor.crtc_w as i32;
+                                    cursor_dst_h = cursor.crtc_h as i32;
+                                } else {
+                                    ffi::av_frame_unref(self.cursor_vaapi_frame);
+                                }
+                            } else {
+                                free_drm_frame_descriptor(ptr::null_mut(), cdesc_ptr as *mut u8);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Allocate destination NV12 VA-API surface directly from encoder pool.
+            ffi::av_frame_unref(out);
+            let ret = ffi::av_hwframe_get_buffer(enc_hw_frames_ctx, out, 0);
+            if ret < 0 {
+                ffi::av_frame_unref(self.cursor_vaapi_frame);
+                ffi::av_frame_unref(self.vaapi_in_frame);
+                bail!("av_hwframe_get_buffer(NV12) failed (error {ret})");
+            }
+            let dst_surface = (*out).data[3] as usize as u32;
+
+            // 4. Single-pass GPU color convert (+ alpha-blended cursor overlay).
+            let vpp_ret = screx_va_vpp_compose(
+                self.va_vpp,
+                dst_surface,
+                primary_surface,
+                self.width,
+                self.height,
+                has_cursor,
+                cursor_surface,
+                cursor_x,
+                cursor_y,
+                cursor_src_w,
+                cursor_src_h,
+                cursor_dst_w,
+                cursor_dst_h,
+            );
+            ffi::av_frame_unref(self.cursor_vaapi_frame);
+            ffi::av_frame_unref(self.vaapi_in_frame);
+            if vpp_ret < 0 {
+                ffi::av_frame_unref(out);
+                bail!("screx_va_vpp_compose failed (VAStatus error {})", -vpp_ret);
+            }
+            (*out).pts = pts;
+            Ok(())
+        }
+    }
+}
+
+impl Drop for DmaBufVppScaler {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.cursor_vaapi_frame.is_null() {
+                ffi::av_frame_free(&mut self.cursor_vaapi_frame);
+            }
+            if !self.cursor_drm_frame.is_null() {
+                ffi::av_frame_free(&mut self.cursor_drm_frame);
+            }
+            if !self.cursor_vaapi_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.cursor_vaapi_frames_ctx);
+            }
+            if !self.cursor_drm_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.cursor_drm_frames_ctx);
+            }
+            if !self.vaapi_in_frame.is_null() {
+                ffi::av_frame_free(&mut self.vaapi_in_frame);
+            }
+            if !self.drm_frame.is_null() {
+                ffi::av_frame_free(&mut self.drm_frame);
+            }
+            if !self.va_vpp.is_null() {
+                screx_va_vpp_destroy(self.va_vpp);
+            }
+            if !self.vaapi_in_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.vaapi_in_frames_ctx);
+            }
+            if !self.drm_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.drm_frames_ctx);
+            }
+            if !self.drm_device_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.drm_device_ctx);
+            }
+            if !self.vaapi_device_ctx.is_null() {
+                ffi::av_buffer_unref(&mut self.vaapi_device_ctx);
+            }
+        }
     }
 }
 
@@ -1108,6 +1613,7 @@ impl HwEncoder {
                 hw_frames_ctx,
                 sws,
                 vpp,
+                dmabuf_vpp: None,
                 sw_bgra,
                 sw_nv12,
                 hw_frame,
@@ -1128,84 +1634,133 @@ impl HwEncoder {
     ) -> Result<Vec<EncodedAccessUnit>> {
         unsafe {
             let pts = (self.frame_index as i64 * 90_000) / self.fps as i64;
-            (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
-            (*self.sw_bgra).pts = pts;
-
-            // The graph hands back an NV12 surface already on the encoder's
-            // VA-API device; nothing else to do before sending it.
-            let mut conversion_error = None;
-            if let Some(vpp) = self.vpp.as_mut() {
-                if let Err(error) = vpp.convert(self.sw_bgra, self.hw_frame) {
-                    conversion_error = Some(error);
-                }
-            }
-            if let Some(error) = conversion_error {
-                eprintln!("[encode] VA-API VPP conversion failed, converting on the CPU: {error:#}");
-                self.vpp = None;
-                ffi::av_frame_unref(self.hw_frame);
-            }
-            let converted = self.vpp.is_some();
-
-            if !converted {
-                let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
-                if ret < 0 {
-                    bail!("failed to get hw frame buffer (error {ret})");
-                }
-
-                let map_flags = (ffi::AV_HWFRAME_MAP_WRITE as libc::c_int)
-                    | (ffi::AV_HWFRAME_MAP_OVERWRITE as libc::c_int);
-                let mapped = ffi::av_hwframe_map(self.mapped_frame, self.hw_frame, map_flags);
-
-                if mapped >= 0 {
-                    self.sws.scale(
-                        (*self.sw_bgra).data.as_ptr() as *const *const u8,
-                        (*self.sw_bgra).linesize.as_ptr(),
-                        (*self.mapped_frame).data.as_mut_ptr(),
-                        (*self.mapped_frame).linesize.as_mut_ptr(),
-                    );
-                    ffi::av_frame_unref(self.mapped_frame);
-                } else {
-                    // Fallback for drivers that do not support direct mapping.
-                    // Allocate the NV12 system buffer lazily on first use.
-                    if self.sw_nv12.is_null() {
-                        eprintln!("[encode] hwframe mapping unavailable, allocating sw_nv12 fallback");
-                        self.sw_nv12 = ffi::av_frame_alloc();
-                        if self.sw_nv12.is_null() {
-                            ffi::av_frame_unref(self.mapped_frame);
-                            ffi::av_frame_unref(self.hw_frame);
-                            bail!("failed to allocate NV12 fallback frame");
-                        }
-                        (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
-                        (*self.sw_nv12).width = (*self.ctx).width;
-                        (*self.sw_nv12).height = (*self.ctx).height;
-                        let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
-                        if ret < 0 {
-                            ffi::av_frame_free(&mut self.sw_nv12);
-                            ffi::av_frame_unref(self.mapped_frame);
-                            ffi::av_frame_unref(self.hw_frame);
-                            bail!("failed to allocate NV12 fallback buffer (error {ret})");
-                        }
+            match &frame.data {
+                FrameData::DmaBuf(dmabuf) => {
+                    if !matches!(self.kind, HwKind::Vaapi) || !self.config.gpu_convert {
+                        bail!("DMA-BUF input requires VA-API with GPU VPP enabled");
                     }
-
-                    ffi::av_frame_unref(self.mapped_frame);
-                    ffi::av_frame_unref(self.hw_frame);
-
-                    self.sws.scale(
-                        (*self.sw_bgra).data.as_ptr() as *const *const u8,
-                        (*self.sw_bgra).linesize.as_ptr(),
-                        (*self.sw_nv12).data.as_mut_ptr(),
-                        (*self.sw_nv12).linesize.as_mut_ptr(),
-                    );
-
-                    let ret = ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
-                    if ret < 0 {
-                        bail!("failed to get hw frame buffer (error {ret})");
+                    let sw_format = drm_fourcc_to_sw_pix_fmt(dmabuf.pixel_format).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "unsupported DRM fourcc 0x{:08x} for DMA-BUF import",
+                                dmabuf.pixel_format
+                            )
+                        },
+                    )?;
+                    let width = frame.width as i32;
+                    let height = frame.height as i32;
+                    let needs_init = self
+                        .dmabuf_vpp
+                        .as_ref()
+                        .is_none_or(|s| !s.matches(width, height, sw_format));
+                    if needs_init {
+                        self.dmabuf_vpp = Some(DmaBufVppScaler::new(
+                            width,
+                            height,
+                            sw_format,
+                            self.hw_device_ctx,
+                        )?);
                     }
-
-                    let ret = ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
-                    if ret < 0 {
+                    let dmabuf_vpp = self.dmabuf_vpp.as_mut().unwrap();
+                    if let Err(err) =
+                        dmabuf_vpp.convert(dmabuf, pts, (*self.ctx).hw_frames_ctx, self.hw_frame)
+                    {
                         ffi::av_frame_unref(self.hw_frame);
-                        bail!("failed to upload frame to hw surface (error {ret})");
+                        return Err(err);
+                    }
+                }
+                FrameData::Bgra(bytes) => {
+                    (*self.sw_bgra).data[0] = bytes.as_ptr() as *mut u8;
+                    (*self.sw_bgra).pts = pts;
+
+                    // The graph hands back an NV12 surface already on the encoder's
+                    // VA-API device; nothing else to do before sending it.
+                    let mut conversion_error = None;
+                    if let Some(vpp) = self.vpp.as_mut() {
+                        if let Err(error) = vpp.convert(self.sw_bgra, self.hw_frame) {
+                            conversion_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = conversion_error {
+                        eprintln!(
+                            "[encode] VA-API VPP conversion failed, converting on the CPU: {error:#}"
+                        );
+                        self.vpp = None;
+                        ffi::av_frame_unref(self.hw_frame);
+                    }
+                    let converted = self.vpp.is_some();
+
+                    if !converted {
+                        let ret =
+                            ffi::av_hwframe_get_buffer((*self.ctx).hw_frames_ctx, self.hw_frame, 0);
+                        if ret < 0 {
+                            bail!("failed to get hw frame buffer (error {ret})");
+                        }
+
+                        let map_flags = (ffi::AV_HWFRAME_MAP_WRITE as libc::c_int)
+                            | (ffi::AV_HWFRAME_MAP_OVERWRITE as libc::c_int);
+                        let mapped =
+                            ffi::av_hwframe_map(self.mapped_frame, self.hw_frame, map_flags);
+
+                        if mapped >= 0 {
+                            self.sws.scale(
+                                (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                                (*self.sw_bgra).linesize.as_ptr(),
+                                (*self.mapped_frame).data.as_mut_ptr(),
+                                (*self.mapped_frame).linesize.as_mut_ptr(),
+                            );
+                            ffi::av_frame_unref(self.mapped_frame);
+                        } else {
+                            // Fallback for drivers that do not support direct mapping.
+                            // Allocate the NV12 system buffer lazily on first use.
+                            if self.sw_nv12.is_null() {
+                                eprintln!(
+                                    "[encode] hwframe mapping unavailable, allocating sw_nv12 fallback"
+                                );
+                                self.sw_nv12 = ffi::av_frame_alloc();
+                                if self.sw_nv12.is_null() {
+                                    ffi::av_frame_unref(self.mapped_frame);
+                                    ffi::av_frame_unref(self.hw_frame);
+                                    bail!("failed to allocate NV12 fallback frame");
+                                }
+                                (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                                (*self.sw_nv12).width = (*self.ctx).width;
+                                (*self.sw_nv12).height = (*self.ctx).height;
+                                let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
+                                if ret < 0 {
+                                    ffi::av_frame_free(&mut self.sw_nv12);
+                                    ffi::av_frame_unref(self.mapped_frame);
+                                    ffi::av_frame_unref(self.hw_frame);
+                                    bail!("failed to allocate NV12 fallback buffer (error {ret})");
+                                }
+                            }
+
+                            ffi::av_frame_unref(self.mapped_frame);
+                            ffi::av_frame_unref(self.hw_frame);
+
+                            self.sws.scale(
+                                (*self.sw_bgra).data.as_ptr() as *const *const u8,
+                                (*self.sw_bgra).linesize.as_ptr(),
+                                (*self.sw_nv12).data.as_mut_ptr(),
+                                (*self.sw_nv12).linesize.as_mut_ptr(),
+                            );
+
+                            let ret = ffi::av_hwframe_get_buffer(
+                                (*self.ctx).hw_frames_ctx,
+                                self.hw_frame,
+                                0,
+                            );
+                            if ret < 0 {
+                                bail!("failed to get hw frame buffer (error {ret})");
+                            }
+
+                            let ret =
+                                ffi::av_hwframe_transfer_data(self.hw_frame, self.sw_nv12, 0);
+                            if ret < 0 {
+                                ffi::av_frame_unref(self.hw_frame);
+                                bail!("failed to upload frame to hw surface (error {ret})");
+                            }
+                        }
                     }
                 }
             }
@@ -1276,6 +1831,8 @@ impl HwEncoder {
 
 impl Drop for HwEncoder {
     fn drop(&mut self) {
+        self.dmabuf_vpp = None;
+        self.vpp = None;
         unsafe {
             if !self.pkt.is_null() {
                 ffi::av_packet_free(&mut self.pkt);
@@ -1513,6 +2070,9 @@ impl SwEncoder {
         is_idr: bool,
     ) -> Result<Vec<EncodedAccessUnit>> {
         unsafe {
+            let FrameData::Bgra(bytes) = frame.data else {
+                bail!("software encoder does not accept zero-copy DMA-BUF frames");
+            };
             // Ensure we have exclusive ownership of the YUV buffer
             // (libx264 may still hold a ref from the previous frame)
             let ret = ffi::av_frame_make_writable(self.sw_yuv);
@@ -1520,7 +2080,7 @@ impl SwEncoder {
                 bail!("av_frame_make_writable failed (error {ret})");
             }
 
-            (*self.sw_bgra).data[0] = frame.data.as_ptr() as *mut u8;
+            (*self.sw_bgra).data[0] = bytes.as_ptr() as *mut u8;
             self.sws.scale(
                 (*self.sw_bgra).data.as_ptr() as *const *const u8,
                 (*self.sw_bgra).linesize.as_ptr(),
@@ -1630,7 +2190,7 @@ mod banded_scaler_tests {
             return;
         };
         let bgra = vec![128u8; 256 * 256 * 4];
-        let capture = CaptureFrame { width: 256, height: 256, data: &bgra };
+        let capture = CaptureFrame::bgra(256, 256, &bgra);
         // async_depth pipelines, so the first packets arrive a frame later.
         let mut units = Vec::new();
         for index in 0..3 {
@@ -1638,6 +2198,285 @@ mod banded_scaler_tests {
         }
         assert!(!units.is_empty());
         assert!(units.iter().any(|unit| unit.is_idr));
+    }
+
+    /// Exports a real GPU DMA-BUF from a VA-API BGR0/BGRA surface, wraps it in
+    /// `CaptureFrame::dmabuf`, verifies `DmaBufVppScaler` produces valid non-black
+    /// NV12 pixels, and verifies `Encoder::encode_frame` emits an H.264 IDR.
+    #[test]
+    fn vaapi_dmabuf_zero_copy_converts_and_encodes() {
+        use std::os::fd::FromRawFd;
+        use crate::capture::{DmaBufObject, DmaBufPlane};
+
+        let width: i32 = 256;
+        let height: i32 = 256;
+        unsafe {
+            let mut va_dev = ptr::null_mut();
+            let dev_path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+            if ffi::av_hwdevice_ctx_create(
+                &mut va_dev,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                dev_path.as_ptr(),
+                ptr::null_mut(),
+                0,
+            ) < 0
+            {
+                eprintln!("skipping: no VA-API device for zero-copy test");
+                return;
+            }
+
+            // Create a VA-API BGRA surface pool and fill one surface with color.
+            let va_frames = ffi::av_hwframe_ctx_alloc(va_dev);
+            assert!(!va_frames.is_null());
+            let fc = (*va_frames).data as *mut ffi::AVHWFramesContext;
+            (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*fc).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*fc).width = width;
+            (*fc).height = height;
+            (*fc).initial_pool_size = 2;
+            if ffi::av_hwframe_ctx_init(va_frames) < 0 {
+                eprintln!("skipping: VA-API BGRA frame pool unavailable");
+                ffi::av_buffer_unref(&mut (va_frames as *mut _));
+                ffi::av_buffer_unref(&mut va_dev);
+                return;
+            }
+
+            let mut src_va = ffi::av_frame_alloc();
+            assert!(ffi::av_hwframe_get_buffer(va_frames, src_va, 0) >= 0);
+
+            let mut sw_src = ffi::av_frame_alloc();
+            (*sw_src).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+            (*sw_src).width = width;
+            (*sw_src).height = height;
+            assert!(ffi::av_frame_get_buffer(sw_src, 0) >= 0);
+            let stride = (*sw_src).linesize[0] as usize;
+            for row in 0..height as usize {
+                let row_ptr = (*sw_src).data[0].add(row * stride);
+                for col in 0..width as usize {
+                    *row_ptr.add(col * 4) = 40;
+                    *row_ptr.add(col * 4 + 1) = 200;
+                    *row_ptr.add(col * 4 + 2) = 90;
+                    *row_ptr.add(col * 4 + 3) = 255;
+                }
+            }
+            assert!(ffi::av_hwframe_transfer_data(src_va, sw_src, 0) >= 0);
+
+            // Export the VA-API surface to a real DRM_PRIME DMA-BUF descriptor.
+            let mut drm_dev = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM);
+            assert!(!drm_dev.is_null());
+            let dev_ctx = (*drm_dev).data as *mut ffi::AVHWDeviceContext;
+            let drm_hwctx = (*dev_ctx).hwctx as *mut ffi::AVDRMDeviceContext;
+            (*drm_hwctx).fd = -1;
+            assert!(ffi::av_hwdevice_ctx_init(drm_dev) >= 0);
+
+            let mut drm_frames = ptr::null_mut();
+            let derive_ret = ffi::av_hwframe_ctx_create_derived(
+                &mut drm_frames,
+                ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME,
+                drm_dev,
+                va_frames,
+                0,
+            );
+            assert!(
+                derive_ret >= 0,
+                "av_hwframe_ctx_create_derived(DRM_PRIME <- VAAPI) failed: {derive_ret}"
+            );
+            let mut exported_drm = ffi::av_frame_alloc();
+            (*exported_drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*exported_drm).hw_frames_ctx = ffi::av_buffer_ref(drm_frames);
+            let export_map_ret = ffi::av_hwframe_map(
+                exported_drm,
+                src_va,
+                ffi::AV_HWFRAME_MAP_READ as libc::c_int,
+            );
+            assert!(
+                export_map_ret >= 0,
+                "av_hwframe_map(VAAPI -> DRM_PRIME) failed: {export_map_ret}"
+            );
+
+            let desc = &*((*exported_drm).data[0] as *const ffi::AVDRMFrameDescriptor);
+            assert!(desc.nb_objects >= 1 && desc.nb_layers >= 1);
+            let layer = &desc.layers[0];
+            let mut objects = Vec::new();
+            for i in 0..desc.nb_objects as usize {
+                let dup_fd = libc::fcntl(desc.objects[i].fd, libc::F_DUPFD_CLOEXEC, 0);
+                assert!(dup_fd >= 0);
+                objects.push(DmaBufObject {
+                    fd: std::os::fd::OwnedFd::from_raw_fd(dup_fd),
+                    size: desc.objects[i].size as u64,
+                    modifier: desc.objects[i].format_modifier,
+                });
+            }
+            let mut planes = Vec::new();
+            for p in 0..layer.nb_planes as usize {
+                planes.push(DmaBufPlane {
+                    object_index: layer.planes[p].object_index as usize,
+                    offset: layer.planes[p].offset as u32,
+                    pitch: layer.planes[p].pitch as u32,
+                });
+            }
+            let mut dmabuf = DmaBufFrame {
+                fb_id: 1,
+                pixel_format: layer.format,
+                flags: 0,
+                objects,
+                planes,
+                cursor: None,
+            };
+
+            // Also export a 64x64 premultiplied-alpha cursor surface (white opaque square).
+            let cursor_size: i32 = 64;
+            let cursor_va_frames = ffi::av_hwframe_ctx_alloc(va_dev);
+            assert!(!cursor_va_frames.is_null());
+            let cfc = (*cursor_va_frames).data as *mut ffi::AVHWFramesContext;
+            (*cfc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*cfc).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
+            (*cfc).width = cursor_size;
+            (*cfc).height = cursor_size;
+            (*cfc).initial_pool_size = 2;
+            assert!(ffi::av_hwframe_ctx_init(cursor_va_frames) >= 0);
+
+            let mut cur_va = ffi::av_frame_alloc();
+            assert!(ffi::av_hwframe_get_buffer(cursor_va_frames, cur_va, 0) >= 0);
+            let mut cur_sw = ffi::av_frame_alloc();
+            (*cur_sw).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+            (*cur_sw).width = cursor_size;
+            (*cur_sw).height = cursor_size;
+            assert!(ffi::av_frame_get_buffer(cur_sw, 0) >= 0);
+            let cstride = (*cur_sw).linesize[0] as usize;
+            for row in 0..cursor_size as usize {
+                let row_ptr = (*cur_sw).data[0].add(row * cstride);
+                for col in 0..cursor_size as usize {
+                    // Left half opaque white (255,255,255,255), right half transparent (0,0,0,0).
+                    let val = if col < 32 { 255u8 } else { 0u8 };
+                    *row_ptr.add(col * 4) = val;
+                    *row_ptr.add(col * 4 + 1) = val;
+                    *row_ptr.add(col * 4 + 2) = val;
+                    *row_ptr.add(col * 4 + 3) = val;
+                }
+            }
+            assert!(ffi::av_hwframe_transfer_data(cur_va, cur_sw, 0) >= 0);
+
+            let mut cur_drm_frames = ptr::null_mut();
+            assert!(
+                ffi::av_hwframe_ctx_create_derived(
+                    &mut cur_drm_frames,
+                    ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME,
+                    drm_dev,
+                    cursor_va_frames,
+                    0,
+                ) >= 0
+            );
+            let mut cur_drm = ffi::av_frame_alloc();
+            (*cur_drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*cur_drm).hw_frames_ctx = ffi::av_buffer_ref(cur_drm_frames);
+            assert!(
+                ffi::av_hwframe_map(cur_drm, cur_va, ffi::AV_HWFRAME_MAP_READ as libc::c_int) >= 0
+            );
+            let cdesc = &*((*cur_drm).data[0] as *const ffi::AVDRMFrameDescriptor);
+            let clayer = &cdesc.layers[0];
+            let cdup_fd = libc::fcntl(cdesc.objects[0].fd, libc::F_DUPFD_CLOEXEC, 0);
+            assert!(cdup_fd >= 0);
+            dmabuf.cursor = Some(crate::capture::DmaBufCursor {
+                fb_id: 2,
+                x: 64,
+                y: 64,
+                width: cursor_size as u32,
+                height: cursor_size as u32,
+                crtc_w: cursor_size as u32,
+                crtc_h: cursor_size as u32,
+                pixel_format: clayer.format,
+                fd: std::os::fd::OwnedFd::from_raw_fd(cdup_fd),
+                size: cdesc.objects[0].size as u64,
+                modifier: cdesc.objects[0].format_modifier,
+                pitch: clayer.planes[0].pitch as u32,
+                offset: clayer.planes[0].offset as u32,
+            });
+
+            // 1. Verify DmaBufVppScaler converts primary + alpha-blends cursor into NV12.
+            let nv12_frames = ffi::av_hwframe_ctx_alloc(va_dev);
+            assert!(!nv12_frames.is_null());
+            let nfc = (*nv12_frames).data as *mut ffi::AVHWFramesContext;
+            (*nfc).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*nfc).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*nfc).width = width;
+            (*nfc).height = height;
+            (*nfc).initial_pool_size = 4;
+            assert!(ffi::av_hwframe_ctx_init(nv12_frames) >= 0);
+
+            let sw_fmt = drm_fourcc_to_sw_pix_fmt(dmabuf.pixel_format)
+                .expect("exported VA-API fourcc should map to supported pixel format");
+            let mut scaler =
+                DmaBufVppScaler::new(width, height, sw_fmt, va_dev).expect("DmaBufVppScaler::new");
+            let mut nv12_hw = ffi::av_frame_alloc();
+            scaler
+                .convert(&dmabuf, 0, nv12_frames, nv12_hw)
+                .expect("DmaBufVppScaler::convert");
+            assert_eq!((*nv12_hw).format, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32);
+            let mut readback = ffi::av_frame_alloc();
+            assert!(
+                ffi::av_hwframe_map(readback, nv12_hw, ffi::AV_HWFRAME_MAP_READ as libc::c_int)
+                    >= 0
+            );
+            let luma_stride = (*readback).linesize[0] as usize;
+            let bg_luma = *(*readback).data[0];
+            let cursor_opaque_luma = *(*readback).data[0].add(70 * luma_stride + 70);
+            let cursor_transparent_luma = *(*readback).data[0].add(70 * luma_stride + 110);
+            assert!(
+                bg_luma > 100 && bg_luma < 190,
+                "expected mid-bright NV12 background luma, got {bg_luma}"
+            );
+            assert!(
+                cursor_opaque_luma > 220,
+                "expected bright white composited cursor pixel at (70,70), got {cursor_opaque_luma}"
+            );
+            assert!(
+                (cursor_transparent_luma as i32 - bg_luma as i32).abs() <= 4,
+                "expected transparent half of cursor at (110,70) to preserve background ({bg_luma}), got {cursor_transparent_luma}"
+            );
+            ffi::av_frame_free(&mut readback);
+            ffi::av_frame_free(&mut nv12_hw);
+            ffi::av_buffer_unref(&mut (nv12_frames as *mut _));
+            drop(scaler);
+
+            // 2. Verify full Encoder::encode_frame path produces H.264 IDR output.
+            let config = EncoderConfig {
+                bitrate_bps: 4_000_000,
+                vaapi_async_depth: 1,
+                gop: 0,
+                fps: 60,
+                width: width as u32,
+                height: height as u32,
+                backend: EncoderBackend::Vaapi,
+                codec: VideoCodec::H264,
+                intra_refresh: false,
+                gpu_convert: true,
+            };
+            let mut encoder = Encoder::new(config).expect("VA-API H.264 encoder");
+            assert!(encoder.supports_dmabuf());
+            let capture = CaptureFrame::dmabuf(width as u32, height as u32, &dmabuf);
+            let mut units = Vec::new();
+            for i in 0..3 {
+                units.extend(encoder.encode_frame(&capture, i == 0).expect("dmabuf encode"));
+            }
+            assert!(!units.is_empty());
+            assert!(units.iter().any(|u| u.is_idr));
+
+            // Cleanup
+            drop(dmabuf);
+            ffi::av_frame_free(&mut cur_drm);
+            ffi::av_frame_free(&mut cur_sw);
+            ffi::av_frame_free(&mut cur_va);
+            ffi::av_buffer_unref(&mut cur_drm_frames);
+            ffi::av_buffer_unref(&mut (cursor_va_frames as *mut _));
+            ffi::av_frame_free(&mut exported_drm);
+            ffi::av_frame_free(&mut sw_src);
+            ffi::av_frame_free(&mut src_va);
+            ffi::av_buffer_unref(&mut drm_frames);
+            ffi::av_buffer_unref(&mut drm_dev);
+            ffi::av_buffer_unref(&mut (va_frames as *mut _));
+            ffi::av_buffer_unref(&mut va_dev);
+        }
     }
 
     /// Exercises the VA-API VPP path on a real device: converts a BGRA frame

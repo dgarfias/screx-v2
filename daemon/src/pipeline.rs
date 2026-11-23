@@ -113,6 +113,7 @@ impl CaptureWorker {
             gop: config.gop,
             intra_refresh: config.intra_refresh,
         };
+        let zero_copy_requested = config.zero_copy;
         worker.thread = Some(
             thread::Builder::new()
                 .name(format!("capture-{}", display as u8))
@@ -120,6 +121,14 @@ impl CaptureWorker {
                     let result = (|| -> Result<()> {
                         let mut encoder = crate::encode::Encoder::new(enc_config)?;
                         let codec = encoder.codec().transport_id();
+                        let allow_zero_copy = Arc::new(AtomicBool::new(
+                            zero_copy_requested && encoder.supports_dmabuf(),
+                        ));
+                        if zero_copy_requested && !encoder.supports_dmabuf() {
+                            crate::log_detail!(
+                                "[pipeline/{display:?}] active encoder does not support VA-API DMA-BUF import; using CPU capture"
+                            );
+                        }
                         let mut backend =
                             capture::create_display_backend(&capture::CaptureConfig {
                                 display_id: display,
@@ -128,6 +137,7 @@ impl CaptureWorker {
                                 width: settings.width,
                                 height: settings.height,
                                 fps: settings.fps,
+                                zero_copy: Arc::clone(&allow_zero_copy),
                             })?;
                         backend.attach(capture::DisplayMode {
                             width: settings.width,
@@ -140,6 +150,11 @@ impl CaptureWorker {
                         let mut current_fps = settings.fps;
                         let mut consecutive_errors = 0;
                         let mut pipeline_error = None;
+                        let mut perf_start = Instant::now();
+                        let mut perf_frames: u64 = 0;
+                        let mut perf_zc_frames: u64 = 0;
+                        let mut perf_enc_us: u64 = 0;
+                        let mut perf_send_us: u64 = 0;
                         backend.run_capture_loop(&stop, &control.force_refresh, &mut |frame| {
                             if stop.load(Ordering::Relaxed)
                                 || !shared.is_current_network_session(session)
@@ -176,8 +191,12 @@ impl CaptureWorker {
                                     );
                                 }
                             }
+                            let is_dmabuf = frame.is_dmabuf();
+                            let t_enc = Instant::now();
                             let result = (|| -> Result<()> {
                                 let units = encoder.encode_frame(&frame, force_idr)?;
+                                let enc_us = t_enc.elapsed().as_micros() as u64;
+                                let t_send = Instant::now();
                                 {
                                     if !shared.is_current_network_session(session) {
                                         return Ok(());
@@ -203,10 +222,40 @@ impl CaptureWorker {
                                         }
                                     }
                                 }
+                                let send_us = t_send.elapsed().as_micros() as u64;
+                                perf_frames += 1;
+                                if is_dmabuf {
+                                    perf_zc_frames += 1;
+                                }
+                                perf_enc_us += enc_us;
+                                perf_send_us += send_us;
+                                if perf_start.elapsed() >= Duration::from_secs(1) {
+                                    let elapsed = perf_start.elapsed().as_secs_f64();
+                                    let fps = perf_frames as f64 / elapsed;
+                                    let enc_ms = (perf_enc_us as f64 / perf_frames.max(1) as f64) / 1000.0;
+                                    let send_ms = (perf_send_us as f64 / perf_frames.max(1) as f64) / 1000.0;
+                                    let mode = if perf_zc_frames > 0 { "dmabuf" } else { "cpu" };
+                                    crate::log_detail!(
+                                        "[pipeline/{display:?}] mode={mode} fps={fps:.1} enc_avg={enc_ms:.2}ms send_avg={send_ms:.2}ms"
+                                    );
+                                    perf_start = Instant::now();
+                                    perf_frames = 0;
+                                    perf_zc_frames = 0;
+                                    perf_enc_us = 0;
+                                    perf_send_us = 0;
+                                }
                                 Ok(())
                             })();
                             if let Err(e) = result {
                                 if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if is_dmabuf && allow_zero_copy.swap(false, Ordering::AcqRel) {
+                                    eprintln!(
+                                        "[pipeline/{display:?}] zero-copy VA-API encode failed, falling back to CPU capture: {e:#}"
+                                    );
+                                    control.force_idr.store(true, Ordering::Relaxed);
+                                    control.force_refresh.store(true, Ordering::Relaxed);
                                     return;
                                 }
                                 eprintln!("[pipeline/{display:?}] frame failed: {e:#}");

@@ -3,6 +3,15 @@ fn main() {
     cc::Build::new()
         .file("csrc/v4l2_helper.c")
         .compile("v4l2_helper");
+    println!("cargo:rerun-if-changed=csrc/drm_helper.c");
+    cc::Build::new()
+        .file("csrc/drm_helper.c")
+        .compile("drm_helper");
+    println!("cargo:rerun-if-changed=csrc/vaapi_vpp_helper.c");
+    cc::Build::new()
+        .file("csrc/vaapi_vpp_helper.c")
+        .compile("vaapi_vpp_helper");
+    println!("cargo:rustc-link-lib=va");
     println!("cargo:rerun-if-changed=../shared");
     cc::Build::new()
         .file("../shared/cpace_primitives.c")

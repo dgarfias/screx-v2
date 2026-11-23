@@ -92,6 +92,11 @@ struct Cli {
     #[arg(long)]
     no_vpp: bool,
 
+    /// Disable DRM PRIME DMA-BUF zero-copy capture and fall back to CPU
+    /// pixel readback via evdi_grab_pixels (also disabled by SCREX_ZEROCOPY=0)
+    #[arg(long, default_value_t = false)]
+    no_zero_copy: bool,
+
     /// Number of frames the VA-API encoder may work on at once. The default
     /// keeps the old serialized behaviour; 2–4 can improve throughput at the
     /// cost of up to that many frames of latency.
@@ -144,6 +149,7 @@ enum Commands {
 struct AppConfig {
     encoder_backend: encode::EncoderBackend,
     gpu_convert: bool,
+    zero_copy: bool,
     vaapi_async_depth: u32,
     codec: encode::VideoCodec,
     width: u32,
@@ -164,9 +170,13 @@ impl AppConfig {
     // negotiates via SETTINGS" — the same field does both jobs, since an
     // un-negotiated session is defined as "get the daemon's max."
     fn from_cli(cli: &Cli) -> Self {
+        let env_disable_zero_copy = std::env::var("SCREX_ZEROCOPY")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "0" | "false" | "FALSE" | "no"));
         Self {
             encoder_backend: encode::EncoderBackend::from_str(&cli.backend),
             gpu_convert: !cli.no_vpp,
+            zero_copy: !cli.no_zero_copy && !env_disable_zero_copy,
             vaapi_async_depth: cli.vaapi_async_depth.clamp(1, 8),
             codec: encode::VideoCodec::from_str(&cli.codec),
             width: cli.max_width,
@@ -348,13 +358,17 @@ async fn main() -> Result<()> {
 }
 
 fn dump_capture_frame_ppm(index: u32, frame: &capture::CaptureFrame<'_>) {
+    let Some(bytes) = frame.bgra_bytes() else {
+        println!("[capture] skipping PPM dump #{index:03} for zero-copy DMA-BUF frame");
+        return;
+    };
     let path = std::env::temp_dir()
         .join(format!("screx-daemon-capture-{index:03}.ppm"))
         .to_string_lossy()
         .to_string();
-    let mut ppm = Vec::with_capacity(32 + frame.data.len() / 4 * 3);
+    let mut ppm = Vec::with_capacity(32 + bytes.len() / 4 * 3);
     ppm.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width, frame.height).as_bytes());
-    for px in frame.data.chunks_exact(4) {
+    for px in bytes.chunks_exact(4) {
         ppm.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     match fs::write(&path, ppm) {

@@ -1,12 +1,16 @@
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::{c_int, c_uint, c_void};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::capture::{CaptureFrame, DisplayBackend, DisplayId, DisplayMode};
+use crate::capture::{
+    CaptureFrame, DisplayBackend, DisplayId, DisplayMode, DmaBufCursor, DmaBufFrame, DmaBufObject,
+    DmaBufPlane,
+};
 
 // Allocation and opening must be serialized: checking a card does not reserve it.
 // Keep an explicit lease until close, even if libevdi still reports it available.
@@ -137,6 +141,191 @@ extern "C" fn on_crtc_state(state: c_int, _user_data: *mut c_void) {
     crate::log_detail!("[capture] CRTC state changed: {state}");
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ScrexDrmCursorPlane {
+    plane_id: u32,
+    prop_crtc_x: u32,
+    prop_crtc_y: u32,
+    prop_crtc_w: u32,
+    prop_crtc_h: u32,
+}
+
+#[repr(C)]
+struct ScrexDrmExport {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    num_objects: u32,
+    num_planes: u32,
+    fds: [i32; 4],
+    object_sizes: [u64; 4],
+    object_modifiers: [u64; 4],
+    plane_obj_idx: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+
+    cursor_fb_id: u32,
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor_width: u32,
+    cursor_height: u32,
+    cursor_crtc_w: u32,
+    cursor_crtc_h: u32,
+    cursor_pixel_format: u32,
+    cursor_fd: i32,
+    cursor_size: u64,
+    cursor_modifier: u64,
+    cursor_pitch: u32,
+    cursor_offset: u32,
+}
+
+extern "C" {
+    fn screx_drm_open_card(
+        card_index: c_int,
+        out_crtc_id: *mut u32,
+        out_cursor: *mut ScrexDrmCursorPlane,
+    ) -> c_int;
+    fn screx_drm_export_fb(
+        drm_fd: c_int,
+        io_crtc_id: *mut u32,
+        cursor_plane: *const ScrexDrmCursorPlane,
+        out: *mut ScrexDrmExport,
+    ) -> c_int;
+    fn screx_evdi_ack_vblank(evdi_fd: c_int) -> c_int;
+}
+
+struct DrmCard {
+    fd: OwnedFd,
+    crtc_id: u32,
+    cursor_plane: ScrexDrmCursorPlane,
+}
+
+impl DrmCard {
+    fn open(card_index: c_int) -> Result<Self, i32> {
+        let mut crtc_id = 0u32;
+        let mut cursor_plane = ScrexDrmCursorPlane::default();
+        let fd = unsafe { screx_drm_open_card(card_index, &mut crtc_id, &mut cursor_plane) };
+        if fd < 0 {
+            return Err(fd);
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Self {
+            fd,
+            crtc_id,
+            cursor_plane,
+        })
+    }
+
+    fn export_fb(&mut self) -> Result<(u32, u32, DmaBufFrame), i32> {
+        let mut raw = ScrexDrmExport {
+            fb_id: 0,
+            width: 0,
+            height: 0,
+            pixel_format: 0,
+            flags: 0,
+            num_objects: 0,
+            num_planes: 0,
+            fds: [-1; 4],
+            object_sizes: [0; 4],
+            object_modifiers: [0; 4],
+            plane_obj_idx: [0; 4],
+            pitches: [0; 4],
+            offsets: [0; 4],
+            cursor_fb_id: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_width: 0,
+            cursor_height: 0,
+            cursor_crtc_w: 0,
+            cursor_crtc_h: 0,
+            cursor_pixel_format: 0,
+            cursor_fd: -1,
+            cursor_size: 0,
+            cursor_modifier: 0,
+            cursor_pitch: 0,
+            cursor_offset: 0,
+        };
+        let ret = unsafe {
+            screx_drm_export_fb(
+                self.fd.as_raw_fd(),
+                &mut self.crtc_id,
+                &self.cursor_plane,
+                &mut raw,
+            )
+        };
+        if ret < 0 {
+            return Err(ret);
+        }
+        let num_objects = (raw.num_objects as usize).min(4);
+        let num_planes = (raw.num_planes as usize).min(4);
+        let mut objects = Vec::with_capacity(num_objects);
+        for i in 0..num_objects {
+            let fd = unsafe { OwnedFd::from_raw_fd(raw.fds[i]) };
+            objects.push(DmaBufObject {
+                fd,
+                size: raw.object_sizes[i],
+                modifier: raw.object_modifiers[i],
+            });
+        }
+        let mut planes = Vec::with_capacity(num_planes);
+        for p in 0..num_planes {
+            planes.push(DmaBufPlane {
+                object_index: raw.plane_obj_idx[p] as usize,
+                offset: raw.offsets[p],
+                pitch: raw.pitches[p],
+            });
+        }
+        let cursor = if raw.cursor_fd >= 0 && raw.cursor_width > 0 && raw.cursor_height > 0 {
+            Some(DmaBufCursor {
+                fb_id: raw.cursor_fb_id,
+                x: raw.cursor_x,
+                y: raw.cursor_y,
+                width: raw.cursor_width,
+                height: raw.cursor_height,
+                crtc_w: raw.cursor_crtc_w,
+                crtc_h: raw.cursor_crtc_h,
+                pixel_format: raw.cursor_pixel_format,
+                fd: unsafe { OwnedFd::from_raw_fd(raw.cursor_fd) },
+                size: raw.cursor_size,
+                modifier: raw.cursor_modifier,
+                pitch: raw.cursor_pitch,
+                offset: raw.cursor_offset,
+            })
+        } else {
+            None
+        };
+        Ok((
+            raw.width,
+            raw.height,
+            DmaBufFrame {
+                fb_id: raw.fb_id,
+                pixel_format: raw.pixel_format,
+                flags: raw.flags,
+                objects,
+                planes,
+                cursor,
+            },
+        ))
+    }
+}
+
+fn fourcc_label(fourcc: u32) -> String {
+    let bytes = fourcc.to_le_bytes();
+    bytes
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 pub struct EvdiDisplay {
     display_id: DisplayId,
     monitor_name: [u8; 13],
@@ -144,6 +333,7 @@ pub struct EvdiDisplay {
     width: u32,
     height: u32,
     fps: u32,
+    zero_copy: Arc<AtomicBool>,
     handle: Option<EvdiHandle>,
     device_lease: Option<DeviceLease>,
 }
@@ -158,6 +348,7 @@ impl EvdiDisplay {
         width: u32,
         height: u32,
         fps: u32,
+        zero_copy: Arc<AtomicBool>,
     ) -> Result<Self> {
         Ok(Self {
             display_id,
@@ -166,6 +357,7 @@ impl EvdiDisplay {
             width,
             height,
             fps,
+            zero_copy,
             handle: None,
             device_lease: None,
         })
@@ -274,10 +466,42 @@ impl DisplayBackend for EvdiDisplay {
         let poll_timeout_ms = frame_interval.as_millis().max(1).min(100) as i32;
         let mut stats_start = Instant::now();
         let mut stats_frames: u64 = 0;
+        let mut stats_zc_frames: u64 = 0;
+        let mut stats_cap_us: u64 = 0;
         let start_time = Instant::now();
 
+        let mut drm_card = if self.zero_copy.load(Ordering::Acquire) {
+            match DrmCard::open(dev) {
+                Ok(card) => {
+                    crate::log_detail!(
+                        "[capture] zero-copy DRM /dev/dri/card{dev} opened (crtc={}, cursor_plane={} props=x:{},y:{},w:{},h:{})",
+                        card.crtc_id,
+                        card.cursor_plane.plane_id,
+                        card.cursor_plane.prop_crtc_x,
+                        card.cursor_plane.prop_crtc_y,
+                        card.cursor_plane.prop_crtc_w,
+                        card.cursor_plane.prop_crtc_h,
+                    );
+                    Some(card)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[capture] zero-copy open /dev/dri/card{dev} failed (err={err}); falling back to CPU capture"
+                    );
+                    self.zero_copy.store(false, Ordering::Release);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut logged_zc_format: Option<(u32, u64, u32, bool)> = None;
+        let mut logged_zc_export_err = false;
+        let mut logged_zc_ack_err = false;
+
         crate::log_detail!(
-            "[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms)"
+            "[capture] entering EVDI capture loop (poll timeout={poll_timeout_ms}ms, zero_copy={})",
+            drm_card.is_some()
         );
         crate::log_detail!(
             "[capture] monitor: {}",
@@ -333,25 +557,127 @@ impl DisplayBackend for EvdiDisplay {
                 pending_request = false;
                 no_update_count = 0;
 
-                let mut num_rects: c_int = rects.len() as c_int;
-                unsafe {
-                    evdi_grab_pixels(handle, rects.as_mut_ptr(), &mut num_rects);
+                let mut sent_zero_copy = false;
+                if self.zero_copy.load(Ordering::Acquire) {
+                    if let Some(card) = drm_card.as_mut() {
+                        let t_cap = Instant::now();
+                        match card.export_fb() {
+                            Ok((fb_w, fb_h, dmabuf))
+                                if fb_w == self.width && fb_h == self.height =>
+                            {
+                                let export_us = t_cap.elapsed().as_micros() as u64;
+                                let mod0 = dmabuf
+                                    .objects
+                                    .first()
+                                    .map_or(0, |o| o.modifier);
+                                let pitch0 = dmabuf.planes.first().map_or(0, |p| p.pitch);
+                                let size0 = dmabuf.objects.first().map_or(0, |o| o.size);
+                                let cursor_fb_id = dmabuf.cursor.as_ref().map_or(0, |c| c.fb_id);
+                                let sig = (
+                                    dmabuf.pixel_format,
+                                    mod0,
+                                    dmabuf.planes.len() as u32,
+                                    cursor_fb_id != 0,
+                                );
+                                if logged_zc_format != Some(sig) {
+                                    crate::log_detail!(
+                                        "[capture] zero-copy DMA-BUF active: {fb_w}x{fb_h} fb={} fourcc={} (0x{:08x}) flags=0x{:x} mod=0x{:016x} planes={} objs={} pitch={} size={} cursor_fb={}",
+                                        dmabuf.fb_id,
+                                        fourcc_label(dmabuf.pixel_format),
+                                        dmabuf.pixel_format,
+                                        dmabuf.flags,
+                                        mod0,
+                                        dmabuf.planes.len(),
+                                        dmabuf.objects.len(),
+                                        pitch0,
+                                        size0,
+                                        cursor_fb_id,
+                                    );
+                                    logged_zc_format = Some(sig);
+                                }
+                                logged_zc_export_err = false;
+
+                                let frame = CaptureFrame::dmabuf(fb_w, fb_h, &dmabuf);
+                                on_frame(frame);
+
+                                let t_ack = Instant::now();
+                                let ack_ret = unsafe { screx_evdi_ack_vblank(evdi_fd) };
+                                let ack_us = t_ack.elapsed().as_micros() as u64;
+                                if ack_ret != 0 && ack_ret != -libc::EAGAIN && !logged_zc_ack_err {
+                                    eprintln!(
+                                        "[capture] zero-copy EVDI vblank ack returned {ack_ret}"
+                                    );
+                                    logged_zc_ack_err = true;
+                                }
+
+                                stats_cap_us += export_us + ack_us;
+                                stats_frames += 1;
+                                stats_zc_frames += 1;
+                                has_first_frame = true;
+                                sent_zero_copy = true;
+
+                                if refresh_retries > 0 {
+                                    crate::log_detail!(
+                                        "[capture] force refresh: got real zero-copy frame from compositor"
+                                    );
+                                    refresh_retries = 0;
+                                }
+                            }
+                            Ok((fb_w, fb_h, _)) => {
+                                crate::log_detail!(
+                                    "[capture] zero-copy FB size mismatch ({fb_w}x{fb_h} vs {}x{}); using CPU grab",
+                                    self.width,
+                                    self.height
+                                );
+                            }
+                            Err(err) => {
+                                let fatal = matches!(
+                                    -err,
+                                    libc::EACCES
+                                        | libc::EPERM
+                                        | libc::EOPNOTSUPP
+                                        | libc::ENOSYS
+                                );
+                                if fatal {
+                                    eprintln!(
+                                        "[capture] zero-copy DRM export unsupported/denied (err={err}); disabling zero-copy"
+                                    );
+                                    drm_card = None;
+                                    self.zero_copy.store(false, Ordering::Release);
+                                } else if !logged_zc_export_err {
+                                    crate::log_detail!(
+                                        "[capture] zero-copy DRM export deferred (err={err}); using CPU grab"
+                                    );
+                                    logged_zc_export_err = true;
+                                }
+                            }
+                        }
+                    }
+                } else if drm_card.is_some() {
+                    // Pipeline disabled zero-copy (e.g. VA-API rejected the DMA-BUF).
+                    drm_card = None;
                 }
 
-                if num_rects > 0 || !has_first_frame || refresh_retries > 0 {
-                    let frame = CaptureFrame {
-                        width: self.width,
-                        height: self.height,
-                        data: &pixel_buf,
-                    };
+                if !sent_zero_copy {
+                    let t_cap = Instant::now();
+                    let mut num_rects: c_int = rects.len() as c_int;
+                    unsafe {
+                        evdi_grab_pixels(handle, rects.as_mut_ptr(), &mut num_rects);
+                    }
+                    let cap_us = t_cap.elapsed().as_micros() as u64;
 
-                    on_frame(frame);
-                    stats_frames += 1;
-                    has_first_frame = true;
+                    if num_rects > 0 || !has_first_frame || refresh_retries > 0 {
+                        let frame = CaptureFrame::bgra(self.width, self.height, &pixel_buf);
 
-                    if refresh_retries > 0 {
-                        crate::log_detail!("[capture] force refresh: got real frame from compositor");
-                        refresh_retries = 0;
+                        on_frame(frame);
+                        stats_cap_us += cap_us;
+                        stats_frames += 1;
+                        has_first_frame = true;
+
+                        if refresh_retries > 0 {
+                            crate::log_detail!("[capture] force refresh: got real frame from compositor");
+                            refresh_retries = 0;
+                        }
                     }
                 }
             } else {
@@ -364,31 +690,56 @@ impl DisplayBackend for EvdiDisplay {
                 if refresh_retries > 0 {
                     refresh_retries -= 1;
                     if refresh_retries == 0 {
-                        if has_first_frame {
-                            crate::log_detail!("[capture] force refresh: no new damage, sending last captured buffer");
-                        } else {
-                            crate::log_detail!("[capture] force refresh: no compositor damage yet, sending black bootstrap frame");
+                        let mut refreshed_zc = false;
+                        if self.zero_copy.load(Ordering::Acquire) {
+                            if let Some(card) = drm_card.as_mut() {
+                                if let Ok((fb_w, fb_h, dmabuf)) = card.export_fb() {
+                                    if fb_w == self.width && fb_h == self.height {
+                                        crate::log_detail!(
+                                            "[capture] force refresh: no new damage, re-exporting current DMA-BUF"
+                                        );
+                                        on_frame(CaptureFrame::dmabuf(fb_w, fb_h, &dmabuf));
+                                        refreshed_zc = true;
+                                    }
+                                }
+                            }
                         }
-                        let frame = CaptureFrame {
-                            width: self.width,
-                            height: self.height,
-                            data: &pixel_buf,
-                        };
-                        on_frame(frame);
+                        if !refreshed_zc {
+                            if has_first_frame {
+                                crate::log_detail!("[capture] force refresh: no new damage, sending last captured buffer");
+                            } else {
+                                crate::log_detail!("[capture] force refresh: no compositor damage yet, sending black bootstrap frame");
+                            }
+                            let frame = CaptureFrame::bgra(self.width, self.height, &pixel_buf);
+                            on_frame(frame);
+                        }
                     }
                 }
             }
 
             if stats_start.elapsed() >= Duration::from_secs(1) {
-                let fps = stats_frames as f64 / stats_start.elapsed().as_secs_f64();
+                let elapsed = stats_start.elapsed().as_secs_f64();
+                let fps = stats_frames as f64 / elapsed;
+                let cap_ms = if stats_frames > 0 {
+                    (stats_cap_us as f64 / stats_frames as f64) / 1000.0
+                } else {
+                    0.0
+                };
+                let mode = if stats_zc_frames > 0 || (stats_frames == 0 && drm_card.is_some()) {
+                    "dmabuf"
+                } else {
+                    "cpu"
+                };
                 let uptime = start_time.elapsed().as_secs();
                 crate::log_detail!(
-                    "[capture] fps={fps:.1} resolution={}x{} uptime={uptime}s",
+                    "[capture] fps={fps:.1} mode={mode} cap_avg={cap_ms:.2}ms resolution={}x{} uptime={uptime}s",
                     self.width,
                     self.height
                 );
                 stats_start = Instant::now();
                 stats_frames = 0;
+                stats_zc_frames = 0;
+                stats_cap_us = 0;
             }
         }
 

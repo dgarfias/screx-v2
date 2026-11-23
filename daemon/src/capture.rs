@@ -1,4 +1,6 @@
+use std::os::fd::OwnedFd;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -27,12 +29,88 @@ pub struct DisplayMode {
     pub fps: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DmaBufPlane {
+    pub object_index: usize,
+    pub offset: u32,
+    pub pitch: u32,
+}
+
 #[derive(Debug)]
-/// One captured BGRA frame.
+pub struct DmaBufObject {
+    pub fd: OwnedFd,
+    pub size: u64,
+    pub modifier: u64,
+}
+
+#[derive(Debug)]
+pub struct DmaBufCursor {
+    pub fb_id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub crtc_w: u32,
+    pub crtc_h: u32,
+    pub pixel_format: u32,
+    pub fd: OwnedFd,
+    pub size: u64,
+    pub modifier: u64,
+    pub pitch: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug)]
+pub struct DmaBufFrame {
+    pub fb_id: u32,
+    pub pixel_format: u32,
+    pub flags: u32,
+    pub objects: Vec<DmaBufObject>,
+    pub planes: Vec<DmaBufPlane>,
+    pub cursor: Option<DmaBufCursor>,
+}
+
+#[derive(Debug)]
+pub enum FrameData<'a> {
+    Bgra(&'a [u8]),
+    DmaBuf(&'a DmaBufFrame),
+}
+
+#[derive(Debug)]
+/// One captured frame, either CPU BGRA pixels or a zero-copy GPU DMA-BUF.
 pub struct CaptureFrame<'a> {
     pub width: u32,
     pub height: u32,
-    pub data: &'a [u8],
+    pub data: FrameData<'a>,
+}
+
+impl<'a> CaptureFrame<'a> {
+    pub fn bgra(width: u32, height: u32, data: &'a [u8]) -> Self {
+        Self {
+            width,
+            height,
+            data: FrameData::Bgra(data),
+        }
+    }
+
+    pub fn dmabuf(width: u32, height: u32, dmabuf: &'a DmaBufFrame) -> Self {
+        Self {
+            width,
+            height,
+            data: FrameData::DmaBuf(dmabuf),
+        }
+    }
+
+    pub fn bgra_bytes(&self) -> Option<&'a [u8]> {
+        match self.data {
+            FrameData::Bgra(bytes) => Some(bytes),
+            FrameData::DmaBuf(_) => None,
+        }
+    }
+
+    pub fn is_dmabuf(&self) -> bool {
+        matches!(self.data, FrameData::DmaBuf(_))
+    }
 }
 
 /// Backend-specific display control and frame capture.
@@ -62,6 +140,9 @@ pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Shared toggle enabling DRM PRIME zero-copy capture; the pipeline may
+    /// clear it to fall back to CPU capture if VA-API rejects the DMA-BUF.
+    pub zero_copy: Arc<AtomicBool>,
 }
 
 /// The monitor's size as EDID stores it: whole centimetres, 1..=255. Compositors read the
@@ -81,5 +162,6 @@ pub fn create_display_backend(config: &CaptureConfig) -> Result<Box<dyn DisplayB
         config.width,
         config.height,
         config.fps,
+        Arc::clone(&config.zero_copy),
     )?))
 }
