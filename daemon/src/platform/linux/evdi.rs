@@ -385,6 +385,34 @@ impl DisplayBackend for EvdiDisplay {
         self.handle = Some(handle);
         self.device_lease = Some(lease);
 
+        // Open the auxiliary DRM fd and drop DRM master BEFORE evdi_connect()
+        // emits a hotplug event, so the compositor never races with open().
+        let mut drm_card = if self.zero_copy.load(Ordering::Acquire) {
+            match DrmCard::open(dev) {
+                Ok(card) => {
+                    crate::log_detail!(
+                        "[capture] zero-copy DRM /dev/dri/card{dev} opened (crtc={}, cursor_plane={} props=x:{},y:{},w:{},h:{})",
+                        card.crtc_id,
+                        card.cursor_plane.plane_id,
+                        card.cursor_plane.prop_crtc_x,
+                        card.cursor_plane.prop_crtc_y,
+                        card.cursor_plane.prop_crtc_w,
+                        card.cursor_plane.prop_crtc_h,
+                    );
+                    Some(card)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[capture] zero-copy open /dev/dri/card{dev} failed (err={err}); falling back to CPU capture"
+                    );
+                    self.zero_copy.store(false, Ordering::Release);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut edid = generate_edid(
             self.display_id,
             self.width,
@@ -470,31 +498,6 @@ impl DisplayBackend for EvdiDisplay {
         let mut stats_cap_us: u64 = 0;
         let start_time = Instant::now();
 
-        let mut drm_card = if self.zero_copy.load(Ordering::Acquire) {
-            match DrmCard::open(dev) {
-                Ok(card) => {
-                    crate::log_detail!(
-                        "[capture] zero-copy DRM /dev/dri/card{dev} opened (crtc={}, cursor_plane={} props=x:{},y:{},w:{},h:{})",
-                        card.crtc_id,
-                        card.cursor_plane.plane_id,
-                        card.cursor_plane.prop_crtc_x,
-                        card.cursor_plane.prop_crtc_y,
-                        card.cursor_plane.prop_crtc_w,
-                        card.cursor_plane.prop_crtc_h,
-                    );
-                    Some(card)
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[capture] zero-copy open /dev/dri/card{dev} failed (err={err}); falling back to CPU capture"
-                    );
-                    self.zero_copy.store(false, Ordering::Release);
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let mut logged_zc_format: Option<(u32, u64, u32, bool)> = None;
         let mut logged_zc_export_err = false;
         let mut logged_zc_ack_err = false;
@@ -744,6 +747,7 @@ impl DisplayBackend for EvdiDisplay {
         }
 
         crate::log_detail!("[capture] stopping EVDI capture");
+        drop(drm_card);
         unsafe {
             evdi_unregister_buffer(handle, 0);
             evdi_disconnect(handle);

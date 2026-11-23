@@ -200,6 +200,12 @@ int screx_drm_open_card(
         return -errno;
     }
 
+    /* Immediately drop DRM master (matching libevdi's slave-open behavior).
+       Without this, opening /dev/dri/cardN as root when no compositor currently
+       holds master (e.g. after screen lock, disconnect, or display switch)
+       steals DRM master and causes logind/compositor to fail with EBUSY. */
+    (void)drm_ioctl_retry(fd, DRM_IOCTL_DROP_MASTER, NULL);
+
     struct drm_set_client_cap cap;
     memset(&cap, 0, sizeof(cap));
     cap.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES;

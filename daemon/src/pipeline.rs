@@ -246,7 +246,10 @@ impl CaptureWorker {
                                                 }
                                             }
                                             if let Some(e) = frame_err {
-                                                if send_stop.load(Ordering::Relaxed) {
+                                                if send_stop.load(Ordering::Relaxed)
+                                                    || !send_shared.is_current_network_session(session)
+                                                    || !send_shared.has_active_client.load(Ordering::Acquire)
+                                                {
                                                     break;
                                                 }
                                                 eprintln!(
