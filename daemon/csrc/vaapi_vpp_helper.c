@@ -107,8 +107,9 @@ int screx_va_vpp_compose(
     primary_param.surface_region = &full_rect;
     primary_param.output_region = &full_rect;
     primary_param.output_background_color = 0xff000000;
-    primary_param.surface_color_standard = VAProcColorStandardNone;
-    primary_param.output_color_standard = VAProcColorStandardNone;
+    primary_param.surface_color_standard = VAProcColorStandardSRGB;
+    primary_param.output_color_standard = VAProcColorStandardBT709;
+    primary_param.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
 
     VABufferID primary_buf = VA_INVALID_ID;
     st = vaCreateBuffer(
@@ -180,8 +181,9 @@ int screx_va_vpp_compose(
                 cursor_param.surface_region = &src_rect;
                 cursor_param.output_region = &dst_rect;
                 cursor_param.blend_state = &blend;
-                cursor_param.surface_color_standard = VAProcColorStandardNone;
-                cursor_param.output_color_standard = VAProcColorStandardNone;
+                cursor_param.surface_color_standard = VAProcColorStandardSRGB;
+                cursor_param.output_color_standard = VAProcColorStandardBT709;
+                cursor_param.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
 
                 st = vaCreateBuffer(
                     vpp->display,

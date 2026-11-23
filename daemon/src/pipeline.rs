@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -50,6 +51,25 @@ impl FrameRateGate {
         true
     }
 }
+
+/// Work items passed from the capture/encode thread to the per-display sender
+/// thread so Reed-Solomon FEC and paced QUIC sends overlap with the next
+/// frame's capture and GPU encode.
+enum SendItem {
+    ReplaceSequence(ServerPacketSequence),
+    SetFps(u32),
+    Frame {
+        units: Vec<crate::encode::EncodedAccessUnit>,
+        timestamp: u32,
+        codec: u8,
+        tuning: crate::stream_server::StreamTuning,
+    },
+}
+
+/// Bounded queue depth between encode and send. Deep enough to overlap
+/// Reed-Solomon + paced send with the next capture/encode without building
+/// multi-frame latency.
+const SEND_QUEUE_CAPACITY: usize = 2;
 
 pub struct CaptureWorker {
     display: DisplayId,
@@ -154,7 +174,111 @@ impl CaptureWorker {
                         let mut perf_frames: u64 = 0;
                         let mut perf_zc_frames: u64 = 0;
                         let mut perf_enc_us: u64 = 0;
-                        let mut perf_send_us: u64 = 0;
+                        let mut perf_queue_us: u64 = 0;
+                        let perf_send_us_acc = Arc::new(AtomicU64::new(0));
+                        let perf_send_frames_acc = Arc::new(AtomicU64::new(0));
+
+                        // Decouple Reed-Solomon FEC + paced QUIC sending onto its
+                        // own thread so capture/encode can start the next frame
+                        // immediately instead of blocking on network pacing.
+                        let (send_tx, send_rx) =
+                            mpsc::sync_channel::<SendItem>(SEND_QUEUE_CAPACITY);
+                        let send_stop = Arc::clone(&stop);
+                        let send_shared = Arc::clone(&shared);
+                        let send_control = Arc::clone(&control);
+                        let send_ready = Arc::clone(&ready);
+                        let send_error = Arc::clone(&error);
+                        let send_us_acc = Arc::clone(&perf_send_us_acc);
+                        let send_frames_acc = Arc::clone(&perf_send_frames_acc);
+                        let sender_thread = thread::Builder::new()
+                            .name(format!("send-{}", display as u8))
+                            .spawn(move || {
+                                let mut consecutive_send_errors = 0u32;
+                                while let Ok(item) = send_rx.recv() {
+                                    if send_stop.load(Ordering::Relaxed)
+                                        || !send_shared.is_current_network_session(session)
+                                        || !send_shared.has_active_client.load(Ordering::Acquire)
+                                    {
+                                        break;
+                                    }
+                                    match item {
+                                        SendItem::ReplaceSequence(sequence) => {
+                                            sender.replace_sequence(sequence);
+                                        }
+                                        SendItem::SetFps(fps) => {
+                                            sender.set_session(fps);
+                                        }
+                                        SendItem::Frame {
+                                            units,
+                                            timestamp,
+                                            codec,
+                                            tuning,
+                                        } => {
+                                            let t_send = Instant::now();
+                                            let mut frame_err = None;
+                                            for unit in &units {
+                                                if display == DisplayId::Internal && dump_au > 0 {
+                                                    crate::dump_sent_access_unit(
+                                                        dump_au,
+                                                        codec,
+                                                        unit.is_idr,
+                                                        &unit.annex_b,
+                                                    );
+                                                    dump_au -= 1;
+                                                }
+                                                match sender.send_frame(
+                                                    unit, timestamp, codec, tuning,
+                                                ) {
+                                                    Ok((_, send_wait)) => {
+                                                        send_control.note_transport(
+                                                            sender.transport_feedback(),
+                                                            send_wait,
+                                                        );
+                                                        if unit.is_idr {
+                                                            send_ready
+                                                                .store(true, Ordering::Release);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        frame_err = Some(e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(e) = frame_err {
+                                                if send_stop.load(Ordering::Relaxed) {
+                                                    break;
+                                                }
+                                                eprintln!(
+                                                    "[pipeline/{display:?}] send failed: {e:#}"
+                                                );
+                                                send_control
+                                                    .force_idr
+                                                    .store(true, Ordering::Relaxed);
+                                                send_control
+                                                    .force_refresh
+                                                    .store(true, Ordering::Relaxed);
+                                                consecutive_send_errors += 1;
+                                                if consecutive_send_errors >= 5 {
+                                                    *send_error.lock().unwrap() =
+                                                        Some(format!("{e:#}"));
+                                                    send_stop.store(true, Ordering::Release);
+                                                    break;
+                                                }
+                                            } else {
+                                                consecutive_send_errors = 0;
+                                                send_us_acc.fetch_add(
+                                                    t_send.elapsed().as_micros() as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                                send_frames_acc.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .context("spawn display sender worker")?;
+
                         backend.run_capture_loop(&stop, &control.force_refresh, &mut |frame| {
                             if stop.load(Ordering::Relaxed)
                                 || !shared.is_current_network_session(session)
@@ -164,7 +288,10 @@ impl CaptureWorker {
                                 return;
                             }
                             if let Some(sequence) = next_sequence.lock().unwrap().take() {
-                                sender.replace_sequence(sequence);
+                                if send_tx.send(SendItem::ReplaceSequence(sequence)).is_err() {
+                                    stop.store(true, Ordering::Release);
+                                    return;
+                                }
                                 control.force_idr.store(true, Ordering::Relaxed);
                             }
                             if !frame_gate
@@ -182,7 +309,10 @@ impl CaptureWorker {
                             if tuning.target_fps != current_fps {
                                 current_fps = tuning.target_fps;
                                 frame_gate.set_fps(current_fps);
-                                sender.set_session(current_fps);
+                                if send_tx.send(SendItem::SetFps(current_fps)).is_err() {
+                                    stop.store(true, Ordering::Release);
+                                    return;
+                                }
                             }
                             if tuning.bitrate_bps != encoder.bitrate_bps() {
                                 if let Err(e) = encoder.reconfigure_bitrate(tuning.bitrate_bps) {
@@ -196,53 +326,51 @@ impl CaptureWorker {
                             let result = (|| -> Result<()> {
                                 let units = encoder.encode_frame(&frame, force_idr)?;
                                 let enc_us = t_enc.elapsed().as_micros() as u64;
-                                let t_send = Instant::now();
-                                {
-                                    if !shared.is_current_network_session(session) {
-                                        return Ok(());
-                                    }
-                                    for unit in &units {
-                                        if display == DisplayId::Internal && dump_au > 0 {
-                                            crate::dump_sent_access_unit(
-                                                dump_au,
-                                                codec,
-                                                unit.is_idr,
-                                                &unit.annex_b,
-                                            );
-                                            dump_au -= 1;
-                                        }
-                                        let (_, send_wait) =
-                                            sender.send_frame(unit, timestamp, codec, tuning)?;
-                                        control.note_transport(
-                                            sender.transport_feedback(),
-                                            send_wait,
-                                        );
-                                        if unit.is_idr {
-                                            ready.store(true, Ordering::Release);
-                                        }
-                                    }
+                                if !shared.is_current_network_session(session) {
+                                    return Ok(());
                                 }
-                                let send_us = t_send.elapsed().as_micros() as u64;
+                                let t_q = Instant::now();
+                                if !units.is_empty()
+                                    && send_tx
+                                        .send(SendItem::Frame {
+                                            units,
+                                            timestamp,
+                                            codec,
+                                            tuning,
+                                        })
+                                        .is_err()
+                                {
+                                    stop.store(true, Ordering::Release);
+                                    return Ok(());
+                                }
+                                let q_us = t_q.elapsed().as_micros() as u64;
                                 perf_frames += 1;
                                 if is_dmabuf {
                                     perf_zc_frames += 1;
                                 }
                                 perf_enc_us += enc_us;
-                                perf_send_us += send_us;
+                                perf_queue_us += q_us;
                                 if perf_start.elapsed() >= Duration::from_secs(1) {
                                     let elapsed = perf_start.elapsed().as_secs_f64();
                                     let fps = perf_frames as f64 / elapsed;
                                     let enc_ms = (perf_enc_us as f64 / perf_frames.max(1) as f64) / 1000.0;
-                                    let send_ms = (perf_send_us as f64 / perf_frames.max(1) as f64) / 1000.0;
+                                    let q_ms = (perf_queue_us as f64 / perf_frames.max(1) as f64) / 1000.0;
+                                    let send_us = perf_send_us_acc.swap(0, Ordering::Relaxed);
+                                    let send_n = perf_send_frames_acc.swap(0, Ordering::Relaxed);
+                                    let send_ms = if send_n > 0 {
+                                        (send_us as f64 / send_n as f64) / 1000.0
+                                    } else {
+                                        0.0
+                                    };
                                     let mode = if perf_zc_frames > 0 { "dmabuf" } else { "cpu" };
                                     crate::log_detail!(
-                                        "[pipeline/{display:?}] mode={mode} fps={fps:.1} enc_avg={enc_ms:.2}ms send_avg={send_ms:.2}ms"
+                                        "[pipeline/{display:?}] mode={mode} fps={fps:.1} enc_avg={enc_ms:.2}ms q_wait={q_ms:.2}ms send_avg={send_ms:.2}ms"
                                     );
                                     perf_start = Instant::now();
                                     perf_frames = 0;
                                     perf_zc_frames = 0;
                                     perf_enc_us = 0;
-                                    perf_send_us = 0;
+                                    perf_queue_us = 0;
                                 }
                                 Ok(())
                             })();
@@ -270,6 +398,10 @@ impl CaptureWorker {
                                 consecutive_errors = 0;
                             }
                         })?;
+                        drop(send_tx);
+                        if sender_thread.join().is_err() {
+                            eprintln!("[pipeline/{display:?}] sender worker panicked");
+                        }
                         backend.detach();
                         if let Some(error) = pipeline_error {
                             return Err(error);

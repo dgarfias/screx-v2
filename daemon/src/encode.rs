@@ -456,7 +456,7 @@ impl BandedScaler {
 
     fn new(width: i32, height: i32, dst_format: ffi::AVPixelFormat) -> Option<Self> {
         let dst_planes = match dst_format {
-            ffi::AVPixelFormat::AV_PIX_FMT_NV12 => 2,
+            ffi::AVPixelFormat::AV_PIX_FMT_NV12 | ffi::AVPixelFormat::AV_PIX_FMT_P010LE => 2,
             ffi::AVPixelFormat::AV_PIX_FMT_YUV420P => 3,
             _ => return None,
         };
@@ -494,6 +494,20 @@ impl BandedScaler {
             };
             if sws.is_null() {
                 return None; // Drop frees the bands created so far
+            }
+            // Match the encoder's BT.709 limited-range (MPEG/TV) signaling.
+            unsafe {
+                let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as libc::c_int);
+                ffi::sws_setColorspaceDetails(
+                    sws,
+                    coeffs,
+                    1, // full-range RGB source
+                    coeffs,
+                    0, // limited-range (MPEG/TV) YUV destination
+                    0,
+                    1 << 16,
+                    1 << 16,
+                );
             }
             scaler.bands.push((first_row, rows, sws));
         }
@@ -558,6 +572,7 @@ impl Drop for BandedScaler {
 
 struct HwEncoder {
     kind: HwKind,
+    sw_pix_fmt: ffi::AVPixelFormat,
     config: EncoderConfig,
     vaapi_rc_mode: VaapiHevcMode,
     last_reopen_at: Instant,
@@ -596,7 +611,12 @@ struct VppScaler {
 unsafe impl Send for VppScaler {}
 
 impl VppScaler {
-    fn new(width: i32, height: i32, device: *mut ffi::AVBufferRef) -> Option<Self> {
+    fn new(
+        width: i32,
+        height: i32,
+        dst_format: ffi::AVPixelFormat,
+        device: *mut ffi::AVBufferRef,
+    ) -> Option<Self> {
         unsafe {
             let graph = ffi::avfilter_graph_alloc();
             if graph.is_null() {
@@ -624,7 +644,11 @@ impl VppScaler {
             let source = format!(
                 "video_size={width}x{height}:pix_fmt=bgra:time_base=1/90000:pixel_aspect=1/1"
             );
-            let convert = "format=nv12".to_owned();
+            let fmt_name = match dst_format {
+                ffi::AVPixelFormat::AV_PIX_FMT_P010LE => "p010le",
+                _ => "nv12",
+            };
+            let convert = format!("format={fmt_name}:out_color_matrix=bt709:out_range=tv");
             let (Some(src), Some(convert), Some(sink)) = (
                 create("buffer", Some(&source), "in"),
                 create("scale_vaapi", Some(&convert), "convert"),
@@ -1249,6 +1273,7 @@ impl HwEncoder {
     unsafe fn open_codec_context(
         config: &EncoderConfig,
         kind: HwKind,
+        sw_pix_fmt: ffi::AVPixelFormat,
         vaapi_mode: VaapiHevcMode,
         hw_device_ctx: *mut ffi::AVBufferRef,
         hw_frames_ctx: *mut ffi::AVBufferRef,
@@ -1273,7 +1298,17 @@ impl HwEncoder {
         (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device_ctx);
         (*ctx).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
         (*ctx).pix_fmt = hw_pix_fmt;
-        (*ctx).sw_pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*ctx).sw_pix_fmt = sw_pix_fmt;
+        (*ctx).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*ctx).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        (*ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+        if matches!(kind, HwKind::Vaapi)
+            && config.codec == VideoCodec::H265
+            && sw_pix_fmt == ffi::AVPixelFormat::AV_PIX_FMT_P010LE
+        {
+            (*ctx).profile = ffi::AV_PROFILE_HEVC_MAIN_10;
+        }
         (*ctx).width = config.width as i32;
         (*ctx).height = config.height as i32;
         (*ctx).time_base = ffi::AVRational { num: 1, den: 90_000 };
@@ -1395,6 +1430,7 @@ impl HwEncoder {
                     let (new_ctx, new_extradata) = Self::open_codec_context(
                         &next_config,
                         self.kind,
+                        self.sw_pix_fmt,
                         next_mode,
                         self.hw_device_ctx,
                         self.hw_frames_ctx,
@@ -1419,12 +1455,40 @@ impl HwEncoder {
         hw_supports_intra_refresh(self.kind)
     }
 
+    fn new_vaapi_with_format_fallback(
+        config: &EncoderConfig,
+        vaapi_mode: VaapiHevcMode,
+    ) -> Result<Self> {
+        // For H.265 with GPU VPP, prefer 10-bit P010 (HEVC Main10) for smoother
+        // dark-UI gradients and better compression, silently falling back to
+        // 8-bit NV12 on GPUs/drivers that lack 10-bit HEVC encode.
+        if config.codec == VideoCodec::H265 && config.gpu_convert {
+            if let Ok(enc) = Self::new_with_vaapi_hevc_mode(
+                config,
+                HwKind::Vaapi,
+                ffi::AVPixelFormat::AV_PIX_FMT_P010LE,
+                vaapi_mode,
+            ) {
+                return Ok(enc);
+            }
+            crate::log_detail!(
+                "[encode] VA-API 10-bit HEVC (P010) unavailable, falling back to 8-bit NV12"
+            );
+        }
+        Self::new_with_vaapi_hevc_mode(
+            config,
+            HwKind::Vaapi,
+            ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+            vaapi_mode,
+        )
+    }
+
     fn new_vaapi(config: &EncoderConfig) -> Result<Self> {
-        if let Ok(enc) = Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Cbr) {
+        if let Ok(enc) = Self::new_vaapi_with_format_fallback(config, VaapiHevcMode::Cbr) {
             crate::log_detail!("[encode] VA-API using CBR rate control");
             return Ok(enc);
         }
-        match Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Bitrate) {
+        match Self::new_vaapi_with_format_fallback(config, VaapiHevcMode::Bitrate) {
             Ok(enc) => {
                 crate::log_detail!("[encode] VA-API using auto bitrate rate control");
                 Ok(enc)
@@ -1434,7 +1498,7 @@ impl HwEncoder {
                 eprintln!(
                     "[encode] VA-API HEVC bitrate mode unavailable, retrying with CQP (qp={qp}): {primary_err:#}"
                 );
-                Self::new_with_vaapi_hevc_mode(config, HwKind::Vaapi, VaapiHevcMode::Cqp(qp))
+                Self::new_vaapi_with_format_fallback(config, VaapiHevcMode::Cqp(qp))
                     .with_context(|| {
                         format!(
                             "VA-API HEVC init failed in bitrate mode and CQP fallback; bitrate mode error: {primary_err:#}"
@@ -1446,12 +1510,18 @@ impl HwEncoder {
     }
 
     fn new_nvenc(config: &EncoderConfig) -> Result<Self> {
-        Self::new_with_vaapi_hevc_mode(config, HwKind::Nvenc, VaapiHevcMode::Bitrate)
+        Self::new_with_vaapi_hevc_mode(
+            config,
+            HwKind::Nvenc,
+            ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+            VaapiHevcMode::Bitrate,
+        )
     }
 
     fn new_with_vaapi_hevc_mode(
         config: &EncoderConfig,
         kind: HwKind,
+        sw_pix_fmt: ffi::AVPixelFormat,
         vaapi_hevc_mode: VaapiHevcMode,
     ) -> Result<Self> {
         let width = config.width as i32;
@@ -1503,7 +1573,7 @@ impl HwEncoder {
             }
             let frames_ctx = (*hw_frames_ctx).data as *mut ffi::AVHWFramesContext;
             (*frames_ctx).format = hw_pix_fmt;
-            (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*frames_ctx).sw_format = sw_pix_fmt;
             (*frames_ctx).width = width;
             (*frames_ctx).height = height;
             (*frames_ctx).initial_pool_size = 20;
@@ -1518,6 +1588,7 @@ impl HwEncoder {
             let (ctx, extradata) = match Self::open_codec_context(
                 config,
                 kind,
+                sw_pix_fmt,
                 vaapi_hevc_mode,
                 hw_device_ctx,
                 hw_frames_ctx,
@@ -1530,11 +1601,11 @@ impl HwEncoder {
                 }
             };
 
-            // VA-API can convert BGRA to NV12 on the GPU, which keeps the
+            // VA-API can convert BGRA to NV12/P010 on the GPU, which keeps the
             // capture thread out of the pixel path. If the driver, the filter
             // set or the graph cannot provide it, keep the CPU scaler below.
             let vpp = if matches!(kind, HwKind::Vaapi) && config.gpu_convert {
-                match VppScaler::new(width, height, hw_device_ctx) {
+                match VppScaler::new(width, height, sw_pix_fmt, hw_device_ctx) {
                     Some(vpp) => {
                         crate::log_detail!("[encode] VA-API VPP colour conversion enabled");
                         Some(vpp)
@@ -1551,7 +1622,7 @@ impl HwEncoder {
                 None
             };
 
-            let Some(sws) = BandedScaler::new(width, height, ffi::AVPixelFormat::AV_PIX_FMT_NV12)
+            let Some(sws) = BandedScaler::new(width, height, sw_pix_fmt)
             else {
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
                 ffi::av_buffer_unref(&mut (hw_frames_ctx as *mut _));
@@ -1598,13 +1669,19 @@ impl HwEncoder {
                 VideoCodec::H265 => "H.265",
             };
 
+            let fmt_label = if sw_pix_fmt == ffi::AVPixelFormat::AV_PIX_FMT_P010LE {
+                "P010 (10-bit)"
+            } else {
+                "NV12 (8-bit)"
+            };
             crate::log_detail!(
-                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} bitrate={} gop={} intra_refresh={}",
+                "[encode] {kind_name} {codec_label} encoder: {}x{}@{} fmt={fmt_label} color=BT.709 bitrate={} gop={} intra_refresh={}",
                 width, height, config.fps, config.bitrate_bps, config.gop, use_intra_refresh
             );
 
             Ok(Self {
                 kind,
+                sw_pix_fmt,
                 config: config.clone(),
                 vaapi_rc_mode: vaapi_hevc_mode,
                 last_reopen_at: Instant::now(),
@@ -1723,7 +1800,7 @@ impl HwEncoder {
                                     ffi::av_frame_unref(self.hw_frame);
                                     bail!("failed to allocate NV12 fallback frame");
                                 }
-                                (*self.sw_nv12).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                                (*self.sw_nv12).format = self.sw_pix_fmt as i32;
                                 (*self.sw_nv12).width = (*self.ctx).width;
                                 (*self.sw_nv12).height = (*self.ctx).height;
                                 let ret = ffi::av_frame_get_buffer(self.sw_nv12, 0);
@@ -1940,6 +2017,10 @@ impl SwEncoder {
         };
         (*ctx).max_b_frames = 0;
         (*ctx).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P;
+        (*ctx).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*ctx).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        (*ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
         (*ctx).thread_count = 1;
         (*ctx).flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
 
@@ -2439,28 +2520,31 @@ mod banded_scaler_tests {
             ffi::av_buffer_unref(&mut (nv12_frames as *mut _));
             drop(scaler);
 
-            // 2. Verify full Encoder::encode_frame path produces H.264 IDR output.
-            let config = EncoderConfig {
-                bitrate_bps: 4_000_000,
-                vaapi_async_depth: 1,
-                gop: 0,
-                fps: 60,
-                width: width as u32,
-                height: height as u32,
-                backend: EncoderBackend::Vaapi,
-                codec: VideoCodec::H264,
-                intra_refresh: false,
-                gpu_convert: true,
-            };
-            let mut encoder = Encoder::new(config).expect("VA-API H.264 encoder");
-            assert!(encoder.supports_dmabuf());
-            let capture = CaptureFrame::dmabuf(width as u32, height as u32, &dmabuf);
-            let mut units = Vec::new();
-            for i in 0..3 {
-                units.extend(encoder.encode_frame(&capture, i == 0).expect("dmabuf encode"));
+            // 2. Verify full Encoder::encode_frame path produces H.264 IDR and
+            //    10-bit/8-bit HEVC IDR output from the same DMA-BUF.
+            for codec in [VideoCodec::H264, VideoCodec::H265] {
+                let config = EncoderConfig {
+                    bitrate_bps: 4_000_000,
+                    vaapi_async_depth: 1,
+                    gop: 0,
+                    fps: 60,
+                    width: width as u32,
+                    height: height as u32,
+                    backend: EncoderBackend::Vaapi,
+                    codec,
+                    intra_refresh: false,
+                    gpu_convert: true,
+                };
+                let mut encoder = Encoder::new(config).expect("VA-API encoder");
+                assert!(encoder.supports_dmabuf());
+                let capture = CaptureFrame::dmabuf(width as u32, height as u32, &dmabuf);
+                let mut units = Vec::new();
+                for i in 0..3 {
+                    units.extend(encoder.encode_frame(&capture, i == 0).expect("dmabuf encode"));
+                }
+                assert!(!units.is_empty(), "{codec:?} produced no units");
+                assert!(units.iter().any(|u| u.is_idr), "{codec:?} produced no IDR");
             }
-            assert!(!units.is_empty());
-            assert!(units.iter().any(|u| u.is_idr));
 
             // Cleanup
             drop(dmabuf);
@@ -2498,7 +2582,7 @@ mod banded_scaler_tests {
             eprintln!("skipping: no VA-API device for VPP");
             return;
         }
-        let Some(mut vpp) = VppScaler::new(64, 48, device) else {
+        let Some(mut vpp) = VppScaler::new(64, 48, ffi::AVPixelFormat::AV_PIX_FMT_NV12, device) else {
             eprintln!("skipping: VPP graph unavailable");
             unsafe { ffi::av_buffer_unref(&mut device) };
             return;
@@ -2608,6 +2692,8 @@ mod banded_scaler_tests {
                 ptr::null(),
             );
             assert!(!sws.is_null());
+            let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as libc::c_int);
+            ffi::sws_setColorspaceDetails(sws, coeffs, 1, coeffs, 0, 0, 1 << 16, 1 << 16);
             let mut dst = [ptr::null_mut::<u8>(); 4];
             for p in 0..planes {
                 dst[p] = reference[p].as_mut_ptr();

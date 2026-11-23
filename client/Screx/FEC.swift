@@ -34,17 +34,9 @@ enum ReedSolomonDecoder {
         // Use first dataCount present shards for the decoding matrix
         let usedIndices = Array(presentIndices.prefix(dataCount))
 
-        // Build the sub-matrix from the Vandermonde-like coding matrix
-        // The coding matrix for reed-solomon-erasure uses an inverted Vandermonde * Vandermonde approach.
-        // Row i of the coding matrix = row usedIndices[i] of the full matrix.
-        // The full matrix: top dataCount rows = identity, bottom parityCount rows = Cauchy-like.
+        // Build the sub-matrix from the Vandermonde-like coding matrix.
+        // Stored flat row-major: element (r, c) is at `r * dataCount + c`.
         let codingMatrix = getCodingMatrix(dataCount: dataCount, parityCount: parityCount)
-
-        // Extract the sub-matrix for the used indices
-        var subMatrix = [[UInt8]](repeating: [UInt8](repeating: 0, count: dataCount), count: dataCount)
-        for i in 0..<dataCount {
-            subMatrix[i] = codingMatrix[usedIndices[i]]
-        }
 
         // Look up or compute the inverse of the sub-matrix.
         let cacheKey = InvertMatrixKey(
@@ -52,11 +44,23 @@ enum ReedSolomonDecoder {
             parityCount: parityCount,
             usedIndices: usedIndices
         )
-        let invMatrix: [[UInt8]]
+        let invMatrix: [UInt8]
         if let cached = invertMatrixCache[cacheKey] {
             invMatrix = cached
         } else {
-            guard let inverted = invertMatrix(subMatrix) else { return false }
+            var subMatrix = [UInt8](repeating: 0, count: dataCount * dataCount)
+            codingMatrix.withUnsafeBufferPointer { srcBuf in
+                subMatrix.withUnsafeMutableBufferPointer { dstBuf in
+                    guard let srcBase = srcBuf.baseAddress,
+                          let dstBase = dstBuf.baseAddress else { return }
+                    for i in 0..<dataCount {
+                        let srcRow = usedIndices[i] * dataCount
+                        dstBase.advanced(by: i * dataCount)
+                            .update(from: srcBase.advanced(by: srcRow), count: dataCount)
+                    }
+                }
+            }
+            guard let inverted = invertMatrix(subMatrix, n: dataCount) else { return false }
             invertMatrixCache[cacheKey] = inverted
             // The key space is small but unbounded under pathological loss;
             // reset if we ever grow too large. Recovery is bursty, so a reset
@@ -70,6 +74,7 @@ enum ReedSolomonDecoder {
 
         // Collect the data from present shards (in the order of usedIndices)
         var presentData: [Data] = []
+        presentData.reserveCapacity(dataCount)
         for idx in usedIndices {
             presentData.append(shards[idx]!)
         }
@@ -78,10 +83,18 @@ enum ReedSolomonDecoder {
         // Callers only consume data shards, so skip reconstructing missing parity shards.
         for missingIdx in missingIndices where missingIdx < dataCount {
             var recovered = Data(repeating: 0, count: shardSize)
-            for j in 0..<dataCount {
-                let coeff = invMatrix[missingIdx][j]
-                if coeff == 0 { continue }
-                gf_mul_add(&recovered, presentData[j], coeff)
+            let rowOffset = missingIdx * dataCount
+            recovered.withUnsafeMutableBytes { dstRaw in
+                guard let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                for j in 0..<dataCount {
+                    let coeff = invMatrix[rowOffset + j]
+                    if coeff == 0 { continue }
+                    presentData[j].withUnsafeBytes { srcRaw in
+                        guard let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                        let count = min(shardSize, srcRaw.count)
+                        screx_gf256_mul_add(dstPtr, srcPtr, count, coeff)
+                    }
+                }
             }
             shards[missingIdx] = recovered
         }
@@ -126,41 +139,10 @@ enum ReedSolomonDecoder {
         return gfExp[255 - Int(gfLog[Int(a)])]
     }
 
-    /// dst[i] ^= src[i] * coeff (for all i)
-    private static func gf_mul_add(_ dst: inout Data, _ src: Data, _ coeff: UInt8) {
-        if coeff == 0 { return }
-        if coeff == 1 {
-            dst.withUnsafeMutableBytes { dstRaw in
-                src.withUnsafeBytes { srcRaw in
-                    guard let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress,
-                          let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress else { return }
-                    let count = min(dstRaw.count, srcRaw.count)
-                    for i in 0..<count {
-                        dstPtr[i] ^= srcPtr[i]
-                    }
-                }
-            }
-            return
-        }
-        let logCoeff = Int(gfLog[Int(coeff)])
-        dst.withUnsafeMutableBytes { dstRaw in
-            src.withUnsafeBytes { srcRaw in
-                guard let dstPtr = dstRaw.bindMemory(to: UInt8.self).baseAddress,
-                      let srcPtr = srcRaw.bindMemory(to: UInt8.self).baseAddress else { return }
-                let count = min(dstRaw.count, srcRaw.count)
-                for i in 0..<count {
-                    let v = srcPtr[i]
-                    if v != 0 {
-                        dstPtr[i] ^= gfExp[Int(gfLog[Int(v)]) + logCoeff]
-                    }
-                }
-            }
-        }
-    }
-
     // MARK: - Coding matrix (Vandermonde / Cauchy, compatible with reed-solomon-erasure)
 
-    private static var matrixCache: [UInt64: [[UInt8]]] = [:]
+    /// Flat row-major coding matrices: `totalCount * dataCount` bytes.
+    private static var matrixCache: [UInt64: [UInt8]] = [:]
     private static let matrixCacheMaxEntries = 64
 
     /// Cache key for an inverted decode sub-matrix.
@@ -172,13 +154,14 @@ enum ReedSolomonDecoder {
         let usedIndices: [Int]
     }
 
-    /// Inverted sub-matrices keyed by the loss pattern that produced them.
-    /// Recovery is driven from a single NWConnection receive queue, so no lock
-    /// is required; if that ever changes, wrap cache access in an NSLock.
-    private static var invertMatrixCache: [InvertMatrixKey: [[UInt8]]] = [:]
+    /// Flat row-major inverted sub-matrices (`dataCount * dataCount` bytes) keyed
+    /// by the loss pattern that produced them. Recovery is driven from a single
+    /// NWConnection receive queue, so no lock is required; if that ever changes,
+    /// wrap cache access in an NSLock.
+    private static var invertMatrixCache: [InvertMatrixKey: [UInt8]] = [:]
     private static let invertMatrixCacheMaxEntries = 64
 
-    private static func getCodingMatrix(dataCount: Int, parityCount: Int) -> [[UInt8]] {
+    private static func getCodingMatrix(dataCount: Int, parityCount: Int) -> [UInt8] {
         let key = UInt64(dataCount) << 32 | UInt64(parityCount)
         if let cached = matrixCache[key] { return cached }
         let matrix = buildCodingMatrix(dataCount: dataCount, parityCount: parityCount)
@@ -189,95 +172,115 @@ enum ReedSolomonDecoder {
         return matrix
     }
 
-    private static func buildCodingMatrix(dataCount: Int, parityCount: Int) -> [[UInt8]] {
+    private static func buildCodingMatrix(dataCount: Int, parityCount: Int) -> [UInt8] {
         let totalCount = dataCount + parityCount
-        var matrix = [[UInt8]](repeating: [UInt8](repeating: 0, count: dataCount), count: totalCount)
 
-        // Identity for data shards
-        for i in 0..<dataCount {
-            matrix[i][i] = 1
-        }
-
-        // Vandermonde-derived parity rows (same as reed-solomon-erasure)
-        // Build a Vandermonde matrix, then multiply by inverse of top square to get systematic form
-        var vand = [[UInt8]](repeating: [UInt8](repeating: 0, count: dataCount), count: totalCount)
+        // Vandermonde-derived parity rows (same as reed-solomon-erasure):
+        // build a Vandermonde matrix, then multiply by inverse of top square to get systematic form.
+        var vand = [UInt8](repeating: 0, count: totalCount * dataCount)
         for r in 0..<totalCount {
             var val: UInt8 = 1
             let x = UInt8(r)
+            let rowBase = r * dataCount
             for c in 0..<dataCount {
-                vand[r][c] = val
+                vand[rowBase + c] = val
                 val = gf_mul(val, x)
             }
         }
 
-        // Invert top square
-        let topSquare = Array(vand.prefix(dataCount))
-        guard let topInv = invertMatrix(topSquare) else {
-            // Fallback to simple Vandermonde without systematic form
+        // Invert top square (`dataCount * dataCount`).
+        let topSquare = Array(vand[0..<(dataCount * dataCount)])
+        guard let topInv = invertMatrix(topSquare, n: dataCount) else {
             return vand
         }
 
-        // Multiply full Vandermonde by top-inverse to get systematic form
-        for r in 0..<totalCount {
-            for c in 0..<dataCount {
-                var sum: UInt8 = 0
-                for k in 0..<dataCount {
-                    sum ^= gf_mul(vand[r][k], topInv[k][c])
+        // Multiply full Vandermonde by top-inverse to get systematic form.
+        var matrix = [UInt8](repeating: 0, count: totalCount * dataCount)
+        matrix.withUnsafeMutableBufferPointer { dstBuf in
+            topInv.withUnsafeBufferPointer { invBuf in
+                guard let dstBase = dstBuf.baseAddress,
+                      let invBase = invBuf.baseAddress else { return }
+                for r in 0..<totalCount {
+                    let vandRow = r * dataCount
+                    let dstRow = dstBase.advanced(by: vandRow)
+                    for k in 0..<dataCount {
+                        let coeff = vand[vandRow + k]
+                        if coeff == 0 { continue }
+                        screx_gf256_mul_add(dstRow, invBase.advanced(by: k * dataCount), dataCount, coeff)
+                    }
                 }
-                matrix[r][c] = sum
             }
         }
 
         return matrix
     }
 
-    /// Invert a square matrix over GF(2^8) using Gauss-Jordan elimination
-    private static func invertMatrix(_ m: [[UInt8]]) -> [[UInt8]]? {
-        let n = m.count
-        // Augmented matrix [m | I]
-        var aug = [[UInt8]](repeating: [UInt8](repeating: 0, count: 2 * n), count: n)
-        for i in 0..<n {
-            for j in 0..<n {
-                aug[i][j] = m[i][j]
-            }
-            aug[i][n + i] = 1
-        }
-
-        for col in 0..<n {
-            // Find pivot
-            var pivotRow = -1
-            for row in col..<n {
-                if aug[row][col] != 0 {
-                    pivotRow = row
-                    break
-                }
-            }
-            guard pivotRow >= 0 else { return nil }
-
-            if pivotRow != col {
-                aug.swapAt(pivotRow, col)
-            }
-
-            // Scale pivot row
-            let scale = gf_inv(aug[col][col])
-            for j in 0..<(2 * n) {
-                aug[col][j] = gf_mul(aug[col][j], scale)
-            }
-
-            // Eliminate column
-            for row in 0..<n where row != col {
-                let factor = aug[row][col]
-                if factor == 0 { continue }
-                for j in 0..<(2 * n) {
-                    aug[row][j] ^= gf_mul(factor, aug[col][j])
+    /// Invert a flat row-major `n x n` matrix over GF(2^8) using Gauss-Jordan elimination.
+    private static func invertMatrix(_ m: [UInt8], n: Int) -> [UInt8]? {
+        let stride = 2 * n
+        var aug = [UInt8](repeating: 0, count: n * stride)
+        aug.withUnsafeMutableBufferPointer { augBuf in
+            m.withUnsafeBufferPointer { srcBuf in
+                guard let augBase = augBuf.baseAddress,
+                      let srcBase = srcBuf.baseAddress else { return }
+                for i in 0..<n {
+                    augBase.advanced(by: i * stride)
+                        .update(from: srcBase.advanced(by: i * n), count: n)
+                    augBase[i * stride + n + i] = 1
                 }
             }
         }
 
-        // Extract inverse
-        var result = [[UInt8]](repeating: [UInt8](repeating: 0, count: n), count: n)
-        for i in 0..<n {
-            result[i] = Array(aug[i][n..<(2 * n)])
+        let ok = aug.withUnsafeMutableBufferPointer { augBuf -> Bool in
+            guard let base = augBuf.baseAddress else { return false }
+            for col in 0..<n {
+                // Find pivot
+                var pivotRow = -1
+                for row in col..<n {
+                    if base[row * stride + col] != 0 {
+                        pivotRow = row
+                        break
+                    }
+                }
+                guard pivotRow >= 0 else { return false }
+
+                if pivotRow != col {
+                    let r1 = base.advanced(by: pivotRow * stride)
+                    let r2 = base.advanced(by: col * stride)
+                    for j in 0..<stride {
+                        let tmp = r1[j]
+                        r1[j] = r2[j]
+                        r2[j] = tmp
+                    }
+                }
+
+                // Scale pivot row so pivot becomes 1
+                let pivotPtr = base.advanced(by: col * stride)
+                let scale = gf_inv(pivotPtr[col])
+                screx_gf256_mul_scale(pivotPtr, stride, scale)
+
+                // Eliminate column in all other rows
+                for row in 0..<n where row != col {
+                    let rowPtr = base.advanced(by: row * stride)
+                    let factor = rowPtr[col]
+                    if factor == 0 { continue }
+                    screx_gf256_mul_add(rowPtr, pivotPtr, stride, factor)
+                }
+            }
+            return true
+        }
+        guard ok else { return nil }
+
+        var result = [UInt8](repeating: 0, count: n * n)
+        result.withUnsafeMutableBufferPointer { resBuf in
+            aug.withUnsafeBufferPointer { augBuf in
+                guard let resBase = resBuf.baseAddress,
+                      let augBase = augBuf.baseAddress else { return }
+                for i in 0..<n {
+                    resBase.advanced(by: i * n)
+                        .update(from: augBase.advanced(by: i * stride + n), count: n)
+                }
+            }
         }
         return result
     }
