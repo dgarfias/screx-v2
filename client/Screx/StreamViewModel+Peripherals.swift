@@ -256,11 +256,11 @@ extension StreamViewModel {
         sendMouseButtonChanges(from: previousMask)
     }
 
-    /// Sends smooth high-resolution 2D scroll (`0x04`, Linux `REL_WHEEL_HI_RES` /
+    /// Sends smooth high-resolution 2D scroll (`0x05`, Linux `REL_WHEEL_HI_RES` /
     /// `REL_HWHEEL_HI_RES` units where `120` = one standard wheel detent).
     private func sendMouseScrollHiRes(dx: Int16, dy: Int16) {
         guard dx != 0 || dy != 0 else { return }
-        var data = Data([0x04]) // MOUSE_SCROLL_HIRES
+        var data = Data([0x05]) // MOUSE_SCROLL_HIRES
         withUnsafeBytes(of: dx.bigEndian) { data.append(contentsOf: $0) }
         withUnsafeBytes(of: dy.bigEndian) { data.append(contentsOf: $0) }
         sendMouse(data)

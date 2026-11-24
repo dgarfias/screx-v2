@@ -228,6 +228,7 @@ const MOUSE_MOVE: u8 = 0x01;
 const MOUSE_BUTTON: u8 = 0x02;
 const MOUSE_SCROLL: u8 = 0x03;
 const MOUSE_MOVE_ABS: u8 = 0x04;
+const MOUSE_SCROLL_HIRES: u8 = 0x05;
 
 /// Parse a mouse event packet.
 pub fn parse_mouse_packet(data: &[u8]) -> Option<MouseEvent> {
@@ -253,7 +254,7 @@ pub fn parse_mouse_packet(data: &[u8]) -> Option<MouseEvent> {
             let dy = i16::from_be_bytes([data[1], data[2]]);
             Some(MouseEvent::Scroll { dy })
         }
-        0x04 if data.len() >= 5 => {
+        MOUSE_SCROLL_HIRES if data.len() >= 5 => {
             let dx = i16::from_be_bytes([data[1], data[2]]);
             let dy = i16::from_be_bytes([data[3], data[4]]);
             Some(MouseEvent::ScrollHiRes { dx, dy })
@@ -491,5 +492,22 @@ pub fn hid_to_evdev(hid: u16) -> Option<u16> {
         0xE6 => Some(KEY_RIGHTALT),
         0xE7 => Some(KEY_RIGHTMETA),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mouse_packet_distinguishes_abs_move_and_hires_scroll() {
+        assert!(matches!(
+            parse_mouse_packet(&[0x04, 0x00, 0x10, 0x00, 0x20]),
+            Some(MouseEvent::MoveAbsolute { x: 16, y: 32 })
+        ));
+        assert!(matches!(
+            parse_mouse_packet(&[0x05, 0xFF, 0x88, 0x00, 0x78]),
+            Some(MouseEvent::ScrollHiRes { dx: -120, dy: 120 })
+        ));
     }
 }
