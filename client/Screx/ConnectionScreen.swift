@@ -157,77 +157,90 @@ private struct HostTile: View {
     private static let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
 
     var body: some View {
-        Button(action: onConnect) {
-            VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
                 Image(systemName: "desktopcomputer")
                     .font(.title2)
                     .foregroundStyle(Color.accentColor)
                     .frame(width: 48, height: 48)
                     .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(host.displayName)
-                            .font(.title3.weight(.semibold))
-                            .lineLimit(1)
-                        if host.isPinned {
-                            Image(systemName: "star.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .accessibilityLabel("Pinned")
-                        }
-                    }
-                    // Hosts without a name would show the same address twice.
-                    if host.displayName != host.endpointLabel {
-                        Text(host.endpointLabel)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
+                    .allowsHitTesting(false)
 
                 Spacer(minLength: 0)
-                statusLine
-                    // Room for the Cancel / Settings button drawn over the bottom-right corner.
-                    .padding(.trailing, isConnecting || (failure != nil && showsSettingsAction) ? 96 : 0)
+
+                if !isConnecting {
+                    Menu { menuItems } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, height: 44)
+                    }
+                    .disabled(isOtherHostConnecting)
+                    .offset(x: 10, y: -10)
+                    .accessibilityLabel("Options for \(host.displayName)")
+                }
             }
-            .padding(18)
-            .frame(maxWidth: .infinity, minHeight: 156, alignment: .topLeading)
-            .background(Color(.secondarySystemGroupedBackground), in: Self.shape)
-            .overlay {
-                Self.shape.strokeBorder(failure != nil ? Color.red.opacity(0.6) : Color.accentColor,
-                                        lineWidth: failure != nil || isConnecting ? 1.5 : 0)
-            }
-            .contentShape(Self.shape)
-        }
-        .buttonStyle(.plain)
-        .disabled(isConnecting || isOtherHostConnecting)
-        .opacity(isOtherHostConnecting ? 0.45 : 1)
-        .overlay(alignment: .topTrailing) {
-            if !isConnecting {
-                Menu { menuItems } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.title3)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(host.displayName)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                    if host.isPinned {
+                        Image(systemName: "star.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("Pinned")
+                    }
+                }
+                // Hosts without a name would show the same address twice.
+                if host.displayName != host.endpointLabel {
+                    Text(host.endpointLabel)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .frame(width: 48, height: 48)
-                }
-                .disabled(isOtherHostConnecting)
-                .padding(6)
-                .accessibilityLabel("Options for \(host.displayName)")
-            }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            Group {
-                if isConnecting {
-                    Button("Cancel", action: onCancel)
-                        .buttonStyle(.bordered)
-                } else if failure != nil && showsSettingsAction {
-                    Button("Settings", action: onOpenSettings)
-                        .buttonStyle(.bordered)
+                        .lineLimit(1)
                 }
             }
-            .padding(14)
+            .allowsHitTesting(false)
+
+            Spacer(minLength: 0)
+
+            if isConnecting || failure != nil {
+                HStack(alignment: .center, spacing: 10) {
+                    statusLine
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .allowsHitTesting(false)
+
+                    if isConnecting {
+                        Button("Cancel", action: onCancel)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                    } else if failure != nil && showsSettingsAction {
+                        Button("Settings", action: onOpenSettings)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .fixedSize()
+                    }
+                }
+            }
         }
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: 156, alignment: .topLeading)
+        .background {
+            Button(action: onConnect) {
+                Self.shape.fill(Color(.secondarySystemGroupedBackground))
+            }
+            .buttonStyle(.plain)
+            .disabled(isConnecting || isOtherHostConnecting)
+            .accessibilityLabel("Connect to \(host.displayName)")
+        }
+        .clipShape(Self.shape)
+        .overlay {
+            Self.shape.strokeBorder(failure != nil ? Color.red.opacity(0.6) : Color.accentColor,
+                                    lineWidth: failure != nil || isConnecting ? 1.5 : 0)
+        }
+        .opacity(isOtherHostConnecting ? 0.45 : 1)
         .contextMenu { if !isConnecting && !isOtherHostConnecting { menuItems } }
         .accessibilityElement(children: .contain)
     }
@@ -237,11 +250,14 @@ private struct HostTile: View {
         if case let .connecting(label) = state {
             HStack(spacing: 8) {
                 ProgressView()
+                    .controlSize(.small)
                 Text(label)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
             }
-            .frame(minHeight: 34)
+            .frame(minHeight: 28, alignment: .leading)
         } else if let failure {
             Label {
                 Text(failure)
@@ -252,7 +268,7 @@ private struct HostTile: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
             }
-            .frame(minHeight: 34, alignment: .leading)
+            .frame(minHeight: 28, alignment: .leading)
         }
     }
 

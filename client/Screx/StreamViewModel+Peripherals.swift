@@ -64,7 +64,7 @@ extension StreamViewModel {
     }
 
     func stopPeripheralMonitoring() {
-        setTrackpadEnabled(false)
+        setTrackpadEnabled(false, persist: false)
         for obs in mouseObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in keyboardObservers { NotificationCenter.default.removeObserver(obs) }
         for obs in controllerObservers { NotificationCenter.default.removeObserver(obs) }
@@ -205,7 +205,7 @@ extension StreamViewModel {
         }
     }
 
-    func setTrackpadEnabled(_ enabled: Bool) {
+    func setTrackpadEnabled(_ enabled: Bool, persist: Bool = true) {
         guard enabled != isTrackpadEnabled else { return }
         if enabled {
             guard isConnected else { return }
@@ -225,6 +225,10 @@ extension StreamViewModel {
         trackpadMotionRemainder = .zero
         trackpadScrollRemainderX = 0
         trackpadScrollRemainderY = 0
+        if persist {
+            let current = isTrackpadEnabled
+            updateCurrentHostPillPreferences { $0.trackpadEnabled = current }
+        }
     }
 
     /// On-screen trackpad input is accepted from the floating trackpad when it's enabled, and
@@ -513,11 +517,17 @@ extension StreamViewModel {
     var isCameraAvailable: Bool { daemonCapabilities?.camera ?? false }
 
     func toggleCamera() {
+        setCameraEnabled(!cameraCapture.isRunning, persist: true)
+    }
+
+    private func setCameraEnabled(_ enabled: Bool, persist: Bool) {
         guard isCameraAvailable else { return }
-        if cameraCapture.isRunning {
+        if !enabled {
+            guard cameraCapture.isRunning else { return }
             cameraCapture.stop()
             sendCameraDisable()
         } else {
+            guard !cameraCapture.isRunning else { return }
             sendCameraEnable()
             cameraCapture.onJPEG = { [weak self, weak stream = self.stream] jpeg in
                 DispatchQueue.main.async {
@@ -528,6 +538,10 @@ extension StreamViewModel {
                 }
             }
             cameraCapture.start()
+        }
+        if persist {
+            let isRunning = cameraCapture.isRunning
+            updateCurrentHostPillPreferences { $0.cameraEnabled = isRunning }
         }
         objectWillChange.send()
     }
@@ -560,9 +574,14 @@ extension StreamViewModel {
     var isMicAvailable: Bool { daemonCapabilities?.microphone ?? false }
 
     func toggleMic() {
+        setMicEnabled(!micCapture.isRunning, persist: true)
+    }
+
+    private func setMicEnabled(_ enabled: Bool, persist: Bool) {
         guard isMicAvailable else { return }
         let speakerWasEnabled = audioPlayer.isOutputEnabled
-        if micCapture.isRunning {
+        if !enabled {
+            guard micCapture.isRunning else { return }
             micCapture.stop()
             sendMicDisable()
             configureAudioSession()
@@ -570,6 +589,7 @@ extension StreamViewModel {
                 resetSpeakerOutput()
             }
         } else {
+            guard !micCapture.isRunning else { return }
             configureAudioSession(micActive: true)
             sendMicEnable()
             micCapture.onOpusPacket = { [weak self, weak stream = self.stream] opusData in
@@ -588,6 +608,10 @@ extension StreamViewModel {
             if speakerWasEnabled {
                 resetSpeakerOutput()
             }
+        }
+        if persist {
+            let isRunning = micCapture.isRunning
+            updateCurrentHostPillPreferences { $0.micEnabled = isRunning }
         }
         objectWillChange.send()
     }
@@ -624,6 +648,7 @@ extension StreamViewModel {
         let isEnabled = !audioPlayer.isOutputEnabled
         audioPlayer.setOutputEnabled(isEnabled)
         sendSpeakerTransportState(isEnabled: isEnabled)
+        updateCurrentHostPillPreferences { $0.speakerEnabled = isEnabled }
         objectWillChange.send()
     }
 
@@ -637,5 +662,24 @@ extension StreamViewModel {
         guard isControllerAvailable else { return }
         isControllerPassthroughEnabled.toggle()
         refreshControllerPassthrough()
+        let isEnabled = isControllerPassthroughEnabled
+        updateCurrentHostPillPreferences { $0.controllerPassthroughEnabled = isEnabled }
+    }
+
+    /// Restores the current host's remembered pill toggles once the stream is live.
+    /// Speaker and controller preferences are applied earlier at session establishment so
+    /// initial audio/controller attach uses them immediately.
+    func applyRememberedPillPreferencesOnSessionStart() {
+        let prefs = pillPreferences(for: connectionTarget?.id)
+        if prefs.trackpadEnabled && !isTrackpadEnabled {
+            setTrackpadEnabled(true, persist: false)
+        }
+        if prefs.cameraEnabled && isCameraAvailable && !cameraCapture.isRunning {
+            setCameraEnabled(true, persist: false)
+        }
+        if prefs.micEnabled && isMicAvailable && !micCapture.isRunning {
+            setMicEnabled(true, persist: false)
+        }
+        objectWillChange.send()
     }
 }

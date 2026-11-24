@@ -160,6 +160,18 @@ struct HostStreamSettings: Codable, Equatable {
     }
 }
 
+/// Per-host pill toggle selections remembered across disconnects and app restarts.
+/// The info overlay is intentionally excluded so it starts enabled every session.
+struct HostPillPreferences: Codable, Equatable {
+    var trackpadEnabled: Bool = false
+    var controllerPassthroughEnabled: Bool = true
+    var cameraEnabled: Bool = false
+    var micEnabled: Bool = false
+    var speakerEnabled: Bool = true
+
+    static let defaults = HostPillPreferences()
+}
+
 /// The stream limits a host advertised in its last `CAPS`, so its Settings only offer what it
 /// supports.
 struct HostLimits: Codable, Equatable {

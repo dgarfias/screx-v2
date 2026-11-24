@@ -292,6 +292,8 @@ final class StreamViewModel: ObservableObject {
 
     /// Stream settings per host tile, keyed by tile ID.
     @Published private(set) var hostSettings: [String: HostStreamSettings] = StreamViewModel.loadHostSettings()
+    /// Pill toggle preferences per host tile, keyed by tile ID.
+    private var hostPillPreferences: [String: HostPillPreferences] = StreamViewModel.loadHostPillPreferences()
 
     let decoder = VideoDecoder()
     let externalDecoder = VideoDecoder()
@@ -456,6 +458,10 @@ final class StreamViewModel: ObservableObject {
             hostSettings = hostSettings.filter { keep.contains($0.key) }
             persistHostSettings()
         }
+        if hostPillPreferences.keys.contains(where: { !keep.contains($0) }) {
+            hostPillPreferences = hostPillPreferences.filter { keep.contains($0.key) }
+            persistHostPillPreferences()
+        }
         KeychainHelper.deletePairingKeys(except: keep)
         do {
             let data = try JSONEncoder().encode(recentConnections)
@@ -506,6 +512,32 @@ final class StreamViewModel: ObservableObject {
 
     func settings(for tileId: String?) -> HostStreamSettings {
         tileId.flatMap { hostSettings[$0] } ?? .defaults
+    }
+
+    private static let hostPillPreferencesKey = "screx_host_pill_preferences"
+
+    private static func loadHostPillPreferences() -> [String: HostPillPreferences] {
+        guard let data = UserDefaults.standard.data(forKey: hostPillPreferencesKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: HostPillPreferences].self, from: data)) ?? [:]
+    }
+
+    private func persistHostPillPreferences() {
+        if let data = try? JSONEncoder().encode(hostPillPreferences) {
+            UserDefaults.standard.set(data, forKey: Self.hostPillPreferencesKey)
+        }
+    }
+
+    func pillPreferences(for tileId: String?) -> HostPillPreferences {
+        tileId.flatMap { hostPillPreferences[$0] } ?? .defaults
+    }
+
+    func updateCurrentHostPillPreferences(_ update: (inout HostPillPreferences) -> Void) {
+        guard let id = connectionTarget?.id else { return }
+        var prefs = hostPillPreferences[id] ?? .defaults
+        update(&prefs)
+        guard hostPillPreferences[id] != prefs else { return }
+        hostPillPreferences[id] = prefs
+        persistHostPillPreferences()
     }
 
     /// The reason `address` can't be used for the tile (nil: a new host), or nil if it can.
@@ -977,7 +1009,7 @@ final class StreamViewModel: ObservableObject {
             isChangingDisplays = false
             if update.activeMask == DisplayOutputMode.externalOnly.rawValue {
                 if trackpadBeforeExternalOnly == nil { trackpadBeforeExternalOnly = isTrackpadEnabled }
-                setTrackpadEnabled(true)
+                setTrackpadEnabled(true, persist: false)
             } else {
                 restoreTrackpadAfterExternalOnly()
             }
@@ -1000,7 +1032,7 @@ final class StreamViewModel: ObservableObject {
         guard displayRouting.committedMask != DisplayOutputMode.externalOnly.rawValue,
               let saved = trackpadBeforeExternalOnly else { return }
         trackpadBeforeExternalOnly = nil
-        setTrackpadEnabled(saved)
+        setTrackpadEnabled(saved, persist: false)
     }
 
     /// Clears capability-negotiation state on disconnect so a fresh connection starts
@@ -1217,6 +1249,9 @@ final class StreamViewModel: ObservableObject {
                 self.beginCapabilityNegotiation(transport: .network)
                 control.start()
                 self.decoder.setSuspended(false)
+                let rememberedPill = self.pillPreferences(for: self.connectionTarget?.id)
+                self.audioPlayer.setOutputEnabled(rememberedPill.speakerEnabled)
+                self.isControllerPassthroughEnabled = rememberedPill.controllerPassthroughEnabled
                 self.syncSpeakerPassthroughState()
 
                 self.startEncryptedStream(endpoint: endpoint, name: name, session: session, controlClient: control)
@@ -1309,6 +1344,7 @@ final class StreamViewModel: ObservableObject {
                 self.rememberTarget(name: self.sessionDisplayName)
                 self.audioPlayer.start()
                 self.startPeripheralMonitoring()
+                self.applyRememberedPillPreferencesOnSessionStart()
             }
         }
         client.connect()

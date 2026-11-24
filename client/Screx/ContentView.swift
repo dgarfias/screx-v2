@@ -234,6 +234,11 @@ struct ContentView: View {
                 isKeyboardActive = false
             }
         }
+        .onChange(of: model.isConnected) { connected in
+            if connected {
+                showOverlay = true
+            }
+        }
     }
 
     // MARK: - Floating button bar
@@ -346,15 +351,17 @@ struct ContentView: View {
                     .accessibilityHint("Choose internal, external, or both displays")
                 }
 
-                toolbarButton(
-                    icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
-                    active: isKeyboardActive && !model.physicalKeyboardConnected,
-                    color: model.physicalKeyboardConnected ? .gray : (isKeyboardActive ? .green : .white)
-                ) {
-                    if model.physicalKeyboardConnected {
-                        showToolbarMessage("External keyboard detected")
-                    } else {
-                        isKeyboardActive.toggle()
+                if !model.physicalKeyboardConnected || isToolbarExpanded {
+                    toolbarButton(
+                        icon: isKeyboardActive ? "keyboard.fill" : "keyboard",
+                        active: isKeyboardActive && !model.physicalKeyboardConnected,
+                        color: model.physicalKeyboardConnected ? .gray : (isKeyboardActive ? .green : .white)
+                    ) {
+                        if model.physicalKeyboardConnected {
+                            showToolbarMessage("External keyboard detected")
+                        } else {
+                            isKeyboardActive.toggle()
+                        }
                     }
                 }
 
