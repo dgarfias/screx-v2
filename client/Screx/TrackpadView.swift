@@ -11,7 +11,7 @@ struct TrackpadOverlay: View {
     let keyboardFrame: CGRect
     let onMove: (CGFloat, CGFloat) -> Void
     let onButton: (UInt8, Bool) -> Void
-    let onScroll: (CGFloat) -> Void
+    let onScroll: (CGFloat, CGFloat) -> Void
 
     /// Trackpad frame, as fractions of the container so it survives rotation and size changes.
     @State private var normalizedFrame: CGRect = Self.loadFrame()
@@ -187,7 +187,7 @@ struct TrackpadOverlay: View {
 struct TrackpadSurface: UIViewRepresentable {
     let onMove: (CGFloat, CGFloat) -> Void
     let onButton: (UInt8, Bool) -> Void
-    let onScroll: (CGFloat) -> Void
+    let onScroll: (CGFloat, CGFloat) -> Void
     let onInteractionChanged: (Bool) -> Void
 
     func makeUIView(context: Context) -> TrackpadSurfaceView {
@@ -220,7 +220,7 @@ struct TrackpadSurface: UIViewRepresentable {
 final class TrackpadSurfaceView: UIView {
     var onMove: ((CGFloat, CGFloat) -> Void)?
     var onButton: ((UInt8, Bool) -> Void)?
-    var onScroll: ((CGFloat) -> Void)?
+    var onScroll: ((CGFloat, CGFloat) -> Void)?
     var onInteractionChanged: ((Bool) -> Void)?
 
     static let buttonLeft: UInt8 = 0x00
@@ -290,7 +290,7 @@ final class TrackpadSurfaceView: UIView {
                 let dx = location.x - last.x
                 let dy = location.y - last.y
                 movement += hypot(dx, dy)
-                if movement >= Self.tapMaxMovement { onScroll?(dy) }
+                if movement >= Self.tapMaxMovement { onScroll?(dx, dy) }
             }
             lastTwoFingerLocation = location
             return

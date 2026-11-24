@@ -27,6 +27,9 @@ pub enum MouseEvent {
     MoveAbsolute { x: u16, y: u16 },
     Button { btn: u8, state: u8 },
     Scroll { dy: i16 },
+    /// High-resolution 2D scroll in Linux `REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES`
+    /// units (`120` = one standard wheel detent; `dy > 0` up, `dx > 0` right).
+    ScrollHiRes { dx: i16, dy: i16 },
 }
 
 /// Gamepad button bits (same layout as Linux evdev mapping used by iPad).
@@ -249,6 +252,11 @@ pub fn parse_mouse_packet(data: &[u8]) -> Option<MouseEvent> {
         MOUSE_SCROLL if data.len() >= 3 => {
             let dy = i16::from_be_bytes([data[1], data[2]]);
             Some(MouseEvent::Scroll { dy })
+        }
+        0x04 if data.len() >= 5 => {
+            let dx = i16::from_be_bytes([data[1], data[2]]);
+            let dy = i16::from_be_bytes([data[3], data[4]]);
+            Some(MouseEvent::ScrollHiRes { dx, dy })
         }
         _ => None,
     }

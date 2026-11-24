@@ -181,7 +181,8 @@ final class StreamClient {
         }
 
         // QUIC has already authenticated and decrypted the complete datagram.
-        let payload = Data(data.dropFirst(Self.headerLen))
+        // Zero-copy slice (preserves `startIndex`; all consumers respect slice bounds).
+        let payload = data.dropFirst(Self.headerLen)
 
         // Only the audio, IDR and external-display flags exist.
         guard packet.generation > 0, flags & ~0x13 == 0,

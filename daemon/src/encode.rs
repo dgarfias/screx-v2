@@ -786,9 +786,52 @@ extern "C" {
     ) -> libc::c_int;
 }
 
+/// Unique identity for a cached imported DMA-BUF surface. Including the
+/// kernel `dma_buf` anon_inode `(st_dev, st_ino)` prevents stale hits even if
+/// DRM reuses an `fb_id` after destroying and recreating a framebuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedSurfaceKey {
+    fb_id: u32,
+    dev: u64,
+    ino: u64,
+    width: i32,
+    height: i32,
+    pixel_format: u32,
+    modifier: u64,
+    pitch: u32,
+    offset: u32,
+}
+
+struct CachedVaSurface {
+    key: CachedSurfaceKey,
+    vaapi_frame: *mut ffi::AVFrame,
+    surface_id: u32,
+}
+
+impl Drop for CachedVaSurface {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.vaapi_frame.is_null() {
+                ffi::av_frame_free(&mut self.vaapi_frame);
+            }
+        }
+    }
+}
+
+fn dmabuf_inode(fd: libc::c_int) -> Option<(u64, u64)> {
+    unsafe {
+        let mut st = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(fd, &mut st) == 0 {
+            Some((st.st_dev as u64, st.st_ino as u64))
+        } else {
+            None
+        }
+    }
+}
+
 /// Imports a DRM PRIME DMA-BUF directly into a VA-API surface via
 /// `av_hwframe_map` and runs single-pass VA-API VPP (`VAEntrypointVideoProc`)
-/// directly into the encoder's NV12 surface pool, alpha-blending the DRM
+/// directly into the encoder's NV12/P010 surface pool, alpha-blending the DRM
 /// hardware cursor plane on the GPU when present.
 struct DmaBufVppScaler {
     width: i32,
@@ -800,17 +843,22 @@ struct DmaBufVppScaler {
     vaapi_in_frames_ctx: *mut ffi::AVBufferRef,
     va_vpp: *mut ScrexVaVpp,
     drm_frame: *mut ffi::AVFrame,
-    vaapi_in_frame: *mut ffi::AVFrame,
+    /// Small LRU cache of imported primary swapchain surfaces (typically 2-3).
+    primary_cache: Vec<CachedVaSurface>,
     cursor_key: Option<(i32, i32, ffi::AVPixelFormat)>,
     cursor_drm_frames_ctx: *mut ffi::AVBufferRef,
     cursor_vaapi_frames_ctx: *mut ffi::AVBufferRef,
     cursor_drm_frame: *mut ffi::AVFrame,
-    cursor_vaapi_frame: *mut ffi::AVFrame,
+    /// Small LRU cache of imported hardware cursor surfaces (typically 1-2).
+    cursor_cache: Vec<CachedVaSurface>,
 }
 
 unsafe impl Send for DmaBufVppScaler {}
 
 impl DmaBufVppScaler {
+    const PRIMARY_CACHE_CAP: usize = 4;
+    const CURSOR_CACHE_CAP: usize = 2;
+
     fn new(
         width: i32,
         height: i32,
@@ -828,12 +876,12 @@ impl DmaBufVppScaler {
                 vaapi_in_frames_ctx: ptr::null_mut(),
                 va_vpp: ptr::null_mut(),
                 drm_frame: ptr::null_mut(),
-                vaapi_in_frame: ptr::null_mut(),
+                primary_cache: Vec::with_capacity(Self::PRIMARY_CACHE_CAP),
                 cursor_key: None,
                 cursor_drm_frames_ctx: ptr::null_mut(),
                 cursor_vaapi_frames_ctx: ptr::null_mut(),
                 cursor_drm_frame: ptr::null_mut(),
-                cursor_vaapi_frame: ptr::null_mut(),
+                cursor_cache: Vec::with_capacity(Self::CURSOR_CACHE_CAP),
             };
             if scaler.vaapi_device_ctx.is_null() {
                 bail!("failed to ref VA-API device context");
@@ -888,19 +936,13 @@ impl DmaBufVppScaler {
             }
 
             scaler.drm_frame = ffi::av_frame_alloc();
-            scaler.vaapi_in_frame = ffi::av_frame_alloc();
             scaler.cursor_drm_frame = ffi::av_frame_alloc();
-            scaler.cursor_vaapi_frame = ffi::av_frame_alloc();
-            if scaler.drm_frame.is_null()
-                || scaler.vaapi_in_frame.is_null()
-                || scaler.cursor_drm_frame.is_null()
-                || scaler.cursor_vaapi_frame.is_null()
-            {
+            if scaler.drm_frame.is_null() || scaler.cursor_drm_frame.is_null() {
                 bail!("failed to allocate zero-copy VPP scratch frames");
             }
 
             crate::log_detail!(
-                "[encode] VA-API zero-copy DMA-BUF VPP initialized ({width}x{height} sw_fmt={sw_format:?}, GPU cursor blend enabled)"
+                "[encode] VA-API zero-copy DMA-BUF VPP initialized ({width}x{height} sw_fmt={sw_format:?}, GPU cursor blend + surface cache enabled)"
             );
             Ok(scaler)
         }
@@ -923,6 +965,7 @@ impl DmaBufVppScaler {
         {
             return Ok(());
         }
+        self.cursor_cache.clear();
         if !self.cursor_vaapi_frames_ctx.is_null() {
             ffi::av_buffer_unref(&mut self.cursor_vaapi_frames_ctx);
         }
@@ -965,6 +1008,34 @@ impl DmaBufVppScaler {
         Ok(())
     }
 
+    fn lookup_cached(cache: &mut Vec<CachedVaSurface>, key: CachedSurfaceKey) -> Option<u32> {
+        if let Some(pos) = cache.iter().position(|e| e.key == key) {
+            let entry = cache.remove(pos);
+            let sid = entry.surface_id;
+            cache.push(entry);
+            Some(sid)
+        } else {
+            None
+        }
+    }
+
+    fn insert_cached(
+        cache: &mut Vec<CachedVaSurface>,
+        cap: usize,
+        key: CachedSurfaceKey,
+        vaapi_frame: *mut ffi::AVFrame,
+        surface_id: u32,
+    ) {
+        if cache.len() >= cap {
+            cache.remove(0);
+        }
+        cache.push(CachedVaSurface {
+            key,
+            vaapi_frame,
+            surface_id,
+        });
+    }
+
     fn convert(
         &mut self,
         dmabuf: &DmaBufFrame,
@@ -980,79 +1051,118 @@ impl DmaBufVppScaler {
         }
 
         unsafe {
-            // 1. Import primary plane DMA-BUF into VA-API surface.
-            let mut desc = Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
-            for obj in &mut desc.objects {
-                obj.fd = -1;
-            }
-            desc.nb_objects = dmabuf.objects.len() as i32;
-            for (i, obj) in dmabuf.objects.iter().enumerate() {
-                let dup_fd = libc::fcntl(obj.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
-                if dup_fd < 0 {
-                    for prev in &desc.objects[..i] {
-                        if prev.fd >= 0 {
-                            libc::close(prev.fd);
-                        }
-                    }
-                    bail!("F_DUPFD_CLOEXEC failed for DMA-BUF object {i}");
+            // 1. Resolve primary VA-API surface (LRU cache by fb_id + dmabuf inode).
+            let primary_key = if dmabuf.objects.len() == 1 && dmabuf.planes.len() == 1 {
+                dmabuf_inode(dmabuf.objects[0].fd.as_raw_fd()).map(|(dev, ino)| CachedSurfaceKey {
+                    fb_id: dmabuf.fb_id,
+                    dev,
+                    ino,
+                    width: self.width,
+                    height: self.height,
+                    pixel_format: dmabuf.pixel_format,
+                    modifier: dmabuf.objects[0].modifier,
+                    pitch: dmabuf.planes[0].pitch,
+                    offset: dmabuf.planes[0].offset,
+                })
+            } else {
+                None
+            };
+
+            let mut temp_primary_frame: *mut ffi::AVFrame = ptr::null_mut();
+            let primary_surface = if let Some(sid) =
+                primary_key.and_then(|k| Self::lookup_cached(&mut self.primary_cache, k))
+            {
+                sid
+            } else {
+                let mut desc = Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
+                for obj in &mut desc.objects {
+                    obj.fd = -1;
                 }
-                desc.objects[i] = ffi::AVDRMObjectDescriptor {
-                    fd: dup_fd,
-                    size: obj.size as usize,
-                    format_modifier: obj.modifier,
-                };
-            }
+                desc.nb_objects = dmabuf.objects.len() as i32;
+                for (i, obj) in dmabuf.objects.iter().enumerate() {
+                    let dup_fd = libc::fcntl(obj.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+                    if dup_fd < 0 {
+                        for prev in &desc.objects[..i] {
+                            if prev.fd >= 0 {
+                                libc::close(prev.fd);
+                            }
+                        }
+                        bail!("F_DUPFD_CLOEXEC failed for DMA-BUF object {i}");
+                    }
+                    desc.objects[i] = ffi::AVDRMObjectDescriptor {
+                        fd: dup_fd,
+                        size: obj.size as usize,
+                        format_modifier: obj.modifier,
+                    };
+                }
 
-            desc.nb_layers = 1;
-            desc.layers[0].format = dmabuf.pixel_format;
-            desc.layers[0].nb_planes = dmabuf.planes.len() as i32;
-            for (p, plane) in dmabuf.planes.iter().enumerate() {
-                desc.layers[0].planes[p] = ffi::AVDRMPlaneDescriptor {
-                    object_index: plane.object_index as i32,
-                    offset: plane.offset as isize,
-                    pitch: plane.pitch as isize,
-                };
-            }
+                desc.nb_layers = 1;
+                desc.layers[0].format = dmabuf.pixel_format;
+                desc.layers[0].nb_planes = dmabuf.planes.len() as i32;
+                for (p, plane) in dmabuf.planes.iter().enumerate() {
+                    desc.layers[0].planes[p] = ffi::AVDRMPlaneDescriptor {
+                        object_index: plane.object_index as i32,
+                        offset: plane.offset as isize,
+                        pitch: plane.pitch as isize,
+                    };
+                }
 
-            let desc_ptr = Box::into_raw(desc);
-            let buf_ref = ffi::av_buffer_create(
-                desc_ptr as *mut u8,
-                std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
-                Some(free_drm_frame_descriptor),
-                ptr::null_mut(),
-                ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
-            );
-            if buf_ref.is_null() {
-                free_drm_frame_descriptor(ptr::null_mut(), desc_ptr as *mut u8);
-                bail!("av_buffer_create failed for AVDRMFrameDescriptor");
-            }
+                let desc_ptr = Box::into_raw(desc);
+                let buf_ref = ffi::av_buffer_create(
+                    desc_ptr as *mut u8,
+                    std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+                    Some(free_drm_frame_descriptor),
+                    ptr::null_mut(),
+                    ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
+                );
+                if buf_ref.is_null() {
+                    free_drm_frame_descriptor(ptr::null_mut(), desc_ptr as *mut u8);
+                    bail!("av_buffer_create failed for AVDRMFrameDescriptor");
+                }
 
-            ffi::av_frame_unref(self.drm_frame);
-            (*self.drm_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-            (*self.drm_frame).width = self.width;
-            (*self.drm_frame).height = self.height;
-            (*self.drm_frame).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames_ctx);
-            (*self.drm_frame).buf[0] = buf_ref;
-            (*self.drm_frame).data[0] = (*buf_ref).data;
-            (*self.drm_frame).pts = pts;
+                ffi::av_frame_unref(self.drm_frame);
+                (*self.drm_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+                (*self.drm_frame).width = self.width;
+                (*self.drm_frame).height = self.height;
+                (*self.drm_frame).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames_ctx);
+                (*self.drm_frame).buf[0] = buf_ref;
+                (*self.drm_frame).data[0] = (*buf_ref).data;
+                (*self.drm_frame).pts = pts;
 
-            ffi::av_frame_unref(self.vaapi_in_frame);
-            (*self.vaapi_in_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-            (*self.vaapi_in_frame).hw_frames_ctx = ffi::av_buffer_ref(self.vaapi_in_frames_ctx);
+                let mut mapped = ffi::av_frame_alloc();
+                if mapped.is_null() {
+                    ffi::av_frame_unref(self.drm_frame);
+                    bail!("failed to allocate VA-API import frame");
+                }
+                (*mapped).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+                (*mapped).hw_frames_ctx = ffi::av_buffer_ref(self.vaapi_in_frames_ctx);
 
-            let map_ret = ffi::av_hwframe_map(
-                self.vaapi_in_frame,
-                self.drm_frame,
-                ffi::AV_HWFRAME_MAP_READ as libc::c_int,
-            );
-            ffi::av_frame_unref(self.drm_frame);
-            if map_ret < 0 {
-                ffi::av_frame_unref(self.vaapi_in_frame);
-                bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed (error {map_ret})");
-            }
-            let primary_surface = (*self.vaapi_in_frame).data[3] as usize as u32;
+                let map_ret = ffi::av_hwframe_map(
+                    mapped,
+                    self.drm_frame,
+                    ffi::AV_HWFRAME_MAP_READ as libc::c_int,
+                );
+                ffi::av_frame_unref(self.drm_frame);
+                if map_ret < 0 {
+                    ffi::av_frame_free(&mut mapped);
+                    bail!("av_hwframe_map(DRM_PRIME -> VAAPI) failed (error {map_ret})");
+                }
+                let sid = (*mapped).data[3] as usize as u32;
+                if let Some(key) = primary_key {
+                    Self::insert_cached(
+                        &mut self.primary_cache,
+                        Self::PRIMARY_CACHE_CAP,
+                        key,
+                        mapped,
+                        sid,
+                    );
+                } else {
+                    temp_primary_frame = mapped;
+                }
+                sid
+            };
 
-            // 2. Best-effort import of hardware cursor plane DMA-BUF.
+            // 2. Best-effort import/cache of hardware cursor plane DMA-BUF.
             let mut has_cursor = 0;
             let mut cursor_surface = 0u32;
             let mut cursor_x = 0i32;
@@ -1061,93 +1171,143 @@ impl DmaBufVppScaler {
             let mut cursor_src_h = 0i32;
             let mut cursor_dst_w = 0i32;
             let mut cursor_dst_h = 0i32;
+            let mut temp_cursor_frame: *mut ffi::AVFrame = ptr::null_mut();
 
             if let Some(cursor) = &dmabuf.cursor {
                 if let Some(c_sw_fmt) = drm_fourcc_to_sw_pix_fmt(cursor.pixel_format) {
                     let cw = cursor.width as i32;
                     let ch = cursor.height as i32;
                     if self.ensure_cursor_frames(cw, ch, c_sw_fmt).is_ok() {
-                        let dup_fd = libc::fcntl(cursor.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
-                        if dup_fd >= 0 {
-                            let mut cdesc =
-                                Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
-                            for obj in &mut cdesc.objects {
-                                obj.fd = -1;
+                        let ckey = dmabuf_inode(cursor.fd.as_raw_fd()).map(|(dev, ino)| {
+                            CachedSurfaceKey {
+                                fb_id: cursor.fb_id,
+                                dev,
+                                ino,
+                                width: cw,
+                                height: ch,
+                                pixel_format: cursor.pixel_format,
+                                modifier: cursor.modifier,
+                                pitch: cursor.pitch,
+                                offset: cursor.offset,
                             }
-                            cdesc.nb_objects = 1;
-                            cdesc.objects[0] = ffi::AVDRMObjectDescriptor {
-                                fd: dup_fd,
-                                size: cursor.size as usize,
-                                format_modifier: cursor.modifier,
-                            };
-                            cdesc.nb_layers = 1;
-                            cdesc.layers[0].format = cursor.pixel_format;
-                            cdesc.layers[0].nb_planes = 1;
-                            cdesc.layers[0].planes[0] = ffi::AVDRMPlaneDescriptor {
-                                object_index: 0,
-                                offset: cursor.offset as isize,
-                                pitch: cursor.pitch as isize,
-                            };
-
-                            let cdesc_ptr = Box::into_raw(cdesc);
-                            let cbuf = ffi::av_buffer_create(
-                                cdesc_ptr as *mut u8,
-                                std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
-                                Some(free_drm_frame_descriptor),
-                                ptr::null_mut(),
-                                ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
-                            );
-                            if !cbuf.is_null() {
-                                ffi::av_frame_unref(self.cursor_drm_frame);
-                                (*self.cursor_drm_frame).format =
-                                    ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-                                (*self.cursor_drm_frame).width = cw;
-                                (*self.cursor_drm_frame).height = ch;
-                                (*self.cursor_drm_frame).hw_frames_ctx =
-                                    ffi::av_buffer_ref(self.cursor_drm_frames_ctx);
-                                (*self.cursor_drm_frame).buf[0] = cbuf;
-                                (*self.cursor_drm_frame).data[0] = (*cbuf).data;
-
-                                ffi::av_frame_unref(self.cursor_vaapi_frame);
-                                (*self.cursor_vaapi_frame).format =
-                                    ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-                                (*self.cursor_vaapi_frame).hw_frames_ctx =
-                                    ffi::av_buffer_ref(self.cursor_vaapi_frames_ctx);
-
-                                let cmap = ffi::av_hwframe_map(
-                                    self.cursor_vaapi_frame,
-                                    self.cursor_drm_frame,
-                                    ffi::AV_HWFRAME_MAP_READ as libc::c_int,
-                                );
-                                ffi::av_frame_unref(self.cursor_drm_frame);
-                                if cmap >= 0 {
-                                    has_cursor = 1;
-                                    cursor_surface =
-                                        (*self.cursor_vaapi_frame).data[3] as usize as u32;
-                                    cursor_x = cursor.x;
-                                    cursor_y = cursor.y;
-                                    cursor_src_w = cw;
-                                    cursor_src_h = ch;
-                                    cursor_dst_w = cursor.crtc_w as i32;
-                                    cursor_dst_h = cursor.crtc_h as i32;
-                                } else {
-                                    ffi::av_frame_unref(self.cursor_vaapi_frame);
+                        });
+                        if let Some(sid) =
+                            ckey.and_then(|k| Self::lookup_cached(&mut self.cursor_cache, k))
+                        {
+                            has_cursor = 1;
+                            cursor_surface = sid;
+                            cursor_x = cursor.x;
+                            cursor_y = cursor.y;
+                            cursor_src_w = cw;
+                            cursor_src_h = ch;
+                            cursor_dst_w = cursor.crtc_w as i32;
+                            cursor_dst_h = cursor.crtc_h as i32;
+                        } else {
+                            let dup_fd =
+                                libc::fcntl(cursor.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+                            if dup_fd >= 0 {
+                                let mut cdesc =
+                                    Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
+                                for obj in &mut cdesc.objects {
+                                    obj.fd = -1;
                                 }
-                            } else {
-                                free_drm_frame_descriptor(ptr::null_mut(), cdesc_ptr as *mut u8);
+                                cdesc.nb_objects = 1;
+                                cdesc.objects[0] = ffi::AVDRMObjectDescriptor {
+                                    fd: dup_fd,
+                                    size: cursor.size as usize,
+                                    format_modifier: cursor.modifier,
+                                };
+                                cdesc.nb_layers = 1;
+                                cdesc.layers[0].format = cursor.pixel_format;
+                                cdesc.layers[0].nb_planes = 1;
+                                cdesc.layers[0].planes[0] = ffi::AVDRMPlaneDescriptor {
+                                    object_index: 0,
+                                    offset: cursor.offset as isize,
+                                    pitch: cursor.pitch as isize,
+                                };
+
+                                let cdesc_ptr = Box::into_raw(cdesc);
+                                let cbuf = ffi::av_buffer_create(
+                                    cdesc_ptr as *mut u8,
+                                    std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+                                    Some(free_drm_frame_descriptor),
+                                    ptr::null_mut(),
+                                    ffi::AV_BUFFER_FLAG_READONLY as libc::c_int,
+                                );
+                                if !cbuf.is_null() {
+                                    ffi::av_frame_unref(self.cursor_drm_frame);
+                                    (*self.cursor_drm_frame).format =
+                                        ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+                                    (*self.cursor_drm_frame).width = cw;
+                                    (*self.cursor_drm_frame).height = ch;
+                                    (*self.cursor_drm_frame).hw_frames_ctx =
+                                        ffi::av_buffer_ref(self.cursor_drm_frames_ctx);
+                                    (*self.cursor_drm_frame).buf[0] = cbuf;
+                                    (*self.cursor_drm_frame).data[0] = (*cbuf).data;
+
+                                    let mut cmapped = ffi::av_frame_alloc();
+                                    if !cmapped.is_null() {
+                                        (*cmapped).format =
+                                            ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+                                        (*cmapped).hw_frames_ctx =
+                                            ffi::av_buffer_ref(self.cursor_vaapi_frames_ctx);
+
+                                        let cmap = ffi::av_hwframe_map(
+                                            cmapped,
+                                            self.cursor_drm_frame,
+                                            ffi::AV_HWFRAME_MAP_READ as libc::c_int,
+                                        );
+                                        ffi::av_frame_unref(self.cursor_drm_frame);
+                                        if cmap >= 0 {
+                                            let csid = (*cmapped).data[3] as usize as u32;
+                                            if let Some(key) = ckey {
+                                                Self::insert_cached(
+                                                    &mut self.cursor_cache,
+                                                    Self::CURSOR_CACHE_CAP,
+                                                    key,
+                                                    cmapped,
+                                                    csid,
+                                                );
+                                            } else {
+                                                temp_cursor_frame = cmapped;
+                                            }
+                                            has_cursor = 1;
+                                            cursor_surface = csid;
+                                            cursor_x = cursor.x;
+                                            cursor_y = cursor.y;
+                                            cursor_src_w = cw;
+                                            cursor_src_h = ch;
+                                            cursor_dst_w = cursor.crtc_w as i32;
+                                            cursor_dst_h = cursor.crtc_h as i32;
+                                        } else {
+                                            ffi::av_frame_free(&mut cmapped);
+                                        }
+                                    } else {
+                                        ffi::av_frame_unref(self.cursor_drm_frame);
+                                    }
+                                } else {
+                                    free_drm_frame_descriptor(
+                                        ptr::null_mut(),
+                                        cdesc_ptr as *mut u8,
+                                    );
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // 3. Allocate destination NV12 VA-API surface directly from encoder pool.
+            // 3. Allocate destination NV12/P010 VA-API surface directly from encoder pool.
             ffi::av_frame_unref(out);
             let ret = ffi::av_hwframe_get_buffer(enc_hw_frames_ctx, out, 0);
             if ret < 0 {
-                ffi::av_frame_unref(self.cursor_vaapi_frame);
-                ffi::av_frame_unref(self.vaapi_in_frame);
-                bail!("av_hwframe_get_buffer(NV12) failed (error {ret})");
+                if !temp_cursor_frame.is_null() {
+                    ffi::av_frame_free(&mut temp_cursor_frame);
+                }
+                if !temp_primary_frame.is_null() {
+                    ffi::av_frame_free(&mut temp_primary_frame);
+                }
+                bail!("av_hwframe_get_buffer(NV12/P010) failed (error {ret})");
             }
             let dst_surface = (*out).data[3] as usize as u32;
 
@@ -1167,8 +1327,12 @@ impl DmaBufVppScaler {
                 cursor_dst_w,
                 cursor_dst_h,
             );
-            ffi::av_frame_unref(self.cursor_vaapi_frame);
-            ffi::av_frame_unref(self.vaapi_in_frame);
+            if !temp_cursor_frame.is_null() {
+                ffi::av_frame_free(&mut temp_cursor_frame);
+            }
+            if !temp_primary_frame.is_null() {
+                ffi::av_frame_free(&mut temp_primary_frame);
+            }
             if vpp_ret < 0 {
                 ffi::av_frame_unref(out);
                 bail!("screx_va_vpp_compose failed (VAStatus error {})", -vpp_ret);
@@ -1181,10 +1345,10 @@ impl DmaBufVppScaler {
 
 impl Drop for DmaBufVppScaler {
     fn drop(&mut self) {
+        // Drop cached imported surfaces before freeing their frames contexts.
+        self.cursor_cache.clear();
+        self.primary_cache.clear();
         unsafe {
-            if !self.cursor_vaapi_frame.is_null() {
-                ffi::av_frame_free(&mut self.cursor_vaapi_frame);
-            }
             if !self.cursor_drm_frame.is_null() {
                 ffi::av_frame_free(&mut self.cursor_drm_frame);
             }
@@ -1193,9 +1357,6 @@ impl Drop for DmaBufVppScaler {
             }
             if !self.cursor_drm_frames_ctx.is_null() {
                 ffi::av_buffer_unref(&mut self.cursor_drm_frames_ctx);
-            }
-            if !self.vaapi_in_frame.is_null() {
-                ffi::av_frame_free(&mut self.vaapi_in_frame);
             }
             if !self.drm_frame.is_null() {
                 ffi::av_frame_free(&mut self.drm_frame);

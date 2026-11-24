@@ -235,7 +235,7 @@ struct VideoDisplayView: UIViewControllerRepresentable {
     let videoWidth: Int
     let videoHeight: Int
     var onTouch: ((Data) -> Void)?
-    var onScroll: ((CGFloat) -> Void)?
+    var onScroll: ((CGFloat, CGFloat) -> Void)?
     var hidePointer: Bool = false
     var lockPointer: Bool = false
     var acceptsTouch: Bool = true
@@ -316,7 +316,7 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     var touchForwardingEnabled = true {
         didSet { if !touchForwardingEnabled { cancelActiveTouches() } }
     }
-    var onScroll: ((CGFloat) -> Void)?
+    var onScroll: ((CGFloat, CGFloat) -> Void)?
     var hidePointer: Bool = false {
         didSet {
             if hidePointer && pointerInteraction == nil {
@@ -359,8 +359,8 @@ final class DisplayContainerView: UIView, UIPointerInteractionDelegate {
     @objc private func handleDiscreteScroll(_ recognizer: UIPanGestureRecognizer) {
         guard let onScroll else { return }
         let translation = recognizer.translation(in: self)
-        guard translation.y != 0 else { return }
-        onScroll(translation.y)
+        guard translation.x != 0 || translation.y != 0 else { return }
+        onScroll(translation.x, translation.y)
         recognizer.setTranslation(.zero, in: self)
     }
 

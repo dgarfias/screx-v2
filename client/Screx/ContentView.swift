@@ -38,7 +38,7 @@ struct ContentView: View {
                         videoWidth: Int(model.internalVideoSize.width),
                         videoHeight: Int(model.internalVideoSize.height),
                         onTouch: { data in model.sendTouch(data) },
-                        onScroll: { deltaY in model.forwardPhysicalMouseScroll(deltaY: deltaY) },
+                        onScroll: { dx, dy in model.forwardPhysicalMouseScroll(deltaX: dx, deltaY: dy) },
                         hidePointer: model.physicalMouseConnected,
                         lockPointer: model.physicalMouseConnected,
                         acceptsTouch: model.canForwardInternalTouch,
@@ -130,7 +130,7 @@ struct ContentView: View {
                             ),
                             onMove: { dx, dy in model.moveTrackpad(dx: dx, dy: dy) },
                             onButton: { code, pressed in model.trackpadButton(code, pressed: pressed) },
-                            onScroll: { model.scrollTrackpad(deltaY: $0) }
+                            onScroll: { dx, dy in model.scrollTrackpad(deltaX: dx, deltaY: dy) }
                         )
                         .id(model.inputLayoutRevision)
                         .frame(width: geo.size.width, height: geo.size.height)

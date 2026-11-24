@@ -105,7 +105,7 @@ struct ExternalControlPanel: View {
             TrackpadSurface(
                 onMove: { dx, dy in model.moveTrackpad(dx: dx, dy: dy) },
                 onButton: { code, pressed in model.trackpadButton(code, pressed: pressed) },
-                onScroll: { model.scrollTrackpad(deltaY: $0) },
+                onScroll: { dx, dy in model.scrollTrackpad(deltaX: dx, deltaY: dy) },
                 onInteractionChanged: { active in
                     withAnimation(.easeOut(duration: 0.15)) { isTrackpadActive = active }
                 }

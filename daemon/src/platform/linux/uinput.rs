@@ -40,11 +40,16 @@ const ABS_MT_POSITION_Y: u16 = 0x36;
 
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
+const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
+const REL_WHEEL_HI_RES: u16 = 0x0b;
+const REL_HWHEEL_HI_RES: u16 = 0x0c;
 
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
 
 const BTN_SOUTH: u16 = 0x130;
 const BTN_EAST: u16 = 0x131;
@@ -371,6 +376,10 @@ impl InputBackend for LinuxInput {
                 crate::log_trace!("[mouse] recv scroll: dy={dy}");
                 m.scroll(dy as i32);
             }
+            MouseEvent::ScrollHiRes { dx, dy } => {
+                crate::log_trace!("[mouse] recv scroll hires: dx={dx} dy={dy}");
+                m.scroll_hires(dx as i32, dy as i32);
+            }
         }
         Ok(())
     }
@@ -599,9 +608,13 @@ impl Drop for VirtualTouchscreen {
 
 pub struct VirtualMouse {
     file: File,
+    wheel_v_acc: i32,
+    wheel_h_acc: i32,
 }
 
 impl VirtualMouse {
+    const HI_RES_DETENT: i32 = 120;
+
     pub fn new() -> Result<Self> {
         let file = OpenOptions::new()
             .write(true)
@@ -618,9 +631,14 @@ impl VirtualMouse {
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_LEFT as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_SIDE as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_KEYBIT, BTN_EXTRA as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_X as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_Y as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_HWHEEL as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_WHEEL as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_WHEEL_HI_RES as libc::c_int))?;
+            ioctl_check(libc::ioctl(fd, UI_SET_RELBIT, REL_HWHEEL_HI_RES as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_X as libc::c_int))?;
             ioctl_check(libc::ioctl(fd, UI_SET_ABSBIT, ABS_Y as libc::c_int))?;
             set_abs(fd, ABS_X, 0, 65535)?;
@@ -640,7 +658,11 @@ impl VirtualMouse {
 
         std::thread::sleep(std::time::Duration::from_millis(200));
         crate::log_detail!("[mouse] virtual mouse created");
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            wheel_v_acc: 0,
+            wheel_h_acc: 0,
+        })
     }
 
     pub fn move_rel(&mut self, dx: i32, dy: i32) {
@@ -666,51 +688,75 @@ impl VirtualMouse {
     }
 
     pub fn button(&mut self, btn: u8, state: i32) {
-        if btn == 2 {
-            if state != 0 {
-                emit_batch(
-                    &mut self.file,
-                    &[
-                        input_event(EV_KEY, BTN_MIDDLE, 1),
-                        input_event(EV_SYN, SYN_REPORT, 0),
-                        input_event(EV_KEY, BTN_MIDDLE, 0),
-                        input_event(EV_SYN, SYN_REPORT, 0),
-                    ],
-                );
-            }
-            return;
-        }
         let code = match btn {
             0 => BTN_LEFT,
             1 => BTN_RIGHT,
+            2 => BTN_MIDDLE,
+            3 => BTN_SIDE,
+            4 => BTN_EXTRA,
             _ => return,
         };
         emit_batch(
             &mut self.file,
             &[
-                input_event(EV_KEY, code, state),
+                input_event(EV_KEY, code, if state != 0 { 1 } else { 0 }),
                 input_event(EV_SYN, SYN_REPORT, 0),
             ],
         );
     }
 
     pub fn scroll(&mut self, dy: i32) {
+        if dy == 0 {
+            return;
+        }
         emit_batch(
             &mut self.file,
             &[
+                input_event(EV_REL, REL_WHEEL_HI_RES, dy.saturating_mul(Self::HI_RES_DETENT)),
                 input_event(EV_REL, REL_WHEEL, dy),
                 input_event(EV_SYN, SYN_REPORT, 0),
             ],
         );
     }
 
+    pub fn scroll_hires(&mut self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let mut events = Vec::with_capacity(5);
+        if dy != 0 {
+            events.push(input_event(EV_REL, REL_WHEEL_HI_RES, dy));
+            self.wheel_v_acc = self.wheel_v_acc.saturating_add(dy);
+            let coarse = self.wheel_v_acc / Self::HI_RES_DETENT;
+            if coarse != 0 {
+                self.wheel_v_acc -= coarse * Self::HI_RES_DETENT;
+                events.push(input_event(EV_REL, REL_WHEEL, coarse));
+            }
+        }
+        if dx != 0 {
+            events.push(input_event(EV_REL, REL_HWHEEL_HI_RES, dx));
+            self.wheel_h_acc = self.wheel_h_acc.saturating_add(dx);
+            let coarse = self.wheel_h_acc / Self::HI_RES_DETENT;
+            if coarse != 0 {
+                self.wheel_h_acc -= coarse * Self::HI_RES_DETENT;
+                events.push(input_event(EV_REL, REL_HWHEEL, coarse));
+            }
+        }
+        events.push(input_event(EV_SYN, SYN_REPORT, 0));
+        emit_batch(&mut self.file, &events);
+    }
+
     pub fn release_all_buttons(&mut self) {
+        self.wheel_v_acc = 0;
+        self.wheel_h_acc = 0;
         emit_batch(
             &mut self.file,
             &[
                 input_event(EV_KEY, BTN_LEFT, 0),
                 input_event(EV_KEY, BTN_RIGHT, 0),
                 input_event(EV_KEY, BTN_MIDDLE, 0),
+                input_event(EV_KEY, BTN_SIDE, 0),
+                input_event(EV_KEY, BTN_EXTRA, 0),
                 input_event(EV_SYN, SYN_REPORT, 0),
             ],
         );
